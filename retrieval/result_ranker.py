@@ -225,8 +225,12 @@ class ResultRanker:
                 seen_uris[hit.uri] = hit
         l2_only = list(seen_uris.values())
 
-        ranked = self._ranker.rank(typed_query, l2_only)
+        graph_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") == "graph_neighbor"]
+        vector_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") != "graph_neighbor"]
+        ranked = self._ranker.rank(typed_query, vector_hits)
         top = ranked[: typed_query.top_k]
+        top += [RankedHit(h, h.score, f"graph score {h.score:.4f}")
+                for h in sorted(graph_hits, key=lambda h: (-h.score,h.uri))]
 
         blocks: list[RetrievedBlock] = []
         for item in top:
@@ -240,6 +244,8 @@ class ResultRanker:
                     category=hit.category,
                     owner_space=hit.owner_space,
                     abstract=hit.abstract or None,
+                    overview=hit.overview,
+                    content_excerpt=hit.content_excerpt,
                     has_overview=hit.has_overview,
                     has_content=hit.has_content,
                     match_reason=item.reason,

@@ -334,6 +334,7 @@ class Extractor:
         mode: str = "eager",
         react_timeout_seconds: float = 180.0,
         internal_tool_usage_tracker: Any | None = None,
+        activation_enabled: bool = False,
     ):
         """Initialize the Extractor.
 
@@ -367,12 +368,15 @@ class Extractor:
         self._mode = mode
         self._react_timeout_seconds = react_timeout_seconds
         self._internal_tool_usage_tracker = internal_tool_usage_tracker
+        self._activation_enabled = activation_enabled
+        self._extraction_template = "extraction_graph" if activation_enabled else "extraction"
         self._prefetcher: Optional[MemoryPrefetcher] = None
         if fs and vector_index and embedder and uri_resolver and self._schema_registry:
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
-        self._extraction_tools = build_extraction_tools(self._schema_registry)
+        self._extraction_tools = (build_extraction_tools(self._schema_registry, activation_enabled=True)
+                                  if activation_enabled else build_extraction_tools(self._schema_registry))
         if not self._extraction_tools:
             incompatible = [
                 f"{schema.memory_type}:{schema.version}"
@@ -381,7 +385,9 @@ class Extractor:
             detail = f" incompatible={incompatible}" if incompatible else ""
             raise ValueError(f"No compatible extraction tools available.{detail}")
         self._tool_to_category = build_tool_to_category(self._schema_registry)
-        self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, self._schema_registry)
+        self._parse_tool_call_fn = (
+            (lambda name, inp: parse_tool_call(name, inp, self._schema_registry, activation_enabled=True))
+            if activation_enabled else (lambda name, inp: parse_tool_call(name, inp, self._schema_registry)))
         logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
 
     # ------------------------------------------------------------------
@@ -671,6 +677,8 @@ class Extractor:
         content. Merges when/who/where fields by taking non-empty values.
         """
         merged: dict[tuple[str, str], CandidateMemory] = {}
+        from extraction.relation_proposals import attach, take
+        proposals = take(candidates)
         for c in candidates:
             key = (c.category, c.routing_key)
             if key not in merged:
@@ -698,7 +706,9 @@ class Extractor:
                 if not c.where and existing.where:
                     c.where = existing.where
                 merged[key] = c
-        return list(merged.values())
+        result = list(merged.values())
+        attach(result, proposals)
+        return result
 
     def _prepare_unique_spans(
         self,
@@ -895,10 +905,18 @@ class Extractor:
             )
 
         candidates: list[CandidateMemory] = []
+        proposals = []
+        from extraction.relation_proposals import attach, parse_proposal
         for call in tool_calls:
+            if self._activation_enabled and call.get("tool") == "extract_relation":
+                proposal = parse_proposal(call.get("input"))
+                if proposal is not None:
+                    proposals.append(proposal)
+                continue
             c = self._to_candidate(call)
             if c is not None:
                 candidates.append(c)
+        attach(candidates, proposals)
         if not candidates:
             raise ToolCallProtocolError(
                 "native tool calls contained no schema-valid extraction operation",
@@ -923,12 +941,20 @@ class Extractor:
         )
         envelope = ExtractionEnvelope.model_validate(raw)
         candidates: list[CandidateMemory] = []
+        proposals = []
+        from extraction.relation_proposals import attach, parse_proposal
         for operation in envelope.operations:
+            if self._activation_enabled and operation.tool == "extract_relation":
+                proposal = parse_proposal(operation.input)
+                if proposal is not None:
+                    proposals.append(proposal)
+                continue
             candidate = self._to_candidate(
                 {"tool": operation.tool, "input": operation.input}
             )
             if candidate is not None:
                 candidates.append(candidate)
+        attach(candidates, proposals)
         if envelope.operations and not candidates:
             raise ToolCallProtocolError(
                 "JSON fallback contained no schema-valid extraction operation"
@@ -973,6 +999,7 @@ class Extractor:
                 prompt_manager=self._prompt_manager,
                 prefetcher=self._prefetcher,
                 timeout_seconds=self._react_timeout_seconds,
+                activation_enabled=self._activation_enabled,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )
             result = loop.run(prompt, ctx, prefetch_result)
@@ -1051,12 +1078,12 @@ class Extractor:
     ) -> str:
         """Build extraction prompt from YAML template (Eager mode)."""
         system_prompt = self._prompt_manager.render(
-            "extraction", "system_prompt",
+            self._extraction_template, "system_prompt",
             session_summary=session_summary,
         )
-        examples = self._prompt_manager.render("extraction", "examples")
+        examples = self._prompt_manager.render(self._extraction_template, "examples")
         output_instruction = self._prompt_manager.render(
-            "extraction", "output_instruction",
+            self._extraction_template, "output_instruction",
             output_language=language,
         )
 
@@ -1068,8 +1095,15 @@ class Extractor:
                 user_id=ctx.user_id,
             )
 
+        relation_instruction = ""
+        if self._activation_enabled:
+            relation_instruction = self._prompt_manager.render(
+                self._extraction_template, "lazy_tools_instruction")
+        # Keep graph-off input bytes unchanged; graph-on uses the archived
+        # prompt contract, including examples and relationship guidance.
+        relation_block = relation_instruction + "\n\n" if relation_instruction else ""
         return (
-            f"{system_prompt}\n\n{identity_block}\n\n{examples}\n\n"
+            f"{system_prompt}\n\n{identity_block}\n\n{relation_block}{examples}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"
         )
 

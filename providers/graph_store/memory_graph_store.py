@@ -451,14 +451,8 @@ class MemoryGraphStore(GraphStore):
         Returns 0.0 when either vector has zero norm or the lengths differ
         rather than raising — search stays robust against dirty data.
         """
-        if not a or not b or len(a) != len(b):
-            return 0.0
-        dot = sum(x * y for x, y in zip(a, b))
-        na = math.sqrt(sum(x * x for x in a))
-        nb = math.sqrt(sum(y * y for y in b))
-        if na == 0 or nb == 0:
-            return 0.0
-        return dot / (na * nb)
+        from core.vector_math import cosine_similarity
+        return cosine_similarity(a, b)
 
     def search_by_embedding(
         self,

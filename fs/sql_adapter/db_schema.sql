@@ -86,6 +86,95 @@ CREATE TABLE IF NOT EXISTS relation_edges (
 CREATE INDEX IF NOT EXISTS idx_re_from ON relation_edges (from_uri);
 CREATE INDEX IF NOT EXISTS idx_re_to   ON relation_edges (to_uri);
 
+-- Keep canonical relation labels consistent with edge_projection_jobs.
+-- CREATE TABLE IF NOT EXISTS alone does not widen existing installations.
+-- Do not narrow databases that already use a wider or unbounded type.
+DO $widen_relation_type$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'relation_edges'
+          AND column_name = 'relation_type'
+          AND data_type = 'character varying'
+          AND character_maximum_length < 256
+    ) THEN
+        ALTER TABLE relation_edges ALTER COLUMN relation_type TYPE VARCHAR(256);
+    END IF;
+END $widen_relation_type$;
+
+-- S8R-03P durable semantic-search projection for accepted relation edges.
+-- JSONB keeps the disposable embedding projection backend-portable; canonical
+-- relation identity and lifecycle remain owned by relation_edges.
+ALTER TABLE relation_edges ADD COLUMN IF NOT EXISTS projection_edge_id VARCHAR(64);
+ALTER TABLE relation_edges ADD COLUMN IF NOT EXISTS edge_projection JSONB;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_re_projection_edge_id
+    ON relation_edges (account_id, projection_edge_id)
+    WHERE projection_edge_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS edge_projection_jobs (
+    account_id VARCHAR(128) NOT NULL,
+    edge_id VARCHAR(64) NOT NULL,
+    source_uri VARCHAR(512) NOT NULL,
+    target_uri VARCHAR(512) NOT NULL,
+    relation_type VARCHAR(256) NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    target_text TEXT NOT NULL DEFAULT '',
+    source_revision INTEGER NOT NULL,
+    target_revision INTEGER NOT NULL,
+    representation_version VARCHAR(64) NOT NULL,
+    embedding_profile VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING','PROCESSING','COMPLETE','FAILED')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_retry_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, edge_id)
+);
+CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_pending
+    ON edge_projection_jobs (account_id, status, next_retry_at)
+    WHERE status IN ('PENDING','FAILED');
+ALTER TABLE edge_projection_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE edge_projection_jobs FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON edge_projection_jobs
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION invalidate_edge_projections_for_node_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (OLD.version, OLD.content, OLD.abstract, OLD.overview)
+       IS DISTINCT FROM
+       (NEW.version, NEW.content, NEW.abstract, NEW.overview) THEN
+        UPDATE edge_projection_jobs
+           SET source_revision = CASE WHEN source_uri = NEW.uri THEN NEW.version ELSE source_revision END,
+               target_revision = CASE WHEN target_uri = NEW.uri THEN NEW.version ELSE target_revision END,
+               target_text = CASE WHEN target_uri = NEW.uri
+                                  THEN concat_ws(E'\n', NEW.abstract, NEW.overview, NEW.content)
+                                  ELSE target_text END,
+               status = 'PENDING', last_error = NULL, next_retry_at = NULL,
+               updated_at = NOW()
+         WHERE account_id = NEW.account_id
+           AND (source_uri = NEW.uri OR target_uri = NEW.uri);
+        UPDATE relation_edges
+           SET edge_projection = NULL, updated_at = NOW()
+         WHERE account_id = NEW.account_id
+           AND (from_uri = NEW.uri OR to_uri = NEW.uri)
+           AND projection_edge_id IS NOT NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_invalidate_edge_projections ON context_nodes;
+CREATE TRIGGER trg_invalidate_edge_projections
+AFTER UPDATE OF version, content, abstract, overview ON context_nodes
+FOR EACH ROW EXECUTE FUNCTION invalidate_edge_projections_for_node_update();
+
 -- Session archives
 CREATE TABLE IF NOT EXISTS session_archives (
     archive_id    VARCHAR(64)  NOT NULL,

@@ -59,7 +59,8 @@ def test_opengauss_schema_preserves_tenant_write_isolation():
     assert "current_setting('app.account_id', true)" not in schema_sql
     assert "WITH CHECK (account_id" not in schema_sql
     assert "CHECK (account_id = current_setting('app.account_id')) NOT VALID" in schema_sql
-    assert schema_sql.count("_tenant_write_guard") == 11
+    assert schema_sql.count("_tenant_write_guard") == 12
+    assert "edge_projection_jobs_tenant_write_guard" in schema_sql
     assert conn.autocommit is False
     schema_module._schema_ensured.clear()
 

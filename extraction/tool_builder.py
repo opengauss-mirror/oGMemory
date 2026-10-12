@@ -34,7 +34,7 @@ _EXCLUDED_TOOL_FIELDS = {"provenance_ids"}
 _INTERNAL_MEMORY_TYPES = {"session_archive", "session_summary"}
 
 
-def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
+def build_extraction_tools(registry: SchemaRegistry, *, activation_enabled: bool = False) -> list[dict]:
     """Generate OpenAI function calling tool definitions from enabled schemas.
 
     Each schema generates one tool definition with:
@@ -52,6 +52,9 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
 
     for schema in registry.list_enabled():
         if schema.memory_type in _INTERNAL_MEMORY_TYPES:
+            continue
+        # Relation proposals belong to graph-on ingestion, not memory storage.
+        if schema.memory_type == "relation" and not activation_enabled:
             continue
 
         if not is_schema_version_compatible(schema):
@@ -85,6 +88,13 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
             if field.required:
                 required.append(field.name)
 
+        if activation_enabled and schema.memory_type != "relation":
+            properties["update_activation"] = {
+                "type": "string", "minLength": 1,
+                "description": "One compact source-grounded declarative sentence describing this memory's explicit subject, concrete fact, and stated distinguishing context. Preserve uncertainty and negation. Generate alongside this candidate; do not invent scope, future queries, or links.",
+            }
+            required.append("update_activation")
+
         tools.append({
             "name": schema.tool_name,
             "description": schema.description,
@@ -117,7 +127,7 @@ def build_tool_to_category(registry: SchemaRegistry) -> dict[str, tuple[str, str
     return {
         schema.tool_name: (schema.memory_type, schema.owner_scope)
         for schema in registry.list_compatible_enabled()
-        if schema.memory_type not in _INTERNAL_MEMORY_TYPES
+        if schema.memory_type not in _INTERNAL_MEMORY_TYPES and schema.memory_type != "relation"
     }
 
 
@@ -125,6 +135,8 @@ def parse_tool_call(
     tool_name: str,
     tool_input: dict,
     registry: SchemaRegistry,
+    *,
+    activation_enabled: bool = False,
 ) -> tuple[str, str, CandidateMemory] | None:
     """Validate and parse a tool call using schema definitions.
 
@@ -142,6 +154,8 @@ def parse_tool_call(
     for s in registry.list_compatible_enabled():
         if s.memory_type in _INTERNAL_MEMORY_TYPES:
             continue
+        if s.memory_type == "relation":
+            continue  # handled as a proposal, never a CandidateMemory
         if s.tool_name == tool_name:
             schema = s
             break
@@ -149,6 +163,14 @@ def parse_tool_call(
     if schema is None:
         logger.warning(f"Unknown tool name: {tool_name}")
         return None
+
+    activation = None
+    if activation_enabled:
+        value = tool_input.get("update_activation")
+        if not isinstance(value, str) or not value.strip() or "\n" in value.strip() or "\r" in value.strip():
+            logger.warning("Invalid or missing update_activation for %s", tool_name)
+            return None
+        activation = value.strip()
 
     # Pre-fill auto-generatable fields before validation so required checks pass
     tool_input = dict(tool_input)  # copy to avoid mutating caller's dict
@@ -297,5 +319,8 @@ def parse_tool_call(
             attributed_speaker=attributed_speaker,
             attribution_basis=attribution_basis,
             provenance_ids=validated_fields.get("provenance_ids", []),
+            metadata={"update_activation": activation,
+                      "update_activation_version": "c1-integrated-activation-v1"}
+            if activation is not None else {},
         ),
     )

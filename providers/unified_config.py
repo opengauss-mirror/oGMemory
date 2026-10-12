@@ -581,6 +581,15 @@ class OgMemConfig:
     sql_connection_string: str | None = None
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
+    # Opt-in ContextNode semantic graph; not the multimodal graph store.
+    graph_backend: str = "none"  # none | sql
+    enable_graph_expansion: bool = True
+    graph_expand_top_k: int = 5
+    graph_expand_limit: int = 3
+    graph_min_weight: float = 0.0
+    graph_edge_similarity_threshold: float = 0.35
+    graph_edge_embedding_profile: str = "shared-node-embedding-v1"
+    graph_supplement_enabled: bool = True
 
     # -- Agent skill sedimentation --------------------------------------------
     skill_sedimentation_enabled: bool = False
@@ -707,6 +716,17 @@ class OgMemConfig:
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.graph_backend not in {"none", "sql"}:
+            raise ValueError("graph.backend must be none or sql")
+        if self.graph_backend == "sql" and self.storage_backend != "sql":
+            raise ValueError("graph.backend=sql requires storage.backend=sql")
+        if not 0 <= self.graph_edge_similarity_threshold <= 1 or not 0 <= self.graph_min_weight <= 1:
+            raise ValueError("graph similarity threshold and minimum weight must be between 0 and 1")
+        if (any(not isinstance(v,int) or isinstance(v,bool) for v in (self.graph_expand_top_k,self.graph_expand_limit))
+                or not 1 <= self.graph_expand_top_k <= 5 or not 1 <= self.graph_expand_limit <= 3):
+            raise ValueError("graph expansion supports 1..5 anchors and 1..3 outgoing edges per anchor")
+        if not self.graph_edge_embedding_profile.strip():
+            raise ValueError("graph edge embedding profile must not be empty")
         from fs.sql_adapter.dialect import normalize_sql_dialect
 
         self.sql_dialect = normalize_sql_dialect(self.sql_dialect)
@@ -1090,6 +1110,7 @@ class OgMemConfig:
         tool_output = features.get("tool_output") or {}
         mcp = raw.get("mcp") or {}
         storage = raw.get("storage") or {}
+        graph = raw.get("graph") or {}
         agfs = raw.get("agfs") or {}
         idx = raw.get("index") or {}
         ident = raw.get("identity") or {}
@@ -1863,6 +1884,14 @@ class OgMemConfig:
                 128,
                 int,
             ),
+            graph_backend=_resolve(graph.get("backend"), "GRAPH_BACKEND", "none"),
+            enable_graph_expansion=_resolve_bool(graph.get("enable_expansion"), "ENABLE_GRAPH_EXPANSION", True),
+            graph_expand_top_k=_resolve(graph.get("expand_top_k"), "GRAPH_EXPAND_TOP_K", 5, int),
+            graph_expand_limit=_resolve(graph.get("expand_limit"), "GRAPH_EXPAND_LIMIT", 3, int),
+            graph_min_weight=_resolve(graph.get("min_weight"), "GRAPH_MIN_WEIGHT", 0.0, float),
+            graph_edge_similarity_threshold=_resolve(graph.get("edge_similarity_threshold"), "GRAPH_EDGE_SIMILARITY_THRESHOLD", 0.35, float),
+            graph_edge_embedding_profile=_resolve(graph.get("edge_embedding_profile"), "GRAPH_EDGE_EMBEDDING_PROFILE", "shared-node-embedding-v1"),
+            graph_supplement_enabled=_resolve_bool(graph.get("supplement_enabled"), "GRAPH_SUPPLEMENT_ENABLED", True),
             # Agent skill sedimentation
             skill_sedimentation_enabled=_resolve_bool(
                 sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,

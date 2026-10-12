@@ -95,6 +95,8 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         "has_content": bool(node.content),
     }
     base_metadata.update(code_metadata)
+    expected = node.metadata.get("_expected_version", node.metadata.get("expected_version"))
+    base_metadata["canonical_revision"] = int(expected) + 1 if expected is not None else node.metadata.get("version", 1)
 
     # Enrich metadata with structured extraction fields (when/who/where)
     for key in ("when", "who", "where", "routing_key"):
@@ -111,7 +113,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         level=0,
         text=node.abstract,
         filters=dict(base_filters),
-        metadata={"level": "abstract", **base_metadata},
+        metadata={"level": "abstract", "record_kind": "node_abstract", **base_metadata},
     ))
 
     # Level 2: Content (L2) - full content for deep reading
@@ -129,8 +131,14 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
             level=2,
             text=node.content,
             filters=dict(base_filters),
-            metadata={"level": "content", **l2_metadata},
+            metadata={"level": "content", "record_kind": "node_content", **l2_metadata},
         ))
+
+    # Ingestion-only connection descriptor; ordinary search filters L0/L1/L2.
+    from index.activation_projection import build_activation_record
+    activation = build_activation_record(node, base_filters)
+    if activation is not None:
+        records.append(activation)
 
     # Validate every emitted record has the required filters
     _validate_filters(records)

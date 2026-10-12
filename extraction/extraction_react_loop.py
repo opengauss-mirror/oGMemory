@@ -149,6 +149,7 @@ class ExtractionReActLoop(ReactLoop):
         max_iterations: int = 3,
         timeout_seconds: float = 30.0,
         internal_tool_usage_tracker: Any | None = None,
+        activation_enabled: bool = False,
     ):
         super().__init__(
             llm, max_iterations, timeout_seconds,
@@ -160,8 +161,10 @@ class ExtractionReActLoop(ReactLoop):
         self._uri_resolver = uri_resolver
         self._prefetcher = prefetcher
         self._prompt_manager = prompt_manager
+        self._activation_enabled = activation_enabled
 
-        self._extraction_tools = build_extraction_tools(registry)
+        self._extraction_tools = (build_extraction_tools(registry, activation_enabled=True)
+                                  if activation_enabled else build_extraction_tools(registry))
 
         # All available tools: read, list, relations, access_stats, and extraction tools
         self._all_tools = [_READ_TOOL, _LIST_TOOL, _RELATIONS_TOOL, _ACCESS_STATS_TOOL] + self._extraction_tools
@@ -215,11 +218,12 @@ class ExtractionReActLoop(ReactLoop):
 
         messages = []
 
-        system_prompt = self._prompt_manager.render("extraction", "system_prompt")
-        lazy_tools = self._prompt_manager.render("extraction", "lazy_tools_instruction")
-        identity_block = self._prompt_manager.render("extraction", "identity_block", user_id=ctx.user_id)
-        examples = self._prompt_manager.render("extraction", "examples")
-        output_instruction = self._prompt_manager.render("extraction", "output_instruction")
+        template = "extraction_graph" if self._activation_enabled else "extraction"
+        system_prompt = self._prompt_manager.render(template, "system_prompt")
+        lazy_tools = self._prompt_manager.render(template, "lazy_tools_instruction")
+        identity_block = self._prompt_manager.render(template, "identity_block", user_id=ctx.user_id)
+        examples = self._prompt_manager.render(template, "examples")
+        output_instruction = self._prompt_manager.render(template, "output_instruction")
 
         # Build system prompt: system_prompt + identity + lazy_tools + examples + output
         system_content = f"{system_prompt}\n\n{identity_block}\n\n{lazy_tools}\n\n{examples}\n\n{output_instruction}"
@@ -328,7 +332,8 @@ class ExtractionReActLoop(ReactLoop):
                 tool_name, tool_input["raw"],
             )
             return None
-        parsed = parse_tool_call(tool_name, tool_input, self._registry)
+        parsed = (parse_tool_call(tool_name, tool_input, self._registry, activation_enabled=True)
+                  if self._activation_enabled else parse_tool_call(tool_name, tool_input, self._registry))
         if parsed:
             memory_type, owner_scope, candidate = parsed
             logger.info(f"Parsed candidate from {tool_name}: {memory_type}/{candidate.routing_key}")
@@ -372,11 +377,15 @@ class ExtractionReActLoop(ReactLoop):
             return []
 
         candidates = []
+        proposals = []
+        from extraction.relation_proposals import attach, parse_proposal
         for item in items:
             if not isinstance(item, dict):
                 continue
 
             tool_name = item.get("name", "")
+            if self._activation_enabled and not tool_name:
+                tool_name = item.get("tool", "")
             tool_input = item.get("input", item)
             if not tool_name.startswith("extract_"):
                 for key in item:
@@ -385,9 +394,15 @@ class ExtractionReActLoop(ReactLoop):
                         tool_input = item[key]
                         break
 
+            if self._activation_enabled and tool_name == "extract_relation":
+                proposal = parse_proposal(tool_input)
+                if proposal is not None:
+                    proposals.append(proposal)
+                continue
             candidate = self._to_candidate(tool_name, tool_input)
             if candidate:
                 candidates.append(candidate)
+        attach(candidates, proposals)
         return candidates
 
     def _should_continue_after_output(
@@ -661,6 +676,8 @@ class ExtractionReActLoop(ReactLoop):
 
         # Collect candidates from parsed output (content JSON)
         candidates = [item for item in loop_result.output if isinstance(item, CandidateMemory)]
+        proposals = []
+        from extraction.relation_proposals import attach, parse_proposal
 
         # Also extract candidates from tools_used (extract_* tool calls)
         # This handles cases where LLM used tool calling instead of outputting JSON
@@ -674,10 +691,17 @@ class ExtractionReActLoop(ReactLoop):
             tool_result = tool_record.get("result", {})
             # Use params (original input) with unified _to_candidate method
             if tool_result.get("status") == "recorded":
+                if self._activation_enabled and tool_name == "extract_relation":
+                    proposal = parse_proposal(tool_params)
+                    if proposal is not None:
+                        proposals.append(proposal)
+                    continue
                 candidate = self._to_candidate(tool_name, tool_params)
                 if candidate:
                     candidates.append(candidate)
 
+        from extraction.relation_proposals import take
+        attach(candidates, take(candidates) + proposals)
         # Validate URIs before returning
         errors = self._validate_operations_uris(candidates, ctx)
         if errors:
