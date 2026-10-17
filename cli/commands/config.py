@@ -32,6 +32,7 @@ def run(args) -> int:
         try:
             from cli.lib.config_loader import get_reference_yaml, load_template
             tmpl = load_template(get_reference_yaml())
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
             cfg_path.write_text(tmpl)
             print(ok(f"Created: {CYAN}{cfg_path}{NC}\n  {YELLOW}Edit API keys and settings as needed{NC}\n"))
             return 0
