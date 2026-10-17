@@ -93,18 +93,27 @@ packages = [
     "skills",
     "scene",
     "integrations",
+    "perf",
 ]
+
+# CLI 的 config init 与 deploy helpers 以仓库根目录为基准读取 config/ 模板；
+# wheel 里必须落到 site-packages/config，否则安装后的 ogmem 找不到模板。
+[tool.hatch.build.targets.wheel.force-include]
+"config" = "config"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "/README.md",
     "/LICENSE",
+    "/cli",
+    "/config",
     "/core",
     "/fs",
     "/extraction",
     "/commit",
     "/index",
     "/retrieval",
+    "/perf",
     "/providers",
     "/service",
     "/server",
