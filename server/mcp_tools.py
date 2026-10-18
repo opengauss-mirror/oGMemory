@@ -284,7 +284,8 @@ def search_skills(
     for row in rows:
         haystack = set(_search_tokens(f"{row['name']} {row.get('description', '')}"))
         row["score"] = len(query_tokens & haystack) / max(1, len(query_tokens | haystack))
-    skills = sorted(rows, key=lambda row: (-float(row["score"]), row["name"]))[:top_k]
+    matching = [row for row in rows if row["score"] > 0]
+    skills = sorted(matching, key=lambda row: (-float(row["score"]), row["name"]))[:top_k]
     return {
         "query": query.strip(),
         "skills": skills,
