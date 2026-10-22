@@ -15,7 +15,7 @@ included. Graph support remains opt-in; use the configuration below to enable
 it. Ordinary upstream model settings, keyword routing and cache defaults are
 unchanged.
 
-Fresh focused verification: **432 passed, 5 skipped**. Four skips require an
+Previous PR266 checkpoint verification: **432 passed, 5 skipped**. Four skips require an
 explicit disposable PostgreSQL database (`GRAPH_TEST_DSN`); one requires
 Chroma. The selection covers graph on/off boundaries, descriptors, relation
 generation, projections, retrieval, prefix/budget protection, the summary fix,
@@ -23,6 +23,46 @@ and upstream code-resource, lexical-index, provider and threading regressions.
 `git diff --check anttrail..HEAD` is clean. No model API, live-database or fresh
 BEAM/LoCoMo benchmark was run for this checkpoint; it does not establish
 historical accuracy parity.
+
+### Review fixes verified on 2026-10-22
+
+- One-hop and two-hop graph results obey explicit or planner-effective category
+  filters. Canonical categories are checked again after hydration and before
+  supplemental delivery; excluded categories cannot become traversal bridges.
+- The graph invalidation trigger uses `EXECUTE PROCEDURE`, supported by both
+  dialects. Node changes enqueue durable `PROJECT_GRAPH` events in the same
+  transaction, rather than relying on process-local remembered accounts.
+- Relation writes, projection completion and node moves acquire canonical-node
+  locks before job locks and relation locks. Node and job locks use stable order.
+  The old edge/node lock inversion was reproduced as `DeadlockDetected` on the
+  unchanged PR266 commit; the same scenario completes with these fixes.
+- Projection claims carry a private lease token. Both success and failure reject
+  expired/replaced claims, including retries of the same node revisions. The
+  token is not included in searchable relation metadata.
+- L3 descriptors are excluded from lexical projection/backfill and ordinary
+  memory BM25 queries. Node embeddings persist their actual model and dimension;
+  supplemental traversal rejects unidentified or incompatible stored vectors.
+- Node moves migrate projection endpoint URIs, edge IDs and relation projection
+  IDs atomically, invalidate old worker leases and enqueue replacement jobs.
+  Moved-node index events reuse `build_index_records` to rebuild L3 and L0/L2,
+  retaining the move path's existing L1 records.
+- Endpoint indexes `(account_id, source_uri)` and `(account_id, target_uri)`
+  support invalidation without scanning all completed tenant jobs.
+
+Validation: **559 selected unit tests passed**, plus **11 real PostgreSQL/pgvector
+integration tests passed** using a dedicated disposable database and fake
+providers. Includes stale failure/success, same-revision lease replacement,
+restart after ordinary-event acknowledgement, source/target moves, descriptor
+rebuilding, subsequent re-projection and a deterministic concurrent update.
+This is not a full-suite or live-openGauss verification claim; no new paid
+benchmark was run for these review fixes.
+
+Upgrade: stop old indexing workers before applying the idempotent schema update
+and restart them afterwards. The update adds `claim_token` and endpoint indexes;
+it preserves canonical memories/relations. Legacy node vectors without model
+identity must be re-indexed before they can qualify incoming supplemental edges.
+Do not guess their model from dimensions or relabel them as the current model.
+The feature remains default-off and contains no conflict-management changes.
 
 This feature ports the accepted graph-control ingestion and retrieval design
 from `reuse-v3-good-20261009` (`65784e86111fa7258f3c1484182c1955274767b9`)

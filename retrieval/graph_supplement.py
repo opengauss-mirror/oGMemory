@@ -89,6 +89,8 @@ class GraphSupplement:
                 or record.filters.get("owner_space") != block.owner_space
                 or meta.get("record_kind") not in ("node_abstract", "node_overview", "node_content")
                 or str(meta.get("canonical_revision", -1)) != str(revision(block))
+                or meta.get("embedding_model") != self.profile["model"]
+                or meta.get("embedding_dimension") != self.profile["dimension"]
                 or any(k in meta and meta[k] != value for k, value in identities.items())
                 or not isinstance(vector, (list, tuple)) or len(vector) != self.profile["dimension"]
                 or not all(math.isfinite(x) for x in vector)):
@@ -96,7 +98,7 @@ class GraphSupplement:
             result.append(vector)
         return result
 
-    def select(self, query, pregraph, ordinary, ctx, *, query_vector=None):
+    def select(self, query, pregraph, ordinary, ctx, *, query_vector=None, categories=None):
         audit = dict(protocol=PROTOCOL, reference_method=REFERENCE_METHOD,
             embedding_profile=dict(self.profile), query_sha256=digest(query), scope=binding(ctx),
             anchors=[], selected=[], decisions=[], expanded_nodes=[], authorization_rejections=0,
@@ -105,7 +107,8 @@ class GraphSupplement:
             local_limit_per_lane=LOCAL_LANE_LIMIT, local_max_unique_candidates=2*LOCAL_LANE_LIMIT,
             max_hops=MAX_HOPS, max_expanded_nodes=MAX_EXPANDED_NODES, max_graph_nodes=MAX_GRAPH_NODES,
             final_selection="URI-unique semantic/query interleaving, semantic first",
-            additional_embedding_calls=0, generative_llm_calls=0)
+            additional_embedding_calls=0, generative_llm_calls=0,
+            categories=sorted(categories) if categories is not None else None)
         if not pregraph:
             return audit
         if query_vector is None:
@@ -124,6 +127,8 @@ class GraphSupplement:
             if uri not in blocks:
                 try:
                     blocks[uri] = self.read(uri, ctx)
+                    if categories is not None and blocks[uri].category not in categories:
+                        raise NodeNotFoundError(uri)
                     nodes[uri] = body(blocks[uri])
                 except EXPECTED_REJECTIONS:
                     blocks[uri] = None
@@ -265,6 +270,9 @@ class GraphSupplement:
                 block = self.read(uri, ctx)  # Re-authorize at the final injection boundary.
             except EXPECTED_REJECTIONS:
                 marker["rejected_additions"].append("unavailable_or_unauthorized")
+                continue
+            if audit.get("categories") is not None and block.category not in audit["categories"]:
+                marker["rejected_additions"].append("category_outside_request")
                 continue
             if revision(block) != selected["revision"] or digest(body(block)) != selected["body_sha256"]:
                 marker["rejected_additions"].append("node_changed_during_request")

@@ -38,13 +38,20 @@ class _Connection:
 def test_postgresql_schema_is_applied_through_dialect():
     conn = _Connection()
     schema_module._schema_ensured.clear()
-
     schema_module.ensure_schema(conn, "postgresql")
 
     schema_sql = conn.cursor_instance.statements[0][0]
     assert "current_setting('app.account_id', true)" in schema_sql
     assert conn.autocommit is False
     schema_module._schema_ensured.clear()
+
+
+def test_graph_trigger_uses_portable_procedure_invocation_for_both_dialects():
+    from fs.sql_adapter.dialect import resolve_sql_dialect
+    for name in ('postgresql','opengauss'):
+        text=resolve_sql_dialect(name).prepare_schema(schema_module._SCHEMA_SQL)
+        assert 'EXECUTE PROCEDURE invalidate_edge_projections_for_node_update()' in text
+        assert 'EXECUTE FUNCTION invalidate_edge_projections_for_node_update()' not in text
 
 
 def test_opengauss_schema_preserves_tenant_write_isolation():

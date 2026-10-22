@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS edge_projection_jobs (
         CHECK (status IN ('PENDING','PROCESSING','COMPLETE','FAILED')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    claim_token VARCHAR(64),
     next_retry_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -136,6 +137,11 @@ CREATE TABLE IF NOT EXISTS edge_projection_jobs (
 CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_pending
     ON edge_projection_jobs (account_id, status, next_retry_at)
     WHERE status IN ('PENDING','FAILED');
+ALTER TABLE edge_projection_jobs ADD COLUMN IF NOT EXISTS claim_token VARCHAR(64);
+CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_source
+    ON edge_projection_jobs (account_id, source_uri);
+CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_target
+    ON edge_projection_jobs (account_id, target_uri);
 ALTER TABLE edge_projection_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE edge_projection_jobs FORCE ROW LEVEL SECURITY;
 DO $$ BEGIN
@@ -147,20 +153,35 @@ END $$;
 
 CREATE OR REPLACE FUNCTION invalidate_edge_projections_for_node_update()
 RETURNS TRIGGER AS $$
+DECLARE
+    job RECORD;
 BEGIN
     IF (OLD.version, OLD.content, OLD.abstract, OLD.overview)
        IS DISTINCT FROM
        (NEW.version, NEW.content, NEW.abstract, NEW.overview) THEN
+        FOR job IN SELECT edge_id FROM edge_projection_jobs
+                    WHERE account_id = NEW.account_id
+                      AND (source_uri = NEW.uri OR target_uri = NEW.uri)
+                    ORDER BY edge_id FOR UPDATE
+        LOOP
         UPDATE edge_projection_jobs
            SET source_revision = CASE WHEN source_uri = NEW.uri THEN NEW.version ELSE source_revision END,
                target_revision = CASE WHEN target_uri = NEW.uri THEN NEW.version ELSE target_revision END,
                target_text = CASE WHEN target_uri = NEW.uri
                                   THEN concat_ws(E'\n', NEW.abstract, NEW.overview, NEW.content)
                                   ELSE target_text END,
-               status = 'PENDING', last_error = NULL, next_retry_at = NULL,
+               status = 'PENDING', last_error = NULL, next_retry_at = NULL, claim_token = NULL,
                updated_at = NOW()
          WHERE account_id = NEW.account_id
-           AND (source_uri = NEW.uri OR target_uri = NEW.uri);
+           AND edge_id = job.edge_id;
+            -- Same transaction as invalidation: restart cannot lose discovery
+            -- even after the ordinary node event was acknowledged.
+            INSERT INTO outbox_events
+                (event_id,event_type,uri,account_id,payload,status,retry_count)
+            VALUES (md5(NEW.account_id || job.edge_id || clock_timestamp()::text || random()::text),
+                    'PROJECT_GRAPH',NEW.uri,NEW.account_id,
+                    ('{"edge_id":"' || job.edge_id || '"}')::jsonb,'PENDING',0);
+        END LOOP;
         UPDATE relation_edges
            SET edge_projection = NULL, updated_at = NOW()
          WHERE account_id = NEW.account_id
@@ -173,7 +194,7 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_invalidate_edge_projections ON context_nodes;
 CREATE TRIGGER trg_invalidate_edge_projections
 AFTER UPDATE OF version, content, abstract, overview ON context_nodes
-FOR EACH ROW EXECUTE FUNCTION invalidate_edge_projections_for_node_update();
+FOR EACH ROW EXECUTE PROCEDURE invalidate_edge_projections_for_node_update();
 
 -- Session archives
 CREATE TABLE IF NOT EXISTS session_archives (

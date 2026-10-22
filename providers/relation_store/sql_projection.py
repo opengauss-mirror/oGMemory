@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from psycopg2.extras import Json
 
@@ -24,23 +25,51 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
             pool = SharedConnectionPool(connection_string,pool_size=pool_size,dialect=dialect)
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._claimed_accounts: dict[str, str] = {}
+        self._claimed_tokens: dict[str, str] = {}
         conn = self._get_connection()
         try:
             ensure_schema(conn, self.sql_dialect)
         finally:
             self._return_connection(conn)
 
+    @staticmethod
+    def _lock_endpoints(cur, account_id, edge_ids):
+        """Global write order: canonical nodes, then jobs, then relation rows."""
+        cur.execute("""SELECT uri FROM context_nodes
+            WHERE account_id=%s AND uri IN (
+                SELECT source_uri FROM edge_projection_jobs WHERE account_id=%s AND edge_id=ANY(%s)
+                UNION SELECT target_uri FROM edge_projection_jobs WHERE account_id=%s AND edge_id=ANY(%s))
+            ORDER BY uri FOR UPDATE""", (account_id,account_id,edge_ids,account_id,edge_ids))
+        cur.fetchall()
+
     def put_many(self, projections: list[EdgeProjection]) -> None:
         if not projections:
             return
         conn = self._get_connection()
+        completed = []
         try:
             with conn.cursor() as cur:
+                accounts = {}
                 for item in projections:
+                    account = self._claimed_accounts.get(item.edge_id)
+                    if account is not None and item.claim_token:
+                        accounts.setdefault(account, []).append(item.edge_id)
+                for account, ids in sorted(accounts.items()):
+                    self.bind_tenant(conn, account)
+                    self._lock_endpoints(cur, account, ids)
+                for item in sorted(projections, key=lambda p: p.edge_id):
                     account_id = self._claimed_accounts.get(item.edge_id)
-                    if account_id is None:
+                    if account_id is None or not item.claim_token:
                         continue
                     self.bind_tenant(conn, account_id)
+                    cur.execute("""SELECT claim_token,source_revision,target_revision,
+                        embedding_profile,representation_version FROM edge_projection_jobs
+                        WHERE account_id=%s AND edge_id=%s AND status='PROCESSING' FOR UPDATE""",
+                        (account_id,item.edge_id))
+                    current = cur.fetchone()
+                    if current is None or tuple(current) != (item.claim_token,item.source_revision,
+                            item.target_revision,item.embedding_profile,item.representation_version):
+                        continue
                     metadata = item.as_graph_metadata()
                     metadata["vector"] = list(item.vector)
                     cur.execute(
@@ -48,28 +77,25 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
                         UPDATE relation_edges
                            SET edge_projection = %s, updated_at = NOW()
                          WHERE account_id = %s AND projection_edge_id = %s
-                           AND EXISTS (SELECT 1 FROM edge_projection_jobs j
-                               WHERE j.account_id=%s AND j.edge_id=%s
-                                 AND j.source_revision=%s AND j.target_revision=%s
-                                 AND j.embedding_profile=%s AND j.representation_version=%s)
                         """,
-                        (Json(metadata),account_id,item.edge_id,account_id,item.edge_id,
-                         item.source_revision,item.target_revision,item.embedding_profile,item.representation_version),
+                        (Json(metadata),account_id,item.edge_id),
                     )
                     cur.execute(
                         """
                         UPDATE edge_projection_jobs
                            SET status = 'COMPLETE', last_error = NULL,
-                               next_retry_at = NULL, updated_at = NOW()
+                               next_retry_at = NULL, claim_token = NULL, updated_at = NOW()
                          WHERE account_id = %s AND edge_id = %s
-                           AND source_revision=%s AND target_revision=%s
-                           AND embedding_profile=%s AND representation_version=%s
+                           AND claim_token=%s
                         """,
-                        (account_id,item.edge_id,item.source_revision,item.target_revision,
-                         item.embedding_profile,item.representation_version),
+                        (account_id,item.edge_id,item.claim_token),
                     )
-                    self._claimed_accounts.pop(item.edge_id, None)
+                    completed.append((item.edge_id,item.claim_token))
             conn.commit()
+            for edge_id, token in completed:
+                if self._claimed_tokens.get(edge_id) == token:
+                    self._claimed_accounts.pop(edge_id, None)
+                    self._claimed_tokens.pop(edge_id, None)
         except Exception:
             conn.rollback()
             raise
@@ -78,19 +104,28 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
 
     def delete(self, edge_id: str) -> None:
         account_id = self._claimed_accounts.get(edge_id)
-        if account_id is None:
+        token = self._claimed_tokens.get(edge_id)
+        if account_id is None or token is None:
             return
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
+                self._lock_endpoints(cur, account_id, [edge_id])
+                cur.execute("DELETE FROM edge_projection_jobs WHERE account_id=%s AND edge_id=%s AND claim_token=%s",
+                            (account_id,edge_id,token))
+                owned = cur.rowcount
+                if not owned:
+                    conn.rollback()
+                    return
                 cur.execute(
-                    "UPDATE relation_edges SET edge_projection = NULL WHERE projection_edge_id = %s",
-                    (edge_id,),
+                    "UPDATE relation_edges SET edge_projection = NULL WHERE account_id=%s AND projection_edge_id = %s",
+                    (account_id,edge_id),
                 )
-                cur.execute("DELETE FROM edge_projection_jobs WHERE edge_id = %s", (edge_id,))
             conn.commit()
-            self._claimed_accounts.pop(edge_id, None)
+            if self._claimed_tokens.get(edge_id) == token:
+                self._claimed_accounts.pop(edge_id, None)
+                self._claimed_tokens.pop(edge_id, None)
         except Exception:
             conn.rollback()
             raise
@@ -120,17 +155,19 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
                     (account_id, limit),
                 )
                 rows = cur.fetchall()
+                token = uuid4().hex
                 self._claimed_accounts.update((row[0], account_id) for row in rows)
+                self._claimed_tokens.update((row[0], token) for row in rows)
                 ids = [row[0] for row in rows]
                 if ids:
                     cur.execute(
                         """
                         UPDATE edge_projection_jobs
                            SET status = 'PROCESSING', attempt_count = attempt_count + 1,
-                               updated_at = NOW()
+                               claim_token = %s, updated_at = NOW()
                          WHERE account_id = %s AND edge_id = ANY(%s)
                         """,
-                        (account_id, ids),
+                        (token, account_id, ids),
                     )
             conn.commit()
         except Exception:
@@ -141,41 +178,46 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
         return [
             AcceptedEdgeProjectionInput(
                 edge_id=row[0], source_uri=row[1], target_uri=row[2], relation=row[3],
-                reason=row[4], target_text=row[5], source_revision=row[6], target_revision=row[7]
+                reason=row[4], target_text=row[5], source_revision=row[6], target_revision=row[7],
+                claim_token=token,
             )
             for row in rows
         ]
 
-    def mark_failed(self, edge_ids: list[str], error: str) -> None:
+    def mark_failed(self, edge_ids: list[str], error: str, *, claims=None) -> None:
         if not edge_ids:
             return
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                by_account: dict[str, list[str]] = {}
+                tokens = ({item.edge_id:item.claim_token for item in claims}
+                          if claims is not None else dict(self._claimed_tokens))
                 for edge_id in edge_ids:
                     account_id = self._claimed_accounts.get(edge_id)
-                    if account_id is not None:
-                        by_account.setdefault(account_id, []).append(edge_id)
-                for account_id, account_edge_ids in by_account.items():
+                    token = tokens.get(edge_id)
+                    if account_id is None or token is None:
+                        continue
                     self.bind_tenant(conn, account_id)
                     cur.execute(
                         """
                         UPDATE edge_projection_jobs
                            SET status = 'FAILED', last_error = %s,
-                               next_retry_at = %s, updated_at = NOW()
-                         WHERE account_id = %s AND edge_id = ANY(%s)
+                               next_retry_at = %s, claim_token = NULL, updated_at = NOW()
+                         WHERE account_id = %s AND edge_id = %s
+                           AND status='PROCESSING' AND claim_token=%s
                         """,
                         (
                             error[:2000],
                             datetime.now(UTC) + timedelta(minutes=1),
                             account_id,
-                            account_edge_ids,
+                            edge_id, token,
                         ),
                     )
             conn.commit()
             for edge_id in edge_ids:
-                self._claimed_accounts.pop(edge_id, None)
+                if self._claimed_tokens.get(edge_id) == tokens.get(edge_id):
+                    self._claimed_accounts.pop(edge_id, None)
+                    self._claimed_tokens.pop(edge_id, None)
         except Exception:
             conn.rollback()
             raise
@@ -206,7 +248,7 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
             with distributed_usage_scope(embedding_scope_weights(inputs),inputs=inputs):
                 worker.project_accepted_sync(items)
         except Exception as exc:
-            self.mark_failed([item.edge_id for item in items], str(exc))
+            self.mark_failed([item.edge_id for item in items], str(exc), claims=items)
             raise
         return len(items)
 

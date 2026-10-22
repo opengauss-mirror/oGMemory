@@ -115,6 +115,11 @@ class RetrievalPipeline:
             all_leaf_hits.extend(leaves)
 
         pregraph_hits = list(all_leaf_hits)
+        # Graph additions must obey the same effective category scope as seeds.
+        # An empty category list means unrestricted, as in the ordinary path.
+        graph_categories = set(categories) if categories else None
+        if graph_categories is None and typed_queries and all(tq.categories for tq in typed_queries):
+            graph_categories = {c for tq in typed_queries for c in tq.categories}
         # Graph memory never expands resource, trace or skill-only rounds.
         memory_round = all(str(tq.context_type).upper() == "MEMORY" for tq in typed_queries) and bool(typed_queries)
         memory_round = memory_round and categories != ["session_summary"]
@@ -122,14 +127,15 @@ class RetrievalPipeline:
             vector = next((sr.query_vector for tq, sr in zip(typed_queries, all_seed_results)
                            if tq.text == query and sr.query_vector), None)
             all_leaf_hits = self._expand_by_graph(query, all_leaf_hits, ctx, trace,
-                                                 query_vector=vector)
+                                                 query_vector=vector, categories=graph_categories)
         if (collect_graph_supplement and memory_round and self.cfg.enable_graph_expansion
                 and self.cfg.graph_supplement_enabled and self._graph_supplement):
             try:
                 vector = next((sr.query_vector for tq, sr in zip(typed_queries, all_seed_results)
                                if tq.text == query), None)
                 trace.graph_expansion["two_hop_supplement"] = self._graph_supplement.select(
-                    query, pregraph_hits, all_leaf_hits, ctx, query_vector=vector)
+                    query, pregraph_hits, all_leaf_hits, ctx, query_vector=vector,
+                    **({"categories": graph_categories} if graph_categories is not None else {}))
             except Exception as exc:
                 logger.warning("Graph supplement failed; preserving baseline: %s", exc)
                 trace.graph_expansion["two_hop_supplement_error"] = type(exc).__name__
@@ -161,6 +167,7 @@ class RetrievalPipeline:
         trace: RetrievalTrace,
         *,
         query_vector: list[float] | None = None,
+        categories: set[str] | None = None,
     ) -> list[LeafHit]:
         """Expand candidates via the configured graph retriever (serial).
 
@@ -199,6 +206,8 @@ class RetrievalPipeline:
                 # Only the native retriever opts into this additive contract.
                 # Third-party retrievers keep their existing signatures.
                 extra = {}
+                if type(self._graph_retriever) is OneHopRetriever and categories is not None:
+                    extra["categories"] = categories
                 if (type(self._graph_retriever) is OneHopRetriever
                         and self._graph_retriever._embedder is self.seed_retriever.embedder):
                     extra["query_vector"] = query_vector
@@ -262,6 +271,9 @@ class RetrievalPipeline:
                     hydrated = self._context_reader.read_authorized(hit.uri, ctx)
                 except Exception as exc:
                     logger.debug("[graph_expansion] hydration rejected %s: %s", hit.uri, exc)
+                    report.hydration_rejection_count += 1
+                    continue
+                if categories is not None and hydrated.category not in categories:
                     report.hydration_rejection_count += 1
                     continue
                 candidate_uris.add(norm)

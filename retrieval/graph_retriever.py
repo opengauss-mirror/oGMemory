@@ -264,9 +264,10 @@ class OneHopRetriever(BaseGraphRetriever):
         query_time: datetime | None = None,
         *,
         query_vector: list[float] | None = None,
+        categories: set[str] | None = None,
     ) -> tuple[list[GraphHit], GraphRetrievalReport]:
         return await self._search_with_report(query, ctx, seed_hits, top_k, query_time,
-                                              query_vector=query_vector)
+                                              query_vector=query_vector, categories=categories)
 
     async def _search_with_report(
         self,
@@ -277,6 +278,7 @@ class OneHopRetriever(BaseGraphRetriever):
         query_time: datetime | None,
         *,
         query_vector: list[float] | None = None,
+        categories: set[str] | None = None,
     ) -> tuple[list[GraphHit], GraphRetrievalReport]:
         """Search with 1-hop expansion. Returns seed hits + expanded neighbors."""
         del query_time
@@ -317,6 +319,9 @@ class OneHopRetriever(BaseGraphRetriever):
             report.candidate_edge_count += len(neighbors)
 
             for nb in neighbors:
+                if categories is not None and nb.category not in categories:
+                    report.hydration_rejection_count += 1
+                    continue
                 nb_uri = nb.uri
                 if not nb_uri:
                     continue

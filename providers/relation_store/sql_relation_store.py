@@ -401,14 +401,14 @@ class SQLRelationStore(PoolAdapterMixin):
     def _enqueue_edge_projection(self, cur, edge: RelationEdge, ctx: RequestContext) -> None:
         """Queue in the canonical edge transaction, using portable SQL.
 
-        The preceding edge upsert holds its row lock, serializing identical
-        identities on both PostgreSQL and openGauss. Unchanged jobs stay intact.
+        Caller locks all endpoints first. Lock/update the job before writing
+        its relation row, matching the node-update trigger and projector.
         """
         from providers.relation_store.projection_identity import canonical_edge_id, REPRESENTATION_VERSION
         edge_id = canonical_edge_id(ctx.account_id, edge.from_uri, edge.to_uri, edge.relation_type)
         cur.execute("""SELECT s.version, t.version, concat_ws(E'\\n', t.abstract, t.overview, t.content)
                        FROM context_nodes s JOIN context_nodes t ON t.account_id=s.account_id
-                       WHERE s.account_id=%s AND s.uri=%s AND t.uri=%s FOR UPDATE""",
+                       WHERE s.account_id=%s AND s.uri=%s AND t.uri=%s""",
                     (ctx.account_id, edge.from_uri, edge.to_uri))
         endpoints = cur.fetchone()
         if endpoints is None:
@@ -431,8 +431,10 @@ class SQLRelationStore(PoolAdapterMixin):
         elif changed:
             cur.execute("""UPDATE edge_projection_jobs SET reason=%s,target_text=%s,
                 source_revision=%s,target_revision=%s,representation_version=%s,embedding_profile=%s,
-                status='PENDING',last_error=NULL,next_retry_at=NULL,updated_at=NOW()
+                status='PENDING',last_error=NULL,next_retry_at=NULL,claim_token=NULL,updated_at=NOW()
                 WHERE account_id=%s AND edge_id=%s""", (*signature,ctx.account_id,edge_id))
+        self.sql_dialect.upsert_relation_edge(cur, (
+            edge.from_uri,edge.to_uri,edge.relation_type,edge.weight,edge.reason,ctx.account_id))
         cur.execute("""UPDATE relation_edges SET projection_edge_id=%s,
             edge_projection=CASE WHEN %s THEN NULL ELSE edge_projection END
             WHERE account_id=%s AND from_uri=%s AND to_uri=%s AND relation_type=%s""",
@@ -463,7 +465,15 @@ class SQLRelationStore(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                for edge in edges:
+                if self._edge_projection_profile_id:
+                    # Lock every endpoint before any job/edge row. Consistent
+                    # URI order also prevents reversed A->B/B->A deadlocks.
+                    uris = sorted({uri for edge in edges for uri in (edge.from_uri,edge.to_uri)})
+                    cur.execute("SELECT uri FROM context_nodes WHERE account_id=%s AND uri=ANY(%s) ORDER BY uri FOR UPDATE",
+                                (ctx.account_id,uris))
+                    if len(cur.fetchall()) != len(uris):
+                        raise ValueError("Cannot project an edge with missing endpoints")
+                for edge in sorted(edges, key=lambda e:(e.from_uri,e.to_uri,e.relation_type)):
                     params = (
                         edge.from_uri,
                         edge.to_uri,
@@ -472,9 +482,10 @@ class SQLRelationStore(PoolAdapterMixin):
                         edge.reason,
                         ctx.account_id,
                     )
-                    self.sql_dialect.upsert_relation_edge(cur, params)
                     if self._edge_projection_profile_id:
                         self._enqueue_edge_projection(cur, edge, ctx)
+                    else:
+                        self.sql_dialect.upsert_relation_edge(cur, params)
             conn.commit()
         except Exception:
             conn.rollback()

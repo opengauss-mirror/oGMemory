@@ -185,3 +185,121 @@ def test_real_extraction_writer_and_index_pipeline_keeps_descriptors(graph_db):
     assert store.get_relation_neighbors(source,ctx)[0].edge_projection is not None
     descriptor = index.get_record(IndexRecord.generate_id(source,3))
     assert descriptor.level == 3 and descriptor.metadata["record_kind"] == "update_activation"
+
+
+def _graph_sql(fs,ctx,query,params=()):
+    conn=fs._get_connection()
+    try:
+        fs.bind_tenant(conn,ctx.account_id)
+        with conn.cursor() as cur:
+            cur.execute(query,params)
+            rows=cur.fetchall() if cur.description else []
+        conn.commit();return rows
+    except Exception:
+        conn.rollback();raise
+    finally:fs._return_connection(conn)
+
+
+@pytest.mark.parametrize('same_revision',[False,True])
+def test_stale_worker_failure_cannot_reset_completed_replacement(graph_db,same_revision):
+    from index.edge_projection import EdgeProjectionWorker
+    ctx,fs,index,store,old_store,outbox,worker,nodes,profile=graph_db
+    a,b,_=nodes;store.upsert_edges([RelationEdge(a.uri,b.uri,'related',1.,'evidence')],ctx)
+    old=old_store.claim_pending(ctx.account_id)
+    if same_revision:
+        _graph_sql(fs,ctx,"UPDATE edge_projection_jobs SET updated_at=NOW()-INTERVAL '6 minutes' WHERE account_id=%s",(ctx.account_id,))
+    else:
+        current=fs.read_node(b.uri,ctx);current.content='New target';current.metadata['_expected_version']=current.metadata['version']
+        fs.write_node(current,ctx)
+    new_store=SQLEdgeProjectionStore(os.environ['GRAPH_TEST_DSN'])
+    new=new_store.claim_pending(ctx.account_id)
+    assert old[0].claim_token!=new[0].claim_token
+    EdgeProjectionWorker(worker._embedder,new_store,profile).project_accepted_sync(new)
+    old_store.mark_failed([old[0].edge_id],'late failed embedding call',claims=old)
+    # A late successful result must also be fenced by the same lease.
+    EdgeProjectionWorker(Mock(embed_texts=lambda texts:[[0.,1.] for _ in texts]),old_store,profile).project_accepted_sync(old)
+    assert _graph_sql(fs,ctx,'SELECT status FROM edge_projection_jobs WHERE account_id=%s',(ctx.account_id,))==[('COMPLETE',)]
+    assert store.get_relation_neighbors(a.uri,ctx)[0].edge_projection['vector']==[1.,0.]
+
+
+def test_node_update_leaves_durable_wakeup_after_ordinary_event_ack_and_restart(graph_db):
+    ctx,fs,index,store,projections,outbox,worker,nodes,profile=graph_db
+    a,b,_=nodes;store.upsert_edges([RelationEdge(a.uri,b.uri,'related',1.,'evidence')],ctx)
+    projections.drain_sync(ctx.account_id,worker._embedder,profile)
+    _graph_sql(fs,ctx,'DELETE FROM outbox_events WHERE account_id=%s',(ctx.account_id,))
+    current=fs.read_node(b.uri,ctx);current.content='Updated after indexing';current.metadata['_expected_version']=current.metadata['version']
+    fs.write_node(current,ctx)
+    _graph_sql(fs,ctx,"DELETE FROM outbox_events WHERE account_id=%s AND event_type <> 'PROJECT_GRAPH'",(ctx.account_id,))
+    assert _graph_sql(fs,ctx,"SELECT count(*) FROM outbox_events WHERE account_id=%s AND event_type='PROJECT_GRAPH'",(ctx.account_id,))==[(1,)]
+    restarted=OutboxWorker(index,worker._embedder,fs=fs,directory_summary_enabled=False,
+        edge_projection_components=(SQLEdgeProjectionStore(os.environ['GRAPH_TEST_DSN']),profile))
+    stats=restarted.run_once(outbox,[])
+    assert stats['failed']==0
+    assert store.get_relation_neighbors(a.uri,ctx)[0].edge_projection['target_revision']==2
+
+
+@pytest.mark.parametrize('endpoint',['source','target'])
+def test_move_rekeys_projection_jobs_rebuilds_descriptor_and_survives_next_update(graph_db,endpoint):
+    from index.edge_projection import EdgeProjectionWorker
+    from providers.relation_store.projection_identity import canonical_edge_id
+    ctx,fs,index,store,projections,outbox,worker,nodes,profile=graph_db
+    a,b,_=nodes;store.upsert_edges([RelationEdge(a.uri,b.uri,'related',1.,'evidence')],ctx)
+    old=projections.claim_pending(ctx.account_id)
+    moved=a if endpoint=='source' else b;destination=moved.uri+'-moved'
+    fs.move_node(moved.uri,destination,ctx)
+    source=destination if endpoint=='source' else a.uri;target=destination if endpoint=='target' else b.uri
+    new_id=canonical_edge_id(ctx.account_id,source,target,'related')
+    rows=_graph_sql(fs,ctx,'SELECT edge_id,source_uri,target_uri,status,claim_token FROM edge_projection_jobs WHERE account_id=%s',(ctx.account_id,))
+    assert rows==[(new_id,source,target,'PENDING',None)]
+    EdgeProjectionWorker(worker._embedder,projections,profile).project_accepted_sync(old)
+    descriptor=None
+    for _ in range(4):
+        stats=worker.run_once(outbox,[ctx.account_id]);assert stats['failed']==0
+        descriptor=index.get_record(IndexRecord.generate_id(destination,3))
+        if descriptor:break
+    assert descriptor and descriptor.metadata['record_kind']=='update_activation'
+    assert index.get_record(IndexRecord.generate_id(moved.uri,3)) is None
+    assert store.get_relation_neighbors(source,ctx)[0].edge_projection['edge_id']==new_id
+    current=fs.read_node(destination,ctx);current.content='Changed moved node';current.metadata['_expected_version']=current.metadata['version']
+    fs.write_node(current,ctx)
+    assert _graph_sql(fs,ctx,'SELECT status FROM edge_projection_jobs WHERE account_id=%s',(ctx.account_id,))==[('PENDING',)]
+    projections.drain_sync(ctx.account_id,worker._embedder,profile)
+    assert store.get_relation_neighbors(source,ctx)[0].edge_projection is not None
+
+
+def test_upsert_waits_for_node_without_holding_relation_lock(graph_db):
+    """Deterministic old deadlock: node owner updates while edge writer waits."""
+    from concurrent.futures import ThreadPoolExecutor
+    import time
+    ctx,fs,index,store,projections,outbox,worker,nodes,profile=graph_db
+    a,b,_=nodes;edge=RelationEdge(a.uri,b.uri,'related',1.,'evidence')
+    store.upsert_edges([edge],ctx)
+    application='graph-review-'+uuid4().hex
+    writer=SQLRelationStore(os.environ['GRAPH_TEST_DSN']+' application_name='+application,edge_projection_profile_id='test')
+    conn=fs._get_connection()
+    try:
+        fs.bind_tenant(conn,ctx.account_id)
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout='3s'")
+            cur.execute('SELECT uri FROM context_nodes WHERE uri=%s FOR UPDATE',(b.uri,))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future=pool.submit(writer.upsert_edges,[replace(edge,weight=.9)],ctx)
+                deadline=time.monotonic()+5
+                waiting=False
+                while time.monotonic()<deadline:
+                    rows=_graph_sql(fs,ctx,"SELECT count(*) FROM pg_stat_activity WHERE application_name=%s AND wait_event_type='Lock'",(application,))
+                    if rows==[(1,)]:waiting=True;break
+                    time.sleep(.02)
+                try:
+                    assert waiting,'Concurrent edge writer did not reach its endpoint lock'
+                    cur.execute("UPDATE context_nodes SET content=content || ' changed',version=version+1 WHERE uri=%s",(b.uri,))
+                    conn.commit()
+                finally:conn.rollback()
+                future.result(timeout=5)
+    finally:conn.rollback();fs._return_connection(conn)
+
+
+def test_projection_endpoint_indexes_are_installed(graph_db):
+    ctx,fs,*_=graph_db
+    names={r[0] for r in _graph_sql(fs,ctx,"SELECT indexname FROM pg_indexes WHERE tablename='edge_projection_jobs'")}
+    assert {'idx_edge_projection_jobs_source','idx_edge_projection_jobs_target'}<=names

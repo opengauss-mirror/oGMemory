@@ -1381,6 +1381,18 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
+                # Same write order as projection workers: nodes, jobs, edges.
+                cur.execute("""SELECT uri FROM context_nodes WHERE account_id=%s
+                    AND (uri=%s OR uri LIKE %s OR relations::text LIKE %s)
+                    ORDER BY uri FOR UPDATE""",
+                    (account_id,from_uri,from_prefix+"%","%"+from_uri+"%"))
+                cur.fetchall()
+                cur.execute("""SELECT edge_id,source_uri,target_uri,relation_type
+                    FROM edge_projection_jobs WHERE account_id=%s
+                    AND (source_uri=%s OR source_uri LIKE %s OR target_uri=%s OR target_uri LIKE %s)
+                    ORDER BY edge_id FOR UPDATE""",
+                    (account_id,from_uri,from_prefix+"%",from_uri,from_prefix+"%"))
+                projection_jobs = cur.fetchall()
                 # 1) Move the node itself
                 cur.execute(
                     "UPDATE context_nodes SET uri = %s, updated_at = NOW() WHERE uri = %s",
@@ -1436,6 +1448,24 @@ class SQLContextFS(PoolAdapterMixin):
                     to_prefix=to_prefix,
                     json_wrapper=Json,
                 )
+                from providers.relation_store.projection_identity import canonical_edge_id
+                from uuid import uuid4
+                def moved(uri):
+                    if uri == from_uri:
+                        return to_uri
+                    return to_prefix+uri[len(from_prefix):] if uri.startswith(from_prefix) else uri
+                for old_id,source,target,relation in projection_jobs:
+                    source,target=moved(source),moved(target)
+                    new_id=canonical_edge_id(account_id,source,target,relation)
+                    cur.execute("""UPDATE edge_projection_jobs SET edge_id=%s,source_uri=%s,target_uri=%s,
+                        status='PENDING',claim_token=NULL,last_error=NULL,next_retry_at=NULL,updated_at=NOW()
+                        WHERE account_id=%s AND edge_id=%s""",(new_id,source,target,account_id,old_id))
+                    cur.execute("""UPDATE relation_edges SET projection_edge_id=%s,edge_projection=NULL,updated_at=NOW()
+                        WHERE account_id=%s AND projection_edge_id=%s""",(new_id,account_id,old_id))
+                    cur.execute("""INSERT INTO outbox_events
+                        (event_id,event_type,uri,account_id,payload,status,retry_count)
+                        VALUES (%s,'PROJECT_GRAPH',%s,%s,%s,'PENDING',0)""",
+                        (str(uuid4()),source,account_id,Json({"edge_id":new_id})))
 
                 # 5) Cascade: update outbox_events (only if table exists)
                 if self.sql_dialect.table_exists(cur, "outbox_events"):
@@ -1471,13 +1501,6 @@ class SQLContextFS(PoolAdapterMixin):
 
                     def _record_id(uri: str, level: int) -> str:
                         return _IndexRecord.generate_id(uri, level)
-
-                    def _parent_uri(uri: str) -> str:
-                        """Derive parent URI (same logic as ContextNode.parent_uri)."""
-                        s = uri.rstrip("/")
-                        if "/" not in s:
-                            return ""
-                        return s.rsplit("/", 1)[0] + "/"
 
                     # Collect ALL descendants (not just immediate children).
                     # The context_nodes UPDATE already moved every row whose
@@ -1519,14 +1542,11 @@ class SQLContextFS(PoolAdapterMixin):
 
                     # --- 5c) Emit UPSERT_CONTEXT for new URIs.
                     #
-                    # Build IndexRecords directly from context_nodes data
-                    # using hashlib (no index-package dependency).  The
-                    # outbox worker embeds the text and upserts to the
-                    # vector index, making the node immediately searchable
-                    # at its new URI without waiting for a next write.
+                    # Reuse the complete builder, including L3 descriptors and
+                    # canonical revisions. Keep the move path's existing L1.
                     cur.execute(
                         "SELECT uri, abstract, overview, content, "
-                        "owner_space, category, context_type "
+                        "owner_space, category, context_type, metadata, version "
                         "FROM context_nodes "
                         "WHERE uri = %s OR uri LIKE %s",
                         (to_uri, to_prefix + "%"),
@@ -1534,63 +1554,22 @@ class SQLContextFS(PoolAdapterMixin):
                     moved_rows = cur.fetchall()
 
                     for row in moved_rows:
-                        r_uri, r_abstract, r_overview, r_content, r_owner, r_cat, r_ct = row
-
-                        records = []
-                        base_filters = {
-                            "account_id": account_id,
-                            "owner_space": r_owner,
-                            "category": r_cat,
-                            "context_type": r_ct,
-                        }
-                        # Shared metadata — must match build_index_records()
-                        base_meta = {
-                            "category": r_cat,
-                            "context_type": r_ct,
-                            "parent_uri": _parent_uri(r_uri),
-                            "has_overview": bool(r_overview),
-                            "has_content": bool(r_content),
-                        }
-                        # L0: abstract (always present)
-                        records.append(
-                            {
-                                "id": _record_id(r_uri, 0),
-                                "uri": r_uri,
-                                "level": 0,
-                                "text": r_abstract or "",
-                                "filters": dict(base_filters),
-                                "metadata": {"level": "abstract", **base_meta},
-                            }
-                        )
-                        # L1: overview
-                        if r_overview:
-                            records.append(
-                                {
-                                    "id": _record_id(r_uri, 1),
-                                    "uri": r_uri,
-                                    "level": 1,
-                                    "text": r_overview,
-                                    "filters": dict(base_filters),
-                                    "metadata": {"level": "overview", **base_meta},
-                                }
-                            )
-                        # L2: content (id uses /content.md suffix)
-                        l2_uri = r_uri.rstrip("/") + "/content.md"
-                        if r_content:
-                            records.append(
-                                {
-                                    "id": _record_id(l2_uri, 2),
-                                    "uri": l2_uri,
-                                    "level": 2,
-                                    "text": r_content,
-                                    "filters": dict(base_filters),
-                                    "metadata": {
-                                        "level": "content",
-                                        **base_meta,
-                                        "parent_uri": r_uri,
-                                    },
-                                }
-                            )
+                        r_uri, r_abstract, r_overview, r_content, r_owner, r_cat, r_ct, metadata, version = row
+                        from index.index_record_builder import build_index_records
+                        metadata = dict(metadata or {})
+                        metadata.pop("_expected_version", None)
+                        metadata.pop("expected_version", None)
+                        metadata["version"] = version
+                        node = ContextNode(uri=r_uri, context_type=r_ct, category=r_cat, level=2,
+                            owner_space=r_owner, abstract=r_abstract or "", overview=r_overview or "",
+                            content=r_content or "", metadata=metadata)
+                        built = build_index_records(node)
+                        if r_overview and not metadata.get("indexing_disabled"):
+                            built.append(_IndexRecord(id=_record_id(r_uri, 1), uri=r_uri, level=1,
+                                text=r_overview, filters=dict(built[0].filters),
+                                metadata={**built[0].metadata, "level":"overview", "record_kind":"node_overview"}))
+                        from dataclasses import asdict
+                        records = [asdict(record) for record in built]
 
                         if records:
                             cur.execute(

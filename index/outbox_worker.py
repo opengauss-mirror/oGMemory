@@ -607,9 +607,12 @@ class OutboxWorker:
             # Create a copy with embedding in metadata
             new_metadata = dict(record.metadata)
             new_metadata["_embedding"] = embedding
-            if record.metadata.get("record_kind") == "update_activation":
-                new_metadata["embedding_model"] = getattr(self._embedder,"model",type(self._embedder).__name__)
-                new_metadata["embedding_dimension"] = len(embedding)
+            # Persist identity for ordinary vectors too: equal dimensions do
+            # not make embeddings from different models comparable.
+            model = getattr(self._embedder, "model", None)
+            if isinstance(model, str) and model:
+                new_metadata["embedding_model"] = model
+            new_metadata["embedding_dimension"] = len(embedding)
 
             # Create new IndexRecord with augmented metadata
             # Note: IndexRecord is a dataclass, we can create a new instance

@@ -109,7 +109,8 @@ def test_incoming_node_vector_only_adds_eligibility_not_score():
     lane.index.get_record.return_value = IndexRecord(
         id="id", uri=ROOT+"b", level=0, text="b",
         filters={"account_id": "acct", "owner_space": "user:user"},
-        metadata={"record_kind": "node_abstract", "canonical_revision": 1, "_embedding": [1., 0.]})
+        metadata={"record_kind": "node_abstract", "canonical_revision": 1, "_embedding": [1., 0.],
+                  "embedding_model": PROFILE["model"], "embedding_dimension": 2})
     result = select(lane)
     assert result["selected"][0]["incoming"] is True
     assert result["selected"][0]["score"] == 0

@@ -25,6 +25,7 @@ class AcceptedEdgeProjectionInput:
     target_text: str
     source_revision: int
     target_revision: int
+    claim_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,9 +39,12 @@ class EdgeProjection:
     dimension: int
     source_revision: int
     target_revision: int
+    claim_token: str | None = None
 
     def as_graph_metadata(self) -> dict:
-        return asdict(self)
+        metadata = asdict(self)
+        metadata.pop("claim_token")  # A queue lease is not searchable evidence.
+        return metadata
 
 
 class EdgeProjectionStore(Protocol):
@@ -136,6 +140,7 @@ class EdgeProjectionWorker:
                     dimension=dimension,
                     source_revision=edge.source_revision,
                     target_revision=edge.target_revision,
+                    claim_token=edge.claim_token,
                 )
             )
         self._store.put_many(projections)
