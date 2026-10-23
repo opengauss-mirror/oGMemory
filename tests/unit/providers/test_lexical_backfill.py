@@ -61,6 +61,22 @@ class _Lexical:
         pass
 
 
+def test_backfill_excludes_graph_descriptors(monkeypatch):
+    from dataclasses import replace
+    import providers.lexical_backfill as module
+    original=module.build_index_records
+    def with_descriptor(node):
+        records=original(node)
+        return records+[replace(records[0],id='activation',level=3,
+            metadata={'record_kind':'update_activation'})]
+    monkeypatch.setattr(module,'build_index_records',with_descriptor)
+    lexical=_Lexical();backfill=LexicalBackfill(_Scanner(),lexical)
+    try:
+        assert backfill._run_once(('acct','user_u1'))
+        assert {record.level for record in lexical.records}=={0,2}
+    finally:backfill.close(timeout=1.)
+
+
 def test_missing_scope_schedules_background_backfill_and_then_becomes_ready():
     scanner = _Scanner()
     lexical = _Lexical()

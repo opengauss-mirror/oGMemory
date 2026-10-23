@@ -426,6 +426,7 @@ class Extractor:
         source_occurrence_reconciliation_enabled: bool = False,
         dual_pass_enabled: bool = True,
         node_processing_enabled: bool = False,
+        activation_enabled: bool = False,
     ):
         """Initialize the Extractor.
 
@@ -469,12 +470,15 @@ class Extractor:
         self._node_processing_enabled = node_processing_enabled
         if node_processing_enabled:
             self._dual_pass_enabled = False
+        self._activation_enabled = activation_enabled
+        self._extraction_template = "extraction_graph" if activation_enabled else "extraction"
         self._prefetcher: Optional[MemoryPrefetcher] = None
         if fs and vector_index and embedder and uri_resolver and self._schema_registry:
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
-        self._extraction_tools = build_extraction_tools(self._schema_registry)
+        self._extraction_tools = (build_extraction_tools(self._schema_registry, activation_enabled=True)
+                                  if activation_enabled else build_extraction_tools(self._schema_registry))
         self._update_instruction = build_update_instruction(self._schema_registry)
         profile_schema = self._schema_registry.get_compatible("profile")
         self._profile_snapshot_enabled = bool(
@@ -489,7 +493,9 @@ class Extractor:
             detail = f" incompatible={incompatible}" if incompatible else ""
             raise ValueError(f"No compatible extraction tools available.{detail}")
         self._tool_to_category = build_tool_to_category(self._schema_registry)
-        self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, self._schema_registry)
+        self._parse_tool_call_fn = (
+            (lambda name, inp: parse_tool_call(name, inp, self._schema_registry, activation_enabled=True))
+            if activation_enabled else (lambda name, inp: parse_tool_call(name, inp, self._schema_registry)))
         logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
 
     # ------------------------------------------------------------------
@@ -1042,6 +1048,8 @@ class Extractor:
         are paired only between known native runs before this flattened merge.
         Other additions merge when/who/where by taking non-empty values.
         """
+        from extraction.relation_proposals import attach, take
+        proposals = take(candidates)
         merged: dict[tuple[str, ...] | int, CandidateMemory] = {}
         for index, c in enumerate(candidates):
             if c.category in {"event", "case"} and not c.target_uri and (
@@ -1084,7 +1092,9 @@ class Extractor:
                 if not c.where and existing.where:
                     c.where = existing.where
                 merged[key] = c
-        return list(merged.values())
+        result = list(merged.values())
+        attach(result, proposals)
+        return result
 
     def _prepare_unique_spans(
         self,
@@ -1491,6 +1501,7 @@ class Extractor:
                 prompt_manager=self._prompt_manager,
                 prefetcher=self._prefetcher,
                 timeout_seconds=self._react_timeout_seconds,
+                activation_enabled=self._activation_enabled,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )
             result = loop.run(prompt, ctx, prefetch_result)
@@ -1622,12 +1633,12 @@ class Extractor:
     ) -> str:
         """Build extraction prompt from YAML template (Eager mode)."""
         system_prompt = self._prompt_manager.render(
-            "extraction", "system_prompt",
+            self._extraction_template, "system_prompt",
             session_summary=session_summary,
         )
-        examples = self._prompt_manager.render("extraction", "examples") if include_examples else ""
+        examples = self._prompt_manager.render(self._extraction_template, "examples") if include_examples else ""
         output_instruction = self._prompt_manager.render(
-            "extraction", "output_instruction",
+            self._extraction_template, "output_instruction",
             output_language=language,
         )
 
@@ -1640,6 +1651,9 @@ class Extractor:
             )
 
         prefix = f"{system_prompt}\n\n{identity_block}\n\n"
+        if self._activation_enabled:
+            prefix += self._prompt_manager.render(
+                self._extraction_template, "lazy_tools_instruction") + "\n\n"
         if session_summary:
             # Incremental batches often omit the earlier turn naming the project.
             # Supply saved context for reference resolution, never as new evidence.
@@ -1806,9 +1820,16 @@ class Extractor:
                 c.provenance_ids.append(prov_id)
 
     def _parse_candidate_calls(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
+        from extraction.relation_proposals import attach, parse_proposal
         contents = {}
         entries = []
+        proposals = []
         for call in calls:
+            if self._activation_enabled and call.get("tool") == "extract_relation":
+                proposal = parse_proposal(call.get("input"))
+                if proposal is not None:
+                    proposals.append(proposal)
+                continue
             incremental = call.get("tool", "") in INCREMENTAL_TOOLS
             if incremental:
                 inputs = call.get("input", {})
@@ -1817,6 +1838,7 @@ class Extractor:
                     call["tool"], inputs, self._schema_registry,
                     read_nodes=prefetch_result.read_nodes if prefetch_result else None, ctx=ctx,
                     current_content=contents.get(key),
+                    **({"activation_enabled": True} if self._activation_enabled else {}),
                 )
                 candidate = parsed[2]
                 contents[key] = candidate.content
@@ -1841,7 +1863,9 @@ class Extractor:
                 ) from exc
             validate_read_target(candidate, prefetch_result.read_versions if prefetch_result else {},
                                  read_nodes=prefetch_result.read_nodes if prefetch_result else {}, ctx=ctx)
-        return coalesce_incremental_edits(entries)
+        candidates = coalesce_incremental_edits(entries)
+        attach(candidates, proposals)
+        return candidates
 
     def _to_candidate(self, tool_call: dict) -> CandidateMemory | None:
         """Convert tool call result to CandidateMemory."""

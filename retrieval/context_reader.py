@@ -9,6 +9,7 @@ from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError, V
 from core.interfaces import ContextFS
 from core.models import RequestContext, RetrievedBlock
 from retrieval.identity import canonical_uri
+from core.uri_parser import strip_l2_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -97,16 +98,33 @@ class ContextReader:
         else:
             node = canonical_agent_node(node)
 
-        block.category = node.category
-        block.owner_space = node.owner_space
-        block.abstract = node.abstract
-        block.overview = node.overview
-        block.content_excerpt = node.content
-        block.metadata = dict(node.metadata)
-        block.has_overview = bool(node.overview)
-        block.has_content = bool(node.content)
+        return self._hydrate(uri, node)
 
-        return block
+    @staticmethod
+    def _hydrate(uri, node):
+        """Share dev's complete canonical fields across public and graph reads."""
+        return RetrievedBlock(uri=uri, level_hit="L2", category=node.category,
+            owner_space=node.owner_space, abstract=node.abstract, overview=node.overview,
+            content_excerpt=node.content, metadata=dict(node.metadata or {}),
+            has_overview=bool(node.overview), has_content=bool(node.content))
+
+    def read_authorized(self, uri: str, ctx: RequestContext) -> RetrievedBlock:
+        """Strict graph hydration: failed/unauthorized reads never yield evidence.
+
+        Reuse dev's canonical ContextFS authorization and Agent body rendering;
+        unavailable nodes must fail closed before traversal or injection.
+        """
+        self._check_acl(uri, ctx)
+        if self._fs is None:
+            raise NodeNotFoundError(uri)
+        node = self._fs.read_node(strip_l2_suffix(uri), ctx)
+        if node is None:
+            raise NodeNotFoundError(uri)
+        metadata = dict(node.metadata or {})
+        state = metadata.get("status") or metadata.get("lifecycle_status") or metadata.get("visibility") or ""
+        if str(state).lower() in {"archived", "deleted", "broken", "retired", "inactive"}:
+            raise NodeNotFoundError(uri)
+        return self._hydrate(uri, canonical_agent_node(node))
 
     def _check_acl(self, uri: str, ctx: RequestContext) -> None:
         # SECURITY: RequestContext is mandatory for all read operations

@@ -95,6 +95,7 @@ class OutboxWorker:
         directory_summary_enabled: bool = True,
         bm25_index: Bm25Index | None = None,
         agent_memory_handler=None,
+        edge_projection_components=None,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -115,6 +116,20 @@ class OutboxWorker:
         self._directory_summary_enabled = directory_summary_enabled
         self._bm25_index = bm25_index
         self._agent_memory_handler = agent_memory_handler
+        self._edge_projection_store, self._edge_projection_profile = edge_projection_components or (None,None)
+        self._graph_accounts = set()
+
+    def _drain_graph(self, accounts, stats):
+        if self._edge_projection_store is None:
+            return
+        self._graph_accounts.update(accounts)
+        for account in sorted(self._graph_accounts):
+            try:
+                count = self._edge_projection_store.drain_sync(account,self._embedder,self._edge_projection_profile)
+                stats["edge_projections"] = stats.get("edge_projections",0) + count
+            except Exception:
+                stats["edge_projection_failures"] = stats.get("edge_projection_failures",0) + 1
+                logger.exception("Graph projection drain failed for account %s",account)
 
     def _upsert_code_bm25(self, records: list[IndexRecord]) -> None:
         if self._bm25_index is None:
@@ -189,6 +204,17 @@ class OutboxWorker:
                 return self._process_delete_context(event, ctx)
             elif event_type == "ARCHIVE_CONTEXT":
                 return self._process_archive_context(event)
+            elif event_type == "PROJECT_GRAPH":
+                if self._edge_projection_store is None:
+                    raise ValueError("Graph projection worker is not enabled")
+                resolved_ctx = ctx or self._build_request_context(event)
+                if resolved_ctx is None:
+                    raise ValueError("Missing graph projection account")
+                count = self._edge_projection_store.drain_sync(
+                    resolved_ctx.account_id,self._embedder,self._edge_projection_profile)
+                if self._edge_projection_store.unfinished(resolved_ctx.account_id,event.payload["edge_id"]):
+                    raise RuntimeError("Graph projection is pending; retain durable wakeup for retry")
+                return WorkerResult(event_id=event.event_id,success=True,records_upserted=count)
             else:
                 logger.warning("Unknown event type: %s", event_type)
                 return WorkerResult(
@@ -405,6 +431,10 @@ class OutboxWorker:
                 build_record_id(l2_uri, 2),
             ]
 
+        ids_to_delete = list(ids_to_delete)
+        activation_id = IndexRecord.generate_id(event.uri,3)
+        if activation_id not in ids_to_delete:
+            ids_to_delete.append(activation_id)
         self._vector_index.delete(ids_to_delete)
         self._delete_bm25(ids_to_delete)
         self._cleanup_tombstoned_payload(event, ctx)
@@ -444,6 +474,10 @@ class OutboxWorker:
                 build_record_id(l2_uri, 2),
             ]
 
+        ids_to_delete = list(ids_to_delete)
+        activation_id = IndexRecord.generate_id(event.uri,3)
+        if activation_id not in ids_to_delete:
+            ids_to_delete.append(activation_id)
         self._vector_index.delete(ids_to_delete)
         self._delete_bm25(ids_to_delete)
 
@@ -598,6 +632,12 @@ class OutboxWorker:
             # Create a copy with embedding in metadata
             new_metadata = dict(record.metadata)
             new_metadata["_embedding"] = embedding
+            # Persist identity for ordinary vectors too: equal dimensions do
+            # not make embeddings from different models comparable.
+            model = getattr(self._embedder, "model", None)
+            if isinstance(model, str) and model:
+                new_metadata["embedding_model"] = model
+            new_metadata["embedding_dimension"] = len(embedding)
 
             # Create new IndexRecord with augmented metadata
             # Note: IndexRecord is a dataclass, we can create a new instance
@@ -1118,9 +1158,16 @@ class OutboxWorker:
                 return stats
 
             self._process_claimed_events(claimed_events, outbox_store, stats, worker_id)
+            accounts = set(account_ids)
+            for node_uri, event in claimed_events:
+                ctx = self._build_request_context(event)
+                if ctx is not None:
+                    accounts.add(ctx.account_id)
+            self._drain_graph(accounts,stats)
             return stats
 
         # Collect all pending events across accounts, grouped by type.
+        self._drain_graph(account_ids,stats)
         # UPSERT_CONTEXT events are batch-embedded for efficiency.
         all_pending: list[tuple[str, OutboxEvent]] = []
         for account_id in account_ids:

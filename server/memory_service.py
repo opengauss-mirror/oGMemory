@@ -887,11 +887,31 @@ class MemoryService:
     def _get_relation_store(self):
         """Create the appropriate RelationStore implementation based on config."""
         if self._use_sql:
-            return SQLRelationStore(pool=self._get_shared_sql_pool())
+            return SQLRelationStore(pool=self._get_shared_sql_pool(),
+                edge_projection_profile_id=(self._cfg.graph_edge_embedding_profile if self._graph_enabled() else None))
         if _HAS_AGFS:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    def _graph_enabled(self):
+        return getattr(self._cfg,"graph_backend","none") == "sql"
+
+    def _graph_profile(self):
+        from providers.relation_store.projection_identity import REPRESENTATION_VERSION
+        embedder = self._get_shared_embedder()
+        return dict(profile_id=self._cfg.graph_edge_embedding_profile,
+                    model=getattr(embedder,"model",type(embedder).__name__),
+                    dimension=int(getattr(embedder,"dimension",None) or getattr(embedder,"dimensions",None)
+                                  or self._cfg.opengauss_dimension),
+                    representation_version=REPRESENTATION_VERSION)
+
+    def _graph_projection_components(self):
+        if not self._graph_enabled():
+            return None,None
+        from providers.relation_store.sql_projection import SQLEdgeProjectionStore
+        # Workers own their claim bookkeeping; canonical jobs are shared SQL rows.
+        return SQLEdgeProjectionStore(pool=self._get_shared_sql_pool()),self._graph_profile()
 
     @_serialize_lazy_initialization("_trace_event_store")
     def _get_trace_event_store(self):
@@ -1559,6 +1579,12 @@ class MemoryService:
                 return
 
             formatted = gen.format_summary(summary)
+            # A valid structured response can still contain no summary text.
+            # Do not enqueue an empty auxiliary memory for the embedding API;
+            # ordinary extraction and nonempty summaries remain unchanged.
+            if not formatted.strip():
+                logger.info("Skipping blank L0 summary: session=%s", session_id[:8])
+                return
             candidate = gen.build_candidate(
                 summary=summary,
                 formatted_text=formatted,
@@ -2050,6 +2076,7 @@ class MemoryService:
         stats: dict = {}
         try:
             read_api = self.get_read_api()
+            graph_kwargs = dict(include_debug=True,collect_graph_supplement=True) if self._graph_enabled() else {}
 
             # Round 1: structured nodes (all categories)
             if self._cfg.skill_sedimentation_enabled:
@@ -2060,8 +2087,11 @@ class MemoryService:
             else:
                 result = read_api.search_memory(
                     query=query, ctx=ctx, top_k=15,
-                    fill_content_for_top_k=0, mode="QUICK",
+                    fill_content_for_top_k=5 if self._graph_enabled() else 0, mode="QUICK",
+                    **graph_kwargs,
                 )
+            if self._graph_enabled() and result is not None and result.trace is not None:
+                stats["graph_expansion"] = dict(result.trace.graph_expansion)
             if result and result.hits:
                 ordinary_hits = list(result.hits)
                 stats["hit_count"] = len(ordinary_hits)
@@ -2081,7 +2111,12 @@ class MemoryService:
                     }
                     for h in ordinary_hits
                 ]
-                items = self._truncate_by_score_gap(items)
+                if self._graph_enabled():
+                    vector_items = [i for i in items if i["metadata"].get("retrieval_origin") != "graph_neighbor"]
+                    graph_items = [i for i in items if i["metadata"].get("retrieval_origin") == "graph_neighbor"]
+                    items = self._truncate_by_score_gap(vector_items) + graph_items
+                else:
+                    items = self._truncate_by_score_gap(items)
 
             if getattr(self._cfg, "code_retrieval_enabled", False):
                 decision = classify_code_retrieval_intent(query)
@@ -2168,6 +2203,7 @@ class MemoryService:
             top_k=search_top_k,
             fill_content_for_top_k=fill_content_for_top_k,
             mode="QUICK",
+            **(dict(include_debug=True,collect_graph_supplement=True) if self._graph_enabled() else {}),
         )
         if result is None:
             return None
@@ -2176,6 +2212,10 @@ class MemoryService:
             for hit in (getattr(result, "hits", []) or [])
             if (getattr(hit, "metadata", {}) or {}).get("ogmemory_generated") is not True
         ]
+        graph_hits = []
+        if self._graph_enabled():
+            graph_hits = [h for h in candidates if h.metadata.get("retrieval_origin") == "graph_neighbor"]
+            candidates = [h for h in candidates if h.metadata.get("retrieval_origin") != "graph_neighbor"]
         candidates.sort(
             key=lambda hit: float(
                 getattr(hit, "ranking_score", None)
@@ -2188,6 +2228,12 @@ class MemoryService:
         for hit in candidates:
             deduped.setdefault(memory_identity(hit.uri, getattr(hit, "metadata", None)), hit)
         result.hits = list(deduped.values())[:top_k]
+        seen = set(deduped)
+        for hit in graph_hits:
+            identity = memory_identity(hit.uri, getattr(hit, "metadata", None))
+            if identity not in seen:
+                result.hits.append(hit)
+                seen.add(identity)
         return result
 
     @staticmethod
@@ -2295,6 +2341,10 @@ class MemoryService:
             "",
         ]
         header_line_count = len(ws_lines)
+        graph_items = [item for item in working_set
+                       if (item.get("metadata") or {}).get("retrieval_origin") == "graph_neighbor"]
+        working_set = [item for item in working_set
+                       if (item.get("metadata") or {}).get("retrieval_origin") != "graph_neighbor"]
         code_items = [item for item in working_set if item.get("category") == "code"]
         ordinary_items = [item for item in working_set if item.get("category") != "code"]
         working_set_budget = budget.get("working_set", 20000)
@@ -2328,7 +2378,7 @@ class MemoryService:
                 delivery_stats.update(selection_stats)
             if evidence:
                 ws_lines.append(evidence)
-            elif not code_items:
+            elif not code_items and not graph_items:
                 return ""
         ws_text = "\n".join(ws_lines)
         if len(ws_text) > max_chars and working_set_budget > 100:
@@ -2347,6 +2397,17 @@ class MemoryService:
             delivery_stats.setdefault("delivered_uris", []).extend(
                 canonical_uri(item.get("uri", "")) for item in code_items
             )
+        # Reuse dev's source-preserving renderer, but graph additions must not
+        # consume its original 15-candidate quota or rewrite its evidence prefix.
+        for item in graph_items:
+            body_budget = sum(len(str(item.get(k) or "")) for k in
+                              ("uri", "abstract", "overview", "content", "category")) + 4096
+            evidence, graph_stats = select_evidence([item], "", body_budget)
+            addition = "\n\n" + evidence if evidence else ""
+            if addition and len(ws_text) + len(addition) <= max_chars:
+                ws_text += addition
+                if delivery_stats is not None:
+                    delivery_stats.setdefault("delivered_uris", []).extend(graph_stats["delivered_uris"])
         return ws_text
 
     def _get_session_state(
@@ -2517,7 +2578,16 @@ class MemoryService:
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            vector_index = self._provider_cfg.create_vector_index()
+            # Do not share across distinct DSNs or a non-PostgreSQL dialect.
+            pool = None
+            vector_dsn = getattr(self._provider_cfg, "opengauss_connection_string", None)
+            if (self._use_sql
+                    and str(self._provider_cfg.vector_db_type).strip().casefold() == "opengauss"
+                    and self._cfg.sql_dialect in {"postgresql", "opengauss"}
+                    and vector_dsn and vector_dsn == self._cfg.sql_connection_string):
+                pool = self._get_shared_sql_pool()
+            vector_index = (self._provider_cfg.create_vector_index(pool=pool) if pool is not None
+                            else self._provider_cfg.create_vector_index())
             projection_index = vector_index
             lexical_index = None
             if getattr(self._cfg, "retrieval_hybrid_enabled", False):
@@ -2656,6 +2726,7 @@ class MemoryService:
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
+                edge_projection_components=self._graph_projection_components(),
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2769,6 +2840,7 @@ class MemoryService:
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
+                edge_projection_components=self._graph_projection_components(),
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2777,6 +2849,8 @@ class MemoryService:
             )
 
             account_ids = []
+            if self._graph_enabled():
+                account_ids = [account_id or self._default_account_id]
             if not self._supports_batch_claim(outbox_store):
                 effective_account_id = account_id or self._default_account_id
                 account_ids = [effective_account_id]
@@ -2917,6 +2991,14 @@ class MemoryService:
             vector_index = self._get_shared_vector_index()
             embedder = self._get_shared_embedder()
 
+            graph_kwargs = {}
+            if self._graph_enabled():
+                from retrieval.authorized_vector_search import AuthorizedVectorSearch
+                from service.relation_candidate_service import RelationCandidateService
+                graph_kwargs = dict(graph_enabled=True,relation_store=self._get_relation_store(),
+                    relation_candidate_service=RelationCandidateService(AuthorizedVectorSearch(
+                        vector_index,embedder,ContextReader(fs=fs,storage_backend=self._cfg.storage_backend))))
+
             self._write_api = MemoryWriteAPI(
                 fs=fs,
                 llm=self.get_llm(),
@@ -2932,6 +3014,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 dual_pass_enabled=self._cfg.dual_pass_enabled,
                 node_processing_enabled=self._cfg.node_processing_enabled,
                 directory_summary_enabled=self._cfg.directory_summary_enabled,
+                **graph_kwargs,
             )
             logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)
             # Start outbox worker so written memories get indexed
@@ -3048,6 +3131,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 rrf_k=getattr(self._cfg, "retrieval_rrf_k", 60),
                 semantic_weight=getattr(self._cfg, "retrieval_semantic_weight", 1.0),
                 lexical_weight=getattr(self._cfg, "retrieval_lexical_weight", 1.0),
+                enable_graph_expansion=self._graph_enabled() and self._cfg.enable_graph_expansion,
+                graph_expand_top_k=getattr(self._cfg,"graph_expand_top_k",5),
+                graph_expand_limit=getattr(self._cfg,"graph_expand_limit",3),
+                graph_min_weight=getattr(self._cfg,"graph_min_weight",0.0),
+                graph_edge_similarity_threshold=getattr(self._cfg,"graph_edge_similarity_threshold",0.35),
+                graph_supplement_enabled=getattr(self._cfg,"graph_supplement_enabled",True),
             )
 
             # Create relation_store
@@ -3075,6 +3164,21 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     )
                 lexical_backfill = self._get_lexical_backfill()
 
+            graph_kwargs = {}
+            if cfg.enable_graph_expansion:
+                if relation_store is None or context_reader is None:
+                    raise RuntimeError("Graph retrieval requires canonical relation storage and reader")
+                from service.graph_service import GraphService
+                from retrieval.graph_retriever import OneHopRetriever
+                from retrieval.graph_supplement import GraphSupplement
+                graph = GraphService(None,relation_reader=relation_store)
+                profile = self._graph_profile()
+                graph_kwargs = dict(graph_retriever=OneHopRetriever(graph,
+                    dict(edges_per_node=cfg.graph_expand_limit,expansion_limit=cfg.graph_expand_top_k,min_weight=cfg.graph_min_weight,
+                         edge_similarity_threshold=cfg.graph_edge_similarity_threshold),
+                    embedder=embedder,embedding_profile=profile),
+                    graph_supplement=GraphSupplement(graph,context_reader,vector_index,embedder,profile))
+
             pipeline = RetrievalPipeline(
                 planner=QueryPlanner(cfg),
                 seed_retriever=SeedRetriever(
@@ -3088,6 +3192,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
                 context_reader=context_reader,
+                **graph_kwargs,
             )
 
             self._read_api = ReadAPI(
@@ -4274,9 +4379,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         delivery_stats = {}
         if any(item.get("category") != "code" for item in working_set):
+            graph_items = [item for item in working_set
+                           if (item.get("metadata") or {}).get("retrieval_origin") == "graph_neighbor"]
+            ordinary_items = [item for item in working_set
+                              if (item.get("metadata") or {}).get("retrieval_origin") != "graph_neighbor"]
             working_set, delivery_stats = hydrate_evidence(
-                working_set, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs), ctx,
+                ordinary_items, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs), ctx,
             )
+            if graph_items:
+                graph_items, _ = hydrate_evidence(
+                    graph_items, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs), ctx)
+                working_set.extend(graph_items)
             search_stats["evidence_delivery"] = delivery_stats
 
         # Each step degrades independently — a failure in one doesn't kill the rest
@@ -4325,6 +4438,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             logger.warning("assemble episodic_context build failed: %s", exc)
 
         # Step 5c: Build dynamic working set → user message (preserves KV cache)
+        if self._graph_enabled():
+            working_set = self.get_read_api().append_graph_supplement(
+                working_set,query,search_stats,ctx,budget_allocation,
+                lambda items, allocation: self._format_working_set(items, allocation, query=query))
         working_set_msg = ""
         try:
             working_set_msg = self._format_working_set(

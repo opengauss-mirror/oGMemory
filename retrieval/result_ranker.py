@@ -233,13 +233,17 @@ class ResultRanker:
         if ctx is not None and callable(is_visible):
             l2_only = [hit for hit in l2_only if is_visible(hit.uri, ctx)]
 
-        ranked = self._ranker.rank(typed_query, l2_only)
+        graph_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") == "graph_neighbor"]
+        vector_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") != "graph_neighbor"]
+        ranked = self._ranker.rank(typed_query, vector_hits)
         top = select_scene_evidence(
             ranked, typed_query.top_k, direct_evidence_reserve,
             lambda item: bool(item.hit.metadata.get("scene_expanded")),
         )
         if direct_evidence_reserve is not None:
             top.sort(key=lambda item: (item.rank_score, item.hit.score), reverse=True)
+        top += [RankedHit(h, h.score, f"graph score {h.score:.4f}")
+                for h in sorted(graph_hits, key=lambda h: (-h.score,h.uri))]
 
         blocks: list[RetrievedBlock] = []
         for item in top:
@@ -253,6 +257,8 @@ class ResultRanker:
                     category=hit.category,
                     owner_space=hit.owner_space,
                     abstract=hit.abstract or None,
+                    overview=hit.overview,
+                    content_excerpt=hit.content_excerpt,
                     has_overview=hit.has_overview,
                     has_content=hit.has_content,
                     match_reason=item.reason,

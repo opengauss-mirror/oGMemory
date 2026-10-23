@@ -583,6 +583,26 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             self._return_connection(conn)
         if row is None:
             return None
+        return self._row_to_record(row)
+
+    def get_records(self, record_ids: list[str]) -> list[IndexRecord | None]:
+        """Read stored vectors in one round-trip, preserving input order."""
+        if not record_ids:
+            return []
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"SELECT id,uri,level,text,filters,metadata,embedding FROM {self._table_name} WHERE id=ANY(%s)",
+                            (record_ids,))
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        records = {str(row["id"]):self._row_to_record(row) for row in rows}
+        return [records.get(record_id) for record_id in record_ids]
+
+    @staticmethod
+    def _row_to_record(row):
         meta = _ensure_dict(row.get("metadata"))
         filt = _ensure_dict(row.get("filters"))
         embedding = row.get("embedding")
@@ -822,6 +842,10 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             else:
                 clauses.append("level = %(f_level)s")
             params["f_level"] = lvl
+        for key in ("record_kind", "representation_version"):
+            if key in f:
+                clauses.append(f"metadata->>'{key}' = %(f_{key})s")
+                params[f"f_{key}"] = f[key]
         if "space_id" in f:
             sid = f["space_id"]
             if isinstance(sid, list):

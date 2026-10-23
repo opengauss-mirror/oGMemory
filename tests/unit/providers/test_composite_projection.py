@@ -78,6 +78,18 @@ def test_same_outbox_record_updates_vector_and_lexical_projection():
     assert lexical.upserts[0][0].account_id == "acct"
 
 
+def test_connection_descriptor_is_vector_only_not_a_lexical_document():
+    from dataclasses import replace
+    vector,lexical=_Vector(),_Lexical()
+    writer=CompositeProjectionWriter(vector,lexical)
+    descriptor=replace(_record(),id='descriptor',level=3,
+        metadata={'record_kind':'update_activation'})
+    writer.upsert([descriptor])
+    assert vector.upserts==[[descriptor]] and lexical.upserts==[]
+    writer.upsert([_record(),descriptor])
+    assert [r.id for r in lexical.upserts[0]]==['id-1']
+
+
 def test_required_lexical_failure_prevents_vector_commit():
     vector = _Vector()
     writer = CompositeProjectionWriter(vector, _Lexical(fail=True))

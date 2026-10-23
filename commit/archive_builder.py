@@ -139,6 +139,15 @@ class ArchiveBuilder:
         if candidate.category in {"event", "case"} and candidate.title:
             metadata["title"] = candidate.title
 
+        # Preserve only the opt-in graph descriptor, not arbitrary LLM metadata.
+        from index.activation_projection import ACTIVATION_VERSION
+        descriptor = candidate.metadata.get("update_activation")
+        if (candidate.metadata.get("update_activation_version") == ACTIVATION_VERSION
+                and isinstance(descriptor, str) and descriptor.strip()
+                and "\n" not in descriptor.strip() and "\r" not in descriptor.strip()):
+            metadata["update_activation"] = descriptor.strip()
+            metadata["update_activation_version"] = ACTIVATION_VERSION
+
         # Preserve routing_key for metadata-enriched retrieval
         if candidate.routing_key and not (candidate.category == "profile" and metadata.get("routing_key")):
             metadata["routing_key"] = candidate.routing_key
@@ -434,4 +443,3 @@ class ArchiveBuilder:
                 seen.add(key)
                 paragraphs.append(cleaned)
         return "\n\n".join(paragraphs)
-

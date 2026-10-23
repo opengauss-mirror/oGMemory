@@ -26,6 +26,13 @@ class WriteOutcomeUnknownError(RuntimeError):
 
 def operation_digest(candidate: CandidateMemory, ctx: RequestContext) -> str:
     payload = asdict(candidate)
+    from extraction.relation_proposals import KEY
+    metadata = dict(payload.get("metadata") or {})
+    metadata.pop(KEY, None)  # transient edge inputs are not a node-write payload
+    payload["metadata"] = metadata
+    # New opt-in annotations must not invalidate pre-graph durable receipts.
+    if not payload.get("metadata"):
+        payload.pop("metadata", None)
     payload.pop("write_operation_id")
     for name in ("verified_routing_aliases", "verified_object_aliases", "source_contexts", "node_draft_indices"):
         if not payload.get(name):

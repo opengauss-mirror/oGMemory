@@ -10,7 +10,11 @@ from core.models import CandidateMemory
 def candidate_draft_fields(candidate: CandidateMemory) -> dict:
     """Preserve legacy serialization when optional internal partition identity is absent."""
     fields = asdict(candidate)
-    for name in ("source_occurrence_id", "source_contexts", "node_draft_indices"):
+    from extraction.relation_proposals import KEY
+    metadata = dict(fields.get("metadata") or {})
+    metadata.pop(KEY, None)
+    fields["metadata"] = metadata
+    for name in ("source_occurrence_id", "source_contexts", "node_draft_indices", "metadata"):
         if not fields.get(name):
             fields.pop(name, None)
     return fields

@@ -141,6 +141,21 @@ class RelationEdge:
     reason: str
 
 
+@dataclass(frozen=True)
+class RelationNeighbor:
+    """An authorized ContextNode relation with its versioned edge vector."""
+    uri: str
+    abstract: str = ""
+    overview: str = ""
+    category: str = ""
+    relation_type: str = ""
+    weight: float = 0.0
+    reason: str = ""
+    edge_projection: dict | None = None
+    source_revision: int | None = None
+    target_revision: int | None = None
+
+
 @dataclass
 class CandidateMemory:
     """Extracted candidate before merge policy decisions.
@@ -177,6 +192,7 @@ class CandidateMemory:
     verified_object_aliases: list[str] = field(default_factory=list)
     source_contexts: list[str] = field(default_factory=list)  # Internal complete extraction-span evidence.
     node_draft_indices: list[int] = field(default_factory=list)  # Contributors in the durable draft checkpoint.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class WriteAction:
@@ -330,6 +346,8 @@ class LeafHit:
     active_count: int = 0
     updated_at: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    overview: str | None = None
+    content_excerpt: str | None = None
 
 
 @dataclass
@@ -387,6 +405,14 @@ class RetrievalConfig:
     lexical_weight: float = 1.0
     expand_hierarchy: bool = True
     include_agent_memories: bool = False
+    # Semantic ContextNode graph; independent of multimodal/code graphs.
+    enable_graph_expansion: bool = False
+    graph_expand_top_k: int = 5
+    graph_expand_limit: int = 3
+    graph_min_weight: float = 0.0
+    graph_edge_similarity_threshold: float = 0.35
+    graph_edge_embedding_profile: str = "shared-node-embedding-v1"
+    graph_supplement_enabled: bool = True
 
 
 # ---------------------------------------------------------------------------
