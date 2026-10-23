@@ -196,6 +196,33 @@ CREATE TRIGGER trg_invalidate_edge_projections
 AFTER UPDATE OF version, content, abstract, overview ON context_nodes
 FOR EACH ROW EXECUTE PROCEDURE invalidate_edge_projections_for_node_update();
 
+-- Physical deletion must erase copied target text and revoke worker leases in
+-- the same transaction. Recreating a URI at version 1 must not revive an old
+-- relation/vector. Match the node -> jobs -> relations write lock order.
+CREATE OR REPLACE FUNCTION remove_edge_projections_for_node_delete()
+RETURNS TRIGGER AS $$
+DECLARE
+    job RECORD;
+BEGIN
+    FOR job IN SELECT edge_id FROM edge_projection_jobs
+                WHERE account_id = OLD.account_id
+                  AND (source_uri = OLD.uri OR target_uri = OLD.uri)
+                ORDER BY edge_id FOR UPDATE
+    LOOP
+        DELETE FROM edge_projection_jobs
+         WHERE account_id = OLD.account_id AND edge_id = job.edge_id;
+    END LOOP;
+    DELETE FROM relation_edges
+     WHERE account_id = OLD.account_id
+       AND (from_uri = OLD.uri OR to_uri = OLD.uri);
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_remove_edge_projections ON context_nodes;
+CREATE TRIGGER trg_remove_edge_projections
+BEFORE DELETE ON context_nodes
+FOR EACH ROW EXECUTE PROCEDURE remove_edge_projections_for_node_delete();
+
 -- Session archives
 CREATE TABLE IF NOT EXISTS session_archives (
     archive_id    VARCHAR(64)  NOT NULL,

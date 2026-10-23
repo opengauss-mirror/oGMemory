@@ -1254,7 +1254,7 @@ class SQLContextFS(PoolAdapterMixin):
                 # that acquired the mutation lock first finish before deletion.
                 cur.execute(
                     "SELECT uri FROM context_nodes "
-                    "WHERE account_id = %s AND uri = ANY(%s) FOR UPDATE",
+                    "WHERE account_id = %s AND uri = ANY(%s) ORDER BY uri FOR UPDATE",
                     (ctx.account_id, targets),
                 )
                 cur.fetchall()

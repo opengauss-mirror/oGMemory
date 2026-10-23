@@ -555,6 +555,15 @@ class MemoryIdentityResolver:
         if repeats:
             existing = repeats[0] if candidate.target_uri else self.fs.read_node(repeats[0].uri, ctx)
             plan = self._plan(candidate, existing, nodes, directory, ctx, duplicate=True)
+            # Content replay identity stays unchanged. A valid descriptor-only
+            # refresh still needs a real versioned write and index event, while
+            # preserving the existing content rather than appending it twice.
+            from index.activation_projection import ACTIVATION_VERSION, candidate_activation
+            descriptor = candidate_activation(candidate)
+            if descriptor is not None and (
+                    descriptor != existing.metadata.get("update_activation")
+                    or existing.metadata.get("update_activation_version") != ACTIVATION_VERSION):
+                return commit(candidate, ctx, plan)
             metadata = plan.merged_fields["identity_metadata"]
             changed = any(metadata.get(name) != existing.metadata.get(name) for name in
                           ("provenance_ids", "memory_observation_sources",

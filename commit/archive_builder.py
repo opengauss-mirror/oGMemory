@@ -139,15 +139,6 @@ class ArchiveBuilder:
         if candidate.category in {"event", "case"} and candidate.title:
             metadata["title"] = candidate.title
 
-        # Preserve only the opt-in graph descriptor, not arbitrary LLM metadata.
-        from index.activation_projection import ACTIVATION_VERSION
-        descriptor = candidate.metadata.get("update_activation")
-        if (candidate.metadata.get("update_activation_version") == ACTIVATION_VERSION
-                and isinstance(descriptor, str) and descriptor.strip()
-                and "\n" not in descriptor.strip() and "\r" not in descriptor.strip()):
-            metadata["update_activation"] = descriptor.strip()
-            metadata["update_activation_version"] = ACTIVATION_VERSION
-
         # Preserve routing_key for metadata-enriched retrieval
         if candidate.routing_key and not (candidate.category == "profile" and metadata.get("routing_key")):
             metadata["routing_key"] = candidate.routing_key
@@ -186,6 +177,14 @@ class ArchiveBuilder:
                 if (self._card_format_enabled and candidate.category in {"entity", "preference"}
                         and "existing_overview" in plan.merged_fields):
                     abstract = " ".join(abstract.splitlines()).strip()
+
+        # Apply the validated incoming descriptor AFTER existing identity
+        # metadata; otherwise an update silently restores the old descriptor.
+        from index.activation_projection import ACTIVATION_VERSION, candidate_activation
+        descriptor = candidate_activation(candidate)
+        if descriptor is not None:
+            metadata["update_activation"] = descriptor
+            metadata["update_activation_version"] = ACTIVATION_VERSION
 
         if self._card_format_enabled:
             from extraction.card_format import validate_memory_card

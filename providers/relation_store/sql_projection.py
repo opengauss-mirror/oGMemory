@@ -137,12 +137,27 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
+                # Also scrub pre-upgrade orphan payloads. New physical deletes
+                # are covered atomically by the context_nodes delete trigger.
+                cur.execute("""DELETE FROM edge_projection_jobs j
+                    WHERE j.account_id=%s AND (
+                        NOT EXISTS (SELECT 1 FROM context_nodes s
+                                    WHERE s.account_id=j.account_id AND s.uri=j.source_uri)
+                        OR NOT EXISTS (SELECT 1 FROM context_nodes t
+                                       WHERE t.account_id=j.account_id AND t.uri=j.target_uri))""",
+                    (account_id,))
                 cur.execute(
                     """
                     SELECT edge_id, source_uri, target_uri, relation_type, reason,
                            target_text, source_revision, target_revision
                       FROM edge_projection_jobs
                      WHERE account_id = %s
+                       AND EXISTS (SELECT 1 FROM context_nodes s
+                                    WHERE s.account_id=edge_projection_jobs.account_id
+                                      AND s.uri=source_uri AND s.version=source_revision)
+                       AND EXISTS (SELECT 1 FROM context_nodes t
+                                    WHERE t.account_id=edge_projection_jobs.account_id
+                                      AND t.uri=target_uri AND t.version=target_revision)
                        AND (status = 'PENDING'
                             OR (status = 'FAILED' AND
                                 (next_retry_at IS NULL OR next_retry_at <= NOW()))

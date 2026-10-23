@@ -109,6 +109,19 @@ identity must be re-indexed before they can qualify incoming supplemental edges.
 Do not guess their model from dimensions or relabel them as the current model.
 The feature remains default-off and contains no conflict-management changes.
 
+PR314 review follow-up: identity merges retain the newly validated descriptor;
+descriptor-only refreshes use the existing versioned writer without duplicating
+content. Native relation endpoints accept verified routing aliases and still
+reject ambiguous matches. Chroma retains projection/model metadata and graph
+filters; existing Chroma projections missing those fields must be re-indexed.
+Physical node deletion now atomically removes its relation rows and projection
+jobs, including copied target text and claim leases. Recreating a URI cannot
+revive the deleted projection. Apply the updated schema with old workers stopped;
+tenant queue draining also scrubs pre-upgrade orphan jobs before claiming work.
+A provider call already started before deletion cannot be recalled, but its
+stale result cannot recreate a deleted job or relation. These changes do not
+alter extraction prompts, relation semantics, ranking or traversal budgets.
+
 This feature ports the accepted graph-control ingestion and retrieval design
 from `reuse-v3-good-20261009` (`65784e86111fa7258f3c1484182c1955274767b9`)
 onto the current `anttrail` branch (`da754639`). It is not a merge of the old

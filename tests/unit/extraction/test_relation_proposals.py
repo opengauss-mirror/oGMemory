@@ -11,6 +11,23 @@ PROPOSAL = dict(from_routing_key="alice", to_routing_key="project",
                 relation_type="belongs_to", reason="Alice works on the project", weight=.9)
 
 
+def test_verified_alias_resolves_and_ambiguous_alias_is_rejected():
+    from core.models import WritePlan
+    from extraction.relation_proposals import resolve_edges
+    candidates = [CandidateMemory('entity', 'user', key, key, key, key, .9)
+                  for key in ('alicia', 'project')]
+    candidates[0].verified_routing_aliases = ['alice']
+    plans = [WritePlan('create', 'stored/alicia'), WritePlan('merge', 'stored/project')]
+    fs = Mock()
+    fs.read_node.return_value = Mock(category='entity')
+    edges, rejected = resolve_edges([PROPOSAL], candidates, plans, Mock(), fs=fs)
+    assert not rejected and edges[0].from_uri == 'stored/alicia'
+    candidates.append(CandidateMemory('entity','user','alice','a','a','a',.9))
+    plans.append(WritePlan('create','stored/different-alice'))
+    edges, rejected = resolve_edges([PROPOSAL], candidates, plans, Mock(), fs=fs)
+    assert not edges and rejected == ['ambiguous_endpoint']
+
+
 @pytest.mark.parametrize("bad", [dict(weight=True), dict(weight=float("nan")),
     dict(weight=2), dict(reason=""), dict(from_routing_key=None), dict(relation_type="invalid")])
 def test_malformed_proposals_are_rejected(bad):

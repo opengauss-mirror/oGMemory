@@ -69,7 +69,12 @@ def resolve_edges(proposals, candidates, plans, ctx, *, fs, uri_resolver=None):
     refs = {}
     for candidate, plan in zip(candidates, plans, strict=True):
         if plan.action in {"create", "merge", "append"}:
-            refs.setdefault((candidate.category, candidate.routing_key), set()).add(plan.target_uri)
+            # Reconciliation may rename a candidate after extract_relation
+            # emitted its original key. Only verified aliases are accepted;
+            # the sets below preserve ambiguity rejection across candidates.
+            for key in (candidate.routing_key, *candidate.verified_routing_aliases):
+                if key:
+                    refs.setdefault((candidate.category, key), set()).add(plan.target_uri)
 
     def endpoint(category, key):
         choices = refs.get((category, key), set())

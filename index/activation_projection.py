@@ -9,6 +9,16 @@ ACTIVATION_LEVEL = 3
 ACTIVATION_VERSION = "c1-integrated-activation-v1"
 
 
+def candidate_activation(candidate) -> str | None:
+    """Return only a valid opt-in descriptor; absence does not clear old data."""
+    value = candidate.metadata.get("update_activation")
+    if (candidate.metadata.get("update_activation_version") == ACTIVATION_VERSION
+            and isinstance(value, str) and value.strip()
+            and "\n" not in value.strip() and "\r" not in value.strip()):
+        return value.strip()
+    return None
+
+
 def is_current_activation(record: IndexRecord, node: ContextNode) -> bool:
     """Fail closed on stale projections; caller must authorize the canonical node."""
     expected = build_activation_record(node, record.filters)
