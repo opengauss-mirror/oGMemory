@@ -92,22 +92,3 @@ def test_thread_local_models_one_instance_per_thread():
     thread.join()
     assert other[0] is not main_obj
     assert len(built) == 2
-
-
-def test_thread_local_models_warmup_builds_in_parallel():
-    built = []
-
-    def factory():
-        obj = object()
-        built.append(obj)
-        return obj
-
-    models = ThreadLocalModels(factory, name="test-model")
-    models.warmup(4)
-    assert len(built) == 4
-
-
-@pytest.mark.parametrize("count", [0, -1])
-def test_thread_local_models_warmup_noop(count):
-    models = ThreadLocalModels(object, name="test-model")
-    models.warmup(count)  # must not raise

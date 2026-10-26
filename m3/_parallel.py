@@ -144,30 +144,3 @@ class ThreadLocalModels:
             self._local.instance = instance
             logger.debug("ThreadLocalModels: built %s for thread %s", self._name, threading.current_thread().name)
         return instance
-
-    def warmup(self, count: int) -> None:
-        """Pre-build ``count`` instances in fresh daemon threads.
-
-        Avoids a serial warm-up phase when the first batch hits empty
-        worker slots.
-        """
-        if count <= 0:
-            return
-        barrier = threading.Barrier(count + 1)
-
-        def _build() -> None:
-            self.get()
-            barrier.wait()
-
-        threads = [
-            threading.Thread(target=_build, daemon=True, name=f"m3warmup-{i}")
-            for i in range(count)
-        ]
-        for thread in threads:
-            thread.start()
-        try:
-            barrier.wait()
-        except threading.BrokenBarrierError:  # pragma: no cover - defensive
-            logger.warning("ThreadLocalModels warmup barrier broken", exc_info=True)
-        for thread in threads:
-            thread.join(timeout=30)
