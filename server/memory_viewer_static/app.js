@@ -71,6 +71,7 @@ const TASK_ERROR_MESSAGES = {
 };
 const API_KEY_STORAGE_KEY = 'ogmemory-viewer-api-key';
 const API_KEY_CHANNEL_NAME = 'ogmemory-viewer-api-key-sync';
+const SCENE_PAGE_SIZE = 6;
 const storedApiKey = sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
 localStorage.removeItem(API_KEY_STORAGE_KEY);
 
@@ -84,6 +85,8 @@ const state = {
   monitoringData: null, activeMonitor: 'overview',
   tasks: [], tasksPage: 1, tasksRequestId: 0, tasksSnapshot: '',
   taskRetryEnabled: false, selectedTaskId: '',
+  sceneScopes: new Map(), scenes: [], sceneRequestId: 0, sceneOffset: 0, sceneNextOffset: null,
+  selectedSceneId: '',
 };
 const apiKeyChannel = typeof BroadcastChannel === 'function'
   ? new BroadcastChannel(API_KEY_CHANNEL_NAME)
@@ -102,6 +105,7 @@ const elements = {
   retrievalResults: $('#retrieval-results'), retrievalDetail: $('#retrieval-detail'),
   revealCurrent: $('#reveal-current-button'),
   tasksView: $('#tasks-view'), tasksPanel: $('#tasks-panel'),
+  scenesView: $('#scenes-view'), scenesScope: $('#scenes-scope'), scenesList: $('#scenes-list'),
 };
 
 function requestHeaders() { return state.apiKey ? { 'X-API-Key': state.apiKey } : {}; }
@@ -137,6 +141,7 @@ async function loadTree() {
   const accountRequestId = ++state.accountRequestId;
   const requestOptions = { headers: requestHeaders() };
   resetRetrieval();
+  resetScenes();
   setLoading(true);
   try {
     const scope = await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), requestOptions);
@@ -216,6 +221,7 @@ async function selectAccount(accountId, toggle = false) {
   }
   const requestId = ++state.accountRequestId;
   const treeRequestId = state.treeRequestId;
+  resetScenes();
   let tree = state.accountTrees.get(accountId);
   if (!tree && state.adminMode) {
     try {
@@ -415,6 +421,153 @@ function renderSearchScopes() {
   });
   elements.retrievalScope.innerHTML = options.join('') || '<option value="">无可检索范围</option>';
   elements.retrievalScope.value = state.searchTargets.has(previous) ? previous : 'all';
+  renderSceneScopes();
+}
+
+function resetScenes() {
+  state.sceneRequestId += 1;
+  state.scenes = [];
+  state.sceneOffset = 0;
+  state.sceneNextOffset = null;
+  state.selectedSceneId = '';
+  state.sceneScopes.clear();
+  elements.scenesScope.replaceChildren(new Option('加载中', ''));
+  elements.scenesScope.disabled = true;
+  elements.scenesList.replaceChildren();
+  $('#scenes-count').textContent = '';
+  $('#scenes-pagination').hidden = true;
+  $('#scene-detail').hidden = true;
+  $('#scenes-refresh').disabled = false;
+}
+
+function renderSceneScopes() {
+  const previous = elements.scenesScope.value;
+  state.sceneScopes.clear();
+  const options = [];
+  for (const [key, target] of state.searchTargets) {
+    if (key === 'all') continue;
+    const owner = target.agentId ? `agent:${target.agentId}` : `user:${target.userId}`;
+    if (state.sceneScopes.has(owner)) continue;
+    state.sceneScopes.set(owner, { ...target, owner_space: owner });
+    options.push(new Option(target.agentId ? `${target.agentId} · Agent` : `${target.userId} · 用户`, owner));
+  }
+  elements.scenesScope.replaceChildren(...(options.length ? options : [new Option('无可见范围', '')]));
+  if (state.sceneScopes.has(previous)) elements.scenesScope.value = previous;
+  elements.scenesScope.disabled = !options.length;
+  if (state.view === 'scenes') loadScenes();
+}
+
+function sceneText(tag, className, text) {
+  const element = document.createElement(tag);
+  element.className = className;
+  element.textContent = text;
+  return element;
+}
+
+function sceneTime(cluster) {
+  return [cluster.time_start, cluster.time_end].filter(Boolean).join(' — ');
+}
+
+async function loadScenes(offset = 0) {
+  const requestId = ++state.sceneRequestId;
+  const accountRequestId = state.accountRequestId;
+  const target = state.sceneScopes.get(elements.scenesScope.value);
+  const refresh = $('#scenes-refresh');
+  state.scenes = [];
+  $('#scene-detail').hidden = true;
+  $('#scenes-pagination').hidden = true;
+  $('#scenes-count').textContent = '';
+  elements.scenesList.replaceChildren(sceneText('p', 'scene-status', target ? '正在加载场景…' : '请选择可见的用户或 Agent 范围。'));
+  refresh.disabled = false;
+  if (!target) return;
+  refresh.disabled = true;
+  try {
+    const body = await fetchJson(apiUrl('/api/v1/scenes', {
+      accountId: state.adminMode ? target.accountId : '', userId: state.adminMode ? target.userId : '',
+      agentId: target.agentId, owner_space: target.owner_space, offset, limit: SCENE_PAGE_SIZE,
+    }));
+    if (requestId !== state.sceneRequestId || accountRequestId !== state.accountRequestId) return;
+    state.scenes = body.items || [];
+    state.sceneOffset = offset;
+    state.sceneNextOffset = Number.isInteger(body.next_offset) ? body.next_offset : null;
+    $('#scenes-count').textContent = `${body.total} 个场景`;
+    renderScenes();
+    $('#scenes-pagination').hidden = !(offset || state.sceneNextOffset !== null);
+    $('#scenes-page-summary').textContent = `第 ${Math.floor(offset / SCENE_PAGE_SIZE) + 1} / ${Math.max(1, Math.ceil(body.total / SCENE_PAGE_SIZE))} 页`;
+    $('#scenes-previous').disabled = offset === 0;
+    $('#scenes-next').disabled = state.sceneNextOffset === null;
+  } catch (error) {
+    if (requestId !== state.sceneRequestId || accountRequestId !== state.accountRequestId) return;
+    elements.scenesList.replaceChildren(sceneText('p', 'scene-status error', `场景加载失败：${error.message}`));
+  } finally {
+    if (requestId === state.sceneRequestId) refresh.disabled = false;
+  }
+}
+
+function renderScenes() {
+  if (!state.scenes.length) {
+    elements.scenesList.replaceChildren(sceneText('p', 'scene-status', '当前范围暂无场景记忆。'));
+    return;
+  }
+  const cards = state.scenes.map(scene => {
+    const cluster = scene.cluster;
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'scene-card';
+    card.dataset.sceneId = scene.scene_id;
+    card.append(
+      sceneText('strong', 'scene-card-title', cluster.label),
+      sceneText('span', 'scene-card-summary', cluster.summary),
+      sceneText('span', 'scene-card-count', `${cluster.members.length} 个记忆节点`),
+    );
+    return card;
+  });
+  elements.scenesList.replaceChildren(...cards);
+  selectScene(state.scenes.find(scene => scene.scene_id === state.selectedSceneId) || state.scenes[0]);
+}
+
+function sceneMemberTarget(uri) {
+  const match = String(uri).replace(/\/content\.md$/, '').match(/^ctx:\/\/([^/]+)\/(users|agents)\/([^/]+)\/memories\/([^/]+)(?:\/([^/]+))?\/?$/);
+  const decode = value => { try { return decodeURIComponent(value); } catch { return value; } };
+  if (!match || decode(match[1]) !== state.accountId) return null;
+  const [, , ownerType, encodedOwner, directory, encodedId] = match;
+  const owner = decode(encodedOwner);
+  const spec = (ownerType === 'agents' ? AGENT_MEMORY_DIRECTORIES : USER_MEMORY_DIRECTORIES).find(item => item.directory === directory);
+  if (!spec || (!spec.singleton && !encodedId)) return null;
+  const id = spec.singleton ? 'self' : decode(encodedId);
+  const selectedScope = state.sceneScopes.get(elements.scenesScope.value);
+  const userId = ownerType === 'users' ? owner
+    : (state.tree?.agents || []).find(agent => agent.agent_id === owner)?.owner_user_id || selectedScope?.userId;
+  return {
+    uri: `ogmemory://memories/${spec.type}/${spec.type === 'pattern' && ownerType === 'agents' ? 'agent/' : ''}${encodeURIComponent(id)}`,
+    userId, agentId: ownerType === 'agents' ? owner : '', type: spec.type, id,
+  };
+}
+
+function selectScene(scene) {
+  state.selectedSceneId = scene.scene_id;
+  elements.scenesList.querySelectorAll('[data-scene-id]').forEach(card => {
+    card.setAttribute('aria-pressed', String(card.dataset.sceneId === scene.scene_id));
+  });
+  const cluster = scene.cluster;
+  $('#scene-detail').hidden = false;
+  $('#scene-detail-title').textContent = cluster.label;
+  $('#scene-detail-origin').textContent = scene.origin === 'manual' ? '自定义场景' : '自动沉淀';
+  $('#scene-detail-description').textContent = cluster.summary;
+  $('#scene-detail-meta').replaceChildren(...[sceneTime(cluster), `版本 ${scene.version}`].filter(Boolean).map(value => sceneText('span', '', value)));
+  $('#scene-detail-member-count').textContent = cluster.members.length;
+  $('#scene-detail-members').replaceChildren(...cluster.members.map(member => {
+    const target = sceneMemberTarget(member.context_uri);
+    if (!target) return sceneText('span', 'scene-member-path', member.context_uri);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'scene-member';
+    button.dataset.memberUri = target.uri;
+    button.dataset.user = target.userId || '';
+    button.dataset.agent = target.agentId;
+    button.append(sceneText('span', 'scene-member-type', typeLabel(target.type)), sceneText('span', '', target.id));
+    return button;
+  }));
 }
 function openRootDirectories() {
   const root = contextRoot();
@@ -1074,12 +1227,14 @@ function switchView(view) {
   const retrieval = view === 'retrieval';
   const monitoring = view === 'monitoring';
   const tasks = view === 'tasks';
+  const scenes = view === 'scenes';
   elements.dashboardView.hidden = !dashboard;
-  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks;
+  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes;
   elements.retrievalView.hidden = !retrieval;
   elements.monitoringView.hidden = !monitoring;
   elements.tasksView.hidden = !tasks;
-  elements.pageTitle.textContent = dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
+  elements.scenesView.hidden = !scenes;
+  elements.pageTitle.textContent = dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
   const skill = view === 'skill';
   $('#tree-label').textContent = skill ? 'Agent Skill' : 'ContextFS';
   elements.tree.setAttribute('aria-label', skill ? 'Agent Skill 目录树' : 'ContextFS 目录树');
@@ -1092,6 +1247,7 @@ function switchView(view) {
   if (retrieval) { $('#retrieval-input').focus(); return; }
   if (monitoring) { loadMonitoring(); return; }
   if (tasks) { loadTasks(); return; }
+  if (scenes) { loadScenes(state.sceneOffset); return; }
   if (view === 'skill') {
     const root = contextRoot();
     state.expanded.add(root);
@@ -1109,6 +1265,7 @@ function showTreeError(message) {
   elements.treeRoot.textContent = '加载失败';
   elements.treeCount.textContent = '';
   elements.tree.innerHTML = `<div class="tree-error root-error">${escapeHtml(message)}</div>`;
+  if (state.view === 'scenes') elements.scenesList.replaceChildren(sceneText('p', 'scene-status error', message));
 }
 function setLoading(loading) { elements.refresh.classList.toggle('loading', loading); }
 function setConnection(online) {
@@ -1212,7 +1369,29 @@ elements.refresh.addEventListener('click', () => {
   if (state.view === 'dashboard') loadDashboardMetrics();
   else if (state.view === 'monitoring') loadMonitoring();
   else if (state.view === 'tasks') loadTasks();
+  else if (state.view === 'scenes') loadScenes(state.sceneOffset);
   else loadTree();
+});
+$('#scenes-refresh').addEventListener('click', () => loadScenes(state.sceneOffset));
+elements.scenesScope.addEventListener('change', () => {
+  state.selectedSceneId = '';
+  loadScenes();
+});
+$('#scenes-previous').addEventListener('click', () => loadScenes(Math.max(0, state.sceneOffset - SCENE_PAGE_SIZE)));
+$('#scenes-next').addEventListener('click', () => {
+  if (state.sceneNextOffset !== null) loadScenes(state.sceneNextOffset);
+});
+elements.scenesList.addEventListener('click', event => {
+  const card = event.target.closest('[data-scene-id]');
+  const scene = state.scenes.find(item => item.scene_id === card?.dataset.sceneId);
+  if (scene) selectScene(scene);
+});
+$('#scene-detail-members').addEventListener('click', event => {
+  const member = event.target.closest('[data-member-uri]');
+  if (!member) return;
+  state.selectedDirectoryKey = '';
+  switchView('memory');
+  openDetail(member.dataset.memberUri, member.dataset.user, member.dataset.agent);
 });
 $('#tasks-refresh').addEventListener('click', loadTasks);
 ['#tasks-type', '#tasks-status'].forEach((selector) => $(selector).addEventListener('change', () => {
@@ -1292,6 +1471,7 @@ elements.settings.addEventListener('click', (event) => {
 
 document.documentElement.dataset.theme = localStorage.getItem('ogmemory-viewer-theme') || 'light';
 elements.shell.classList.toggle('sidebar-collapsed', localStorage.getItem('ogmemory-viewer-sidebar') === 'collapsed');
+if (location.hash === '#scenes') switchView('scenes');
 if (initialTreeLoadPending) {
   apiKeyChannel.postMessage({ type: 'request' });
   setTimeout(loadTreeAfterApiKeySync, 100);

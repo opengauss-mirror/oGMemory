@@ -463,7 +463,8 @@ class SQLContextFS(PoolAdapterMixin):
     # Access control (reuses parse_uri from agfs_adapter)
     # ------------------------------------------------------------------
 
-    def _is_accessible(self, uri: str, ctx: RequestContext) -> bool:
+    @staticmethod
+    def _is_accessible(uri: str, ctx: RequestContext) -> bool:
         """Check URI accessibility with visible_owner_spaces support (SQL mode)."""
         try:
             components = parse_uri(uri)
@@ -471,12 +472,13 @@ class SQLContextFS(PoolAdapterMixin):
         except ValueError:
             return False
 
-    def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
+    @classmethod
+    def _ensure_accessible(cls, uri: str, ctx: RequestContext) -> None:
         from fs.sql_adapter.session_mutation import active_session_guard
         guard = active_session_guard()
         if guard is not None:
             guard.check_context(ctx)
-        if not self._is_accessible(uri, ctx):
+        if not cls._is_accessible(uri, ctx):
             try:
                 components = parse_uri(uri)
                 owner_id = components.get("owner_id", "")
@@ -965,21 +967,23 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT uri, context_type, category, level, owner_space,
-                           abstract, overview, content, relations, metadata,
-                           status, created_at, updated_at, version
-                    FROM context_nodes
-                    WHERE uri = %s
-                    """,
-                    (uri,),
-                )
-                row = cur.fetchone()
+                return self.read_node_with_cursor(cur, uri, ctx)
         finally:
             conn.rollback()  # Reset SET LOCAL for RLS
             self._return_connection(conn)
 
+    @classmethod
+    def read_node_with_cursor(cls, cursor, uri: str, ctx: RequestContext) -> ContextNode:
+        """Read canonical evidence inside the caller's tenant-bound transaction."""
+        cls._ensure_accessible(uri, ctx)
+        cursor.execute(
+            "SELECT uri, context_type, category, level, owner_space, "
+            "abstract, overview, content, relations, metadata, "
+            "status, created_at, updated_at, version "
+            "FROM context_nodes WHERE account_id=%s AND uri=%s",
+            (ctx.account_id, uri),
+        )
+        row = cursor.fetchone()
         if row is None:
             raise NodeNotFoundError(uri)
 

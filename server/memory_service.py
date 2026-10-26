@@ -665,7 +665,10 @@ class MemoryService:
     Each handler method accepts a plain dict and returns a plain dict.
     """
 
-    def __init__(self, config: OgMemConfig | None = None, tool_result_store=None):
+    def __init__(
+        self, config: OgMemConfig | None = None, tool_result_store=None,
+        *, scene_manager=None, scene_ranker=None, scene_source=None,
+    ):
         cfg = config or get_config()
         self._cfg = cfg
         self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
@@ -727,6 +730,10 @@ class MemoryService:
         self._retrieval_monitoring: dict[tuple[str, str], dict[str, Any]] = {}
         self._retrieval_monitoring_lock = threading.Lock()
         self._init_lock = threading.RLock()
+        self._scene_manager = scene_manager
+        self._scene_ranker = scene_ranker
+        self._scene_source = scene_source
+        self._scene_service = None
         self._tool_result_store = None
         self._configured_tool_result_store = tool_result_store
         self._tool_result_externalizer = None
@@ -2727,6 +2734,7 @@ class MemoryService:
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
                 edge_projection_components=self._graph_projection_components(),
+                memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2841,6 +2849,7 @@ class MemoryService:
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
                 edge_projection_components=self._graph_projection_components(),
+                memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2867,7 +2876,14 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        if self._scene_manager is not None and not self._scene_manager.stop(timeout=join_timeout):
+            logger.warning("Scene worker is completing its current request")
+            return
         self._extraction_retry.close(join_timeout)
+        scene_index = getattr(self._scene_source, "candidate_index", None)
+        if scene_index is not None and not scene_index.close(timeout=join_timeout):
+            logger.warning("Scene lexical index is still closing")
+            return
         if self._code_workspace_sync_service is not None:
             try:
                 self._code_workspace_sync_service.shutdown()
@@ -2953,6 +2969,97 @@ class MemoryService:
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
 
+    def _ensure_scene_runtime(self):
+        if not self._cfg.scene_enabled or self._scene_manager is not None:
+            return
+        with self._init_lock:
+            if self._scene_manager is not None:
+                return
+            from scene.adapters import CanonicalSceneAdapter
+            from scene.config import SceneConfig
+            from scene.decision import SceneDecisionEngine
+            from scene.manager import SceneMemoryManager
+            from scene.retrieval import SceneRanker
+            from scene.service import SceneService
+            from scene.sql_store import SQLSceneConfigProvider, SQLSceneJobStore, SQLSceneRepository
+
+            if not self._use_sql:
+                raise RuntimeError("scene memory requires a configured durable scene-store adapter")
+            pool = self._get_shared_sql_pool()
+            config = SceneConfig().merged(self._cfg.scene_options)
+            repository = SQLSceneRepository(pool)
+            provider = SQLSceneConfigProvider(pool, default=config)
+            from copy import copy
+
+            from providers.lexical_index.factory import create_lexical_index
+            from scene.candidate_index import LazySceneIndex, SceneIndexRefresh
+
+            lexical_config = copy(self._cfg)
+            lexical_config.retrieval_lexical_options = {
+                **self._cfg.retrieval_lexical_options, "table_name": "scene_lexical_v1",
+            }
+            candidate_index = LazySceneIndex(lambda: create_lexical_index(lexical_config),
+                                             projection_queue=repository)
+            refresh_projection = SceneIndexRefresh(repository, candidate_index)
+
+            def projection_refresh():
+                if candidate_index.initialized:
+                    refresh_projection()
+            try:
+                adapter = CanonicalSceneAdapter(
+                    repository, self._get_context_fs(), self._get_shared_vector_index(),
+                    self._get_shared_embedder(), config=config, config_provider=provider,
+                    archive_store=self._get_archive_store(), candidate_index=candidate_index,
+                )
+                manager = SceneMemoryManager(
+                    SQLSceneJobStore(pool), adapter,
+                    SceneDecisionEngine(self.get_llm(), config, evidence_reader=adapter),
+                    config=config, config_provider=provider, projection_refresh=projection_refresh,
+                )
+                scene_service = SceneService(
+                    repository, adapter, manager, provider, self._get_shared_embedder(),
+                )
+                manager.start()
+            except Exception:
+                candidate_index.close()
+                raise
+            self._scene_source = adapter
+            self._scene_ranker = SceneRanker(config)
+            self._scene_service = scene_service
+            self._scene_manager = manager
+
+    def get_scene_service(self):
+        self._ensure_scene_runtime()
+        if self._scene_service is None:
+            raise RuntimeError("scene memory is disabled")
+        return self._scene_service
+
+    def _scene_projection_changed(self, event, ctx):
+        from urllib.parse import urlsplit
+
+        from core.errors import NodeNotFoundError
+
+        parsed = urlsplit(event.uri)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) < 4 or parts[0] not in {"users", "agents"} or parts[2] != "memories":
+            return
+        self._ensure_scene_runtime()
+        owner = f"{parts[0][:-1]}:{parts[1]}"
+        tokens = 0
+        try:
+            node = self._get_context_fs().read_node(event.uri, ctx)
+            if node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+                return
+            tokens = max(1, (len(node.content or node.abstract) + 3) // 4)
+        except NodeNotFoundError:
+            if event.event_type == "UPSERT_CONTEXT":
+                return
+        self._scene_manager.after_memory_write(
+            parsed.netloc, owner, [event.uri], token_count=tokens,
+            force=event.event_type in {"ARCHIVE_CONTEXT", "DELETE_CONTEXT"},
+            notice_id=event.event_id,
+        )
+
     @_serialize_lazy_initialization("_write_api")
     def get_write_api(self):
         if self._write_api is None:
@@ -2990,6 +3097,7 @@ class MemoryService:
             # Get shared vector_index and embedder for prefetch
             vector_index = self._get_shared_vector_index()
             embedder = self._get_shared_embedder()
+            self._ensure_scene_runtime()
 
             graph_kwargs = {}
             if self._graph_enabled():
@@ -3110,6 +3218,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if self._read_api is None:
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
+            self._ensure_scene_runtime()
 
             cfg = RetrievalConfig(
                 include_agent_memories=self._cfg.agent_memory_enabled,
@@ -3193,6 +3302,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 config=cfg,
                 context_reader=context_reader,
                 **graph_kwargs,
+                scene_ranker=self._scene_ranker,
+                scene_source=self._scene_source,
             )
 
             self._read_api = ReadAPI(
@@ -6751,6 +6862,37 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_attribute_request_usage
     def wait_until_idle(self, params: dict | None = None) -> dict:
+        import time
+
+        params = params or {}
+        started = time.monotonic()
+        result = self._wait_until_session_idle(params)
+        if (not result.get("idle") or not self._cfg.scene_enabled
+                or not self._param_bool(params, "waitScenes", "wait_scenes", default=False)):
+            return result
+        self._ensure_scene_runtime()
+        ctx = params.get("_ctx") or self.build_context(params)
+        owners = (ctx.user_space_name(), ctx.agent_space_name())
+        for owner in owners:
+            self._scene_manager.flush(ctx.account_id, owner)
+        deadline = started + self._idle_timeout_seconds(params)
+        while True:
+            states = {owner: self._scene_manager.jobs.summary(ctx.account_id, owner) for owner in owners}
+            busy_owners = {owner for owner, state in states.items()
+                           if state["pending_nodes"] or (state.get("active_job") or {}).get("status")
+                           in {"PENDING", "RUNNING"}}
+            failed = self._scene_manager.halted or any(
+                owner not in busy_owners and (state.get("last_job") or {}).get("status") == "FAILED"
+                for owner, state in states.items()
+            )
+            busy = bool(busy_owners)
+            if failed or not busy or time.monotonic() >= deadline:
+                return {**result, "idle": not failed and not busy,
+                        "reason": "scene_failed" if failed else "scene_in_progress_timeout" if busy else result["reason"],
+                        "scenes": states}
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+
+    def _wait_until_session_idle(self, params: dict | None = None) -> dict:
         """Wait for process-local dispose/extraction/indexing to settle."""
         params = params or {}
         session_id = params.get("sessionId") or params.get("session_id") or ""

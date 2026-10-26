@@ -277,6 +277,14 @@ benchmark is still required before claiming historical accuracy numbers.
 
 ### Replay, authorization and lifecycle boundaries
 
+Graph and Scene have separate switches. The PR314 integration validation covers
+graph enabled / Scene disabled and Scene enabled / graph disabled. It does not
+claim validated behavior or accuracy when both are enabled simultaneously.
+Merging upstream Scene wiring does not enable Scene by default: `scene.enabled`
+remains false. Graph-only retains the graph projection worker and retrieval
+components; Scene-only retains upstream memory projection notifications and
+Scene ranking/member retrieval, without instantiating graph components.
+
 - Connection descriptors are graph annotations, not event/case occurrence identity.
   Descriptor-only replays refresh the existing node with a versioned write; legacy
   descriptor-bearing replay hashes remain readable. Exact durable operation

@@ -1,7 +1,7 @@
 from dataclasses import replace
 
 from core.lexical import LexicalHit
-from scene.candidate_index import LexicalSceneIndex, SceneIndexRefresh
+from scene.candidate_index import LazySceneIndex, LexicalSceneIndex, SceneIndexRefresh
 from scene.models import SceneCluster, SceneMember, SceneRecord, SceneSnapshot
 
 
@@ -92,13 +92,39 @@ def test_refresh_acknowledges_each_published_snapshot():
         def pending_projections(self):
             yield from scopes
 
-        def acknowledge_projection(self, current):
+        def publish_projection(self, current, publish):
+            publish(current)
             assert index.events[-2:] == ["publish", "release"]
             assert any(r.owner_space == current.owner_space for r in index.records)
             index.events.append(("ack", current.owner_space, current.revision))
+            return True
 
-    SceneIndexRefresh(Queue(), LexicalSceneIndex(index))()
+    queue = Queue()
+    SceneIndexRefresh(queue, LazySceneIndex(lambda: index, projection_queue=queue))()
     assert index.events == [
         "begin", "publish", "release", ("ack", "user:alice", 1),
         "begin", "publish", "release", ("ack", "user:bob", 1),
     ]
+
+
+def test_lazy_projection_shares_provider_and_refreshes_each_scope_revision_once():
+    from concurrent.futures import ThreadPoolExecutor
+
+    index = MemoryIndex()
+    factories = []
+
+    def create():
+        factories.append(index)
+        return index
+
+    projection = LazySceneIndex(create)
+    current = snapshot()
+    with ThreadPoolExecutor(max_workers=4) as callers:
+        results = list(callers.map(lambda _: projection.search("Deployment", current, 1), range(8)))
+    assert results == [["release"]] * 8
+    updated = replace(current, revision=2, scenes=(replace(current.scenes[0], version=2),))
+    assert projection.search("Deployment", updated, 1) == ["release"]
+    assert factories == [index]
+    assert index.events.count("publish") == 2
+    assert projection.close(timeout=1)
+    assert projection.close(timeout=1)

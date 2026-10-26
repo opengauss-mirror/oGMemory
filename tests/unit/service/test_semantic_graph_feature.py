@@ -119,6 +119,8 @@ def test_runtime_reuses_reader_index_embedder_and_graph_service(enabled):
     service._init_lock = threading.RLock()
     service._read_api = None
     service._lexical_index = None
+    service._scene_ranker = None
+    service._scene_source = None
     embedder = Mock(model="test-model",dimension=2)
     index = Mock()
     service._get_shared_embedder = Mock(return_value=embedder)
@@ -127,6 +129,7 @@ def test_runtime_reuses_reader_index_embedder_and_graph_service(enabled):
     service._get_context_fs = Mock(return_value=Mock())
     service._start_outbox_worker = Mock()
     pipe = service.get_read_api()._pipeline
+    assert pipe._scene_stage is None
     if enabled:
         assert pipe._graph_supplement.index is index
         assert pipe._graph_supplement.reader is pipe._context_reader

@@ -129,9 +129,10 @@ class TransactionalRepository(Repository):
 
     def compare_and_swap_checked(self, expected, replacement, check):
         with psycopg2.connect(self.dsn) as conn, conn.cursor() as cur:
+            SQLContextFS.bind_tenant(conn, expected.account_id)
             cur.execute("LOCK TABLE context_nodes IN SHARE MODE")
             cur.execute("LOCK TABLE scene_publication IN EXCLUSIVE MODE")
-            if not check():
+            if not check(lambda uri, ctx: SQLContextFS.read_node_with_cursor(cur, uri, ctx)):
                 return False
             self.before_commit()
             if not super().compare_and_swap(expected, replacement):

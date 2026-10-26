@@ -4,7 +4,23 @@ from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
+from core.models import ContextNode
 from core.provenance_resolver import ProvenanceResolver
+
+
+def node_source_refs(node: ContextNode) -> tuple[str, ...]:
+    """Deduplicate complete references, preserving sequence order and sorting sets."""
+    metadata = node.metadata or {}
+    refs: list[str] = []
+    for key in ("provenance_ids", "source_refs", "source_ref"):
+        value = metadata.get(key, [])
+        if isinstance(value, str):
+            value = [value]
+        elif isinstance(value, set):
+            value = sorted(str(item) for item in value)
+        if isinstance(value, (list, tuple)):
+            refs.extend(str(item) for item in value)
+    return tuple(dict.fromkeys(ref for ref in refs if ref.strip()))
 
 
 def source_refs(card: dict[str, Any]) -> set[str]:

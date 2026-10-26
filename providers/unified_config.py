@@ -610,6 +610,10 @@ class OgMemConfig:
     graph_edge_embedding_profile: str = "shared-node-embedding-v1"
     graph_supplement_enabled: bool = True
 
+    # -- Scene memory ---------------------------------------------------------
+    scene_enabled: bool = False
+    scene_options: dict[str, Any] = field(default_factory=dict)
+
     # -- Agent skill sedimentation --------------------------------------------
     skill_sedimentation_enabled: bool = False
     skill_worked_examples_enabled: bool = False
@@ -813,6 +817,8 @@ class OgMemConfig:
             raise ValueError(
                 "tool_output_filter_output_max_chars must be at least the read and bash min chars"
             )
+        from scene.config import SceneConfig
+        SceneConfig().merged(self.scene_options)
         embedding_max_input_chars = self.embedding_max_input_chars
         if isinstance(embedding_max_input_chars, bool) or not isinstance(
             embedding_max_input_chars, int
@@ -1933,6 +1939,10 @@ class OgMemConfig:
             agent_memory_enabled=_resolve_bool(
                 (raw.get("agent_memory") or {}).get("enabled"), "OGMEM_AGENT_MEMORY_ENABLED", False,
             ),
+            scene_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("enabled"), "OGMEM_SCENE_ENABLED", False,
+            ),
+            scene_options=dict((raw.get("scene") or {}).get("options") or {}),
             skill_sedimentation_enabled=_resolve_bool(
                 sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,
             ),

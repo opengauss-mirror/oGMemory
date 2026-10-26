@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 
 from core.provenance_resolver import ProvenanceResolver
+from scene.decision_application import SceneDecisionApplier
 from scene.decision_calls import CallBudget, SceneModelCaller
 from scene.decision_contracts import PreflightOutput
 from scene.decision_evidence import SceneEvidenceBuilder
@@ -46,6 +47,7 @@ def test_tool_completed_member_sources_reach_quality_review(action, source_kind)
     stage = SceneProposalStage(caller)
     budget = CallBudget(3)
     decision = stage.decide(snapshot, packet, budget)
+    assert stage.deterministic_quality_gate(decision, packet).decision == "ACCEPT"
     assert stage.review(decision, packet, budget).decision == "ACCEPT"
     assert decision.draft.member_uris == proposal["draft"]["member_uris"]
     assert model.evidence["tool_evidence"] == packet["tool_evidence"]
@@ -54,6 +56,9 @@ def test_tool_completed_member_sources_reach_quality_review(action, source_kind)
     assert supporting_sources(selected, context) == {("archive", "planning"), ("archive", "review")}
     assert packet == before
     assert budget.used == 2
+    result = SceneDecisionApplier().apply(snapshot, nodes, vectors(nodes), decision)
+    member = next(member for member in result.scenes[0].cluster.members if member.context_uri == nodes[0].uri)
+    assert member.source_refs == (*planning, extra)
 
 
 @pytest.mark.parametrize("with_draft", [False, True])

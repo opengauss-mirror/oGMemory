@@ -41,6 +41,25 @@ class SceneProposalStage:
         prompt = QUALITY_PROMPT + self.caller.dump({"decision": decision.model_dump(), "evidence": evidence})
         return self.caller.call("quality", prompt, QualityGateOutput, budget)
 
+    def deterministic_quality_gate(
+        self, decision: SceneDecisionOutput, packet: dict[str, Any],
+    ) -> QualityGateOutput:
+        """Enforce the selected evidence floor before applying a reviewed proposal."""
+        if decision.action == "WAIT":
+            return QualityGateOutput(decision="DEFER", reason=decision.reason or "awaiting scene evidence")
+        if decision.draft is None:
+            return QualityGateOutput(decision="DEFER", reason="missing scene draft")
+        members = set(decision.draft.member_uris)
+        evidence = set(decision.evidence_uris)
+        selected = [card for card in packet["memories"] if card["uri"] in members]
+        supporting = [card for card in selected if card["uri"] in evidence]
+        if (decision.conflicts or len({card["uri"] for card in selected}) != len(members)
+                or len(members) < self.config.min_evidence_nodes
+                or not evidence <= members or len(evidence) < self.config.min_evidence_nodes
+                or len(supporting_sources(supporting, self._evidence_cards(packet))) < self.config.min_independent_sources):
+            return QualityGateOutput(decision="DEFER", reason="proposal does not meet deterministic evidence floor")
+        return QualityGateOutput(decision="ACCEPT", reason="deterministic evidence gate passed")
+
     @staticmethod
     def _evidence_cards(packet: dict[str, Any]) -> list[dict[str, Any]]:
         return [*packet["memories"], *(card for result in packet.get("tool_evidence", [])
@@ -91,9 +110,11 @@ class SceneProposalStage:
         selected = [card for card in packet["memories"] if card["uri"] in members]
         require(len(selected) >= self.config.min_evidence_nodes,
                 "draft.member_uris", "minimum_evidence_nodes_required")
-        require(len(supporting_sources(selected, self._evidence_cards(packet))) >= self.config.min_independent_sources,
-                "draft.member_uris", "independent_sources_required")
-        require(set(decision.evidence_uris) <= members, "evidence_uris", "member_reference_required")
+        evidence = set(decision.evidence_uris)
+        supporting = [card for card in selected if card["uri"] in evidence]
+        require(len(supporting_sources(supporting, self._evidence_cards(packet))) >= self.config.min_independent_sources,
+                "evidence_uris", "independent_sources_required")
+        require(evidence <= members, "evidence_uris", "member_reference_required")
         source_members = {member.context_uri for record in snapshot.scenes if record.scene_id in targets
                           for member in record.cluster.members}
         require(source_members <= members, "draft.member_uris", "source_members_required")

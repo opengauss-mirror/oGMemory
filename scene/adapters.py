@@ -8,7 +8,7 @@ import math
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, replace
-from itertools import islice
+from itertools import chain, islice
 from urllib.parse import urlsplit
 
 from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
@@ -118,7 +118,8 @@ class CanonicalSceneAdapter:
         bound.config = bound._request_configs[(ctx.account_id, primary)]
         return bound
 
-    def _read(self, uri: str, ctx: RequestContext, owner_spaces: Sequence[str]) -> ContextNode | None:
+    def _read(self, uri: str, ctx: RequestContext, owner_spaces: Sequence[str],
+              read_node=None) -> ContextNode | None:
         parsed = urlsplit(uri)
         allowed = {_canonical_space(space) for space in owner_spaces}
         if parsed.scheme != "ctx" or parsed.netloc != ctx.account_id:
@@ -130,7 +131,7 @@ class CanonicalSceneAdapter:
         if uri_owner not in allowed:
             return None
         try:
-            node = self.fs.read_node(uri, ctx)
+            node = (read_node or self.fs.read_node)(uri, ctx)
         except (NodeNotFoundError, NodeBrokenError, AccessDeniedError):
             return None
         if (node.uri != uri or node.context_type != "MEMORY"
@@ -154,19 +155,25 @@ class CanonicalSceneAdapter:
         return {node.uri: list(vectors[node.uri]) for node in nodes if node.uri in vectors}
 
     def load_nodes(self, account_id: str, owner_space: str, node_uris: Sequence[str]):
+        nodes, vectors, _ = self._load_nodes(account_id, owner_space, node_uris)
+        return nodes, vectors
+
+    def _load_nodes(self, account_id, owner_space, node_uris):
         ctx = self.context_factory(account_id, owner_space)
         if ctx.account_id != account_id:
             raise ValueError("scene context account mismatch")
-        nodes = [node for uri in list(dict.fromkeys(node_uris))[:self.max_input_nodes]
+        requested = list(dict.fromkeys(node_uris))[:self.max_input_nodes]
+        nodes = [node for uri in requested
                  if (node := self._read(uri, ctx, [owner_space])) is not None]
         vectors = self._vectors(nodes, ctx)
         if any(node.uri not in vectors for node in nodes):
             raise RuntimeError("scene evidence is awaiting vector indexing")
-        return nodes, vectors
+        available = {node.uri for node in nodes}
+        return nodes, vectors, tuple(uri for uri in requested if uri not in available)
 
     def load_input(self, account_id: str, owner_space: str, *, node_uris=None) -> SceneDecisionInput:
         config = self._config(account_id, owner_space)
-        offered, vectors = self.load_nodes(account_id, owner_space, node_uris or ())
+        offered, vectors, unavailable_uris = self._load_nodes(account_id, owner_space, node_uris or ())
         budget = max(0, (config.analysis_input_budget_tokens - config.candidate_card_budget_tokens) * 4 - 1024)
         accepted = []
         remaining = budget
@@ -189,16 +196,14 @@ class CanonicalSceneAdapter:
             ))
             selected = {node.uri: node for node in offered}
             used = sum(self._card_cost(node) for node in offered)
-            stale: set[str] = set()
-            unavailable = []
+            unavailable = set(unavailable_uris)
             for record in active[:config.max_candidate_scenes]:
                 members = {member.context_uri for member in record.cluster.members}
                 if len(members | selected.keys()) > self.max_input_nodes:
                     continue
                 resolved = [self._read(uri, ctx, [owner_space]) for uri in sorted(members)]
                 if any(node is None for node in resolved):
-                    stale.add(record.scene_id)
-                    unavailable.extend(uri for uri, node in zip(sorted(members), resolved) if node is None)
+                    unavailable.update(uri for uri, node in zip(sorted(members), resolved) if node is None)
                     continue
                 nodes = [node for node in resolved if node is not None]
                 cost = sum(self._card_cost(node) for node in nodes if node.uri not in selected)
@@ -210,6 +215,8 @@ class CanonicalSceneAdapter:
                 selected.update((node.uri, node) for node in nodes)
                 vectors.update(indexed)
                 used += cost
+            stale = {record.scene_id for record in active
+                     if any(member.context_uri in unavailable for member in record.cluster.members)}
             if stale:
                 replacement = replace(snapshot, revision=snapshot.revision + 1, scenes=tuple(
                     replace(record, status="ARCHIVED", version=record.version + 1)
@@ -217,7 +224,7 @@ class CanonicalSceneAdapter:
                 ))
                 if not self.repository.compare_and_swap_checked(
                     snapshot, replacement,
-                    lambda: all(self._read(uri, ctx, [owner_space]) is None for uri in unavailable),
+                    lambda reader: all(self._read(uri, ctx, [owner_space], reader) is None for uri in unavailable),
                 ):
                     continue
                 snapshot = replacement
@@ -226,19 +233,29 @@ class CanonicalSceneAdapter:
                 snapshot.account_id, snapshot.owner_space, snapshot.revision, snapshot.scenes,
                 tuple((node.uri, _fingerprint(node)) for node in nodes),
             )
-            return SceneDecisionInput(guarded, nodes, {node.uri: vectors[node.uri] for node in nodes})
+            return SceneDecisionInput(guarded, nodes, {node.uri: vectors[node.uri] for node in nodes},
+                                      unavailable_uris=unavailable_uris)
         raise RuntimeError("scene source changed during bounded snapshot read")
 
-    def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool:
+    def compare_and_swap(
+        self, expected: SceneSnapshot, replacement: SceneSnapshot,
+        *, evidence_nodes: Sequence[ContextNode] = (),
+        source_fingerprints: Sequence[tuple[str, str]] = (),
+    ) -> bool:
         if not isinstance(expected, _EvidenceSnapshot):
             raise ValueError("scene publication requires a loaded evidence snapshot")
         ctx = self.context_factory(expected.account_id, expected.owner_space)
+        fingerprints = dict(expected.evidence_fingerprints)
+        evidence = ((node.uri, _fingerprint(node)) for node in evidence_nodes)
+        for uri, fingerprint in chain(evidence, source_fingerprints):
+            if fingerprints.setdefault(uri, fingerprint) != fingerprint:
+                return False
 
-        def check():
+        def check(reader):
             return all(
-                (node := self._read(uri, ctx, [expected.owner_space])) is not None
+                (node := self._read(uri, ctx, [expected.owner_space], reader)) is not None
                 and _fingerprint(node) == fingerprint
-                for uri, fingerprint in expected.evidence_fingerprints
+                for uri, fingerprint in fingerprints.items()
             )
         return self.repository.compare_and_swap_checked(expected, replacement, check)
 
@@ -381,7 +398,7 @@ class CanonicalSceneAdapter:
             "context_type": "MEMORY", "level": 0,
         }, min(limit, config.neighbor_k))
         nodes, _ = self.load_nodes(account_id, owner_space, [hit.uri for hit in hits])
-        return [self.node_card(node) for node in nodes]
+        return [{**self.node_card(node), "node_fingerprint": _fingerprint(node)} for node in nodes]
 
     def search_scene_cards(self, account_id: str, owner_space: str, query: str, limit: int):
         ctx = self.context_factory(account_id, owner_space)
@@ -427,7 +444,7 @@ class CanonicalSceneAdapter:
     def _source_node_card(node, reference, budget):
         card = {"uri": node.uri, "owner_space": node.owner_space, "category": node.category,
                 "source_ref": reference, "source_refs": CanonicalSceneAdapter.node_card(node)["source_refs"],
-                "text": ""}
+                "node_fingerprint": _fingerprint(node), "text": ""}
         available = budget - len(json.dumps(card, ensure_ascii=False))
         if available <= 0:
             return None

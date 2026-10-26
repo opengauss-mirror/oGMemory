@@ -6,11 +6,12 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from core.models import ContextNode
+from core.models import ContextNode, RequestContext
 from scene.models import PersistedScene, SceneArchive, SceneCluster, SceneSnapshot
 
 SceneSourceState = tuple[int, object]
 ResolvedArchiveSource = tuple[str, float]
+SceneNodeReader = Callable[[str, RequestContext], ContextNode]
 
 
 @runtime_checkable
@@ -31,12 +32,14 @@ class SceneEvidenceRepository(SceneSnapshotRepository, Protocol):
     """Publication port sharing the canonical writers' transaction or mutation lock."""
 
     def compare_and_swap_checked(
-        self, expected: SceneSnapshot, replacement: SceneSnapshot, check: Callable[[], bool],
+        self, expected: SceneSnapshot, replacement: SceneSnapshot,
+        check: Callable[[SceneNodeReader | None], bool],
     ) -> bool:
         """Hold canonical mutation protection across check and snapshot CAS.
 
         The backend acquires protection for the account/owner's evidence first,
-        invokes check inside that boundary, and commits only when it returns True.
+        invokes check with a transaction-bound reader (or None for a shared
+        mutation lock), and commits only when it returns True.
         A failed check returns False. All canonical writers share this protection.
         """
         ...
@@ -54,6 +57,7 @@ class SceneDecisionInput:
     snapshot: SceneSnapshot
     nodes: tuple[ContextNode, ...]
     embeddings: dict[str, list[float]]
+    unavailable_uris: tuple[str, ...] = ()
 
 
 @runtime_checkable
@@ -78,13 +82,19 @@ class SceneDecisionStore(Protocol):
         """
         ...
 
-    def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool:
+    def compare_and_swap(
+        self, expected: SceneSnapshot, replacement: SceneSnapshot,
+        *, evidence_nodes: Sequence[ContextNode] = (),
+        source_fingerprints: Sequence[tuple[str, str]] = (),
+    ) -> bool:
         """Publish the full scene replacement when the scope revision still matches.
 
         Both snapshots identify the same account and owner. The replacement
         revision equals expected.revision + 1. Return True after atomic commit;
         return False on revision conflict, preserving the current state.
         Raise ValueError for a scope mismatch or invalid replacement revision.
+        Include any nodes acquired by preflight tools in the same atomic source check.
+        Source-only memory fingerprints capture the state when tool evidence was read.
         """
         ...
 

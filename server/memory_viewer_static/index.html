@@ -17,6 +17,7 @@
             <p>工作区</p>
             <button class="sidebar-link" type="button" data-view="dashboard"><span>⌁</span>控制台</button>
             <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span>▤</span>记忆</button>
+            <button class="sidebar-link" type="button" data-view="scenes" aria-label="场景记忆"><span>◈</span>场景记忆</button>
             <button class="sidebar-link" type="button" data-view="retrieval"><span>⌕</span>检索</button>
             <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Agent Skill</button>
           </section>
@@ -144,6 +145,34 @@
           </div>
         </article>
       </section>
+      </section>
+      <section id="scenes-view" class="scenes-view" hidden>
+        <header class="scenes-heading">
+          <div><h1>场景记忆</h1><p>查看场景的时间脉络与关联记忆。</p></div>
+          <button id="scenes-refresh" class="secondary-button" type="button">↻ 刷新</button>
+        </header>
+        <div class="scenes-toolbar">
+          <label for="scenes-scope">记忆范围<select id="scenes-scope" aria-label="场景记忆范围"><option value="">加载中</option></select></label>
+          <span id="scenes-count" role="status"></span>
+        </div>
+        <div class="scenes-workspace">
+          <section aria-label="场景列表">
+            <div id="scenes-list" class="scenes-list" aria-live="polite"></div>
+            <footer id="scenes-pagination" class="tasks-pagination" hidden>
+              <span id="scenes-page-summary"></span>
+              <div><button id="scenes-previous" type="button">上一页</button><button id="scenes-next" type="button">下一页</button></div>
+            </footer>
+          </section>
+          <article id="scene-detail" class="scene-detail" hidden>
+            <header><span id="scene-detail-origin" class="section-label"></span><h2 id="scene-detail-title"></h2></header>
+            <div id="scene-detail-meta" class="scene-meta"></div>
+            <p id="scene-detail-description" class="scene-description"></p>
+            <section class="scene-members-section">
+              <h3>关联记忆 <span id="scene-detail-member-count"></span></h3>
+              <div id="scene-detail-members" class="scene-members"></div>
+            </section>
+          </article>
+        </div>
       </section>
       <section id="retrieval-view" class="retrieval-view" hidden>
         <form id="retrieval-form" class="retrieval-form">

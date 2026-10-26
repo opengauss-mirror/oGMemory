@@ -12,12 +12,14 @@ Happy path: event → process → delete
 Failure path: retry with exponential backoff → DLQ after MAX_RETRY
 """
 
+import hashlib
 import inspect
+import json
 import logging
 import re
 import uuid
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 
@@ -95,6 +97,7 @@ class OutboxWorker:
         directory_summary_enabled: bool = True,
         bm25_index: Bm25Index | None = None,
         agent_memory_handler=None,
+        memory_projection_handler=None,
         edge_projection_components=None,
     ) -> None:
         """Initialize the OutboxWorker.
@@ -116,6 +119,7 @@ class OutboxWorker:
         self._directory_summary_enabled = directory_summary_enabled
         self._bm25_index = bm25_index
         self._agent_memory_handler = agent_memory_handler
+        self._memory_projection_handler = memory_projection_handler
         self._edge_projection_store, self._edge_projection_profile = edge_projection_components or (None,None)
         self._graph_accounts = set()
 
@@ -264,6 +268,7 @@ class OutboxWorker:
             if obsolete:
                 self._vector_index.delete(obsolete)
                 self._delete_bm25(obsolete)
+        records = self._current_projection_records(event, records)
         if not records:
             logger.warning("Event %s has no records to index", event.event_id)
             return WorkerResult(
@@ -291,6 +296,62 @@ class OutboxWorker:
             success=True,
             records_upserted=len(records),
         )
+
+    @staticmethod
+    def _projection_record_fingerprint(records: list[IndexRecord]) -> str:
+        values = [(item.id, item.uri, item.level, item.text, item.filters, item.metadata)
+                  for item in records]
+        return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _is_memory_projection_event(self, event: OutboxEvent) -> bool:
+        return bool(self._memory_projection_handler is not None
+                    and _MEMORY_OWNER_PATTERN.match(event.uri)
+                    and "/memories/" in event.uri
+                    and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT", "DELETE_CONTEXT"})
+
+    def _current_projection_records(self, event: OutboxEvent, records: list[IndexRecord]) -> list[IndexRecord]:
+        if not self._is_memory_projection_event(event):
+            return records
+        if self._fs is None:
+            raise RuntimeError("memory projection requires canonical node storage")
+        from index.index_record_builder import build_index_records
+
+        try:
+            node = self._fs.read_node(event.uri, self._build_request_context(event))
+        except NodeNotFoundError:
+            return []
+        if node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+            return records
+        current = build_index_records(node)
+        event.payload["records"] = [asdict(record) for record in current]
+        event.payload["_memory_projection_version"] = node.metadata.get("version")
+        event.payload["_memory_projection_fingerprint"] = self._projection_record_fingerprint(current)
+        return current
+
+    def _notify_memory_projection(self, event: OutboxEvent, result: WorkerResult) -> None:
+        if not self._is_memory_projection_event(event):
+            return
+        if event.event_type == "UPSERT_CONTEXT" and result.records_upserted == 0:
+            return
+        if self._fs is None:
+            raise RuntimeError("memory projection requires canonical node storage")
+        ctx = self._build_request_context(event)
+        try:
+            node = self._fs.read_node(event.uri, ctx)
+        except NodeNotFoundError:
+            node = None
+        if event.event_type == "UPSERT_CONTEXT":
+            if node is None or node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+                return
+            from index.index_record_builder import build_index_records
+
+            fingerprint = self._projection_record_fingerprint(build_index_records(node))
+            if (fingerprint != event.payload.get("_memory_projection_fingerprint")
+                    or node.metadata.get("version") != event.payload.get("_memory_projection_version")):
+                raise RuntimeError("canonical memory changed during indexing")
+        elif node is not None:
+            return
+        self._memory_projection_handler(event, ctx)
 
     def _process_upsert_directory(
         self,
@@ -692,6 +753,7 @@ class OutboxWorker:
             stats: Statistics dict to update
         """
         if result.success:
+            self._notify_memory_projection(event, result)
             outbox_store.mark_done(event, node_uri)
             stats["succeeded"] += 1
             return
@@ -1234,7 +1296,7 @@ class OutboxWorker:
 
             if event.event_type == "UPSERT_CONTEXT" and event.payload.get("agent_memory_version") != 1:
                 try:
-                    records = self._extract_records(event)
+                    records = self._current_projection_records(event, self._extract_records(event))
                     if records:
                         upsert_batch.append((event, node_uri, records))
                     else:

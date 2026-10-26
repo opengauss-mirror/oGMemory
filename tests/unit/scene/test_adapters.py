@@ -33,7 +33,7 @@ class Repository:
 
     def compare_and_swap_checked(self, expected, replacement, check):
         with self.lock:
-            return check() and self.compare_and_swap(expected, replacement)
+            return check(None) and self.compare_and_swap(expected, replacement)
 
 
 class CanonicalFS:
@@ -408,7 +408,8 @@ def test_analysis_tools_return_scoped_node_and_scene_cards():
     source = adapter([first], [scene("deployment", [first])])
     source.vector_index.hits = [SeedHit(first.uri, .9, owner_space="user:alice")]
     cards = source.search_related_nodes("acme", "user:alice", "release", 3)
-    assert cards == [source.node_card(first)]
+    evidence = source.read_source_context("acme", "user:alice", [first.uri], 1)
+    assert cards == [{**source.node_card(first), "node_fingerprint": evidence[0]["node_fingerprint"]}]
     assert source.vector_index.search_filters == {
         "account_id": "acme", "owner_space": ["user:alice", "user_alice"],
         "context_type": "MEMORY", "level": 0,

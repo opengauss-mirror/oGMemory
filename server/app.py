@@ -42,6 +42,7 @@ from server.mcp_tools import (
 )
 from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
+from server.scene_api import create_scene_blueprint
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
@@ -222,6 +223,7 @@ def _json_object_body() -> dict:
 
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
+    from scene.config import ConfigRevisionError
     from service.operator_service import OperatorServiceBusyError
 
     if isinstance(exc, OperatorServiceBusyError):
@@ -248,7 +250,7 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 404
     if isinstance(exc, FileExistsError):
         return jsonify({"error": str(exc)}), 409
-    if isinstance(exc, ConcurrentModificationError):
+    if isinstance(exc, (ConcurrentModificationError, ConfigRevisionError)):
         return jsonify({"error": str(exc)}), 409
     if isinstance(exc, SessionOperationInProgress):
         return jsonify({
@@ -267,6 +269,9 @@ def _error_response(exc: Exception):
 
 app.register_blueprint(
     create_memory_viewer_blueprint(_get_service, _build_authenticated_context, _error_response)
+)
+app.register_blueprint(
+    create_scene_blueprint(_get_service, _build_authenticated_context, _error_response)
 )
 
 

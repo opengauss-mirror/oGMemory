@@ -17,7 +17,9 @@ class SceneEvidenceReader(Protocol):
 
     def search_related_nodes(
         self, account_id: str, owner_space: str, query: str, limit: int
-    ) -> Sequence[dict[str, Any]]: ...
+    ) -> Sequence[dict[str, Any]]:
+        """Return bounded memory cards with their read-time node_fingerprint."""
+        ...
 
     def search_scene_cards(
         self, account_id: str, owner_space: str, query: str, limit: int
@@ -25,7 +27,9 @@ class SceneEvidenceReader(Protocol):
 
     def read_source_context(
         self, account_id: str, owner_space: str, source_refs: Sequence[str], limit: int
-    ) -> Sequence[dict[str, Any]]: ...
+    ) -> Sequence[dict[str, Any]]:
+        """Return bounded cards; memory cards include the read-time node_fingerprint."""
+        ...
 
 
 @dataclass(frozen=True)

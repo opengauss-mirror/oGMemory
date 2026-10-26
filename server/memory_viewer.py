@@ -11,7 +11,7 @@ from flask import Blueprint, jsonify, request, send_from_directory
 
 from core.models import RequestContext, Role
 from fs.sql_adapter.sql_context_fs import parse_uri
-from server.auth import AuthorizationError, ControlPlaneDisabledError
+from server.auth import AuthorizationError, ControlPlaneDisabledError, build_admin_target_context
 from server.mcp_resources import (
     MEMORY_TYPES,
     external_to_internal_uri,
@@ -721,37 +721,11 @@ def _task_error_dependency(reason: str) -> str:
 
 def _admin_target_context(service, actor, params=None):
     params = request.args if params is None else params
-    account_id = str(params.get("accountId", "")).strip() or actor.account_id
-    user_id = str(params.get("userId", "")).strip()
-    agent_id = str(params.get("agentId", "")).strip()
-    if not user_id:
-        raise ValueError("userId is required")
-    if _role(actor) != Role.ROOT and account_id != actor.account_id:
-        raise AuthorizationError("account access denied")
-    admin = service.get_tenant_admin_service()
-    users = admin.list_users(actor, account_id).get("users", [])
-    if user_id not in {str(user["user_id"]) for user in users}:
-        raise FileNotFoundError("user not found")
-    if agent_id:
-        agents = admin.list_agents(actor, account_id).get("agents", [])
-        owned_agents = {
-            str(agent["agent_id"])
-            for agent in agents
-            if str(agent.get("owner_user_id") or "") == user_id
-        }
-        if agent_id not in owned_agents:
-            raise FileNotFoundError("agent not found under user")
-    visible = [f"user:{user_id}"]
-    if agent_id:
-        visible.append(f"agent:{agent_id}")
-    return RequestContext(
-        account_id=account_id,
-        user_id=user_id,
-        agent_id=agent_id,
-        session_id=actor.session_id,
-        trace_id=actor.trace_id,
-        role=actor.role,
-        visible_owner_spaces=tuple(visible),
+    return build_admin_target_context(
+        service, actor,
+        account_id=str(params.get("accountId", "")).strip() or actor.account_id,
+        user_id=str(params.get("userId", "")).strip(),
+        agent_id=str(params.get("agentId", "")).strip(),
     )
 
 

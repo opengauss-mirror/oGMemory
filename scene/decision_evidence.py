@@ -11,6 +11,7 @@ from core.models import ContextNode
 from retrieval.owner_scope import canonical_owner_space
 from scene.config import SceneConfig
 from scene.decision_contracts import DecisionLimits, SceneDecisionError
+from scene.decision_sources import node_source_refs
 from scene.discovery import CandidateConfig, generate_scene_candidates
 from scene.models import SceneRecord, SceneSnapshot
 
@@ -31,7 +32,7 @@ class SceneEvidenceBuilder:
         embeddings: dict[str, list[float]],
     ) -> dict[str, Any]:
         """Return bounded cards; the caller budgets the complete stage prompt."""
-        self._validate_input(snapshot, nodes, embeddings)
+        self.validate_input(snapshot, nodes, embeddings)
         nodes = [replace(node, owner_space=canonical_owner_space(node.owner_space)) for node in nodes]
         candidates = generate_scene_candidates(
             nodes, embeddings,
@@ -104,13 +105,6 @@ class SceneEvidenceBuilder:
     def node_card(self, node: ContextNode) -> dict[str, Any]:
         """Retain bounded node text, deduplicated source references and timestamps."""
         metadata = node.metadata or {}
-        source_refs: list[str] = []
-        for key in ("provenance_ids", "source_refs", "source_ref"):
-            value = metadata.get(key, [])
-            if isinstance(value, str):
-                value = [value]
-            if isinstance(value, (list, tuple, set)):
-                source_refs.extend(str(item) for item in value)
         text = "\n".join(
             value.strip()
             for value in (node.abstract, node.overview, node.content)
@@ -122,7 +116,7 @@ class SceneEvidenceBuilder:
             "category": node.category,
             "owner_space": canonical_owner_space(node.owner_space),
             "text": text[:self.limits.max_node_chars],
-            "source_refs": list(dict.fromkeys(value for value in source_refs if value.strip()))[:4],
+            "source_refs": list(node_source_refs(node)[:4]),
             "time": {
                 key: metadata[key]
                 for key in ("created_at", "updated_at", "event_time", "session_date", "timestamp", "when")
@@ -130,10 +124,11 @@ class SceneEvidenceBuilder:
             },
         }
 
-    def _validate_input(
+    def validate_input(
         self, snapshot: SceneSnapshot, nodes: list[ContextNode],
         embeddings: dict[str, list[float]],
     ) -> None:
+        """Check the scope and bounds shared by packet building and application."""
         if not snapshot.account_id or not snapshot.owner_space or snapshot.revision < 0:
             raise SceneDecisionError("scene snapshot requires a scope and nonnegative revision")
         if len(nodes) > self.limits.max_input_nodes:

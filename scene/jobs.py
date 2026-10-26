@@ -8,9 +8,21 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import Protocol
 from uuid import uuid4
+
+from core.models import RequestContext
+from providers.token_tracker import request_usage_scope
+from retrieval.owner_scope import canonical_owner_space
+from scene.config import SceneConfigCache, SceneConfigProvider
+from scene.decision import SceneDecisionEngine
+from scene.decision_contracts import (
+    SceneDecisionError,
+    SceneDecisionResult,
+    SceneRetryableDecisionError,
+)
+from scene.store import SceneDecisionStore
 
 
 class SceneJobStatus(StrEnum):
@@ -60,7 +72,8 @@ class SceneJobStore(Protocol):
                        remaining_uris: Iterable[str] = (),
                        min_evidence_nodes: int = 3) -> SceneJob: ...
 
-    def mark_waiting(self, job: SceneJob, *, reason: str = "") -> SceneJob: ...
+    def mark_waiting(self, job: SceneJob, *, reason: str = "",
+                     remaining_uris: Iterable[str] | None = None) -> SceneJob: ...
 
     def mark_retry(self, job: SceneJob, *, reason: str, delay_seconds: float) -> SceneJob: ...
 
@@ -241,7 +254,7 @@ class InMemorySceneJobStore:
             self._jobs[job.job_id] = result
             state["last_job"] = job.job_id
             if status == SceneJobStatus.WAITING:
-                state["retained"] = list(dict.fromkeys([*state["retained"], *job.node_uris]))
+                state["retained"] = list(dict.fromkeys([*state["retained"], *remaining_uris]))
             elif status == SceneJobStatus.SUCCEEDED:
                 remaining = list(dict.fromkeys(remaining_uris))
                 consumed = set(job.node_uris) - set(remaining)
@@ -263,8 +276,9 @@ class InMemorySceneJobStore:
         return self._finish(job, SceneJobStatus.SUCCEEDED, reason, remaining_uris=remaining_uris,
                             min_evidence_nodes=min_evidence_nodes)
 
-    def mark_waiting(self, job, *, reason="") -> SceneJob:
-        return self._finish(job, SceneJobStatus.WAITING, reason)
+    def mark_waiting(self, job, *, reason="", remaining_uris=None) -> SceneJob:
+        return self._finish(job, SceneJobStatus.WAITING, reason,
+                            remaining_uris=job.node_uris if remaining_uris is None else remaining_uris)
 
     def mark_retry(self, job, *, reason, delay_seconds) -> SceneJob:
         if delay_seconds < 0:
@@ -314,3 +328,116 @@ class InMemorySceneJobStore:
                 return self._clock()
             return min(datetime.fromisoformat(item["at"]) for item in pending.values()) + timedelta(
                 seconds=state["max_wait_seconds"])
+
+
+@dataclass(frozen=True)
+class SceneWorkerOutcome:
+    job: SceneJob
+    decision: SceneDecisionResult | None
+    halted: bool = False
+
+
+def _rate_limited(exc: BaseException) -> bool:
+    current = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        status = getattr(current, "status_code", getattr(response, "status_code", None))
+        if status == 429 or "ratelimit" in type(current).__name__.lower():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _usage_context(job: SceneJob) -> RequestContext:
+    owner_space = canonical_owner_space(job.owner_space)
+    kind, separator, identifier = owner_space.partition(":")
+    if not job.account_id or not separator or not identifier or kind not in {"user", "agent"}:
+        raise SceneDecisionError("scene scope requires an account and user or agent owner")
+    return RequestContext(
+        account_id=job.account_id,
+        user_id=identifier if kind == "user" else "",
+        agent_id=identifier if kind == "agent" else "",
+        session_id="",
+        trace_id=job.job_id,
+        visible_owner_spaces=(owner_space,),
+    )
+
+
+class SceneWorker:
+    """Lease one scope window, execute outside storage locks, then acknowledge."""
+
+    def __init__(self, jobs: SceneJobStore, engine: SceneDecisionEngine, scene_store: SceneDecisionStore,
+                 *, retry_delay_seconds: float = 5.0,
+                 config_provider: SceneConfigProvider | SceneConfigCache | None = None,
+                 lease_seconds: float = 300) -> None:
+        if retry_delay_seconds < 0 or lease_seconds <= 0:
+            raise ValueError("retry delay and lease duration must be valid")
+        self.jobs, self.engine, self.store = jobs, engine, scene_store
+        self.retry_delay_seconds, self.config_provider = retry_delay_seconds, config_provider
+        self.lease_seconds = lease_seconds
+        self.halted = False
+
+    def process_next(self, worker_id: str) -> SceneWorkerOutcome | None:
+        if self.halted:
+            return None
+        job = self.jobs.claim(worker_id, lease_seconds=self.lease_seconds)
+        return None if job is None else self.process(job)
+
+    def process(self, job: SceneJob) -> SceneWorkerOutcome:
+        engine = self.engine
+        stop = Event()
+        lease_lost = Event()
+
+        def renew():
+            while not stop.wait(self.lease_seconds / 3):
+                try:
+                    self.jobs.renew(job, lease_seconds=self.lease_seconds)
+                except Exception:
+                    lease_lost.set()
+                    return
+
+        renewer = Thread(target=renew, daemon=True, name="scene-job-lease")
+        renewer.start()
+        fence = current_scene_job.set(job)
+        try:
+            if self.config_provider is not None:
+                provider = self.config_provider
+                snapshot = (provider.get(job.account_id, job.owner_space)
+                            if isinstance(provider, SceneConfigCache)
+                            else provider.get_effective(job.account_id, job.owner_space))
+                engine = self.engine.for_config(snapshot.config)
+            with request_usage_scope(_usage_context(job)):
+                result = engine.refresh(self.store, job.account_id, job.owner_space, node_uris=job.node_uris)
+            if lease_lost.is_set():
+                raise SceneLeaseLostError("scene analysis lost its lease")
+            if result.action == "WAIT":
+                done = self.jobs.mark_waiting(job, reason=result.reason,
+                                              remaining_uris=result.pending_member_uris)
+            else:
+                done = self.jobs.mark_succeeded(job, reason=result.action,
+                                                remaining_uris=result.pending_member_uris,
+                                                min_evidence_nodes=engine.config.min_evidence_nodes)
+            return SceneWorkerOutcome(done, result)
+        except SceneLeaseLostError:
+            return SceneWorkerOutcome(job, None)
+        except Exception as exc:
+            halted = not isinstance(exc, SceneRetryableDecisionError) and _rate_limited(exc)
+            self.halted |= halted
+            reason = ("provider rate limit (429)" if halted else
+                      str(exc) if isinstance(exc, SceneRetryableDecisionError) else type(exc).__name__)
+            permanent = isinstance(exc, SceneDecisionError) and not isinstance(exc, SceneRetryableDecisionError)
+            try:
+                if halted or permanent or job.failure_count + 1 >= engine.config.retry_limit:
+                    failed = self.jobs.mark_failed(job, reason=reason)
+                else:
+                    failed = self.jobs.mark_retry(job, reason=reason,
+                        delay_seconds=self.retry_delay_seconds * 2 ** job.failure_count)
+            except SceneLeaseLostError:
+                failed = job
+            return SceneWorkerOutcome(failed, None, halted)
+        finally:
+            current_scene_job.reset(fence)
+            stop.set()
+            renewer.join(timeout=1)
