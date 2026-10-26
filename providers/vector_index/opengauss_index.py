@@ -366,29 +366,36 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         finally:
             self._return_connection(conn)
 
-    def _get_connection(self):
-        """Get a connection from the pool or create a new one."""
-        if self._pool:
-            conn = self._pool.pop()
-            if conn.closed == 0:
-                return conn
+    def _create_connection(self):
+        """Open a connection using this module's psycopg2 reference.
 
+        Tests patch ``providers.vector_index.opengauss_index.psycopg2`` at
+        module level, so the mixin's pool-module reference would bypass
+        the mock.
+        """
         return psycopg2.connect(self._connection_string)
 
     def _return_connection(self, conn):
-        """Return a connection to the pool, rolling back dirty transactions."""
+        """Return a connection, rolling back dirty transactions.
+
+        openGauss can leave a connection inside an open transaction after
+        errors; a dirty pooled connection would poison the next borrower,
+        so roll back first (or drop the connection when that fails).
+        """
         if conn.closed != 0:
+            # Slot release is handled by the mixin; closed conns are
+            # simply never pooled again.
+            self._standalone_return_connection(conn)
             return
         try:
             if conn.info.transaction_status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
                 conn.rollback()
         except Exception:
-            conn.close()
-            return
-        if len(self._pool) < self._pool_size:
-            self._pool.append(conn)
-        else:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._standalone_return_connection(conn)
 
     def upsert(self, records: list[IndexRecord]) -> None:
         """Add or update records in the index.

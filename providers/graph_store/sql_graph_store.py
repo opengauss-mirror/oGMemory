@@ -107,21 +107,9 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         self._ensure_schema()
 
     # ------------------------------------------------------------------
-    # Connection pool
+    # Connection pool: provided by PoolAdapterMixin (bounded standalone
+    # pool; shared pool binds its own methods at __init__ time).
     # ------------------------------------------------------------------
-
-    def _get_connection(self):
-        if self._pool:
-            conn = self._pool.pop()
-            if conn.closed == 0:
-                return conn
-        return psycopg2.connect(self._connection_string)
-
-    def _return_connection(self, conn):
-        if len(self._pool) < self._pool_size and conn.closed == 0:
-            self._pool.append(conn)
-        else:
-            conn.close()
 
     # ------------------------------------------------------------------
     # Schema management
@@ -223,6 +211,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                  supporting_node_ids, topic, tags, parent_memory_id,
                  pagerank, account_id, created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid[], %s, %s::text[], %s, %s, %s, %s, %s)
+            ON CONFLICT (node_id) DO NOTHING
             """,
             (
                 payload["node_id"],

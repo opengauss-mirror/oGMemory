@@ -125,21 +125,6 @@ class SQLTraceEventStore(PoolAdapterMixin):
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
-    def _get_connection(self):
-        """Borrow a standalone connection when no shared pool was supplied."""
-        if self._pool:
-            conn = self._pool.pop()
-            if conn.closed == 0:
-                return conn
-        return psycopg2.connect(self._connection_string)
-
-    def _return_connection(self, conn) -> None:
-        """Return a standalone connection to this store's bounded idle pool."""
-        if len(self._pool) < self._pool_size and conn.closed == 0:
-            self._pool.append(conn)
-        else:
-            conn.close()
-
     def _ensure_table(self) -> None:
         from fs.sql_adapter.schema import ensure_schema
 
