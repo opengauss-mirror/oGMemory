@@ -7,12 +7,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from fs.sql_adapter.dialect import resolve_sql_dialect
 from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
 
 def test_shared_vector_pool_is_borrowed_returned_and_not_closed(monkeypatch):
     pool = MagicMock()
     pool.connection_string = "postgresql://vector-db/vectors"
+    pool.sql_dialect = resolve_sql_dialect("opengauss")
     conn = pool.get_connection.return_value
     monkeypatch.setattr("providers.vector_index.opengauss_index.OPENGAUSS_AVAILABLE", True)
     index = OpenGaussVectorIndex(pool=pool, dimension=2)
@@ -27,6 +29,7 @@ def test_shared_vector_pool_is_borrowed_returned_and_not_closed(monkeypatch):
 def test_vector_initialization_failure_is_not_swallowed(monkeypatch):
     pool = MagicMock()
     pool.connection_string = "postgresql://vector-db/vectors"
+    pool.sql_dialect = resolve_sql_dialect("opengauss")
     conn = pool.get_connection.return_value
     conn.cursor.side_effect = RuntimeError("database unavailable")
     monkeypatch.setattr("providers.vector_index.opengauss_index.OPENGAUSS_AVAILABLE", True)

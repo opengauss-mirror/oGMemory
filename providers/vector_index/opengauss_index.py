@@ -12,7 +12,8 @@ from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
 from core.temporal import contains_time, seconds
 from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
-from fs.sql_adapter.pool import PoolAdapterMixin
+from fs.sql_adapter.pool import PoolAdapterMixin, resolve_connection_dialect
+from fs.sql_adapter.dialect import normalize_sql_dialect
 
 try:
     import psycopg2
@@ -122,6 +123,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         table_name: str = "vector_index",
         pool_size: int = 5,
         pool=None,
+        dialect=None,
     ):
         """Initialize OpenGauss index.
 
@@ -130,7 +132,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             dimension: Embedding vector dimension (default 1536)
             table_name: Table name for vector storage (must be valid identifier)
             pool_size: Connection pool size (when pool is not provided)
-            pool: Optional shared connection pool
+            pool: Optional shared connection pool with matching SQL dialect
+            dialect: Explicit dialect or auto detection; omitted inherits the pool or openGauss
 
         Raises:
             ImportError: If psycopg2 is not installed
@@ -144,7 +147,12 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
         self._dimension = dimension
         self._table_name = _validate_table_name(table_name)
-        self._init_pool(pool, connection_string, pool_size)
+        if dialect is None or (pool is not None and normalize_sql_dialect(dialect) == "auto"):
+            dialect = pool.sql_dialect if pool is not None else "opengauss"
+        dialect = resolve_connection_dialect(dialect, connection_string)
+        if pool is not None and pool.sql_dialect.name != dialect.name:
+            raise ValueError("vector index dialect must match shared pool dialect")
+        self._init_pool(pool, connection_string, pool_size, dialect=dialect)
 
         self._ensure_table()
 
@@ -324,8 +332,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     WHERE account_id IS NULL OR owner_space IS NULL
                        OR node_uri IS NULL OR node_status IS NULL
                 """)
-                cur.execute("""SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = current_schema() AND table_name = 'context_nodes'""")
+                cur.execute("""SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'context_nodes'
+                      AND column_name = 'node_id'""")
                 if cur.fetchone() is not None:
                     cur.execute(f"""
                         UPDATE {tbl} vi SET node_id = cn.node_id

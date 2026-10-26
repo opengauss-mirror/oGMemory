@@ -22,7 +22,7 @@ import time
 from concurrent.futures import Future
 from contextlib import contextmanager
 
-from fs.sql_adapter.dialect import SQLDialect, resolve_sql_dialect
+from fs.sql_adapter.dialect import SQLDialect, normalize_sql_dialect, resolve_sql_dialect
 
 try:
     import psycopg2
@@ -118,6 +118,36 @@ def wait_for_postgres(conn, deadline):
                 raise TimeoutError('PostgreSQL operation deadline elapsed')
 
 
+@contextmanager
+def _deadline_connection(connection_string, deadline):
+    addresses = _resolved_hosts(connection_string, deadline)
+    remaining_seconds(deadline)
+    conn = psycopg2.connect(connection_string, async_=True, **addresses)
+    try:
+        wait_for_postgres(conn, deadline)
+        yield conn
+    finally:
+        conn.close()
+
+
+def resolve_connection_dialect(value, connection_string, connect_timeout_seconds=10, *, deadline=None):
+    """Resolve an automatic dialect within one client-side connection/query budget."""
+    if normalize_sql_dialect(value) != "auto":
+        return resolve_sql_dialect(value)
+    local_deadline = time.monotonic() + connect_timeout_seconds
+    deadline = local_deadline if deadline is None else min(deadline, local_deadline)
+    with _deadline_connection(connection_string, deadline) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT version()")
+            wait_for_postgres(conn, deadline)
+            version = str(cursor.fetchone()[0]).casefold()
+        if "opengauss" in version:
+            return resolve_sql_dialect("opengauss")
+        if "postgresql" in version:
+            return resolve_sql_dialect("postgresql")
+        raise ValueError("Unrecognized SQL server; configure its dialect explicitly")
+
+
 class SharedConnectionPool:
     """Process-level, thread-safe psycopg2 connection pool.
 
@@ -148,6 +178,7 @@ class SharedConnectionPool:
         pool_size: int = 10,
         connect_timeout_seconds: int = 10,
         dialect: str | SQLDialect = "postgresql",
+        *, deadline=None,
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
@@ -157,7 +188,7 @@ class SharedConnectionPool:
         if connect_timeout_seconds < 1:
             raise ValueError("connect_timeout_seconds must be positive")
         self._connection_string = connection_string
-        self._dialect = resolve_sql_dialect(dialect)
+        self._dialect = resolve_connection_dialect(dialect, connection_string, connect_timeout_seconds, deadline=deadline)
         self._connect_timeout_seconds = connect_timeout_seconds
         self._pool_size = pool_size
         self._pool: list = []
@@ -253,24 +284,16 @@ class SharedConnectionPool:
         """Use a bounded, nonblocking session within the shared connection limit."""
         if not self._semaphore.acquire(timeout=remaining_seconds(deadline)):
             raise TimeoutError('PostgreSQL connection slot deadline elapsed')
-        conn = None
         try:
             # Replace one idle session so the physical connection cap also holds.
             with self._lock:
                 idle = self._pool.pop() if self._pool else None
             if idle is not None:
                 idle.close()
-            addresses = _resolved_hosts(self._connection_string, deadline)
-            remaining_seconds(deadline)
-            conn = psycopg2.connect(self._connection_string, async_=True, **addresses)
-            wait_for_postgres(conn, deadline)
-            yield conn
+            with _deadline_connection(self._connection_string, deadline) as conn:
+                yield conn
         finally:
-            try:
-                if conn is not None:
-                    conn.close()
-            finally:
-                self._semaphore.release()
+            self._semaphore.release()
 
     def close_all(self):
         """Close every idle connection in the pool (for shutdown / tests)."""
@@ -319,7 +342,7 @@ class PoolAdapterMixin:
             if not connection_string:
                 raise ValueError("connection_string is required when pool is not provided")
             self._connection_string = connection_string
-            self._dialect = resolve_sql_dialect(dialect)
+            self._dialect = resolve_connection_dialect(dialect, connection_string)
             self._sql_dialect = self._dialect.name
             self._pool_size = pool_size
             self._pool: list = []
