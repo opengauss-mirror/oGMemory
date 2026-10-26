@@ -41,6 +41,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import logging
@@ -50,6 +51,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
+from m3._parallel import UnitError, face_max_workers, parallel_clips
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.resume_status import is_completed_extraction
 
@@ -265,6 +267,11 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
 
     only_videos = set(args.video.split(",")) if args.video else None
 
+    # Flatten to per-frame descriptors: face detection fans out per
+    # extracted frame, capped by face_max_workers() (the cv_service
+    # ONNX session serialises detect(), so a small cap avoids request
+    # pile-up).
+    frames: list[dict] = []
     for line in manifest_lines:
         if not line:
             continue
@@ -280,39 +287,54 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                     frame_node_id, video_id, record.get("clip_id"),
                 )
                 continue
-            try:
-                result = detect_faces_for_frame(
-                    graph=graph, op_service=op_service, ctx=ctx,
-                    frame_raw_node=frame_node,
-                    backend=backend,
-                    min_confidence=args.min_confidence,
-                    max_faces=args.max_faces,
-                    force=args.force,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Face detection failed for frame %s", frame_node_id,
-                )
-                failed.append({
-                    "video_id": video_id,
-                    "clip_id": record.get("clip_id"),
-                    "frame_node_id": frame_node_id,
-                    "error": str(exc),
-                })
-                continue
-
-            output_lines.append(json.dumps({
+            frames.append({
                 "video_id": video_id,
                 "clip_id": record.get("clip_id"),
-                "frame_node_id": result["frame_node_id"],
-                "extracted_node_id": result["extracted_node_id"],
-                "child_node_ids": result["child_node_ids"],
-                "face_count": result["face_count"],
-                "resumed": result["resumed"],
-            }, ensure_ascii=False))
-            total_faces += result["face_count"]
-            if not result["resumed"]:
-                total_extractions += 1
+                "frame_node_id": frame_node_id,
+                "frame_node": frame_node,
+            })
+
+    def _unit(frame: dict) -> dict:
+        frame_ctx = dataclasses.replace(
+            ctx, trace_id=f"{ctx.trace_id}-{frame['frame_node_id']}"
+        )
+        return detect_faces_for_frame(
+            graph=graph, op_service=op_service, ctx=frame_ctx,
+            frame_raw_node=frame["frame_node"],
+            backend=backend,
+            min_confidence=args.min_confidence,
+            max_faces=args.max_faces,
+            force=args.force,
+        )
+
+    for frame, result in parallel_clips(
+        frames, _unit, max_workers=face_max_workers()
+    ):
+        if isinstance(result, UnitError):
+            logger.error(
+                "Face detection failed for frame %s: %s",
+                frame["frame_node_id"], result,
+                exc_info=result.exception,
+            )
+            failed.append({
+                "video_id": frame["video_id"],
+                "clip_id": frame["clip_id"],
+                "frame_node_id": frame["frame_node_id"],
+                "error": str(result),
+            })
+            continue
+        output_lines.append(json.dumps({
+            "video_id": frame["video_id"],
+            "clip_id": frame["clip_id"],
+            "frame_node_id": result["frame_node_id"],
+            "extracted_node_id": result["extracted_node_id"],
+            "child_node_ids": result["child_node_ids"],
+            "face_count": result["face_count"],
+            "resumed": result["resumed"],
+        }, ensure_ascii=False))
+        total_faces += result["face_count"]
+        if not result["resumed"]:
+            total_extractions += 1
 
     with output_jsonl.open("w", encoding="utf-8") as f:
         for line in output_lines:
