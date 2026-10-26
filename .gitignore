@@ -64,6 +64,7 @@ $RECYCLE.BIN/
 .env.*
 !config/env.example
 !deploy/.env.example
+!deploy/.env.parallel-locomo.example
 *.pem
 *.key
 *.p12
