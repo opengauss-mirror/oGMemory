@@ -54,6 +54,11 @@ class SeedRetriever:
             not self.config.hybrid_enabled or self.config.semantic_weight > 0
         )
         if semantic_enabled:
+            # Root URIs are the hierarchical seeds _merge_starting_points
+            # walks; they do not depend on the embedder, so compute them
+            # unconditionally — an embedder failure degrades the vector
+            # search, not the root starting points.
+            root_uris = self._get_root_uris(typed_query.context_type, ctx)
             try:
                 query_vector = self.embedder.embed_texts([typed_query.text])[0]
             except Exception as exc:
@@ -68,12 +73,10 @@ class SeedRetriever:
                 )
                 query_vector = []
             if query_vector:
-                root_uris = self._get_root_uris(typed_query.context_type, ctx)
                 global_results = self._global_vector_search(
                     query_vector, typed_query, ctx
                 )
             else:
-                root_uris = []
                 global_results = []
         else:
             query_vector = []

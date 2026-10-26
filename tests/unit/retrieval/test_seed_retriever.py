@@ -753,7 +753,14 @@ class TestDegradeOnEmbedFailure:
         # No raise; BM25 results survive: level-2 hits as candidates,
         # the level-1 profile root as a starting point.
         assert result.query_vector == []
-        assert result.root_uris == []
+        # B1 pin: root URIs do not depend on the embedder — the
+        # hierarchical seeds survive an embedder outage (only the vector
+        # search degrades), so _merge_starting_points still walks them.
+        assert result.root_uris
+        assert any(
+            h.uri in result.root_uris and h.score == 0.0
+            for h in result.starting_points
+        )
         assert result.initial_candidates
         uris = {h.uri for h in result.initial_candidates}
         assert "ctx://acct-1/users/u1/memories/profile/detail" in uris
@@ -782,7 +789,13 @@ class TestDegradeOnEmbedFailure:
         )
         result = r.search(tq, ctx)
         assert result.initial_candidates == []
-        assert result.starting_points == []
+        # B1 pin: total outage (embed + BM25) still preserves the root
+        # URIs as score-0 starting points rather than emptying them.
+        assert result.root_uris
+        assert all(
+            h.uri in result.root_uris and h.score == 0.0
+            for h in result.starting_points
+        )
 
     def test_pipeline_run_seed_falls_back_to_root_uris(self, cfg, ctx, tq):
         """RetrievalPipeline._run_seed must not re-raise when search fails."""
