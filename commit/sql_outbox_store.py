@@ -29,7 +29,14 @@ except ImportError:
 logger = get_logger(__name__)
 
 _PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS = 5
-_PROCESSING_LOCK_TIMEOUT_SECONDS = 5.0
+# Same-URI index processing can legitimately take tens of seconds (large
+# entity/profile nodes embed their full content on every merge), and other
+# queued events for the same hot URI must wait, not fail. A 5s budget made
+# concurrent events for hot nodes exhaust their retries, move to the DLQ,
+# and poison the account-wide index barrier, failing every subsequent
+# ingestion chunk (parallel ingest). 300s matches the LLM/embedding scale;
+# holders of the advisory lock release it as soon as the slow upsert lands.
+_PROCESSING_LOCK_TIMEOUT_SECONDS = 300.0
 _PROCESSING_LOCK_POLL_SECONDS = 0.05
 
 
