@@ -301,7 +301,16 @@ def test_stage_preserves_diarization_diagnostics(tmp_path, monkeypatch):
     from m3.pipeline.stages import speaker_diarization_stage
     output = tmp_path / "speaker_turns.jsonl"
     output.write_text("")
-    diagnostics = {"status": "failed", "failed_audio_nodes": 2, "turns": 0}
+    # Both failed attempts of a 2-clip run exceed the tolerance floor
+    # (max(1, int(2*0.15)) = 1), so the stage must fail despite rc=2
+    # being tolerated at the raise level.
+    diagnostics = {
+        "status": "failed",
+        "failed_audio_nodes": 2,
+        "attempted_audio": 2,
+        "failed_audio": 2,
+        "turns": 0,
+    }
     output.with_suffix(".summary.json").write_text(json.dumps(diagnostics))
     monkeypatch.setattr("m3.speaker_diarization.run_speaker_diarization", lambda *a, **kw: 2)
     context = SimpleNamespace(
