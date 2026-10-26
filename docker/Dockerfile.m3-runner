@@ -19,4 +19,19 @@ RUN pip install --no-cache-dir -q opencv-python-headless==4.10.0.84 || \
 RUN python3 -c "import nltk; [nltk.download(r, download_dir='/usr/local/nltk_data', quiet=True) for r in ('punkt_tab', 'stopwords')]" && \
     python3 -c "import nltk; nltk.data.find('tokenizers/punkt_tab'); nltk.data.find('corpora/stopwords'); print('nltk corpora baked')"
 
+# Local ASR via faster-whisper (CTranslate2 Whisper, CPU int8). The ASR
+# stack defaults to the "large-v3-turbo" model — see
+# extraction/operators/builtin/asr_backends.py::FasterWhisperBackend
+# (m3/voice_asr.py --model defaults to it). The model (~1.5 GB) is
+# downloaded from the HF hub on FIRST USE into HF_HOME; bind-mount that
+# path to download once and share across runs:
+#   -v /data/hf_cache:/home/ogmem/.cache/huggingface
+# Build-time verification: import must work without the model present.
+RUN pip install --no-cache-dir -q "faster-whisper>=1.0.0" && \
+    python3 -c "from faster_whisper import WhisperModel; print('faster-whisper OK')"
+
+ENV HF_HOME=/home/ogmem/.cache/huggingface
+RUN mkdir -p /home/ogmem/.cache/huggingface \
+    && chown -R ogmem:ogmem /home/ogmem/.cache
+
 USER ogmem
