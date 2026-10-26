@@ -22,6 +22,7 @@ from core.models import (
     RetrievedBlock,
     RetrieverMode,
     SearchMemoryResult,
+    SeedHit,
     SeedResult,
     TypedQuery,
 )
@@ -165,8 +166,27 @@ class RetrievalPipeline:
             try:
                 result = self.seed_retriever.search(tq, ctx, mode=mode)
             except Exception as exc:
-                logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
-                raise
+                # Do not re-raise: during embedder/vector-index outages
+                # every turn would otherwise fail. Fall back to a seed
+                # rooted at the typed query's root URIs (score 0.0) so
+                # hierarchical expansion / fallback L2 still has
+                # something to walk and the search run continues.
+                logger.error(
+                    "[seed_retrieval] failed: %s — degrading to "
+                    "root-URI-only seed", exc, exc_info=True,
+                )
+                root_uris = SeedRetriever._get_root_uris(
+                    getattr(tq, "context_type", None), ctx,
+                )
+                result = SeedResult(
+                    starting_points=[
+                        SeedHit(uri=uri, score=0.0)
+                        for uri in root_uris
+                    ],
+                    initial_candidates=[],
+                    query_vector=[],
+                    root_uris=root_uris,
+                )
             st.output_count = len(result.starting_points) + len(result.initial_candidates)
         trace.add_stage(st)
         return result

@@ -54,11 +54,27 @@ class SeedRetriever:
             not self.config.hybrid_enabled or self.config.semantic_weight > 0
         )
         if semantic_enabled:
-            query_vector = self.embedder.embed_texts([typed_query.text])[0]
-            root_uris = self._get_root_uris(typed_query.context_type, ctx)
-            global_results = self._global_vector_search(
-                query_vector, typed_query, ctx
-            )
+            try:
+                query_vector = self.embedder.embed_texts([typed_query.text])[0]
+            except Exception as exc:
+                # Degrade instead of emptying the working set: when the
+                # embedder is saturated/down, continue with BM25-only
+                # retrieval so downstream score-threshold filtering still
+                # behaves conservatively.
+                logger.warning(
+                    "SeedRetriever: embed failed for query (%s: %s) — "
+                    "degrading to keyword/BM25-only retrieval",
+                    type(exc).__name__, exc,
+                )
+                query_vector = []
+            if query_vector:
+                root_uris = self._get_root_uris(typed_query.context_type, ctx)
+                global_results = self._global_vector_search(
+                    query_vector, typed_query, ctx
+                )
+            else:
+                root_uris = []
+                global_results = []
         else:
             query_vector = []
             root_uris = []
@@ -74,20 +90,31 @@ class SeedRetriever:
             self.config.hybrid_enabled
             or getattr(self.bm25_index, "doc_count", 0) > 0
         ):
-            if self.config.hybrid_enabled:
-                owner_spaces = self._hybrid_owner_spaces(typed_query, ctx)
-                if not owner_spaces:
-                    bm25_results = []
+            try:
+                if self.config.hybrid_enabled:
+                    owner_spaces = self._hybrid_owner_spaces(typed_query, ctx)
+                    if not owner_spaces:
+                        bm25_results = []
+                    else:
+                        if self.lexical_backfill is None:
+                            raise RuntimeError(
+                                "hybrid retrieval requires a lexical backfill coordinator"
+                            )
+                        if not self.lexical_backfill.ensure_ready(ctx, owner_spaces):
+                            raise RuntimeError("required lexical backfill is not ready")
+                        bm25_results = self._bm25_search(typed_query, ctx)
                 else:
-                    if self.lexical_backfill is None:
-                        raise RuntimeError(
-                            "hybrid retrieval requires a lexical backfill coordinator"
-                        )
-                    if not self.lexical_backfill.ensure_ready(ctx, owner_spaces):
-                        raise RuntimeError("required lexical backfill is not ready")
                     bm25_results = self._bm25_search(typed_query, ctx)
-            else:
-                bm25_results = self._bm25_search(typed_query, ctx)
+            except Exception as exc:
+                # A BM25 failure must not raise: log and continue with
+                # whatever the vector side produced (possibly nothing —
+                # the caller degrades rather than failing the turn).
+                logger.warning(
+                    "SeedRetriever: BM25 search failed (%s: %s) — "
+                    "continuing without lexical results",
+                    type(exc).__name__, exc,
+                )
+                bm25_results = []
             if bm25_results:
                 if self.config.hybrid_enabled:
                     global_results = self._weighted_rrf(

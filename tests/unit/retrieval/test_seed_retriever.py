@@ -696,3 +696,114 @@ class TestSeedRetriever:
         assert "ctx://other/users/u1/memories/leak" not in uris
         assert "ctx://acct-1/users/u2/memories/leak" not in uris
         assert "ctx://acct-1/users/u1/memories/good" in uris
+
+
+class TestDegradeOnEmbedFailure:
+    """WS 3.4: embed failures degrade to BM25-only retrieval, never raise."""
+
+    def _bm25_index(self):
+        """A minimal BM25 index stub matching the .search() interface."""
+
+        def _hit(uri, level, parent, score):
+            return SimpleNamespace(
+                score=score,
+                metadata={
+                    "uri": uri,
+                    "level": level,
+                    "parent_uri": parent,
+                    "context_type": "MEMORY",
+                    "category": "profile",
+                    "owner_space": "user_u1",
+                    "account_id": "acct-1",
+                },
+            )
+
+        class _Idx:
+            doc_count = 3
+            supported_filters = {"account_id", "owner_space"}
+
+            def search(self, query, top_k, filters):
+                return [
+                    _hit(
+                        "ctx://acct-1/users/u1/memories/profile", 1,
+                        "ctx://acct-1/users/u1/memories", 1.5,
+                    ),
+                    _hit(
+                        "ctx://acct-1/users/u1/memories/profile/detail", 2,
+                        "ctx://acct-1/users/u1/memories/profile", 1.2,
+                    ),
+                ]
+
+        return _Idx()
+
+    def test_embed_failure_degrades_to_bm25_only(self, cfg, ctx, tq):
+        from unittest.mock import Mock
+
+        class ExplodingEmbedder:
+            dimension = 8
+
+            def embed_texts(self, texts, **kwargs):
+                raise RuntimeError("embedder down")
+
+        r = SeedRetriever(
+            Mock(), ExplodingEmbedder(), cfg, bm25_index=self._bm25_index()
+        )
+        result = r.search(tq, ctx)
+
+        # No raise; BM25 results survive: level-2 hits as candidates,
+        # the level-1 profile root as a starting point.
+        assert result.query_vector == []
+        assert result.root_uris == []
+        assert result.initial_candidates
+        uris = {h.uri for h in result.initial_candidates}
+        assert "ctx://acct-1/users/u1/memories/profile/detail" in uris
+        assert any(
+            h.uri == "ctx://acct-1/users/u1/memories/profile"
+            for h in result.starting_points
+        )
+
+    def test_embed_and_bm25_failure_returns_empty_not_raise(self, cfg, ctx, tq):
+        from unittest.mock import Mock
+
+        class ExplodingEmbedder:
+            dimension = 8
+
+            def embed_texts(self, texts, **kwargs):
+                raise RuntimeError("embedder down")
+
+        class ExplodingBM25:
+            doc_count = 3
+
+            def search(self, *args, **kwargs):
+                raise RuntimeError("bm25 down")
+
+        r = SeedRetriever(
+            Mock(), ExplodingEmbedder(), cfg, bm25_index=ExplodingBM25()
+        )
+        result = r.search(tq, ctx)
+        assert result.initial_candidates == []
+        assert result.starting_points == []
+
+    def test_pipeline_run_seed_falls_back_to_root_uris(self, cfg, ctx, tq):
+        """RetrievalPipeline._run_seed must not re-raise when search fails."""
+        from unittest.mock import Mock
+
+        from retrieval.pipeline import RetrievalPipeline
+
+        class ExplodingRetriever:
+            def search(self, tq, ctx, mode="quick"):
+                raise RuntimeError("total outage")
+
+        pipeline = RetrievalPipeline.__new__(RetrievalPipeline)
+        trace = Mock()
+
+        result = pipeline._run_seed(tq, ctx, trace, mode="quick")
+
+        assert result.query_vector == []
+        assert result.initial_candidates == []
+        assert result.root_uris  # rooted at the typed query's roots
+        for hit in result.starting_points:
+            assert hit.score == 0.0
+        assert all(
+            hit.uri in result.root_uris for hit in result.starting_points
+        )
