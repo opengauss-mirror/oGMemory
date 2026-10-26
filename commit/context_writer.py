@@ -128,9 +128,15 @@ class ContextWriter:
                 relation_edges=[],
             )
 
-        # Retry loop for concurrent modification (optimistic locking)
-        max_retries = 3
-        retry_delays = [0.1, 0.2, 0.4]  # Exponential backoff in seconds
+        # Retry loop for concurrent modification (optimistic locking).
+        # CAS conflicts are transient by design (re-plan reads fresh data),
+        # but short retry budgets get exhausted by write stampedes when many
+        # extraction runs merge into the same shared nodes at once (e.g.
+        # parallel benchmark ingest with dozens of concurrent sessions whose
+        # LLM extractions finish together). Use a deeper exponential backoff:
+        # 8 attempts, ~12.7s worst case, instead of 3 attempts over 0.7s.
+        max_retries = 8
+        retry_delays = [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4]  # Exponential backoff in seconds
 
         if self._policy_router is None:
             raise RuntimeError(
