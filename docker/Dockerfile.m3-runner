@@ -1,0 +1,13 @@
+# M3 pipeline runner — extends the serving image with ffmpeg + opencv
+# for local video processing (preprocess, extract_frames).
+FROM ogmemory:ogmem-rychkov-local
+
+USER root
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir -q opencv-python-headless==4.10.0.84 || \
+    pip install --no-cache-dir -q opencv-python-headless
+
+USER ogmem

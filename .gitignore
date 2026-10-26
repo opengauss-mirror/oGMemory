@@ -199,3 +199,4 @@ deploy/_artifacts/
 # Asciinema recordings (local demo artifacts, not source)
 *.cast
 *.gif
+deploy/ogmemory-rendered.yaml
