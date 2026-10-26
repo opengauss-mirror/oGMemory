@@ -389,3 +389,144 @@ def test_disk_audio_and_truthful_flags(tmp_path, audio_node, video_node, frame_n
         assert base64.b64decode(audio[0]["input_audio"]["data"]) == b"RIFFtest"
     else:
         assert audio == []
+
+
+# ---------------------------------------------------------------------------
+# Video mode (video_url instead of sampled frames)
+# ---------------------------------------------------------------------------
+
+class TestVideoMode:
+    """``use_video=True`` sends one video_url part, no frames, no
+    input_audio; failures fall back to frame mode."""
+
+    @pytest.fixture
+    def video_llm(self):
+        llm = MockLLM()
+        llm._mock_multimodal_response = {
+            "description": "A woman hangs her coat on the coat rack.",
+            "characters": [{"name": "Woman", "role": "subject"}],
+            "events": [{"type": "action", "summary": "hangs coat", "ts_sec": 2}],
+            "entities": [{"name": "Coat rack", "type": "furniture"}],
+        }
+        return llm
+
+    def _patch_video(self, monkeypatch, fail=False):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+
+        calls = []
+
+        def fake_part(source_path, *, fps=10, width=512):
+            calls.append((source_path, fps, width))
+            if fail:
+                raise RuntimeError("ffmpeg exploded")
+            return {
+                "type": "video_url",
+                "video_url": {"url": f"data:video/mp4;base64,{fps}-{width}"},
+            }
+
+        monkeypatch.setattr(mod, "_video_part_from_source", fake_part)
+        return calls
+
+    def test_video_mode_sends_one_video_part_no_frames_no_audio(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        from core.graph_models import create_raw_node
+        self._patch_video(monkeypatch)
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True, video_fps=10)
+
+        result = gen.extract(
+            video_node, ctx, frame_nodes=frame_nodes, audio_node=audio,
+        )
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        video_parts = [p for p in parts if p.get("type") == "video_url"]
+        image_parts = [p for p in parts if p.get("type") == "image_url"]
+        audio_parts = [p for p in parts if p.get("type") == "input_audio"]
+        assert len(video_parts) == 1
+        assert image_parts == []
+        assert audio_parts == []
+        # Audio rides inside the video file in this mode.
+        assert result.extracted_content["audio_attached"] is True
+        assert result.extracted_content["video_input"] is True
+        assert result.extracted_content["frame_count"] == 0
+        assert result.extracted_content["video_fps"] == 10
+
+    def test_video_mode_uses_source_path_metadata(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        calls = self._patch_video(monkeypatch)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True, video_fps=5, video_width=256)
+
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes)
+
+        assert calls == [("/tmp/vid_a/0.mp4", 5, 256)]
+
+    def test_video_mode_error_falls_back_to_frames(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        self._patch_video(monkeypatch, fail=True)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        result = gen.extract(video_node, ctx, frame_nodes=frame_nodes)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "video_url"] == []
+        # All 5 frames went through (max_frames default 8 > 5).
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+        assert result.extracted_content["video_input"] is False
+
+    def test_video_mode_missing_source_path_falls_back(
+        self, monkeypatch, ctx, video_llm, frame_nodes,
+    ):
+        self._patch_video(monkeypatch)
+        from core.graph_models import create_raw_node
+        bare = create_raw_node(
+            raw_type=RawDataType.VIDEO, content=b"",
+            account_id="acct", metadata={"video_id": "v", "clip_id": 0},
+        )
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        result = gen.extract(bare, ctx, frame_nodes=frame_nodes)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "video_url"] == []
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+
+    def test_video_mode_no_frames_no_video_errors(
+        self, monkeypatch, ctx, video_llm, video_node,
+    ):
+        self._patch_video(monkeypatch, fail=True)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        result = gen.extract(video_node, ctx, frame_nodes=[])
+
+        assert result.error == "episodic_memory_generator requires frame_nodes"
+
+    def test_default_is_frame_mode(
+        self, ctx, video_llm, video_node, frame_nodes,
+    ):
+        gen = EpisodicMemoryGenerator(video_llm)
+        result = gen.extract(video_node, ctx, frame_nodes=frame_nodes)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "video_url"] == []
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+        assert result.extracted_content["video_input"] is False
+
+    def test_invalid_video_knobs_rejected(self, video_llm):
+        with pytest.raises(ValueError, match="video_fps"):
+            EpisodicMemoryGenerator(video_llm, use_video=True, video_fps=0)
+        with pytest.raises(ValueError, match="video_width"):
+            EpisodicMemoryGenerator(video_llm, use_video=True, video_width=0)

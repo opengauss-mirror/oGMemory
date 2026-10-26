@@ -389,6 +389,12 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
         argv.extend(["--audio-manifest", str(audio_manifest)])
     if no_audio:
         argv.append("--no-audio")
+    if stage.params.get("use_video"):
+        argv.append("--use-video")
+    if stage.params.get("video_fps"):
+        argv.extend(["--video-fps", str(stage.params["video_fps"])])
+    if stage.params.get("video_width"):
+        argv.extend(["--video-width", str(stage.params["video_width"])])
     asr_manifest = ctx.artifact("voice_asr", optional=True)
     if asr_manifest is not None and asr_manifest.exists():
         argv.extend(["--asr-manifest", str(asr_manifest)])

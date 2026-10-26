@@ -102,6 +102,9 @@ def generate_episodic_for_clip(
     temperature: float,
     asr_segments: list[dict] | None = None,
     force: bool = False,
+    use_video: bool = False,
+    video_fps: int = 10,
+    video_width: int = 512,
 ) -> dict:
     """Run :class:`EpisodicMemoryGenerator` for one VIDEO clip.
 
@@ -159,6 +162,9 @@ def generate_episodic_for_clip(
         max_frames=max_frames,
         include_audio=include_audio,
         temperature=temperature,
+        use_video=use_video,
+        video_fps=video_fps,
+        video_width=video_width,
     )
     extraction = extractor.extract(
         video_raw_node, ctx,
@@ -199,6 +205,7 @@ def generate_episodic_for_clip(
         **{key: content.get(key) or [] for key in
            ("characters", "events", "entities", "speech_transcript")},
         "frame_count": content.get("frame_count", len(frame_nodes)),
+        "video_input": bool(content.get("video_input", False)),
         "has_audio": content.get("has_audio", False),
         "audio_attached": content.get("audio_attached", False),
         "has_transcript": bool(content.get("speech_transcript")),
@@ -644,6 +651,9 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
             include_audio=not args.no_audio,
             temperature=args.temperature,
             asr_segments=asr_index.get(clip["key"]) or [],
+            use_video=getattr(args, "use_video", False),
+            video_fps=getattr(args, "video_fps", 10),
+            video_width=getattr(args, "video_width", 512),
             force=(clip["retry_key"] in retry_targets if retry_targets is not None
                    else getattr(args, "force", False)),
         )
@@ -755,6 +765,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-frames", type=int, default=8)
     p.add_argument("--no-audio", action="store_true",
                    help="Skip raw audio payloads; ASR transcripts are still included")
+    p.add_argument("--use-video", action="store_true",
+                   help="Send the whole clip as one video_url part (re-encoded "
+                        "via ffmpeg, cached sidecar) instead of sampled "
+                        "frames. Falls back to frames when the clip's "
+                        "source_path is missing or the re-encode fails.")
+    p.add_argument("--video-fps", type=int, default=10,
+                   help="Target FPS for the LLM video re-encode (default %(default)s)")
+    p.add_argument("--video-width", type=int, default=512,
+                   help="Target pixel width for the LLM video re-encode (default %(default)s)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
     if not 0 <= args.max_retries <= 10:

@@ -175,6 +175,18 @@ class EpisodicMemoryGenerator:
             available (cheaper, vision-only path).
         temperature: float — sampling temperature. Default 0.2 (low
             for stable structured output).
+        use_video: bool — when True, send the WHOLE clip as one
+            ``video_url`` content part (re-encoded to an LLM-friendly
+            mp4 via ffmpeg, cached as a sidecar) instead of sampled
+            ``image_url`` frames. The video carries the audio track in
+            the file, so the ``input_audio`` part is NOT attached in
+            this mode (some backends — e.g. Volcengine Ark — reject
+            ``input_audio`` for video-capable models). When the clip's
+            ``source_path`` is missing or the re-encode fails, the
+            operator falls back to frame mode. Default False.
+        video_fps: int — target FPS for the re-encoded video. Default 10.
+        video_width: int — target pixel width for the re-encoded video
+            (height scales proportionally). Default 512.
     """
 
     def __init__(
@@ -185,6 +197,9 @@ class EpisodicMemoryGenerator:
         image_detail: str = "low",
         include_audio: bool = True,
         temperature: float = 0.2,
+        use_video: bool = False,
+        video_fps: int = 10,
+        video_width: int = 512,
     ) -> None:
         if max_frames <= 0:
             raise ValueError(f"max_frames must be positive, got {max_frames}")
@@ -192,11 +207,18 @@ class EpisodicMemoryGenerator:
             raise ValueError(
                 f"image_detail must be low|high|auto, got {image_detail!r}",
             )
+        if video_fps <= 0:
+            raise ValueError(f"video_fps must be positive, got {video_fps}")
+        if video_width <= 0:
+            raise ValueError(f"video_width must be positive, got {video_width}")
         self._llm = llm
         self._max_frames = int(max_frames)
         self._image_detail = image_detail
         self._include_audio = bool(include_audio)
         self._temperature = float(temperature)
+        self._use_video = bool(use_video)
+        self._video_fps = int(video_fps)
+        self._video_width = int(video_width)
 
     @property
     def supported_types(self) -> list[RawDataType]:
@@ -226,6 +248,9 @@ class EpisodicMemoryGenerator:
                 "image_detail": {"enum": ["low", "high", "auto"]},
                 "include_audio": {"type": "boolean"},
                 "temperature": {"type": "number", "minimum": 0.0, "maximum": 2.0},
+                "use_video": {"type": "boolean"},
+                "video_fps": {"type": "integer", "minimum": 1, "maximum": 30},
+                "video_width": {"type": "integer", "minimum": 64, "maximum": 1920},
             },
         }
         # The operator consumes its own structured output (no graph
@@ -269,7 +294,35 @@ class EpisodicMemoryGenerator:
                 included.
         """
         frames = list(frame_nodes or [])
-        if not frames:
+
+        # Video mode: send the whole clip as one video_url part. The
+        # audio track rides inside the file, so no input_audio part is
+        # attached (backends like Volcengine Ark reject input_audio
+        # for video-capable models). Any failure falls back to frames.
+        video_part = None
+        if self._use_video:
+            source_path = (raw_node.metadata or {}).get("source_path")
+            if source_path:
+                try:
+                    video_part = _video_part_from_source(
+                        source_path,
+                        fps=self._video_fps,
+                        width=self._video_width,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "video re-encode failed for %s (%s: %s) — "
+                        "falling back to frame mode",
+                        raw_node.node_id, type(exc).__name__, exc,
+                    )
+            else:
+                logger.warning(
+                    "use_video set but %s has no metadata.source_path "
+                    "— falling back to frame mode",
+                    raw_node.node_id,
+                )
+
+        if video_part is None and not frames:
             return ExtractionResult(
                 node_id=raw_node.node_id,
                 extracted_content={
@@ -282,13 +335,15 @@ class EpisodicMemoryGenerator:
             )
 
         # Subsample frames evenly if there are more than max_frames.
-        if len(frames) > self._max_frames:
+        # (Skipped in video mode — frames are not sent at all.)
+        if video_part is None and len(frames) > self._max_frames:
             indices = _evenly_spaced_indices(len(frames), self._max_frames)
             frames = [frames[i] for i in indices]
 
         messages = self._build_messages(
             raw_node, frames, audio_node,
             asr_segments=normalise_speech_transcript(asr_segments),
+            video_part=video_part,
         )
         try:
             # Note: complete_multimodal uses the OpenAI-compatible
@@ -318,12 +373,19 @@ class EpisodicMemoryGenerator:
         # Merge LLM response with provenance metadata. The text lives
         # at the top level so downstream consumers (semantic memory
         # consolidator, control loop retrieval) can read it directly.
-        content["frame_count"] = len(frames)
-        content["audio_attached"] = any(
-            part.get("type") == "input_audio"
-            for message in messages if isinstance(message.get("content"), list)
-            for part in message["content"]
-        )
+        content["frame_count"] = 0 if video_part is not None else len(frames)
+        content["video_input"] = video_part is not None
+        if video_part is not None:
+            content["video_fps"] = self._video_fps
+            content["video_width"] = self._video_width
+            # The audio track is embedded in the video file we sent.
+            content["audio_attached"] = self._include_audio
+        else:
+            content["audio_attached"] = any(
+                part.get("type") == "input_audio"
+                for message in messages if isinstance(message.get("content"), list)
+                for part in message["content"]
+            )
         content["speech_transcript"] = normalise_speech_transcript(asr_segments)
         content["has_transcript"] = bool(content["speech_transcript"])
         content["has_audio"] = content["audio_attached"] or content["has_transcript"]
@@ -349,13 +411,17 @@ class EpisodicMemoryGenerator:
         frames: list[RawNode],
         audio_node: RawNode | None,
         asr_segments: list[dict] | None = None,
+        video_part: dict | None = None,
     ) -> list[dict]:
         """Construct the multimodal chat message list for the LLM call."""
         # User prompt: text describing the task + clip metadata + the
         # actual frames (and optionally audio + ASR transcript).
         user_text_parts: list[str] = [
-            "Describe what happens in this video clip based on the "
-            "provided frames and audio (if any). Output JSON only.",
+            ("Describe what happens in this video clip based on the "
+             "provided video. Output JSON only.")
+            if video_part is not None else
+            ("Describe what happens in this video clip based on the "
+             "provided frames and audio (if any). Output JSON only."),
         ]
         meta = raw_node.metadata or {}
         if "video_id" in meta:
@@ -400,6 +466,14 @@ class EpisodicMemoryGenerator:
         content_parts: list[dict] = [
             {"type": "text", "text": "\n".join(user_text_parts)},
         ]
+        if video_part is not None:
+            # Whole-clip video: frames and the separate audio part are
+            # both superseded — the audio track is embedded in the file.
+            content_parts.append(video_part)
+            return [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": content_parts},
+            ]
         for frame in frames:
             image_part = _image_part_from_node(frame, self._image_detail)
             if image_part is not None:
@@ -537,6 +611,74 @@ def _audio_part_from_node(audio: RawNode) -> dict | None:
             "data": base64.b64encode(content).decode("ascii"),
             "format": fmt,
         },
+    }
+
+
+def _prepare_llm_video(
+    source_path: str,
+    *,
+    fps: int = 10,
+    width: int = 512,
+    ffmpeg_bin: str = "ffmpeg",
+    timeout_sec: float = 300.0,
+) -> tuple[Path, str]:
+    """Re-encode a clip into an LLM-friendly mp4; return (path, b64).
+
+    Source clips come out of the slicer as high-bitrate stream copies
+    (~27 MB for 30 s) — far too large for a base64 ``video_url`` part.
+    We re-encode to ``width`` px, ``fps`` frames/s, CRF 30 (~350 KB for
+    30 s at 512px/10fps) keeping a mono 16 kHz AAC track. The result is
+    cached as a sidecar next to the source so re-extraction (``--force``)
+    doesn't pay the ffmpeg cost again, and the encode knobs are baked
+    into the sidecar name so different settings never reuse a stale
+    encode.
+    """
+    import subprocess
+
+    src = Path(source_path)
+    if not src.exists():
+        raise FileNotFoundError(f"clip source not found: {src}")
+    sidecar = src.with_name(
+        f"{src.stem}.llm-f{fps}-w{width}.mp4"
+    )
+    if not sidecar.exists():
+        cmd = [
+            ffmpeg_bin, "-y", "-loglevel", "error",
+            "-i", str(src),
+            "-vf", f"scale={width}:-2,fps={fps}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+            "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "32k",
+            str(sidecar),
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_sec,
+        )
+        if proc.returncode != 0 or not sidecar.exists():
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"ffmpeg re-encode failed (rc={proc.returncode}): "
+                f"{proc.stderr.strip()[:300]}"
+            )
+    data = sidecar.read_bytes()
+    if not data:
+        raise RuntimeError(f"re-encoded video is empty: {sidecar}")
+    return sidecar, base64.b64encode(data).decode("ascii")
+
+
+def _video_part_from_source(
+    source_path: str,
+    *,
+    fps: int = 10,
+    width: int = 512,
+) -> dict:
+    """Build a ``video_url`` content part from a clip's source path."""
+    _, b64 = _prepare_llm_video(source_path, fps=fps, width=width)
+    return {
+        "type": "video_url",
+        "video_url": {"url": f"data:video/mp4;base64,{b64}"},
     }
 
 
