@@ -311,11 +311,11 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 | `OGMEM_EMBED_RETRIES` | 2 | embedder | 瞬态 embed 失败的抖动退避尝试次数 |
 | `OGMEM_EMBED_BASE_DELAY` | 1.0 | embedder | 基础退避延迟（秒） |
 | `OGMEM_EXTRACT_MAX_WORKERS` | 4 | `extraction/tools` | Phase-2 span dual-run 并行度 |
-| `OGMEM_EXTRACT_SPAN_TIMEOUT` | 180 | `extraction/tools` | 每个 span dual-run 的预算（秒）；超时后丢弃滞后者 |
+| `OGMEM_EXTRACT_SPAN_TIMEOUT` | 180 | `extraction/tools` | 一个并行 span 块的等待预算（秒）——每当任一 span 完成时预算重置，因此一个病态滞后者只有在**没有任何 span 完成超过该秒数**时才会被丢弃（不是严格的每-span 硬截止时间） |
 | `OGMEM_EXTRACT_SPAN_RETRIES` | 1 | `extraction/tools` | 丢弃 span 前的额外尝试次数 |
 | `OGMEM_LLM_TIMEOUT` | 120 | `providers/llm/openai_llm` | OpenAI 客户端读/连接超时（秒） |
 | `OGMEM_ASR_FAIL_RATIO` | 0.15 | `m3/voice_asr`、`m3/pipeline/stages` | 每片段 ASR 失败容忍比率，超过则判定该视频失败 |
-| `OGMEM_TENANT_SCOPE` | m3bench | compose（ogmem service） | 后台 worker 的多租户隔离守卫 |
+| `OGMEM_TENANT_SCOPE` | m3bench | compose（ogmem service） | 后台 worker 的多租户隔离守卫（**尚未接入**：等待 WS 1.3 compose 变更；在此之前此表项仅作为规格记录） |
 | `ORTSESSION_INTRA_OP_THREADS` | 8 | `scripts/cv_service` | onnxruntime intra-op 线程上限（避免 192 线程抖动） |
 | `OMP_NUM_THREADS` | 8 | compose（runner） | pyannote 的 torch intra-op 线程（比默认快 23×） |
 

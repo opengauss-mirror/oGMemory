@@ -10,4 +10,13 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 RUN pip install --no-cache-dir -q opencv-python-headless==4.10.0.84 || \
     pip install --no-cache-dir -q opencv-python-headless
 
+# Bake the NLTK corpora BM25 tokenization needs (retrieval/bm25_index.py
+# _ensure_nltk). The lazy runtime download silently fails in offline /
+# firewalled containers → every BM25 search returns empty → QA degrades to
+# "cannot determine". /usr/local/nltk_data is in nltk.data.path for every
+# user, so a root-time download here is found at runtime.
+# The verification line fails the build if the corpora did not land.
+RUN python3 -c "import nltk; [nltk.download(r, download_dir='/usr/local/nltk_data', quiet=True) for r in ('punkt_tab', 'stopwords')]" && \
+    python3 -c "import nltk; nltk.data.find('tokenizers/punkt_tab'); nltk.data.find('corpora/stopwords'); print('nltk corpora baked')"
+
 USER ogmem

@@ -46,9 +46,14 @@ llm:
 
 # ---- Embedding 配置 ----
 embedding:
+  # Local OpenAI-compatible embedding service (e.g. Qwen3-Embedding
+  # served via vllm / TEI / text-embeddings-inference on CPU).
+  # IMPORTANT: ``model`` and ``dimension`` must stay in sync with
+  # ``vector_db.dimension`` below — the vector index is created with
+  # that many components and a mismatch makes every insert fail.
   provider: openai                 # 缺省回退到 llm.provider
-  model: "text-embedding-v4"
-  base_url: "${LLM_BASE_URL}"
+  model: "Qwen/Qwen3-Embedding-0.6B"
+  base_url: "http://127.0.0.1:8000/v1"   # note the /v1 — the SDK appends /embeddings
   api_key: "${LLM_API_KEY}"
   multimodal: false                 # 仅火山引擎需设为 true
   # api_key_command:
@@ -246,9 +251,10 @@ m3:
   # embedding block but are explicit so M3 can evolve independently.
   embedding:
     provider: openai
-    model: "BAAI/bge-large-zh-v1.5"
-    base_url: "${LLM_BASE_URL}"
+    model: "Qwen/Qwen3-Embedding-0.6B"
+    base_url: "http://127.0.0.1:8000/v1"
     api_key: "${LLM_API_KEY}"
+    # Must equal vector_db.dimension (1024 = Qwen3-Embedding-0.6B dims).
     dimension: 1024
 
   # M3 graph store — where graph_nodes / graph_edges live. Resolves in
