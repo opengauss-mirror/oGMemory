@@ -266,6 +266,17 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
                 "executed": True, "error": str(error),
             }
         materialized = result.get("materialized_children") or []
+        if len(materialized) != len(segments):
+            # Parallel path note (P3-3): the extractor normally materializes
+            # exactly one child node per ASR segment, so a length mismatch
+            # means the zip() below would silently drop rows — log it loudly
+            # instead of losing data quietly.
+            logger.warning(
+                "voice_asr: materialized %d child nodes for %d ASR segments "
+                "of clip %s — %d rows will be dropped",
+                len(materialized), len(segments), clip_id,
+                abs(len(segments) - len(materialized)),
+            )
         rows = []
         for m, seg in zip(materialized, segments):
             rows.append(segment_row(

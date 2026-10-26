@@ -684,7 +684,11 @@ def test_build_judge_llm_defaults_to_minimax(monkeypatch):
     import providers.llm as providers_llm
     monkeypatch.setattr(providers_llm, "get_minimax_llm", lambda: _FakeMiniMaxLLM)
 
-    llm = build_judge_llm()
+    # Hermetic (P3-4): point at a nonexistent YAML so an OGMEM_CONFIG in
+    # the ambient environment (e.g. a rendered deploy config with an
+    # m3.judge_llm block) can't flip this to the OpenAI-compatible path.
+    # _load_yaml_config returns {} for a missing path → role defaults → minimax.
+    llm = build_judge_llm(config_path="/nonexistent/ogmemory-hermetic-test.yaml")
     assert isinstance(llm, _FakeMiniMaxLLM)
     # The MiniMax class handles its own api_key fallback via
     # OGMEM_MINIMAX_API_KEY — we just pass through whatever the

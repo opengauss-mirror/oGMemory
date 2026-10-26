@@ -300,6 +300,14 @@ class PoolAdapterMixin:
 
     Subclasses that patch ``psycopg2`` at module level (for unit tests)
     override ``_create_connection`` to use their module reference.
+
+    Timeout semantics (P3-2): the two pool wirings differ by design —
+    the standalone path's ``_get_connection(timeout=None)`` **blocks
+    forever** waiting for a free slot, while a shared
+    ``SharedConnectionPool.get_connection`` defaults to ``timeout=30.0``
+    and raises ``PoolTimeout`` after 30 s. The same call site can thus
+    hang or raise depending on wiring; long-lived batch consumers that
+    must not hang should pass an explicit ``timeout=``.
     """
 
     def _init_pool(

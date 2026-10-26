@@ -48,6 +48,10 @@ def _embed_max_concurrency() -> int:
 
 # Bounded in-flight embed requests shared by ALL embedder instances in
 # this process (module-level: the endpoint, not the instance, saturates).
+# Frozen at import time (P3-1): the semaphore is constructed once when
+# this module is first imported, so changing OGMEM_EMBED_MAX_CONCURRENCY
+# later (e.g. in a long-lived process or via monkeypatch in tests) has
+# no effect. Set it in the environment before process start.
 _EMBED_SEMAPHORE = threading.BoundedSemaphore(_embed_max_concurrency())
 
 
