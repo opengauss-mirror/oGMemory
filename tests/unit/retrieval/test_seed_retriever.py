@@ -109,6 +109,13 @@ def tq():
     )
 
 
+class _VecIdx:
+    """Minimal vector index stub for fail-fast config tests."""
+
+    def search_by_vector(self, query_vector, filters, top_k):
+        return []
+
+
 class TestSeedRetriever:
     def test_returns_seed_result(self, retriever, tq, ctx):
         result = retriever.search(tq, ctx)
@@ -540,6 +547,66 @@ class TestSeedRetriever:
         assert lexical.top_k == 3
         assert lexical.filters["account_id"] == "acct-1"
         assert "user_u1" in lexical.filters["owner_space"]
+
+    def test_hybrid_without_backfill_coordinator_fails_fast(self, embedder, ctx):
+        """P1-2 regression: missing lexical backfill coordinator is a
+        MISCONFIGURATION — it must raise, not silently degrade to
+        vector-only results."""
+
+        class LexicalIndex:
+            supported_filters = frozenset({"account_id", "owner_space"})
+
+            def search(self, *a, **k):
+                return []
+
+        cfg = RetrievalConfig(hybrid_enabled=True, lexical_weight=0.5)
+        query = TypedQuery(
+            text="hybrid", context_type="MEMORY", categories=[], top_k=2,
+            account_id="acct-1", owner_space="user_u1",
+        )
+        r = SeedRetriever(_VecIdx(), embedder, cfg, LexicalIndex())
+        with pytest.raises(RuntimeError, match="lexical backfill coordinator"):
+            r.search(query, ctx)
+
+    def test_hybrid_backfill_not_ready_fails_fast(self, embedder, ctx):
+        """P1-2 regression: backfill refusing ready-state is a
+        misconfiguration signal — raise, don't degrade."""
+
+        class LexicalIndex:
+            supported_filters = frozenset({"account_id", "owner_space"})
+
+            def search(self, *a, **k):
+                return []
+
+        cfg = RetrievalConfig(hybrid_enabled=True, lexical_weight=0.5)
+        query = TypedQuery(
+            text="hybrid", context_type="MEMORY", categories=[], top_k=2,
+            account_id="acct-1", owner_space="user_u1",
+        )
+        backfill = SimpleNamespace(ensure_ready=lambda _ctx, _scopes: False)
+        r = SeedRetriever(_VecIdx(), embedder, cfg, LexicalIndex(), backfill)
+        with pytest.raises(RuntimeError, match="backfill is not ready"):
+            r.search(query, ctx)
+
+    def test_hybrid_provider_missing_security_filters_fails_fast(self, embedder, ctx):
+        """P1-2 regression: a lexical provider without account/owner-space
+        security filters is a misconfiguration — raise, don't degrade."""
+
+        class UnsafeLexicalIndex:
+            supported_filters = frozenset({"account_id"})
+
+            def search(self, *a, **k):
+                return []
+
+        cfg = RetrievalConfig(hybrid_enabled=True, lexical_weight=0.5)
+        query = TypedQuery(
+            text="hybrid", context_type="MEMORY", categories=[], top_k=2,
+            account_id="acct-1", owner_space="user_u1",
+        )
+        backfill = SimpleNamespace(ensure_ready=lambda _ctx, _scopes: True)
+        r = SeedRetriever(_VecIdx(), embedder, cfg, UnsafeLexicalIndex(), backfill)
+        with pytest.raises(RuntimeError, match="security filters"):
+            r.search(query, ctx)
 
     def test_zero_lexical_weight_skips_backfill_and_bm25(self, embedder, ctx):
         class VectorIndex:

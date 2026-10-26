@@ -26,6 +26,16 @@ from retrieval.owner_scope import allowed_owner_space_filter, visible_agent_ids
 logger = logging.getLogger(__name__)
 
 
+class RetrievalConfigError(RuntimeError):
+    """Retrieval is misconfigured (missing lexical backfill coordinator,
+    backfill not ready, lexical provider lacking mandatory security filters).
+
+    Raised — not degraded — so a broken deployment fails fast instead of
+    silently returning vector-only results forever. Subclasses
+    ``RuntimeError`` so pre-existing catch sites keep working.
+    """
+
+
 class SeedRetriever:
     """Global L0+L2 search with optional BM25 hybrid fusion."""
 
@@ -100,18 +110,24 @@ class SeedRetriever:
                         bm25_results = []
                     else:
                         if self.lexical_backfill is None:
-                            raise RuntimeError(
+                            raise RetrievalConfigError(
                                 "hybrid retrieval requires a lexical backfill coordinator"
                             )
                         if not self.lexical_backfill.ensure_ready(ctx, owner_spaces):
-                            raise RuntimeError("required lexical backfill is not ready")
+                            raise RetrievalConfigError("required lexical backfill is not ready")
                         bm25_results = self._bm25_search(typed_query, ctx)
                 else:
                     bm25_results = self._bm25_search(typed_query, ctx)
+            except RetrievalConfigError:
+                # Misconfiguration must fail fast — silently degrading to
+                # vector-only results would hide a broken deployment forever.
+                # Operational failures (any other exception, including a
+                # RuntimeError from the index itself) still degrade below.
+                raise
             except Exception as exc:
-                # A BM25 failure must not raise: log and continue with
-                # whatever the vector side produced (possibly nothing —
-                # the caller degrades rather than failing the turn).
+                # A transient/operational BM25 failure must not raise: log and
+                # continue with whatever the vector side produced (possibly
+                # nothing — the caller degrades rather than failing the turn).
                 logger.warning(
                     "SeedRetriever: BM25 search failed (%s: %s) — "
                     "continuing without lexical results",
@@ -241,7 +257,7 @@ class SeedRetriever:
         if self.config.hybrid_enabled and not {
             "account_id", "owner_space"
         }.issubset(supported_filters):
-            raise RuntimeError(
+            raise RetrievalConfigError(
                 "lexical provider must support account_id and owner_space security filters"
             )
         provider_filters = {
