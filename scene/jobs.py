@@ -49,6 +49,7 @@ class SceneJob:
     lease_token: str = ""
     lease_until: datetime | None = None
     failure_count: int = 0
+    retained_node_uris: tuple[str, ...] = ()
 
 
 class SceneLeaseLostError(RuntimeError):
@@ -70,10 +71,12 @@ class SceneJobStore(Protocol):
 
     def mark_succeeded(self, job: SceneJob, *, reason: str = "",
                        remaining_uris: Iterable[str] = (),
-                       min_evidence_nodes: int = 3) -> SceneJob: ...
+                       min_evidence_nodes: int = 3,
+                       deferred_uris: Iterable[str] = ()) -> SceneJob: ...
 
     def mark_waiting(self, job: SceneJob, *, reason: str = "",
-                     remaining_uris: Iterable[str] | None = None) -> SceneJob: ...
+                     remaining_uris: Iterable[str] | None = None,
+                     deferred_uris: Iterable[str] = ()) -> SceneJob: ...
 
     def mark_retry(self, job: SceneJob, *, reason: str, delay_seconds: float) -> SceneJob: ...
 
@@ -104,6 +107,7 @@ def job_from_dict(raw: dict) -> SceneJob:
     values["created_at"] = values["created_at"] or datetime.min.replace(tzinfo=UTC)
     values["status"] = SceneJobStatus(values["status"])
     values["node_uris"] = tuple(values["node_uris"])
+    values["retained_node_uris"] = tuple(values.get("retained_node_uris", ()))
     return SceneJob(**values)
 
 
@@ -124,7 +128,7 @@ class InMemorySceneJobStore:
 
     def _scope(self, account_id: str, owner_space: str) -> dict:
         return self._scopes.setdefault((account_id, owner_space), {
-            "active": None, "last_job": None, "pending": {}, "retained": [], "force": False,
+            "active": None, "last_job": None, "pending": {}, "retained": [], "deferred": [], "force": False,
             "trigger_tokens": 1, "max_pending_nodes": 32, "max_wait_seconds": 1800,
         })
 
@@ -178,7 +182,9 @@ class InMemorySceneJobStore:
         if (not state["force"] and tokens < state["trigger_tokens"]
                 and len(pending) < state["max_pending_nodes"] and not due):
             return self._jobs.get(state["active"])
-        fresh = sorted(pending, key=lambda uri: (pending[uri]["at"], uri))
+        deferred = [uri for uri in state.get("deferred", ()) if uri in pending]
+        deferred_set = set(deferred)
+        fresh = deferred + sorted(pending.keys() - deferred_set, key=lambda uri: (pending[uri]["at"], uri))
         retained = [uri for uri in state["retained"] if uri not in pending]
         selected = []
         # Alternate fresh and retained evidence; FIFO rotates WAIT evidence fairly.
@@ -194,9 +200,11 @@ class InMemorySceneJobStore:
             if len(selected) == state["max_pending_nodes"]:
                 break
         selected_tokens = sum(pending.pop(uri)["tokens"] for uri in selected if uri in pending)
+        state["deferred"] = [uri for uri in deferred if uri in pending]
         state["retained"] = [uri for uri in retained if uri not in selected]
         job = SceneJob(uuid4().hex, account_id, owner_space, tuple(selected),
-                       token_count=selected_tokens, created_at=self._clock())
+                       token_count=selected_tokens, created_at=self._clock(),
+                       retained_node_uris=tuple(uri for uri in selected if uri in retained))
         self._jobs[job.job_id] = job
         state["active"] = job.job_id
         state["force"] = bool(pending)
@@ -243,7 +251,7 @@ class InMemorySceneJobStore:
             return renewed
 
     def _finish(self, reference, status, reason, *, remaining_uris=(), delay_seconds=0,
-                min_evidence_nodes=3) -> SceneJob:
+                min_evidence_nodes=3, deferred_uris=()) -> SceneJob:
         with self._lock:
             job = self._owned(reference)
             state = self._scope(job.account_id, job.owner_space)
@@ -253,12 +261,14 @@ class InMemorySceneJobStore:
                              if status == SceneJobStatus.PENDING else None)
             self._jobs[job.job_id] = result
             state["last_job"] = job.job_id
+            deferred_set = set(deferred_uris) - set(job.retained_node_uris)
+            deferred = [uri for uri in job.node_uris if uri in deferred_set]
+            remaining = list(dict.fromkeys([*remaining_uris, *deferred]))
             if status == SceneJobStatus.WAITING:
-                state["retained"] = list(dict.fromkeys([*state["retained"], *remaining_uris]))
+                state["retained"] = list(dict.fromkeys([*state["retained"], *remaining]))
             elif status == SceneJobStatus.SUCCEEDED:
-                remaining = list(dict.fromkeys(remaining_uris))
                 consumed = set(job.node_uris) - set(remaining)
-                if consumed and len(remaining) >= min_evidence_nodes:
+                if consumed and len(remaining) >= min_evidence_nodes and not deferred_set:
                     for uri in remaining:
                         state["pending"].setdefault(uri, {"tokens": 0, "at": job.created_at.isoformat()})
                     state["retained"] = [uri for uri in state["retained"] if uri not in remaining]
@@ -268,17 +278,25 @@ class InMemorySceneJobStore:
                 state["active"] = None
             elif status == SceneJobStatus.FAILED:
                 state["active"] = None
+            if deferred:
+                for uri in deferred:
+                    state["pending"].setdefault(uri, {"tokens": 0, "at": job.created_at.isoformat()})
+                state["deferred"] = list(dict.fromkeys([*deferred, *state.get("deferred", ())]))
+                state["retained"] = [uri for uri in state["retained"] if uri not in deferred_set]
+                state["force"] = True
             return result
 
-    def mark_succeeded(self, job, *, reason="", remaining_uris=(), min_evidence_nodes=3) -> SceneJob:
+    def mark_succeeded(self, job, *, reason="", remaining_uris=(), min_evidence_nodes=3,
+                       deferred_uris=()) -> SceneJob:
         if isinstance(min_evidence_nodes, bool) or not isinstance(min_evidence_nodes, int) or min_evidence_nodes < 1:
             raise ValueError("min_evidence_nodes must be a positive integer")
         return self._finish(job, SceneJobStatus.SUCCEEDED, reason, remaining_uris=remaining_uris,
-                            min_evidence_nodes=min_evidence_nodes)
+                            min_evidence_nodes=min_evidence_nodes, deferred_uris=deferred_uris)
 
-    def mark_waiting(self, job, *, reason="", remaining_uris=None) -> SceneJob:
+    def mark_waiting(self, job, *, reason="", remaining_uris=None, deferred_uris=()) -> SceneJob:
         return self._finish(job, SceneJobStatus.WAITING, reason,
-                            remaining_uris=job.node_uris if remaining_uris is None else remaining_uris)
+                            remaining_uris=job.node_uris if remaining_uris is None else remaining_uris,
+                            deferred_uris=deferred_uris)
 
     def mark_retry(self, job, *, reason, delay_seconds) -> SceneJob:
         if delay_seconds < 0:
@@ -413,12 +431,19 @@ class SceneWorker:
             if lease_lost.is_set():
                 raise SceneLeaseLostError("scene analysis lost its lease")
             if result.action == "WAIT":
-                done = self.jobs.mark_waiting(job, reason=result.reason,
-                                              remaining_uris=result.pending_member_uris)
+                fresh = set(job.node_uris) - set(job.retained_node_uris)
+                if (fresh.intersection(result.deferred_member_uris)
+                        and not fresh.intersection(result.reviewed_member_uris)):
+                    done = self.jobs.mark_failed(job, reason="scene capacity blocked: requested evidence exceeds the window")
+                else:
+                    done = self.jobs.mark_waiting(job, reason=result.reason,
+                                                  remaining_uris=result.pending_member_uris,
+                                                  deferred_uris=result.deferred_member_uris)
             else:
                 done = self.jobs.mark_succeeded(job, reason=result.action,
                                                 remaining_uris=result.pending_member_uris,
-                                                min_evidence_nodes=engine.config.min_evidence_nodes)
+                                                min_evidence_nodes=engine.config.min_evidence_nodes,
+                                                deferred_uris=result.deferred_member_uris)
             return SceneWorkerOutcome(done, result)
         except SceneLeaseLostError:
             return SceneWorkerOutcome(job, None)

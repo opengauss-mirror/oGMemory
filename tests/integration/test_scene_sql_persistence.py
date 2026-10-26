@@ -23,6 +23,11 @@ from scene.jobs import SceneJobStatus, current_scene_job, job_to_dict
 from scene.models import SceneCluster, SceneMember, SceneRecord
 from scene.sql_store import SQLSceneConfigProvider, SQLSceneJobStore, SQLSceneRepository
 from tests.unit.scene.test_adapters import Embedder, IndexedVectors
+from tests.unit.scene.test_worker import (
+    exercise_capacity_wait_windows,
+    exercise_mixed_capacity_checkpoint,
+    exercise_retained_publication_continuation,
+)
 
 
 @pytest.fixture
@@ -156,6 +161,15 @@ def test_queue_accumulates_wait_evidence_and_flushes_fresh_tail(scene_sql):
     assert next_job.node_uris == ("fresh", "old")
     jobs.mark_succeeded(next_job, remaining_uris=["old"])
     assert jobs.summary(ctx.account_id, "user:alice")["retained_nodes"] == 1
+
+
+def test_capacity_wait_windows_preserve_claim_provenance_across_sql_reload(scene_sql):
+    pool, _, _, jobs, _, _ = scene_sql
+    outcomes = exercise_capacity_wait_windows(jobs, lambda previous: SQLSceneJobStore(pool))
+    for outcome in outcomes:
+        saved = SQLSceneJobStore(pool).get(outcome.job.job_id, account_id="acct")
+        assert saved.node_uris == outcome.job.node_uris
+        assert saved.retained_node_uris == outcome.job.retained_node_uris
 
 
 def test_completed_projection_persists_remaining_work_across_restart(scene_sql):
@@ -383,3 +397,9 @@ def test_canonical_adapter_publishes_current_fingerprints_across_source_refresh(
         snapshot = repository.load_snapshot(ctx.account_id, "user:alice")
         assert snapshot.scenes[0].cluster.members[0].node_version == version
         assert repository.contributions(ctx.account_id, ["user:alice"], [memory.uri])[0][1] == memory.uri
+
+
+@pytest.mark.parametrize("exercise", [exercise_mixed_capacity_checkpoint, exercise_retained_publication_continuation])
+def test_capacity_review_checkpoints_survive_sql_reload(scene_sql, exercise):
+    pool, _, _, jobs, _, _ = scene_sql
+    exercise(jobs, reopen=lambda _: SQLSceneJobStore(pool))

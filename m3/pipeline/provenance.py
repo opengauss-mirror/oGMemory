@@ -22,7 +22,11 @@ def validate_input(ctx, spec):
     from m3.pipeline.runner import _format_value
     relevant = {}
     for stage in spec.stages:
-        if stage.enabled and stage.type in ("video.trim", "m3.preprocess", "m3.load_clips"):
+        # Execution switches are not media identity. A targeted resume disables
+        # completed stages but must still validate their original parameters;
+        # dropping them would reject an unchanged input (or hide a changed
+        # parameter on a disabled stage).
+        if stage.type in ("video.trim", "m3.preprocess", "m3.load_clips"):
             relevant[stage.id] = _format_value(stage.params, ctx.variables)
     identity = {"source": file_identity(ctx.video), "seconds": ctx.seconds,
                 "video_id": ctx.video_id, "account_id": ctx.account_id,

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -814,6 +814,9 @@ e2e = [
     { name = "matplotlib" },
     { name = "numpy" },
 ]
+m3-budget = [
+    { name = "tokenizers" },
+]
 sentence-transformers = [
     { name = "sentence-transformers" },
 ]
@@ -858,11 +861,12 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "sentence-transformers", marker = "extra == 'sentence-transformers'", specifier = ">=2.0.0" },
     { name = "speechbrain", marker = "extra == 'asr'", specifier = ">=0.5.15" },
+    { name = "tokenizers", marker = "extra == 'm3-budget'", specifier = ">=0.20,<1" },
     { name = "torch", marker = "extra == 'asr'", specifier = ">=2.0.0" },
     { name = "torchaudio", marker = "extra == 'asr'", specifier = ">=2.0.0" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.27" },
 ]
-provides-extras = ["dev", "opengauss", "chroma", "deepagents", "sentence-transformers", "cv", "asr", "e2e", "all"]
+provides-extras = ["dev", "opengauss", "m3-budget", "chroma", "deepagents", "sentence-transformers", "cv", "asr", "e2e", "all"]
 
 [[package]]
 name = "contourpy"

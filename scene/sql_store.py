@@ -435,12 +435,14 @@ class SQLSceneJobStore(_SQLStore):
     def renew(self, job: SceneJob, *, lease_seconds: float = 300):
         return self._change(job, "renew", lease_seconds=lease_seconds)
 
-    def mark_succeeded(self, job: SceneJob, *, reason="", remaining_uris=(), min_evidence_nodes=3):
+    def mark_succeeded(self, job: SceneJob, *, reason="", remaining_uris=(), min_evidence_nodes=3,
+                       deferred_uris=()):
         return self._change(job, "mark_succeeded", reason=reason, remaining_uris=remaining_uris,
-                            min_evidence_nodes=min_evidence_nodes)
+                            min_evidence_nodes=min_evidence_nodes, deferred_uris=deferred_uris)
 
-    def mark_waiting(self, job: SceneJob, *, reason="", remaining_uris=None):
-        return self._change(job, "mark_waiting", reason=reason, remaining_uris=remaining_uris)
+    def mark_waiting(self, job: SceneJob, *, reason="", remaining_uris=None, deferred_uris=()):
+        return self._change(job, "mark_waiting", reason=reason, remaining_uris=remaining_uris,
+                            deferred_uris=deferred_uris)
 
     def mark_retry(self, job: SceneJob, *, reason, delay_seconds):
         return self._change(job, "mark_retry", reason=reason, delay_seconds=delay_seconds)

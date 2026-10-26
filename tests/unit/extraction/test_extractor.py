@@ -18,16 +18,57 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
+from core.errors import LLMCallError, LLMOutputTruncatedError, ToolCallProtocolError
 from core.models import RequestContext, CandidateMemory
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import build_extraction_tools, build_tool_to_category
-from extraction.tools import Extractor, _PreparedSpan, _Span
+from extraction.tools import Extractor, _PreparedSpan, _SPAN_SCHEMA, _Span
 from providers.llm.mock_llm import MockLLM
 
 
 class TestExtractorEmptyResults:
     """Tests for Extractor with no tool calls."""
+
+    @pytest.mark.parametrize("original_error", [None, LLMCallError("output truncated")])
+    def test_lazy_llm_failure_is_not_successful_empty_extraction(self, monkeypatch, original_error):
+        from types import SimpleNamespace
+        loop = Mock()
+        loop.run.return_value = SimpleNamespace(
+            finish_reason="llm_error", llm_error=original_error, candidates=[],
+        )
+        monkeypatch.setattr(
+            "extraction.extraction_react_loop.ExtractionReActLoop",
+            Mock(return_value=loop),
+        )
+        extractor = Extractor(MockLLM(), mode="lazy")
+        extractor._structure_span_eager = Mock()
+        ctx = RequestContext(account_id="a", user_id="u", agent_id="g",
+                             session_id="s", trace_id="t")
+        with pytest.raises(LLMCallError) as error:
+            extractor._structure_span_lazy(_Span(start=0, end=0), "prompt", ctx)
+        if original_error is not None:
+            assert error.value is original_error
+        extractor._structure_span_eager.assert_not_called()
+
+    @pytest.mark.parametrize("message_count", [1, 3])
+    def test_span_prompt_and_schema_bound_outer_message_indices(self, message_count):
+        llm = MockLLM()
+        llm.complete_json = Mock(return_value={"spans": []})
+        extractor = Extractor(llm)
+        messages = [{"role": "user", "content": "Alice: Hello\nBob: Hi\nAlice: I paint."}
+                    for _ in range(message_count)]
+        assert extractor._identify_spans(messages, None, "") == []
+        prompt = llm.complete_json.call_args.args[0]
+        schema = llm.complete_json.call_args.kwargs["schema"]
+        assert f"exactly {message_count} indexed messages" in prompt
+        assert "INSIDE one message are not additional messages" in prompt
+        spans = schema["properties"]["spans"]
+        assert spans["maxItems"] == message_count
+        for key in ("start", "end"):
+            assert spans["items"]["properties"][key]["minimum"] == 0
+            assert spans["items"]["properties"][key]["maximum"] == message_count - 1
+        assert "maxItems" not in _SPAN_SCHEMA["properties"]["spans"]
+        assert "maximum" not in _SPAN_SCHEMA["properties"]["spans"]["items"]["properties"]["start"]
 
     def test_default_lazy_react_timeout_is_long_enough_for_slow_tool_extraction(self):
         """Default ReAct timeout gives slow tool-calling extraction room to finish."""

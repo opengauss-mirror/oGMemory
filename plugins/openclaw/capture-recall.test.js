@@ -450,3 +450,54 @@ test("trace and context engine share the runtime agent over HTTP", async () => {
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+for (const busyStatus of [null, 200, 503]) {
+  test(`compose returns canonical context after ${busyStatus ?? "ready"} response`, async (t) => {
+    const calls = [];
+    const context = "Canonical source confirms the release milestone.";
+    const busyAttempts = busyStatus === 503 ? 2 : Number(busyStatus !== null);
+    const server = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw || "{}");
+      calls.push({ path: req.url, body });
+      res.setHeader("Content-Type", "application/json");
+      if (req.url.endsWith("/compose")) {
+        const attempt = calls.filter((call) => call.path.endsWith("/compose")).length;
+        if (attempt <= busyAttempts) {
+          res.statusCode = busyStatus;
+          res.end(JSON.stringify({ ok: false, retryable: true, status: "processing" }));
+          return;
+        }
+        res.end(JSON.stringify({ messages: body.messages, retrievedEvidence: context, estimatedTokens: 42 }));
+        return;
+      }
+      res.end(JSON.stringify({ ok: true, disposed: true, cleaned: true }));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    t.after(async () => {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    });
+    const { engine, hooks } = host({
+      memoryApiBaseUrl: `http://127.0.0.1:${server.address().port}`,
+      autoCapture: false, prefetchEnabled: false, accountId: "compose-account", userId: "compose-user",
+    });
+    const sessionId = `compose-recovery-${busyStatus ?? "ready"}`;
+    const messages = [{ role: "user", content: "Recall the release milestone." }];
+    const params = { sessionId, messages, prompt: messages[0].content };
+    const assembled = await engine.assemble(params);
+    const composeCalls = calls.filter((call) => call.path.endsWith("/compose"));
+    assert.equal(composeCalls.length, busyAttempts + 1);
+    assert.ok(composeCalls.every((call) => JSON.stringify(call.body) === JSON.stringify(composeCalls[0].body)));
+    assert.deepEqual(assembled.messages[0], messages[0]);
+    assert.ok(assembled.messages.some((message) => message.content.includes(context)));
+    assert.equal(assembled.estimatedTokens, 42);
+    const sessionEnd = hooks.filter((hook) => hook.name === "session_end").at(-1).handler;
+    await sessionEnd({ sessionId, reason: "deleted" }, {});
+    const reused = await engine.assemble(params);
+    assert.ok(reused.messages.some((message) => message.content.includes(context)));
+    assert.equal(calls.filter((call) => call.path.endsWith("/compose")).length, composeCalls.length + 1);
+  });
+}

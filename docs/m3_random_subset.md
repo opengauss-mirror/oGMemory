@@ -46,6 +46,12 @@ Defaults follow the successful `bedroom_03` full-video setup:
 - Raw audio enabled; judge enabled. Debug logging is off to avoid large
   base64 audio payloads.
 
+The default extractor samples at 1 fps and stops after 16 frames. For a
+30-second clip this means frames at approximately 0–15 seconds, **not** uniform
+sampling across the whole clip. `--seconds 0` processes every clip of the full
+video and the audio covers complete clips, but it does not imply complete
+visual coverage. Keep this limitation explicit when interpreting results.
+
 Supported environment overrides:
 
 | Variable | Default / purpose |
@@ -56,7 +62,7 @@ Supported environment overrides:
 | `CONFIG` | `data/ogmem_test_lyj.resolved.yaml` |
 | `ANNOTATIONS` | `data/m3/annotations/robot.json` |
 | `VIDEOS_ROOT` | `data/m3/videos` |
-| `CV_SERVICE_URL` | `http://localhost:8081` |
+| `CV_SERVICE_URL` | Optional explicit override; otherwise use `cv_service.base_url` in the selected YAML (fallback `http://127.0.0.1:8081`). |
 | `ASR_BASE_URL` | Unset: retain the pipeline ASR backend. Set to your OpenAI-compatible ASR base URL to select `openai_http`. |
 | `NO_AUDIO` | `false`; set `true` if the episodic LLM cannot accept raw audio. ASR text remains enabled. |
 | `EXCLUDE` | Optional comma-separated annotated video IDs |
@@ -82,8 +88,13 @@ before launching. Without `ASR_BASE_URL`, the full pipeline retains its
 the target machine.
 
 A fresh output directory does not isolate the SQL graph. Reusing the same
-account/database can update shared evidence; use a dedicated test database or
-account when isolation is needed. Additional runner flags can be appended, e.g.
+account/database can update shared evidence. For an independent rerun of the
+**same video**, use a dedicated test database and point both graph and vector
+configuration at it: the current clip loader's legacy IDs are derived from
+`video_id/clip_id`, and the SQL primary key is global, not account-scoped.
+Changing only the account can therefore cause a duplicate-key error rather than
+creating an isolated copy. Do not clear or rewrite the original graph to work
+around this. Additional runner flags can be appended, e.g.
 `--account-id <experiment-account>`.
 
 ## Outputs and interpretation
@@ -101,7 +112,48 @@ The aggregate mean is question-weighted; a per-video mean averaged across videos
 can be reported separately to give videos equal weight. This is a reproducible
 pilot, not a definitive full-benchmark result.
 
+The graph/ReAct QA driver returns exit code 2 if **any** question fails, while
+retaining completed records for targeted resume. An older implementation
+returned zero for a mixture of answered and failed questions; always inspect
+the per-question `error` and `finish_reason`, including for historical runs.
+
+Multimodal calls preserve the extraction operator's system instructions before
+appending the JSON schema requirement. The schema alone does not communicate
+the full policy for retaining speech facts, object identities, and locations.
+Responses with `finish_reason=length` are rejected before lenient JSON parsing;
+closing truncated braces must not turn an incomplete memory into a success.
+
+Repeated Search cache hits do not copy the entire evidence payload into the
+model conversation again when an identical full payload is still present there.
+The new tool message retains node references and points to that earlier tool
+call. Search results in the cache, `tools_used`, and the retrieval audit remain
+complete. If the earlier full result has been removed or changed, no compaction
+is performed. This prevents repeated cached searches from exhausting a context
+window without adding any information.
+
 ## 模型过载重试与人脸聚类加速
+
+### 单次 LLM 请求超时
+
+M3 的 episodic、QA 和 judge 客户端继承顶层
+`llm.request_timeout_seconds`，也可以在各自的 `m3.*_llm` 中覆盖：
+
+```yaml
+llm:
+  request_timeout_seconds: 300
+m3:
+  episodic_llm:
+    request_timeout_seconds: 600
+```
+
+未配置时保留 120 秒默认值；配置值必须是正的有限数。该配置同时适用于
+OpenAI-compatible 和 MiniMax 客户端。它与 `--qa-timeout` 的控制循环时间
+预算不同，也不会扩大上下文窗口或 `max_tokens` 输出上限。SDK 内部重试
+可能进一步增加总耗时。
+
+此前 M3 模型工厂没有传递这个配置，导致 YAML 写了 300 秒，客户端仍在
+120 秒时超时。完整视频实验暴露并修复了该问题。修复只影响新建客户端，
+不会热更新正在运行的实验。
 
 ### Episodic memory：有上限的退避
 

@@ -40,7 +40,10 @@ WAIT when the evidence floor or a coherent boundary cannot be established.
 Compare the actual activities, goals, participants, event identity and temporal
 continuity of existing candidates. A broad topic or shared person alone establishes
 relatedness; a common event or continuing goal establishes update/merge identity.
-Use only facts, member URIs and scene IDs supported by the packet.
+Use facts and memory URIs supported by the packet. For UPDATE/MERGE choose
+target_scene_ids exclusively from existing_scenes; preserve the complete union
+of their member_uris. tool_evidence provides source context and discovery hints;
+existing_scenes identifies the eligible targets for this decision window.
 Assign every offered_member_uri either to draft.member_uris or to
 unassigned_member_uris. Select only members with a concrete supporting passage for
 the chosen thread. Keep other offered nodes in unassigned_member_uris for later
@@ -50,8 +53,14 @@ action justification concisely in reason.
 Use evidence_uris for supporting memory URIs selected from draft.member_uris;
 source_refs identify the original source material. A publishable scene requires
 at least limits.min_evidence_nodes supporting members and
-limits.min_independent_sources independent sources. Choose WAIT when this
-evidence is insufficient.
+limits.min_independent_sources independent sources. Each memory's source_group_ids
+lists its resolved original sources in source_groups. Count distinct group IDs
+across evidence_uris: repeated groups across multiple memories count once.
+source_group_aliases entries [short_id, full_ids] identify archive aliases;
+when a selected full_id is present, count its short_id as that same source.
+Choose a coherent subset supported by enough distinct groups, or WAIT when the
+current evidence cannot meet that floor. Return unassigned_member_uris as exactly
+offered_member_uris minus the selected draft.member_uris.
 """ + SCENE_BOUNDARY_RULES + """
 EVIDENCE PACKET:
 """

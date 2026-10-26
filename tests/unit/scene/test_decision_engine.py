@@ -14,6 +14,7 @@ from scene.decision_prompts import DECISION_PROMPT, QUALITY_PROMPT
 from tests.unit.scene.test_decision_application import application_case
 from tests.unit.scene.test_decision_evidence import node, vectors
 from tests.unit.scene.test_decision_preflight import JSONModel
+from tests.unit.scene.test_engine_refresh import source_case
 
 
 @pytest.mark.parametrize("action", ["CREATE", "UPDATE", "MERGE"])
@@ -178,6 +179,36 @@ def test_corrected_batch_recovers_with_fresh_budget_and_quality_review(stage):
     assert [schema["title"] for _, schema in model.requests[3:]] == [
         "PreflightOutput", "SceneDecisionOutput", "QualityGateOutput",
     ]
+
+
+@pytest.mark.parametrize("action", ["CREATE", "UPDATE"])
+@pytest.mark.parametrize("stage", ["preflight", "decision", "quality"])
+def test_four_call_budget_publishes_corrected_and_reviewed_canonical_scene(action, stage):
+    source, nodes, _, proposal = source_case(action)
+    original = deepcopy((nodes, proposal))
+    outputs = [{"status": "READY"}, proposal.model_dump(),
+               {"decision": "ADJUST", "title": "Reviewed Atlas release", "description": "Verified scene evidence"}]
+    position, initial = {
+        "preflight": (0, {"status": "READ"}),
+        "decision": (1, {**proposal.model_dump(), "unassigned_member_uris": []}),
+        "quality": (2, {"decision": "ACCPET"}),
+    }[stage]
+    outputs.insert(position, initial)
+    model = JSONModel(*outputs)
+    engine = SceneDecisionEngine(model, SceneConfig(max_llm_calls_per_batch=4), evidence_reader=source)
+    result = engine.refresh(source, "acct", "user:alice", node_uris=[node.uri for node in nodes])
+
+    assert result.action == action
+    assert result.calls == len(model.requests) == 4
+    assert result.snapshot.scenes == source.repository.snapshot.scenes
+    assert result.snapshot.revision == source.repository.snapshot.revision == 1
+    assert result.snapshot.scenes[0].cluster.label == "Reviewed Atlas release"
+    assert result.snapshot.scenes[0].cluster.summary == "Verified scene evidence"
+    assert result.snapshot.scenes[0].version == (1 if action == "CREATE" else 2)
+    assert result.pending_member_uris == (nodes[-1].uri,)
+    assert model.requests[-1][1]["title"] == "QualityGateOutput"
+    assert "OUTPUT CORRECTION" in model.requests[position + 1][0]
+    assert (nodes, proposal) == original
 
 
 def test_configured_engines_share_model_and_limits_and_reset_each_batch_budget():

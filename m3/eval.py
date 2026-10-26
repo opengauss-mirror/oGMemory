@@ -523,6 +523,7 @@ def run(args: argparse.Namespace) -> int:
         temperature=args.temperature,
         config_path=args.config,
     )
+    from m3.context_budget import load_context_budget
     adapter = OGMemoryControlAdapter(
         llm=answer_llm,
         graph=graph,
@@ -536,6 +537,7 @@ def run(args: argparse.Namespace) -> int:
         include_neighbors=getattr(args, "include_neighbors", 1),
         timeout_seconds=args.timeout_seconds,
         default_video_id=args.default_video_id,
+        context_budget=load_context_budget(args.config),
     )
 
     mode = "a" if args.resume else "w"

@@ -150,6 +150,91 @@ def test_media_probe_requires_provenance_and_complete_outputs(tmp_path, kind):
     assert not probe(ctx, stage, None).complete
 
 
+@pytest.mark.parametrize("disabled", [
+    ["trim"], ["preprocess"], ["load_clips"], ["trim", "preprocess", "load_clips"],
+])
+def test_targeted_resume_keeps_original_media_identity(tmp_path, disabled):
+    from m3.pipeline.provenance import validate_input
+    ctx = context(tmp_path)
+    spec = SimpleNamespace(stages=[
+        StageSpec("trim", "video.trim", params={"seconds": "{seconds}"}),
+        StageSpec("preprocess", "m3.preprocess", params={"clip_seconds": 30}),
+        StageSpec("load_clips", "m3.load_clips", params={"clip_seconds": 30}),
+    ])
+    ctx.variables["seconds"] = ctx.seconds
+    validate_input(ctx, spec)
+    path = tmp_path / "input_provenance.json"
+    original = path.read_bytes()
+    for stage in spec.stages:
+        stage.enabled = stage.id not in disabled
+    validate_input(ctx, spec)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("change", [
+    "source", "seconds", "account_id", "video_id", "trim", "preprocess", "load_clips",
+    "removed_stage",
+])
+def test_targeted_resume_still_rejects_changed_media_identity(tmp_path, change):
+    from m3.pipeline.provenance import validate_input
+    ctx = context(tmp_path)
+    spec = SimpleNamespace(stages=[
+        StageSpec("trim", "video.trim", params={"seconds": 120}),
+        StageSpec("preprocess", "m3.preprocess", params={"clip_seconds": 30}),
+        StageSpec("load_clips", "m3.load_clips", params={"clip_seconds": 30}),
+    ])
+    validate_input(ctx, spec)
+    path = tmp_path / "input_provenance.json"
+    original = path.read_bytes()
+    for stage in spec.stages:
+        stage.enabled = False
+    if change == "source":
+        ctx.video.write_bytes(b"changed")
+    elif change == "seconds":
+        ctx.seconds = 60
+    elif change in ("account_id", "video_id"):
+        setattr(ctx, change, "different")
+    elif change == "removed_stage":
+        spec.stages.pop()
+    else:
+        stage = next(stage for stage in spec.stages if stage.id == change)
+        stage.params["seconds" if change == "trim" else "clip_seconds"] = 60
+    with pytest.raises(RuntimeError, match="new --work-dir AND"):
+        validate_input(ctx, spec)
+    assert path.read_bytes() == original
+
+
+def test_resume_cli_can_disable_completed_stages_without_changing_provenance(tmp_path, monkeypatch):
+    from m3.run_video_pipeline import parse_args, run_pipeline
+    ctx = context(tmp_path)
+    run = Mock(return_value={})
+    monkeypatch.setattr("m3.pipeline.runner.PipelineRunner.run", run)
+    argv = [
+        "--video", str(ctx.video), "--video-id", "v", "--seconds", "0",
+        "--work-dir", str(tmp_path), "--config", str(ctx.config_path),
+        "--pipeline", "config/m3/pipelines/video_episodic_full.yaml",
+        "--account-id", "m3bench", "--no-smart-resume",
+    ]
+    run_pipeline(parse_args(argv))
+    path = tmp_path / "input_provenance.json"
+    original = path.read_bytes()
+    disabled = [
+        "trim", "annotate", "preprocess", "load_clips", "extract_audio",
+        "extract_frames", "detect_faces", "voice_asr", "speaker_diarization",
+        "speaker_embedding", "episodic_memory", "create_memory_nodes",
+    ]
+    for name in disabled:
+        argv.extend(["--disable-stage", name])
+    run_pipeline(parse_args(argv))
+    assert run.call_count == 2
+    spec = run.call_args.args[0]
+    assert [stage.id for stage in spec.stages if stage.enabled] == [
+        "build_index", "face_clustering", "voice_segmentation",
+        "voice_clustering", "semantic_memory_consolidator", "qa",
+    ]
+    assert path.read_bytes() == original
+
+
 def test_reuse_graph_resolves_yaml_dsn_before_probe(tmp_path, monkeypatch):
     from m3 import resume
     from m3.run_video_pipeline import parse_args, run_pipeline

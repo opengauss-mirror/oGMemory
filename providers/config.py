@@ -81,6 +81,7 @@ class ProviderConfig:
 
     # Maximum characters sent for each OpenAI-compatible embedding input.
     embedding_max_input_chars: int = 30_000
+    embedding_batch_size: int = 2048
 
     # Lazy secrets cache
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
@@ -139,6 +140,7 @@ class ProviderConfig:
             openai_embedding_api_key_command=cfg.openai_embedding_api_key_command,
             embedding_multimodal=cfg.embedding_multimodal,
             embedding_max_input_chars=cfg.embedding_max_input_chars,
+            embedding_batch_size=cfg.embedding_batch_size,
             embedding_dimension=cfg.opengauss_dimension,
         )
 
@@ -209,6 +211,7 @@ class ProviderConfig:
                     cache_max_size=self.cache_max_size,
                     multimodal=self.embedding_multimodal,
                     max_input_chars=self.embedding_max_input_chars,
+                    batch_size=self.embedding_batch_size,
                 )
             return OpenAIEmbedder(
                 api_key=emb_key,
@@ -217,6 +220,7 @@ class ProviderConfig:
                 dimension=self.opengauss_dimension,
                 multimodal=self.embedding_multimodal,
                 max_input_chars=self.embedding_max_input_chars,
+                batch_size=self.embedding_batch_size,
             )
 
         raise ValueError(f"Unknown embedding provider: {ep}")
@@ -303,6 +307,7 @@ class ProviderConfig:
             openai_embedding_api_key_command=self.openai_embedding_api_key_command,
             embedding_multimodal=self.embedding_multimodal,
             embedding_max_input_chars=self.embedding_max_input_chars,
+            embedding_batch_size=self.embedding_batch_size,
             vector_db_type=self.vector_db_type,
             opengauss_connection_string=self.opengauss_connection_string,
             opengauss_dimension=self.opengauss_dimension,

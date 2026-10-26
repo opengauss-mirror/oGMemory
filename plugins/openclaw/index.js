@@ -489,11 +489,13 @@ async function callHttp(baseUrl, method, params, cfg = {}) {
       headers,
       body: JSON.stringify(params),
       signal: AbortSignal.timeout(
-        method === "after_turn"
-          ? 300_000
-          : method === "govern_first_view_tool_result"
-            ? 10_000
-            : 120_000,
+        cfg.requestTimeoutMs ?? (
+          method === "after_turn"
+            ? 300_000
+            : method === "govern_first_view_tool_result"
+              ? 10_000
+              : 120_000
+        ),
       ),
     });
     if (!resp.ok) {
@@ -596,6 +598,34 @@ async function deleteSessionHttp(baseUrl, sessionId, params, cfg = {}) {
       error: err.message,
     };
   }
+}
+
+const COMPOSE_MAX_ATTEMPTS = 3;
+const COMPOSE_RETRY_DELAY_MS = 250;
+const COMPOSE_TIMEOUT_MS = 120_000;
+
+async function composeWithRetry(call, params) {
+  const deadline = performance.now() + COMPOSE_TIMEOUT_MS;
+  let result;
+  for (let attempt = 1; attempt <= COMPOSE_MAX_ATTEMPTS; attempt += 1) {
+    const remainingMs = Math.floor(deadline - performance.now());
+    if (remainingMs <= 0) break;
+    result = await call("compose", params, remainingMs);
+    if (result?.ok !== false && result?.status !== "processing" && Array.isArray(result?.messages)) {
+      return result;
+    }
+    const processing = result?.status === "processing"
+      && result?.retryable === true
+      && result?.httpStatus !== 429;
+    if (!processing || attempt === COMPOSE_MAX_ATTEMPTS) break;
+    const delayMs = Math.min(COMPOSE_RETRY_DELAY_MS * attempt, deadline - performance.now());
+    if (delayMs <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  console.error(
+    `[og-memory] compose unavailable: ${result?.error_code || result?.status || result?.httpStatus || "invalid_context"}`,
+  );
+  return null;
 }
 
 const DISPOSE_MAX_ATTEMPTS = 3;
@@ -1641,10 +1671,11 @@ export default {
       return callHttp(ogmemUrl, method, params, authCfg);
     }
 
-    function callAsync(method, params) {
+    function callAsync(method, params, requestTimeoutMs) {
       return callHttp(ogmemUrl, method, params, {
         ...authCfg,
         structuredFailures: true,
+        requestTimeoutMs,
       });
     }
 
@@ -2391,7 +2422,7 @@ export default {
           }
         }
 
-        const result = await call("compose", enhancedParams);
+        const result = await composeWithRetry(callAsync, enhancedParams);
 
         console.log(`[og-memory] compose result keys: ${Object.keys(result || {}).join(',')}`);
         console.log(`[og-memory] assemble: identity=${(result?.identityContext||'').length}b, episodic=${(result?.episodicContext||'').length}b, session=${(result?.sessionContext||'').length}b, ws=${(result?.retrievedEvidence||'').length}b, msgs=${(result?.messages||[]).length}`);

@@ -103,3 +103,26 @@ def resolve_sources(
         else:
             roots.add(ref)
     return independent_sources(roots), reached
+
+
+def with_source_groups(packet: dict[str, Any]) -> dict[str, Any]:
+    """Expose the validator's resolved source identities to the scene model."""
+    cards = packet["memories"]
+    context = [*cards, *(card for result in packet.get("tool_evidence", [])
+                        for card in result.get("results", []) if isinstance(card, dict))]
+    roots = [supporting_sources([card], context) for card in cards]
+    groups = sorted(set().union(*roots))
+    indices = {source: index for index, source in enumerate(groups)}
+    aliases: dict[int, list[int]] = {}
+    for index, (kind, identifier) in enumerate(groups):
+        if kind == "archive" and independent_sources([identifier]) == {("archive", identifier)}:
+            short = indices.get(("archive", urlsplit(identifier).path.rsplit("/", 1)[-1]))
+            if short is not None and short != index:
+                aliases.setdefault(short, []).append(index)
+    return {
+        **packet,
+        "source_groups": groups,
+        "source_group_aliases": list(aliases.items()),
+        "memories": [{**card, "source_group_ids": sorted(indices[source] for source in sources)}
+                     for card, sources in zip(cards, roots)],
+    }

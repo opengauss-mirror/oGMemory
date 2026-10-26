@@ -681,6 +681,35 @@ class TestContextManager:
         assert len(index._pool) == 0
 
 
+@pytest.mark.parametrize(
+    ("dialect", "first_statement"),
+    [
+        ("opengauss", "CREATE TABLE IF NOT EXISTS vector_index"),
+        ("postgresql", "CREATE EXTENSION IF NOT EXISTS vector"),
+    ],
+)
+def test_shared_pool_dialect_selects_vector_bootstrap(monkeypatch, dialect, first_statement):
+    from fs.sql_adapter.pool import SharedConnectionPool
+    from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+    cursor = MockCursor()
+    connection = MockConnection(cursor)
+    pool = SharedConnectionPool("host=storage dbname=memory", dialect=dialect)
+    monkeypatch.setattr(pool, "get_connection", lambda: connection)
+    returned = []
+    monkeypatch.setattr(pool, "return_connection", returned.append)
+
+    index = OpenGaussVectorIndex(pool=pool, dimension=3)
+
+    assert index.sql_dialect.name == dialect
+    assert index._shared_pool is pool
+    assert cursor.executed_sql[0].strip().startswith(first_statement)
+    assert any("embedding     vector(3)" in sql for sql in cursor.executed_sql)
+    assert any("USING hnsw (embedding vector_cosine_ops)" in sql for sql in cursor.executed_sql)
+    assert connection.committed
+    assert returned == [connection]
+
+
 @pytest.mark.skip(reason="Auto-initialization feature not implemented yet")
 class TestAutoInit:
     """Tests for auto-initialization.

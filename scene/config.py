@@ -70,8 +70,8 @@ class SceneConfig:
             raise ValueError("analysis_trigger_tokens must not exceed analysis_input_budget_tokens")
         if self.min_evidence_nodes > self.max_members_per_scene:
             raise ValueError("min_evidence_nodes must not exceed max_members_per_scene")
-        if self.max_llm_calls_per_batch < 2 or self.max_llm_calls_per_batch > 3:
-            raise ValueError("max_llm_calls_per_batch must be in [2, 3]")
+        if self.max_llm_calls_per_batch < 2 or self.max_llm_calls_per_batch > 4:
+            raise ValueError("max_llm_calls_per_batch must be in [2, 4]")
         for name in (
             "similarity_threshold",
             "strong_pair_threshold",

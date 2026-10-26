@@ -37,6 +37,70 @@ def test_worker_waits_then_processes_accumulated_evidence():
     assert engine.windows == [("n1",), ("n2", "n1")]
 
 
+class CapacityWindowEngine(Engine):
+    def __init__(self, capacity=3):
+        super().__init__("WAIT")
+        self.capacity = capacity
+        self.reviewed = []
+
+    def refresh(self, store, account_id, owner_space, *, node_uris):
+        self.windows.append(tuple(node_uris))
+        selected = tuple(node_uris[:self.capacity])
+        self.reviewed.extend(selected)
+        return SceneDecisionResult(
+            SceneSnapshot(account_id, owner_space, 1), self.action,
+            pending_member_uris=tuple(node_uris) if self.action == "WAIT" else tuple(node_uris[self.capacity:]),
+            reviewed_member_uris=selected, deferred_member_uris=tuple(node_uris[self.capacity:]),
+        )
+
+
+def exercise_capacity_wait_windows(jobs, reopen=lambda jobs: jobs):
+    engine = CapacityWindowEngine()
+    original = [f"n{index}" for index in range(6)]
+    jobs.enqueue("acct", "user:a", original, token_count=100, max_pending_nodes=6)
+    outcomes = []
+    for round_number in range(12):
+        jobs = reopen(jobs)
+        outcome = SceneWorker(jobs, engine, object()).process_next("worker")
+        if outcome is None:
+            break
+        outcomes.append(outcome)
+        if round_number == 0:
+            jobs.enqueue("acct", "user:a", ["n6", "n7"], token_count=1,
+                         trigger_tokens=100, max_pending_nodes=6)
+    assert len(outcomes) == 4
+    assert all(outcome.job.status == SceneJobStatus.WAITING for outcome in outcomes)
+    assert engine.windows[:2] == [tuple(original), ("n3", "n0", "n4", "n1", "n5", "n2")]
+    assert outcomes[1].job.retained_node_uris == ("n0", "n1", "n2")
+    assert set(engine.reviewed) == {*original, "n6", "n7"}
+    summary = reopen(jobs).summary("acct", "user:a")
+    assert (summary["pending_nodes"], summary["retained_nodes"]) == (0, 8)
+    return outcomes
+
+
+def test_capacity_wait_windows_review_all_fresh_evidence_and_settle():
+    exercise_capacity_wait_windows(InMemorySceneJobStore())
+
+
+def test_capacity_blocked_input_remains_available_for_a_larger_window():
+    jobs = InMemorySceneJobStore()
+    nodes = ("n1", "n2", "n3")
+    jobs.enqueue("acct", "user:a", nodes, token_count=1)
+    engine = CapacityWindowEngine(capacity=0)
+    blocked = SceneWorker(jobs, engine, object()).process_next("worker")
+    saved = jobs.get(blocked.job.job_id)
+    assert saved.status == SceneJobStatus.FAILED
+    assert saved.node_uris == nodes
+    assert saved.reason == "scene capacity blocked: requested evidence exceeds the window"
+    assert jobs.due_at("acct", "user:a") is None
+    engine.capacity = 3
+    engine.action = "CREATE"
+    jobs.enqueue("acct", "user:a", saved.node_uris, token_count=1)
+    completed = SceneWorker(jobs, engine, object()).process_next("worker")
+    assert completed.job.status == SceneJobStatus.SUCCEEDED
+    assert completed.decision.reviewed_member_uris == nodes
+
+
 @pytest.mark.parametrize(("owner", "usage_owner"), [
     ("user:a", "user:a"), ("user_a", "user:a"),
     ("agent:a", "agent:a"), ("agent_a", "agent:a"),
@@ -160,3 +224,58 @@ def test_worker_binds_fresh_owner_configuration_for_each_window(cached):
         jobs.enqueue("acct", "user:a", [f"n{count}"], token_count=1)
         assert worker.process_next("worker").job.status == SceneJobStatus.SUCCEEDED
     assert used == [2, 4]
+
+
+def exercise_mixed_capacity_checkpoint(jobs, reopen=lambda jobs: jobs):
+    class MixedEngine(Engine):
+        def refresh(self, store, account_id, owner_space, *, node_uris):
+            self.windows.append(tuple(node_uris))
+            return SceneDecisionResult(
+                SceneSnapshot(account_id, owner_space, 0), "WAIT",
+                pending_member_uris=tuple(node_uris),
+                reviewed_member_uris=tuple(uri for uri in node_uris if uri == "normal"),
+                deferred_member_uris=("oversized",),
+            )
+
+    jobs.enqueue("acct", "user:a", ["oversized", "normal"], token_count=1)
+    engine = MixedEngine()
+    first = SceneWorker(jobs, engine, object()).process_next("worker")
+    assert first.job.status == SceneJobStatus.WAITING
+    jobs = reopen(jobs)
+    stopped = SceneWorker(jobs, engine, object()).process_next("worker")
+    assert stopped.job.status == SceneJobStatus.FAILED
+    assert stopped.job.failure_count == 1
+    assert stopped.job.retained_node_uris == ("normal",)
+    assert len(engine.windows) == 2
+    jobs = reopen(jobs)
+    assert jobs.get(stopped.job.job_id).node_uris == ("oversized", "normal")
+    assert jobs.summary("acct", "user:a")["pending_nodes"] == 0
+    jobs.enqueue("acct", "user:a", stopped.job.node_uris, token_count=1)
+    resumed = SceneWorker(jobs, Engine(), object()).process_next("worker")
+    assert resumed.job.status == SceneJobStatus.SUCCEEDED
+    assert set(resumed.job.node_uris) == {"normal", "oversized"}
+
+
+def test_mixed_capacity_checkpoint_recovers_after_window_expansion():
+    exercise_mixed_capacity_checkpoint(InMemorySceneJobStore())
+
+
+def exercise_retained_publication_continuation(jobs, reopen=lambda jobs: jobs):
+    retained, fresh = ("a", "b", "c"), ("d", "e", "f")
+    jobs.enqueue("acct", "user:a", retained, token_count=1)
+    jobs.mark_waiting(jobs.claim("worker"))
+    jobs = reopen(jobs)
+    jobs.enqueue("acct", "user:a", fresh, token_count=1)
+    claimed = jobs.claim("worker")
+    assert claimed.retained_node_uris == retained
+    jobs.mark_succeeded(claimed, remaining_uris=retained, deferred_uris=("c",))
+    jobs = reopen(jobs)
+    completed = SceneWorker(jobs, Engine(), object()).process_next("worker")
+    assert completed.job.status == SceneJobStatus.SUCCEEDED
+    assert set(completed.job.node_uris) == set(retained)
+    summary = reopen(jobs).summary("acct", "user:a")
+    assert (summary["pending_nodes"], summary["retained_nodes"]) == (0, 0)
+
+
+def test_retained_publication_continues_remaining_evidence():
+    exercise_retained_publication_continuation(InMemorySceneJobStore())

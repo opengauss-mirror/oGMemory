@@ -499,8 +499,8 @@ def handle_compose():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, _lifecycle_result_ok(result), None, tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("compose failed: %s", exc, exc_info=True)
         if rec.enabled:

@@ -23,7 +23,9 @@ class SceneProposalStage:
 
     def decide(self, snapshot: SceneSnapshot, packet: dict[str, Any], budget: CallBudget) -> SceneDecisionOutput:
         return self.caller.call(
-            "decision", DECISION_PROMPT + self.caller.dump(packet), SceneDecisionOutput, budget,
+            "decision", self.caller.budgeted_prompt(DECISION_PROMPT, packet,
+                reserved_chars=self.caller.correction_reserve), SceneDecisionOutput, budget,
+            reserved_calls=int(self.config.max_llm_calls_per_batch >= 4),
             validator=lambda proposal: self.validate(proposal, snapshot, packet),
         )
 
@@ -32,14 +34,18 @@ class SceneProposalStage:
             return QualityGateOutput(decision="DEFER", reason=decision.reason or "awaiting scene evidence")
         if decision.draft is None:
             return QualityGateOutput(decision="DEFER", reason="missing scene draft")
+        prompt = self.quality_prompt(decision, packet)
+        return self.caller.call("quality", prompt, QualityGateOutput, budget)
+
+    def quality_prompt(self, decision: SceneDecisionOutput, packet: dict[str, Any]) -> str:
         members = set(decision.draft.member_uris)
         selected = [card for card in packet["memories"] if card["uri"] in members]
         _, reached = resolve_sources(selected, self._evidence_cards(packet))
         provenance = [card for card in packet["memories"] if card["uri"] not in members
                       and independent_sources([card["uri"]]) & reached]
         evidence = {**packet, "memories": selected, "provenance_context": provenance}
-        prompt = QUALITY_PROMPT + self.caller.dump({"decision": decision.model_dump(), "evidence": evidence})
-        return self.caller.call("quality", prompt, QualityGateOutput, budget)
+        return self.caller.budgeted_prompt(QUALITY_PROMPT, {"decision": decision.model_dump(), "evidence": evidence},
+                                           reserved_chars=self.caller.correction_reserve)
 
     def deterministic_quality_gate(
         self, decision: SceneDecisionOutput, packet: dict[str, Any],
@@ -122,5 +128,8 @@ class SceneProposalStage:
         require(unassigned <= offered, "unassigned_member_uris", "offered_memory_reference_required")
         require(not unassigned & members, "unassigned_member_uris", "member_assignment_must_be_disjoint")
         require(offered <= members | unassigned, "unassigned_member_uris", "offered_memories_must_be_assigned")
+        if not errors and self.config.max_llm_calls_per_batch >= 3:
+            require(len(self.quality_prompt(decision, packet)) <= self.caller.limits.max_prompt_chars - self.caller.correction_reserve,
+                    "draft", "quality_capacity_reduce_members_or_boundary")
         if errors:
             raise SceneModelOutputError("decision", errors)

@@ -278,7 +278,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Optional stage: run m3.detect_faces after frame extraction")
     p.add_argument("--face-backend", choices=("http", "mock"), default="http")
     p.add_argument("--cv-service-url", default=None)
-    p.add_argument("--cv-timeout", type=float, default=30.0)
+    p.add_argument("--cv-timeout", type=float, default=None,
+                   help="Override cv_service.timeout_seconds from config")
     p.add_argument("--face-min-confidence", type=float, default=0.5)
     p.add_argument("--face-max-faces", type=int, default=20)
     p.add_argument("--memory-topic", default=None)

@@ -5675,7 +5675,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 self._invalidate_identity_cache_if_profile_written(session_id, write_result)
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
-                    "after_turn background extract done: run=%s session=%s "
+                    "after_turn background extraction writes ready: run=%s session=%s "
                     "extracted=%d filtered=%d writes=%d skipped=%d failed=%d "
                     "watermark=%d->%d buffer_len_now=%d elapsed_ms=%d",
                     extraction_run_id,
@@ -5738,6 +5738,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
                 if commit_result.get("status") != "failed":
                     _complete_request({"ok": True, "status": "completed"})
+                    # Bench clients use this marker as a completion barrier.
+                    # Emitting it before commit_snapshot could announce
+                    # success even when durable session archival later failed.
+                    logger.info(
+                        "after_turn background extract done: run=%s session=%s "
+                        "extracted=%d writes=%d archived=%s elapsed_ms=%d",
+                        extraction_run_id,
+                        session_id[:8],
+                        write_result.get("candidates_extracted", 0),
+                        write_result.get("writes_completed", 0),
+                        commit_result.get("archived"),
+                        int((_time.monotonic() - start_time) * 1000),
+                    )
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
                 self._queue_card_format_recovery(

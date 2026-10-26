@@ -8,10 +8,12 @@ working directory (where ``data/annotations/robot.json`` and
 
 from __future__ import annotations
 
+import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 # Tenant id used for all M3-Bench data inside oG-Memory's graph.
 # All videos for a benchmark run share one account so multi-tenant
@@ -100,6 +102,7 @@ class M3ModelConfig:
     model: str = ""
     temperature: float = 0.2
     max_tokens: int = 4096
+    request_timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,15 @@ class M3RuntimeConfig:
     vector_index_connection_string: str | None = None
     vector_index_table_name: str = "m3_episodic_vectors"
     vector_index_pool_size: int = 5
+    embedding_batch_size: int = 2048
+
+    def __post_init__(self):
+        if (
+            isinstance(self.embedding_batch_size, bool)
+            or not isinstance(self.embedding_batch_size, int)
+            or not 1 <= self.embedding_batch_size <= 2048
+        ):
+            raise ValueError("embedding_batch_size must be an integer between 1 and 2048")
 
 
 def _load_yaml_config(config_path: str | None = None) -> dict[str, Any]:
@@ -158,7 +170,76 @@ def _pick(mapping: dict[str, Any], key: str, default: Any = None) -> Any:
     return default if value in (None, "") else value
 
 
+@dataclass(frozen=True)
+class CVServiceConfig:
+    """Connection to the bundled or an externally deployed compatible CV service."""
+
+    base_url: str = "http://127.0.0.1:8081"
+    timeout_seconds: float = 30.0
+    auth_token: str | None = field(default=None, repr=False)
+
+
+def load_cv_service_config(
+    config_path: str | None = None,
+    *,
+    base_url: str | None = None,
+    timeout_seconds: float | None = None,
+    auth_token: str | None = None,
+) -> CVServiceConfig:
+    """Resolve explicit options > exported environment > YAML > Compose defaults.
+
+    Like the other M3 loaders, this does not source deploy/.env. YAML values
+    may reference exported environment variables using ${NAME}.
+    """
+    block = _load_yaml_config(config_path).get("cv_service")
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise ValueError("cv_service must be a mapping")
+    url = base_url or os.environ.get("OGMEM_CV_SERVICE_URL") or _pick(
+        block, "base_url", "http://127.0.0.1:8081",
+    )
+    if not isinstance(url, str):
+        raise ValueError("cv_service.base_url must be an HTTP(S) service URL")
+    try:
+        parsed = urlsplit(url)
+        valid_url = parsed.scheme in ("http", "https") and parsed.hostname and parsed.port != 0
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise ValueError("cv_service.base_url must be an HTTP(S) service URL")
+
+    timeout = timeout_seconds if timeout_seconds is not None else _pick(
+        block, "timeout_seconds", 30.0,
+    )
+    try:
+        if isinstance(timeout, bool):
+            raise ValueError
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("cv_service.timeout_seconds must be a positive finite number") from None
+    token = auth_token if auth_token is not None else (
+        os.environ.get("OGMEM_CV_AUTH_TOKEN") or _pick(block, "auth_token")
+    )
+    if token is not None and not isinstance(token, str):
+        raise ValueError("cv_service.auth_token must be a string")
+    return CVServiceConfig(base_url=url.rstrip("/"), timeout_seconds=timeout, auth_token=token)
+
+
 def _model_from_block(block: dict[str, Any], *, default_provider: str, default_model: str, default_temperature: float) -> M3ModelConfig:
+    timeout = _pick(block, "request_timeout_seconds", 120.0)
+    try:
+        if isinstance(timeout, bool):
+            raise ValueError
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError(
+            "M3 LLM request_timeout_seconds must be a positive finite number"
+        ) from None
     return M3ModelConfig(
         provider=str(_pick(block, "provider", default_provider)),
         api_key=_pick(block, "api_key"),
@@ -166,6 +247,7 @@ def _model_from_block(block: dict[str, Any], *, default_provider: str, default_m
         model=str(_pick(block, "model", default_model)),
         temperature=float(_pick(block, "temperature", default_temperature)),
         max_tokens=int(_pick(block, "max_tokens", 4096)),
+        request_timeout_seconds=timeout,
     )
 
 
@@ -272,6 +354,7 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
         embedding_model=str(_pick(embedding_base, "model", "text-embedding-ada-002")),
         embedding_base_url=_pick(embedding_base, "base_url"),
         embedding_api_key=_pick(embedding_base, "api_key"),
+        embedding_batch_size=_pick(embedding_base, "batch_size", 2048),
         embedding_dimension=(
             int(_pick(embedding_base, "dimension"))
             if _pick(embedding_base, "dimension") is not None

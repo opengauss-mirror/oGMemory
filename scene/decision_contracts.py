@@ -112,6 +112,8 @@ class SceneDecisionResult:
     pending_member_uris: tuple[str, ...] = ()
     calls: int = 0
     reason: str = ""
+    reviewed_member_uris: tuple[str, ...] = ()
+    deferred_member_uris: tuple[str, ...] = ()
 
 
 class SceneDecisionError(ValueError):

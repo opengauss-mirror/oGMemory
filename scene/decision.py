@@ -19,8 +19,10 @@ from scene.decision_contracts import (
 )
 from scene.decision_evidence import SceneEvidenceBuilder
 from scene.decision_preflight import ScenePreflight
+from scene.decision_prompts import DECISION_PROMPT, QUALITY_PROMPT
 from scene.decision_proposal import SceneProposalStage
-from scene.decision_sources import node_source_refs
+from scene.decision_sources import node_source_refs, with_source_groups
+from scene.decision_window import decision_window
 from scene.models import SceneSnapshot
 from scene.store import SceneDecisionStore
 
@@ -62,20 +64,56 @@ class SceneDecisionEngine:
         canonical = {node.uri: node for node in nodes}
         for card in packet["memories"]:
             card["source_refs"] = list(node_source_refs(canonical[card["uri"]]))
-        return packet
+        return with_source_groups(packet)
 
-    def _decide_with_result(self, snapshot, nodes, embeddings, *, source_fingerprints=None):
+    def _fits_window(self, packet):
+        caller = self._proposal.caller
+        reserve = caller.correction_reserve
+        if len(self._preflight.prompt(packet)[1]) > self.limits.max_prompt_chars - reserve:
+            return False
+        if len(caller.budgeted_prompt(DECISION_PROMPT, packet, reserved_chars=reserve)) > self.limits.max_prompt_chars - reserve:
+            return False
+        if self.config.max_llm_calls_per_batch < 3:
+            return True
+        members = sorted((card["uri"] for card in packet["memories"]), key=lambda uri: (-len(uri), uri))[:self.config.max_members_per_scene]
+        estimate = {
+            "action": "MERGE", "target_scene_ids": [card["scene_id"] for card in packet["existing_scenes"]],
+            "draft": {"title": "t" * min(120, self.limits.max_prompt_chars // 512),
+                      "description": "d" * min(2_000, self.limits.max_prompt_chars // 32),
+                      "member_uris": members, "boundary": {}, "time_start": None, "time_end": None},
+            "evidence_uris": members, "unassigned_member_uris": packet["offered_member_uris"],
+            "conflicts": [], "reason": "r" * min(1_000, self.limits.max_prompt_chars // 64),
+        }
+        prompt = caller.budgeted_prompt(QUALITY_PROMPT, {"decision": estimate, "evidence": packet}, reserved_chars=reserve)
+        return len(prompt) <= self.limits.max_prompt_chars - reserve
+
+    def _decide_with_result(self, snapshot, nodes, embeddings, *, source_fingerprints=None, requested_uris=None):
         self._evidence.validate_input(snapshot, nodes, embeddings)
+        known = {node.uri for node in nodes}
+        requested_order = list(requested_uris) if requested_uris is not None else [node.uri for node in nodes]
+        requested = set(requested_order)
+        selected, deferred = known, requested - known
+
+        def finish(snapshot, action, **kwargs):
+            return SceneDecisionResult(snapshot, action, reviewed_member_uris=tuple(sorted(selected)),
+                                       deferred_member_uris=tuple(sorted(deferred)), **kwargs)
+
         if not nodes:
-            return SceneDecisionResult(snapshot, "WAIT", reason="empty input")
+            return finish(snapshot, "WAIT", pending_member_uris=tuple(sorted(requested)), reason="empty input")
         known = {node.uri for node in nodes}
         if len(nodes) < self.config.min_evidence_nodes:
-            return SceneDecisionResult(
+            return finish(
                 snapshot, "WAIT", pending_member_uris=tuple(sorted(known)),
                 reason="evidence count below configured threshold",
             )
 
-        packet = self._packet(snapshot, nodes, embeddings)
+        packet = decision_window(self._packet(snapshot, nodes, embeddings), requested_order, self._fits_window)
+        selected = {card["uri"] for card in packet["memories"]}
+        deferred = requested - selected
+        if len(selected) < self.config.min_evidence_nodes or not self._fits_window(packet):
+            selected, deferred = set(), requested
+            return finish(snapshot, "WAIT", pending_member_uris=tuple(sorted(requested)),
+                                       reason="complete evidence retained for a capacity-bounded window")
         budget = CallBudget(self.config.max_llm_calls_per_batch)
         preflight = self._preflight.run(packet, budget)
         if source_fingerprints is not None:
@@ -86,40 +124,48 @@ class SceneDecisionEngine:
                 for card in result.get("results", []) if isinstance(card, dict)
                 and isinstance(card.get("uri"), str) and isinstance(card.get("node_fingerprint"), str)
             )
-        packet = self._expand_evidence(snapshot, nodes, embeddings, packet)
+        packet = decision_window(with_source_groups(self._expand_evidence(snapshot, nodes, embeddings, packet)),
+                                 requested_order, self._fits_window)
+        selected = {card["uri"] for card in packet["memories"]}
+        deferred = requested - selected
+        if len(selected) < self.config.min_evidence_nodes or not self._fits_window(packet):
+            selected, deferred = set(), requested
+            return finish(snapshot, "WAIT", calls=budget.used,
+                                       pending_member_uris=tuple(sorted(requested)),
+                                       reason="complete tool evidence retained for a capacity-bounded window")
         known = {node.uri for node in nodes}
         offered = set(packet["offered_member_uris"])
         preflight = self._preflight.enforce_gate(packet, preflight)
         if preflight.status == "WAIT":
-            return SceneDecisionResult(
+            return finish(
                 snapshot, "WAIT", calls=budget.used,
-                pending_member_uris=tuple(sorted(offered | (set(preflight.evidence_uris) & known))),
+                pending_member_uris=tuple(sorted(deferred | offered | (set(preflight.evidence_uris) & known))),
                 reason=preflight.reason or "; ".join(preflight.missing),
             )
 
         decision = self._proposal.decide(snapshot, packet, budget)
         if decision.action == "WAIT":
-            return SceneDecisionResult(
+            return finish(
                 snapshot, "WAIT", calls=budget.used,
-                pending_member_uris=tuple(sorted(offered | (set(decision.unassigned_member_uris) & known))),
+                pending_member_uris=tuple(sorted(deferred | offered | (set(decision.unassigned_member_uris) & known))),
                 reason=decision.reason or "; ".join(decision.conflicts),
             )
 
         floor = self._proposal.deterministic_quality_gate(decision, packet)
         if floor.decision == "DEFER":
-            return SceneDecisionResult(
-                snapshot, "WAIT", pending_member_uris=tuple(sorted(offered)),
+            return finish(
+                snapshot, "WAIT", pending_member_uris=tuple(sorted(deferred | offered)),
                 calls=budget.used, reason=floor.reason,
             )
-        if self.config.max_llm_calls_per_batch == 3:
+        if self.config.max_llm_calls_per_batch >= 3:
             if budget.remaining == 0:
                 raise SceneCallBudgetError("quality")
             gate = self._proposal.review(decision, packet, budget)
         else:
             gate = floor
         if gate.decision == "DEFER":
-            return SceneDecisionResult(
-                snapshot, "WAIT", pending_member_uris=tuple(sorted(offered)),
+            return finish(
+                snapshot, "WAIT", pending_member_uris=tuple(sorted(deferred | offered)),
                 calls=budget.used, reason=gate.reason,
             )
         if gate.decision == "ADJUST" and decision.draft is not None:
@@ -130,13 +176,13 @@ class SceneDecisionEngine:
                 }),
             })
         replacement = self._applier.apply(snapshot, nodes, embeddings, decision)
-        pending = tuple(sorted(set(decision.unassigned_member_uris)))
+        pending = tuple(sorted(deferred | set(decision.unassigned_member_uris)))
         if replacement == snapshot:
-            return SceneDecisionResult(
+            return finish(
                 snapshot, "WAIT", pending_member_uris=pending,
                 calls=budget.used, reason="no projection change",
             )
-        return SceneDecisionResult(
+        return finish(
             replacement, decision.action, pending_member_uris=pending, calls=budget.used,
         )
 
@@ -145,24 +191,29 @@ class SceneDecisionEngine:
         tool_evidence = packet.get("tool_evidence", [])
         if not callable(loader) or not tool_evidence:
             return packet
-        requested, selected_ids = [], set()
+        units, selected_ids = [], set()
         for result in tool_evidence:
             for item in result.get("results", []):
                 if not isinstance(item, dict):
                     continue
                 if result["tool"] == "search_related_nodes" and isinstance(item.get("uri"), str):
-                    requested.append(item["uri"])
+                    units.append([item["uri"]])
                 if result["tool"] == "search_scene_cards" and isinstance(item.get("scene_id"), str):
                     selected_ids.add(item["scene_id"])
-        for record in snapshot.scenes:
-            if record.scene_id in selected_ids:
-                requested.extend(member.context_uri for member in record.cluster.members)
+        units.extend([member.context_uri for member in record.cluster.members]
+                     for record in snapshot.scenes if record.scene_id in selected_ids)
         known = {node.uri for node in nodes}
-        requested = list(dict.fromkeys(uri for uri in requested if uri not in known))
-        requested = requested[:max(0, self.limits.max_input_nodes - len(nodes))]
+        admitted, requested = [], set()
+        for unit in units:
+            extra = set(unit) - known
+            if len(known | requested | extra) <= self.limits.max_input_nodes:
+                admitted.append(unit)
+                requested.update(extra)
         if requested:
-            extra, vectors = loader(snapshot.account_id, snapshot.owner_space, requested)
-            extra = [node for node in extra if node.uri in requested and node.uri in vectors]
+            extra, vectors = loader(snapshot.account_id, snapshot.owner_space, sorted(requested))
+            available = {node.uri: node for node in extra if node.uri in requested and node.uri in vectors}
+            accepted = {uri for unit in admitted if set(unit) <= known | available.keys() for uri in unit} - known
+            extra = [available[uri] for uri in sorted(accepted)]
             vectors = {node.uri: vectors[node.uri] for node in extra}
             self._evidence.validate_input(snapshot, nodes + extra, {**embeddings, **vectors})
             nodes.extend(extra)
@@ -183,6 +234,7 @@ class SceneDecisionEngine:
         source_fingerprints = []
         result = self._decide_with_result(
             batch.snapshot, nodes, dict(batch.embeddings), source_fingerprints=source_fingerprints,
+            requested_uris=[uri for uri in node_uris if uri not in batch.unavailable_uris] if node_uris is not None else None,
         )
         pending = set(node_uris or ()) - set(batch.unavailable_uris)
         if result.action != "WAIT":
@@ -192,7 +244,8 @@ class SceneDecisionEngine:
                      for member in scene.cluster.members if member.context_uri in versions
                      and member.node_version != versions[member.context_uri]}
             pending.difference_update(versions.keys() - stale)
-        result = replace(result, pending_member_uris=tuple(sorted(set(result.pending_member_uris) | pending)))
+        result = replace(result, pending_member_uris=tuple(sorted(
+            (set(result.pending_member_uris) | pending) - set(batch.unavailable_uris))))
         if result.snapshot is not batch.snapshot and not store.compare_and_swap(
             batch.snapshot, result.snapshot, evidence_nodes=nodes, source_fingerprints=source_fingerprints,
         ):

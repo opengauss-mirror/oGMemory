@@ -45,9 +45,9 @@ from service.graph_service import GraphService
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _ctx() -> RequestContext:
+def _ctx(account_id=M3BENCH_ACCOUNT_ID) -> RequestContext:
     return RequestContext(
-        account_id=M3BENCH_ACCOUNT_ID, user_id="u", agent_id="a",
+        account_id=account_id, user_id="u", agent_id="a",
         session_id="m3bench-voice-clustering-test", trace_id="t-test",
     )
 
@@ -315,11 +315,17 @@ def test_voice_clustering_stage_is_registered():
     assert "m3.voice_clustering" in DEFAULT_STAGE_REGISTRY
 
 
-def test_voice_clustering_stage_writes_edges_through_pipeline(tmp_path: Path):
+@pytest.mark.parametrize("account_id", [M3BENCH_ACCOUNT_ID, "isolated-pilot"])
+def test_voice_clustering_stage_writes_edges_through_pipeline(tmp_path: Path, account_id):
     """End-to-end: seed two voice segments with close embeddings, run
     the stage, verify edges + JSONL."""
     graph = GraphService(MemoryGraphStore())
-    ctx = _ctx()
+    ctx = _ctx(account_id)
+    other_ctx = _ctx("other-account")
+    _seed_voice_segment(graph, other_ctx, node_id="other_a",
+                        embedding=[1.0, 0.0], voice_id="other")
+    _seed_voice_segment(graph, other_ctx, node_id="other_b",
+                        embedding=[0.99, 0.01], voice_id="other")
     _seed_voice_segment(graph, ctx, node_id="v_a",
                         embedding=[1.0, 0.0], voice_id="va")
     _seed_voice_segment(graph, ctx, node_id="v_b",
@@ -334,7 +340,7 @@ def test_voice_clustering_stage_writes_edges_through_pipeline(tmp_path: Path):
         video_id="v", seconds=10, work_dir=tmp_path / "run",
         config_path=Path("deploy/ogmemory.yaml"),
         graph_store="memory", connection_string=None,
-        account_id=M3BENCH_ACCOUNT_ID,
+        account_id=account_id,
         artifacts={"voice_clusters": tmp_path / "run" / "voice_clusters.jsonl"},
         variables={}, graph=graph,
     )
@@ -347,6 +353,10 @@ def test_voice_clustering_stage_writes_edges_through_pipeline(tmp_path: Path):
     assert result.ok is True
     assert result.counts["voices"] == 2
     assert result.counts["clusters"] == 1
+    for node_id in ("other_a", "other_b"):
+        assert not graph.get_neighbors(
+            node_id, other_ctx, edge_types=[GraphEdgeType.SAME_IDENTITY],
+        )
 
     edges = set()
     for n in graph.list_extracted_nodes(None, ctx):

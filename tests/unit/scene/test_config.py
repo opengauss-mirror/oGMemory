@@ -9,11 +9,12 @@ from scene.config import InMemorySceneConfigProvider, SceneConfig, SceneConfigCa
 def test_config_defaults_and_scoped_overrides():
     defaults = SceneConfig()
     defaults.validate()
-    configured = defaults.merged({"lexical_enabled": True, "neighbor_k": 12})
+    configured = defaults.merged({"lexical_enabled": True, "neighbor_k": 12, "max_llm_calls_per_batch": 4})
     configured.validate()
     assert configured.lexical_enabled is True
     assert configured.neighbor_k == 12
-    assert configured.max_llm_calls_per_batch == 3
+    assert configured.max_llm_calls_per_batch == 4
+    assert defaults.max_llm_calls_per_batch == 3
     assert defaults.neighbor_k == 8
 
 

@@ -26,6 +26,7 @@ def test_from_env_normalizes_base_url_and_parses_numeric_values(monkeypatch: pyt
             opengauss_table_name="memories",
             opengauss_pool_size=7,
             embedding_max_input_chars=8_000,
+            embedding_batch_size=8,
             enable_cache=True,
         )
     )
@@ -41,6 +42,7 @@ def test_from_env_normalizes_base_url_and_parses_numeric_values(monkeypatch: pyt
     assert cfg.opengauss_table_name == "memories"
     assert cfg.opengauss_pool_size == 7
     assert cfg.embedding_max_input_chars == 8_000
+    assert cfg.embedding_batch_size == 8
 
 
 def test_from_env_keeps_existing_v1_suffix(monkeypatch: pytest.MonkeyPatch):
@@ -75,6 +77,7 @@ def test_create_embedder_uses_cached_openai_factory(monkeypatch: pytest.MonkeyPa
         openai_base_url="https://example.com/v1",
         openai_embedding_model="text-embedding-3-small",
         embedding_max_input_chars=8_000,
+        embedding_batch_size=8,
         cache_max_size=123,
     )
 
@@ -88,6 +91,7 @@ def test_create_embedder_uses_cached_openai_factory(monkeypatch: pytest.MonkeyPa
         cache_max_size=123,
         multimodal=False,  # Default embedding_multimodal
         max_input_chars=8_000,
+        batch_size=8,
     )
 
 
@@ -106,6 +110,7 @@ def test_create_embedder_uses_non_cached_openai_factory_when_cache_disabled(
         openai_api_key="secret",
         openai_embedding_model="Qwen/Qwen3-Embedding-0.6B",
         embedding_max_input_chars=8_000,
+        embedding_batch_size=8,
         enable_cache=False,
     )
 
@@ -118,6 +123,7 @@ def test_create_embedder_uses_non_cached_openai_factory_when_cache_disabled(
         dimension=1024,
         multimodal=False,
         max_input_chars=8_000,
+        batch_size=8,
     )
     cached_embedder.assert_not_called()
 

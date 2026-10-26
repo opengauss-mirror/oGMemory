@@ -22,6 +22,7 @@ voice_segmentation) once those operators ship.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -39,6 +40,7 @@ from core.react_loop import (
 )
 from core.tools.operational_tool_spec import operational_tool
 from m3.context_retrieval import neighbor_plan, validate_context_options
+from m3.context_budget import ContextBudget, pack_context
 from m3.retrieval_core import (
     RetrievalBudget,
     fuse_evidence,
@@ -48,6 +50,53 @@ from m3.retrieval_core import (
 from service.graph_service import GraphService
 
 logger = logging.getLogger(__name__)
+
+
+def _compact_cached_search_messages(messages: list[dict], start_index: int) -> None:
+    """Reference duplicate evidence only when its full payload is still in history.
+
+    The search cache, tools_used results, and search_history audit stay unchanged.
+    No new or unique evidence is removed, and an absent/pruned first result
+    prevents compaction. This avoids copying many kilobytes on every cache hit.
+    """
+    groups = ("hits", "context_hits", "boundary_hits")
+    prior = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "tool" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            payload = json.loads(message["content"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("evidence_payload_omitted"):
+            continue
+        values = [payload.get(group, []) for group in groups]
+        if not all(isinstance(value, list) for value in values):
+            continue
+        hits = [hit for value in values for hit in value]
+        if not hits or not all(isinstance(hit, dict) and hit.get("node_id") for hit in hits):
+            continue
+        reference = next((
+            call_id for call_id, previous in prior
+            if all(previous.get(group, []) == payload.get(group, []) for group in groups)
+        ), None)
+        if index >= start_index and payload.get("duplicate_query") and reference:
+            compact = dict(payload)
+            for group in groups:
+                compact[group] = [
+                    {key: hit[key] for key in ("node_id", "video_id", "clip_id") if key in hit}
+                    for hit in payload.get(group, [])
+                ]
+            compact["evidence_payload_omitted"] = True
+            compact["evidence_reference_tool_call_id"] = reference
+            compact["guidance"] = (
+                str(payload.get("guidance") or "")
+                + f" The identical full evidence is already present in tool result {reference}. "
+                "Refer to that earlier result; the references here are not new evidence."
+            ).strip()
+            message["content"] = json.dumps(compact, ensure_ascii=False)
+        elif message.get("tool_call_id"):
+            prior.append((message["tool_call_id"], payload))
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +359,7 @@ class SearchConfig:
     transcript_fusion: str = "rrf"
     include_neighbors: int = 1
     context_k: int = 0
+    context_budget: ContextBudget | None = None
 
 
 @operational_tool(name="Search", runtime_only=("search_config",))
@@ -340,13 +390,20 @@ def Search(
     if not query or not query.strip():
         return {"error": "query is required"}
     effective_top_k = int(top_k) if top_k else search_config.default_top_k
-    budget = RetrievalBudget(effective_top_k, search_config.candidate_k)
-    validate_transcript_options(search_config.transcript_top_k, search_config.transcript_fusion)
-    if search_config.transcript_top_k:
+    limits = search_config.context_budget
+    candidate_k = search_config.candidate_k
+    transcript_top_k = search_config.transcript_top_k
+    if limits:
+        effective_top_k = min(effective_top_k, limits.max_top_k)
+        candidate_k = min(candidate_k or effective_top_k, limits.max_candidates)
+        transcript_top_k = min(transcript_top_k, limits.max_candidates)
+    budget = RetrievalBudget(effective_top_k, candidate_k)
+    validate_transcript_options(transcript_top_k, search_config.transcript_fusion)
+    if transcript_top_k:
         from core.transcript_lexical import validate_transcript_request
         validate_transcript_request(query, {
             "account_id": ctx.account_id, "video_id": search_config.video_id,
-        }, search_config.transcript_top_k)
+        }, transcript_top_k)
     validate_context_options(search_config.include_neighbors, search_config.context_k)
     if search_config.context_k and not search_config.video_id:
         raise ValueError("exact context requires a video_id")
@@ -412,13 +469,13 @@ def Search(
     hits = rerank_with_transcript_bm25(query, hits, lex_query=stripped_query)
     branch_scores = {}
     retrieval_branches = [{"kind": "vector", "query": q} for q in retrieval_queries]
-    if search_config.transcript_top_k:
+    if transcript_top_k:
         from service.graph_service import ClipScope
         lexical_query = stripped_query or query
         lexical = graph.search_by_transcript(
             lexical_query, ctx,
             scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
-            extractor_types=search_config.extractor_types, top_k=search_config.transcript_top_k,
+            extractor_types=search_config.extractor_types, top_k=transcript_top_k,
         )
         fused = fuse_evidence(
             hits, lexical, identity=lambda hit: hit.node.node_id,
@@ -431,33 +488,67 @@ def Search(
         hits, identity=lambda hit: hit.node.node_id, score=lambda hit: hit.score,
         top_k=budget.final_top_k,
     )
+    boundary = []
+    # Class capability check avoids inventing capabilities on dynamic mocks
+    # and legacy adapters. The real GraphService provides the safe projection.
+    boundary_reader = getattr(type(graph), "get_boundary_transcript", None)
+    if (callable(boundary_reader) and search_config.video_id
+            and search_config.before_sec is not None):
+        from service.graph_service import ClipScope
+        boundary = graph.get_boundary_transcript(
+            ctx, scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
+            extractor_types=search_config.extractor_types,
+        )
+        if boundary:
+            retrieval_branches.append({"kind": "boundary_transcript", "clip_ids": [h.clip_id for h in boundary]})
+
+    main_count = len(hits)
+    context_k = search_config.context_k
+    radius = search_config.include_neighbors
+    if limits:
+        # Reserve boundary/main evidence before planning or reading neighbors.
+        # Final evidence slots are separate from the candidate-clip read budget:
+        # an indexed clip may have no usable evidence.
+        boundary = boundary[:1]
+        hits = hits[:limits.max_result_nodes - len(boundary)]
+        context_k = min(context_k, limits.max_result_nodes - len(boundary) - len(hits))
     contexts = []
-    if search_config.context_k and hits:
+    if context_k and hits:
         from service.graph_service import ClipScope
         plan = neighbor_plan(
             [(h.video_id, h.clip_id, h.node.node_id) for h in hits],
-            radius=search_config.include_neighbors, before_clip=search_config.before_clip,
+            radius=radius, before_clip=search_config.before_clip,
+            max_clips=limits.max_neighbor_clips if limits else None,
         )
         if plan:
-            raw_context = graph.get_evidence_by_clips(
-                [clip for video, clip in plan if video == search_config.video_id], ctx,
-                scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
-                extractor_types=search_config.extractor_types,
-            )
-            ranked_context = []
+            candidates = [clip for video, clip in plan if video == search_config.video_id]
+            requested = []
             seen = {h.node.node_id for h in hits}
-            for h in raw_context:
-                key = (h.video_id, h.clip_id)
-                if key not in plan:
-                    continue
-                distance, rank, parent = plan[key]
-                ranked_context.append(((distance, rank, h.clip_id, h.node.node_id), h, parent, distance))
-            for _, h, parent, distance in sorted(ranked_context, key=lambda item: item[0]):
-                if h.node.node_id not in seen:
-                    seen.add(h.node.node_id)
-                    contexts.append((h, parent, distance))
-            contexts = contexts[:search_config.context_k]
-            retrieval_branches.append({"kind": "exact_neighbor", "clip_ids": [clip for _, clip in plan]})
+            while len(requested) < len(candidates) and len(contexts) < context_k:
+                # Keep SQL parameter counts and round trips bounded. With no
+                # budget retain the historical single-read behavior.
+                batch_size = min(8, context_k - len(contexts)) if limits else len(candidates)
+                batch = candidates[len(requested):len(requested) + batch_size]
+                requested.extend(batch)
+                raw_context = graph.get_evidence_by_clips(
+                    batch, ctx,
+                    scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
+                    extractor_types=search_config.extractor_types,
+                )
+                batch_keys = {(search_config.video_id, clip) for clip in batch}
+                ranked_context = []
+                for h in raw_context:
+                    key = (h.video_id, h.clip_id)
+                    if key not in batch_keys:
+                        continue
+                    distance, rank, parent = plan[key]
+                    ranked_context.append(((distance, rank, h.clip_id, h.node.node_id), h, parent, distance))
+                for _, h, parent, distance in sorted(ranked_context, key=lambda item: item[0]):
+                    if h.node.node_id not in seen:
+                        seen.add(h.node.node_id)
+                        contexts.append((h, parent, distance))
+                contexts = contexts[:context_k]
+            retrieval_branches.append({"kind": "exact_neighbor", "clip_ids": requested})
 
     def serialize(h):
         from core.temporal import temporal_metadata
@@ -483,31 +574,19 @@ def Search(
             ),
         }
 
-    boundary = []
-    # Class capability check avoids inventing capabilities on dynamic mocks
-    # and legacy adapters. The real GraphService provides the safe projection.
-    boundary_reader = getattr(type(graph), "get_boundary_transcript", None)
-    if (callable(boundary_reader) and search_config.video_id
-            and search_config.before_sec is not None):
-        from service.graph_service import ClipScope
-        boundary = graph.get_boundary_transcript(
-            ctx, scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
-            extractor_types=search_config.extractor_types,
-        )
-        if boundary:
-            retrieval_branches.append({"kind": "boundary_transcript", "clip_ids": [h.clip_id for h in boundary]})
-
+    retrieved_before_limit = main_count + len(contexts) + len(boundary)
     return {
         "query": query,
         "retrieval_queries": retrieval_queries,
         "candidate_k": budget.fetch_k(),
         "final_top_k": budget.final_top_k,
         "ranking_policy": (f"transcript_{search_config.transcript_fusion}"
-                           if search_config.transcript_top_k else "vector_transcript_bm25"),
+                           if transcript_top_k else "vector_transcript_bm25"),
         "retrieval_branches": retrieval_branches,
-        "transcript_top_k": search_config.transcript_top_k,
-        "context_k": search_config.context_k,
+        "transcript_top_k": transcript_top_k,
+        "context_k": context_k,
         "boundary_k": 1,
+        "retrieved_before_result_limit": retrieved_before_limit,
         "boundary_hits": [
             {**serialize(h), "evidence_role": "boundary_transcript",
              "retrieval_sources": ["boundary_transcript"], "source_scores": {},
@@ -576,6 +655,7 @@ class OGMemoryControlAdapter(ReactLoop):
         include_neighbors: int = 1,
         context_k: int = 0,
         no_gain_limit: int | None = 3,
+        context_budget: ContextBudget | None = None,
     ) -> None:
         super().__init__(
             llm=llm,
@@ -588,6 +668,8 @@ class OGMemoryControlAdapter(ReactLoop):
         ):
             raise ValueError("no_gain_limit must be an integer >= 2 or None")
         self._no_gain_limit = no_gain_limit
+        self._context_budget = context_budget
+        self._search_attempts = 0
         self._seen_evidence: set[str] = set()
         self._no_gain_streak = 0
         self._answer_only = False
@@ -599,7 +681,9 @@ class OGMemoryControlAdapter(ReactLoop):
         RetrievalBudget(self._default_top_k, candidate_k)
         self._candidate_k = candidate_k
         validate_transcript_options(transcript_top_k, transcript_fusion)
-        self._transcript_top_k = transcript_top_k
+        self._transcript_top_k = (
+            min(transcript_top_k, context_budget.max_candidates) if context_budget else transcript_top_k
+        )
         self._transcript_fusion = transcript_fusion
         validate_context_options(include_neighbors, context_k)
         self._include_neighbors = include_neighbors
@@ -642,6 +726,7 @@ class OGMemoryControlAdapter(ReactLoop):
         self._disable_tools_for_iteration = False
         self._search_cache.clear()
         self._seen_evidence.clear()
+        self._search_attempts = 0
         self._no_gain_streak = 0
         self._answer_only = False
         task_ctx.search_history.clear()
@@ -677,13 +762,18 @@ class OGMemoryControlAdapter(ReactLoop):
             transcript_fusion=self._transcript_fusion,
             include_neighbors=self._include_neighbors,
             context_k=self._context_k,
+            context_budget=self._context_budget,
         )
 
         system = (
             "You are an expert video analyst answering questions about a "
-            "robot's point-of-view video. Use the [Search] tool to find "
+            "robot's point-of-view video. Use the Search function to find "
             "relevant episodic evidence in the graph memory, then call "
-            "[Answer] once you have enough to respond. Be concise — the "
+            "the Answer function once you have enough to respond. "
+            "Invoke these functions through the provided tool-call interface; "
+            "writing their names or an intended call as ordinary assistant text "
+            "does not execute a search. Do not put tool instructions, XML tags, "
+            "or code blocks in the final answer. Be concise — the "
             "evaluator scores verbatim against the ground truth.\n\n"
             "Search may return context_hits: exact neighboring clips linked by context_for. "
             "Read them for the preceding/following dialogue or action; adjacency alone "
@@ -698,7 +788,7 @@ class OGMemoryControlAdapter(ReactLoop):
             "hits first; if evidence is missing, search a different action, "
             "location, speaker, or synonym. Repeated queries reuse prior "
             "results and do not provide new evidence.\n"
-            "- Each [Search] hit has TWO fields: ``description`` (a visual "
+            "- Each Search hit has TWO fields: ``description`` (a visual "
             "summary written by the LLM) and ``speech_transcript`` (a list "
             "of {start_sec, end_sec, text} dicts from the Whisper ASR). "
             "The transcript is the strongest signal for dialogue-driven "
@@ -727,7 +817,7 @@ class OGMemoryControlAdapter(ReactLoop):
             "does not establish that mapping, and a speaker label from one "
             "clip does not establish identity across clips. State unresolved "
             "attribution instead of guessing a person or their gender.\n"
-            "- If the first [Search] returns no useful hits, broaden the "
+            "- If the first Search returns no useful hits, broaden the "
             "query with synonyms, the location, or the speaker's action "
             "before giving up."
         )
@@ -738,6 +828,17 @@ class OGMemoryControlAdapter(ReactLoop):
         if task_ctx.temporal_scope:
             from m3.temporal import temporal_prompt
             system += "\n\n" + temporal_prompt(task_ctx.temporal_scope)
+        if self._context_budget:
+            system += (
+                "\nSearch results are budgeted excerpts with source field/index or character offsets. "
+                "evidence_refs point to evidence IDs defined in earlier tool results in THIS request. "
+                "Only admitted evidence has references. Omitted facts are not absent facts, and "
+                "retrieved events are not a complete count. Search a specific missing fact to "
+                "select different excerpts; do not infer unseen facts. "
+                "In this format, description and speech_transcript are identified by the field "
+                "of each evidence[id].passages entry; read the description and adjoining "
+                "speech entries from the same clip together, not as unrelated facts."
+            )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Question: {task_ctx.question}"},
@@ -796,9 +897,16 @@ class OGMemoryControlAdapter(ReactLoop):
         cached = None
         executed = False
         blocked = self._answer_only or bool(self._final_answer)
+        if self._context_budget:
+            blocked = blocked or self._search_attempts >= self._context_budget.max_search_calls
+            self._search_attempts += 1
         key = None
         try:
             top_k = int(params.get("top_k") or self._search_config.default_top_k)
+            if self._context_budget:
+                top_k = min(top_k, self._context_budget.max_top_k)
+                if isinstance(query, str) and len(query.encode("utf-8")) > self._context_budget.max_query_bytes:
+                    query = ""  # reject rather than silently alter the query
             if isinstance(query, str) and query.strip() and top_k > 0:
                 key = (" ".join(query.split()).casefold(), top_k)
                 params["top_k"] = top_k
@@ -845,6 +953,8 @@ class OGMemoryControlAdapter(ReactLoop):
                     "Try a different clue, or Answer and clearly state any missing evidence."
                 )
         # Errors neither consume nor reset the no-gain streak: retries remain possible.
+        if self._context_budget and self._search_attempts >= self._context_budget.max_search_calls:
+            self._answer_only = True
 
         task = self._current_task_ctx
         if task is not None:
@@ -854,7 +964,11 @@ class OGMemoryControlAdapter(ReactLoop):
             stats["cache_hits"] += int(cached is not None)
             stats["blocked_requests"] += int(blocked)
             if self._answer_only:
-                stats["stop_reason"] = "consecutive_no_new_evidence"
+                stats["stop_reason"] = (
+                    "search_call_budget" if self._context_budget
+                    and self._search_attempts >= self._context_budget.max_search_calls
+                    else "consecutive_no_new_evidence"
+                )
             task.search_history.append({
                 "round": len(task.search_history) + 1, "query": query,
                 "top_k": top_k, "stage": "requested", "cache_hit": cached is not None,
@@ -880,16 +994,31 @@ class OGMemoryControlAdapter(ReactLoop):
     def _execute_and_append_tool_calls(self, messages, tool_calls, tools_used,
                                        read_uris, ctx, round_id=""):
         was_answer_only = self._answer_only
+        start_index = len(messages)
         result = super()._execute_and_append_tool_calls(
             messages, tool_calls, tools_used, read_uris, ctx, round_id=round_id,
         )
+        if not self._context_budget:
+            _compact_cached_search_messages(messages, start_index)
         if self._answer_only and not was_answer_only and not self._final_answer:
             messages.append({"role": "user", "content": (
-                "Search is now closed: consecutive searches added no new evidence IDs. "
+                "Search is now closed: no-new-evidence or search-call budget was reached. "
                 "Only Answer is available. Give a supported answer or explicitly state "
                 "that the evidence is insufficient; do not guess."
             )})
         return result
+
+    def _call_llm(self, messages):
+        if not self._context_budget:
+            return super()._call_llm(messages)
+        tools = None if self._disable_tools_for_iteration else self._get_tools()
+        started = time.monotonic()
+        view, stats = pack_context(
+            messages, tools, self._current_task_ctx.question, self._context_budget,
+        )
+        stats["packing_seconds"] = time.monotonic() - started
+        self._current_task_ctx.search_stats.setdefault("context_calls", []).append(stats)
+        return super()._call_llm(view)
 
     # ------------------------------------------------------------------
     # Public helper

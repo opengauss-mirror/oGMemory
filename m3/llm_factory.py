@@ -152,6 +152,7 @@ def build_m3_llm(
             temperature=temperature,
             max_tokens=max_tokens,
             json_mode=json_mode,
+            request_timeout_seconds=configured.request_timeout_seconds,
         )
 
     # OpenAI-compatible fallback. Covers openai / volcengine / deepseek /
@@ -176,6 +177,7 @@ def build_m3_llm(
         temperature=temperature,
         max_tokens=max_tokens,
         json_mode=json_mode,
+        request_timeout_seconds=configured.request_timeout_seconds,
     )
 
 

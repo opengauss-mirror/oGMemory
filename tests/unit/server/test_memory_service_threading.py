@@ -2,11 +2,45 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from unittest.mock import Mock
+
+import pytest
 
 from core.models import RequestContext
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
+
+
+@pytest.mark.parametrize("archive_failed", [False, True])
+def test_background_completion_marker_waits_for_snapshot_commit(caplog, archive_failed):
+    caplog.set_level(logging.INFO, logger="ogmem.service")
+    service = MemoryService(config=OgMemConfig(
+        after_turn_threshold=1, session_state_bridge_enabled=False,
+    ))
+    session_id = "archive-completion-barrier"
+    ctx = _threaded_ctx(session_id)
+    service._write_api = Mock()
+    service._async_drain = Mock()
+    service._chunk_and_extract = Mock(return_value=_successful_write_result())
+    mgr = service.get_session_manager()
+    mgr.save_session_state = Mock(return_value=True)
+
+    def commit(*args, **kwargs):
+        assert "after_turn background extract done:" not in caplog.text
+        return {"status": "failed", "error": "archive failed"} if archive_failed else {
+            "status": "completed", "archived": True,
+        }
+
+    mgr.commit_snapshot = Mock(side_effect=commit)
+    service.after_turn({
+        "sessionId": session_id,
+        "messages": [{"role": "user", "content": "a" * 100}],
+        "_ctx": ctx,
+    })
+    assert mgr.get_or_create(session_id, ctx=ctx).extraction_done_event.wait(timeout=3)
+    mgr.commit_snapshot.assert_called_once()
+    assert ("after_turn background extract done:" in caplog.text) is not archive_failed
 
 
 def test_session_manager_lazy_initialization_is_thread_safe():

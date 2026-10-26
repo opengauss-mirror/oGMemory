@@ -463,7 +463,7 @@ def test_spectral_voice_clusters_are_not_reported_as_verified_identity(tmp_path,
     }) + "\n")
     monkeypatch.setattr("m3.voice_clustering.run_voice_clustering", lambda *a, **kw: 0)
     context = SimpleNamespace(work_dir=tmp_path, graph_store="memory",
-                              connection_string=None, graph=Mock())
+                              connection_string=None, graph=Mock(), account_id="acct")
     stage = SimpleNamespace(id="voice_clustering", type="voice_clustering", params={})
     result = voice_clustering_stage(context, stage)
     assert result.to_dict()["status"] == "degraded"

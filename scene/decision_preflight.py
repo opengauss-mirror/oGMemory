@@ -26,14 +26,21 @@ class ScenePreflight:
         self.config.validate()
         self.evidence_reader = evidence_reader
 
+    def prompt(self, packet: dict[str, Any]) -> tuple[str, str, str]:
+        """Use the same bounded evidence for text and native tool requests."""
+        schema = PreflightOutput.model_json_schema()
+        system = PREFLIGHT_SYSTEM + "\nOUTPUT SCHEMA:\n" + self.caller.dump(schema)
+        if self.evidence_reader is None:
+            system += "\nEvidence mode: packet-only. Base readiness on the packet; choose WAIT for unresolved gaps."
+        prefix = system + "\nPACKET:\n"
+        prompt = self.caller.budgeted_prompt(prefix, packet, reserved_chars=self.caller.correction_reserve)
+        return system, prompt, prompt[len(prefix):]
+
     def run(self, packet: dict[str, Any], budget: CallBudget) -> PreflightOutput:
         """Attach tool evidence; apply enforce_gate after canonical evidence expansion."""
         schema = PreflightOutput.model_json_schema()
         tools = self._tool_schemas() if self.evidence_reader is not None else []
-        system = PREFLIGHT_SYSTEM + "\nOUTPUT SCHEMA:\n" + self.caller.dump(schema)
-        if self.evidence_reader is None:
-            system += "\nEvidence mode: packet-only. Base readiness on the packet; choose WAIT for unresolved gaps."
-        prompt = system + "\nPACKET:\n" + self.caller.dump(packet)
+        system, prompt, wire_packet = self.prompt(packet)
         complete_with_tools = getattr(self.caller.llm, "complete_with_tools_messages", None)
         tool_calls = []
 
@@ -45,7 +52,7 @@ class ScenePreflight:
                 result = complete_with_tools(
                     messages=[
                         {"role": "system", "content": system},
-                        {"role": "user", "content": self.caller.dump(packet)},
+                        {"role": "user", "content": wire_packet},
                     ], tools=tools, tool_choice="auto",
                 )
             except (AttributeError, NotImplementedError):

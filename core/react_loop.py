@@ -477,7 +477,7 @@ class ReactLoop(ABC):
             # Support both formats: {"tool": ...} from OpenAILLM and {"name": ...} from other sources
             tool_name = tool_call.get("name", "") or tool_call.get("tool", "")
             tool_input = tool_call.get("input", {})
-            call_id = tool_call.get("id", "unknown")
+            call_id = tool_call.get("id") or f"call_{uuid4().hex}"
 
             # Skip empty tool names to avoid API errors
             if not tool_name or not tool_name.strip():

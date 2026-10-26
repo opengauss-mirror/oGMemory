@@ -57,6 +57,8 @@ def test_fifth_canonical_source_completes_every_engine_stage(action, calls, sour
         context = [*packet["memories"], *packet.get("provenance_context", [])]
         selected = [card for card in packet["memories"] if card["uri"] in proposal.evidence_uris]
         assert supporting_sources(selected, context) == {("archive", "planning"), ("archive", "review")}
+        described = {tuple(packet["source_groups"][index]) for card in selected for index in card["source_group_ids"]}
+        assert described == supporting_sources(selected, context)
         assert next(card for card in context if card["uri"] == holder.uri)["source_refs"] == list(node_source_refs(holder))
     assert all(len(prompt) <= engine.limits.max_prompt_chars for prompt, _ in model.requests)
     for member in result.snapshot.scenes[0].cluster.members:

@@ -335,6 +335,7 @@ def extract_frames_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
 def detect_faces_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     from m3.detect_faces import parse_args, run
     argv = [
+        "--config", str(ctx.config_path),
         "--frames-manifest", str(ctx.artifact("frames_jsonl")),
         "--output-jsonl", str(ctx.artifact("faces_jsonl")),
         "--graph-store", ctx.graph_store,
@@ -349,6 +350,8 @@ def detect_faces_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--cv-service-url", str(stage.params["cv_service_url"])])
     if stage.params.get("cv_timeout") is not None:
         argv.extend(["--cv-timeout", str(stage.params["cv_timeout"])])
+    if stage.params.get("cv_auth_token") is not None:
+        argv.extend(["--cv-auth-token", str(stage.params["cv_auth_token"])])
     if stage.params.get("force"):
         argv.append("--force")
     rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
@@ -1118,6 +1121,7 @@ def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResul
     )
     argv = [
         "--graph-store", ctx.graph_store,
+        "--account-id", ctx.account_id,
         "--output-jsonl", output_jsonl,
     ]
     if ctx.connection_string:

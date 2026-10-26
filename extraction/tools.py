@@ -32,6 +32,7 @@ from core.candidate_dedup import (
 )
 from core.errors import (
     ExtractionIncompleteError,
+    LLMCallError,
     LLMOutputTruncatedError,
     OperationDeadlineExceededError,
     ToolCallProtocolError,
@@ -373,6 +374,11 @@ Analyze this conversation and identify contiguous message ranges (spans) \
 that contain personal information worth remembering.
 
 Rules:
+- There are exactly {message_count} indexed messages. Valid message indices \
+are 0 through {max_message_index}. Return at most {message_count} spans.
+- Only the outer [N] message prefixes are indices. Dialogue lines, speaker \
+names, lists, and paragraphs INSIDE one message are not additional messages. \
+Never invent an index or continue numbering beyond the supplied messages.
 - ONLY identify spans from non-assistant messages. Ignore lines starting \
 with "[N] assistant:".
 - Each span should contain a coherent unit of extractable information.
@@ -614,11 +620,23 @@ class Extractor:
         prompt = _SPAN_PROMPT.format(
             conversation=conversation,
             session_summary_block=summary_block,
+            message_count=len(messages),
+            max_message_index=max(0, len(messages) - 1),
         )
+        # A bundled chat transcript may be one user message containing many
+        # speaker turns. Bound the schema to real outer message indices so
+        # small models do not enumerate dialogue lines until token exhaustion.
+        schema = deepcopy(_SPAN_SCHEMA)
+        spans_schema = schema["properties"]["spans"]
+        spans_schema["maxItems"] = len(messages)
+        for name in ("start", "end"):
+            spans_schema["items"]["properties"][name].update(
+                minimum=0, maximum=max(0, len(messages) - 1),
+            )
 
         try:
             check_deadline()
-            result = self._llm.complete_json(prompt, schema=_SPAN_SCHEMA)
+            result = self._llm.complete_json(prompt, schema=schema)
             check_deadline()
             spans: list[_Span] = []
             n = len(messages)
@@ -1505,6 +1523,12 @@ class Extractor:
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )
             result = loop.run(prompt, ctx, prefetch_result)
+            if result.finish_reason == "llm_error":
+                # ReactLoop returns failures as data. Do not turn a truncated
+                # or failed model call into a successful zero-memory ingest.
+                raise result.llm_error or LLMCallError(
+                    "Lazy extraction terminated due to an LLM failure"
+                )
             logger.info(
                 f"ReAct loop completed: {len(result.candidates)} candidates, "
                 f"{result.iterations} iterations, {len(result.read_uris)} reads"
@@ -1522,7 +1546,7 @@ class Extractor:
                 read_versions=dict(result.read_versions), read_nodes=dict(result.read_nodes),
             )
             return candidates
-        except OperationDeadlineExceededError:
+        except (LLMCallError, OperationDeadlineExceededError):
             raise
         except Exception as e:
             check_deadline()

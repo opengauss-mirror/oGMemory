@@ -30,7 +30,10 @@ multimodal backend).
 from __future__ import annotations
 
 import base64
+import binascii
+import io
 import logging
+import wave
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -518,6 +521,28 @@ def _audio_part_from_node(audio: RawNode) -> dict | None:
                 return None
     if not content:
         return None
+    # ffmpeg can emit a valid, header-only WAV for a trailing video clip.
+    # Nonempty container bytes do not imply that there are audio samples.
+    # Keep the visual/transcript evidence, but do not send an empty waveform
+    # to multimodal providers (Omni rejects it with HTTP 400).
+    raw = content
+    if isinstance(raw, str):
+        try:
+            raw = base64.b64decode(raw, validate=True)
+        except (ValueError, binascii.Error):
+            raw = b""
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        try:
+            with wave.open(io.BytesIO(raw), "rb") as wav:
+                # Pipe-produced WAV headers use 0xffffffff for unknown
+                # lengths, even when no sample bytes follow the header.
+                if not wav.readframes(1):
+                    logger.warning("Skipping WAV audio with no samples")
+                    return None
+        except (wave.Error, EOFError):
+            # Do not silently discard corrupt/unsupported audio. Preserve
+            # the existing provider-side validation for those payloads.
+            pass
     if isinstance(content, str):
         # Pre-encoded payload (rare); pass through.
         return {

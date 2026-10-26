@@ -67,6 +67,7 @@ dev = [
     "uvicorn>=0.27",
 ]
 opengauss = []  # psycopg2-binary now in core dependencies
+m3-budget = ["tokenizers>=0.20,<1"]
 chroma = ["chromadb>=0.4.0"]
 deepagents = ["deepagents>=0.7.23,<0.8"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]

@@ -44,7 +44,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import sys
 import uuid
 from collections.abc import Iterable
@@ -182,9 +181,8 @@ def detect_faces_for_frame(
 def _build_backend(args):
     """Construct the CVBackend based on --backend flag.
 
-    Default is HTTPBackend pointing at the cv_service URL (env var
-    ``OGMEM_CV_SERVICE_URL`` or ``--cv-service-url``). The mock backend
-    keeps tests / offline smoke runs self-contained.
+    Resolve explicit CLI options, environment overrides and ``cv_service``
+    in the selected YAML. Mock runs do not need a CV service or config.
     """
     backend_name = args.backend
     if backend_name == "mock":
@@ -195,13 +193,17 @@ def _build_backend(args):
         raise ValueError(f"unknown backend: {backend_name}")
 
     from extraction.operators.backends import HTTPBackend
-    url = args.cv_service_url or os.environ.get(
-        "OGMEM_CV_SERVICE_URL", "http://127.0.0.1:8081",
+    from m3.config import load_cv_service_config
+    config = load_cv_service_config(
+        getattr(args, "config", None),
+        base_url=args.cv_service_url,
+        timeout_seconds=args.cv_timeout,
+        auth_token=args.cv_auth_token,
     )
     return HTTPBackend(
-        base_url=url,
-        timeout=float(args.cv_timeout),
-        auth_token=args.cv_auth_token,
+        base_url=config.base_url,
+        timeout=config.timeout_seconds,
+        auth_token=config.auth_token,
     )
 
 
@@ -339,6 +341,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--frames-manifest", required=True,
                    help="Path to frames.jsonl produced by m3.extract_frames")
+    p.add_argument("--config", default=None,
+                   help="ogmemory.yaml containing cv_service (default: $OGMEM_CONFIG or deploy/ogmemory.yaml)")
     p.add_argument("--output-jsonl", default="data/faces.jsonl",
                    help="Output manifest path (default: %(default)s)")
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
@@ -356,10 +360,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--backend", choices=("http", "mock"), default="http",
                    help="CV backend (default: %(default)s)")
     p.add_argument("--cv-service-url", default=None,
-                   help="cv_service base URL (default: $OGMEM_CV_SERVICE_URL "
-                        "or http://127.0.0.1:8081)")
-    p.add_argument("--cv-timeout", type=float, default=30.0,
-                   help="HTTP timeout seconds for CV requests (default: %(default)s)")
+                   help="Override $OGMEM_CV_SERVICE_URL / cv_service.base_url")
+    p.add_argument("--cv-timeout", type=float, default=None,
+                   help="Override cv_service.timeout_seconds (fallback: 30 seconds)")
     p.add_argument("--cv-auth-token", default=None,
                    help="Optional Bearer token for the CV service")
     # Operator config — forwarded to FaceDetectionExtractor.

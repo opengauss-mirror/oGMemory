@@ -171,13 +171,85 @@ class TestOpenAIEmbedder:
                 max_input_chars=0,
             )
 
-    def test_embed_texts_rejects_batches_larger_than_limit(self, fake_client: Mock):
-        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
+    @pytest.mark.parametrize("count,batch_size", [(66, 8), (2049, 2048), (16, 8)])
+    def test_embed_texts_splits_requests(self, fake_client, count, batch_size):
+        fake_client.embeddings.create.side_effect = lambda **kw: _embedding_response(
+            [[float(text)] for text in kw["input"]]
+        )
+        embedder = openai_embedder_module.OpenAIEmbedder(
+            api_key="test-key", dimension=1, batch_size=batch_size,
+        )
+        assert embedder.embed_texts([str(i) for i in range(count)]) == [
+            [float(i)] for i in range(count)
+        ]
+        assert [len(c.kwargs["input"]) for c in fake_client.embeddings.create.call_args_list] == [
+            min(batch_size, count - start) for start in range(0, count, batch_size)
+        ]
 
-        with pytest.raises(ValueError, match="Batch size too large"):
-            embedder.embed_texts(["x"] * 2049)
+    @pytest.mark.parametrize("batch_size", [0, -1, True, 1.5, "8", 2049])
+    def test_invalid_batch_size(self, batch_size):
+        with pytest.raises(ValueError, match="batch_size"):
+            openai_embedder_module.OpenAIEmbedder(api_key="test", batch_size=batch_size)
 
-        fake_client.embeddings.create.assert_not_called()
+    def test_batch_response_count_is_validated(self, fake_client):
+        fake_client.embeddings.create.return_value = _embedding_response([[0.1]])
+        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test", dimension=1)
+        with pytest.raises(ValueError, match="Embedding count mismatch"):
+            embedder.embed_texts(["a", "b"])
+
+    def test_failed_batch_stops_without_returning_partial_results(self, fake_client):
+        fake_client.embeddings.create.side_effect = [
+            _embedding_response([[0.1], [0.2]]),
+            RuntimeError("endpoint failed"),
+        ]
+        embedder = openai_embedder_module.OpenAIEmbedder(
+            api_key="test", dimension=1, batch_size=2,
+        )
+        embedder.token_tracker = Mock()
+        with pytest.raises(RuntimeError, match="endpoint failed"):
+            embedder.embed_texts(["a", "b", "c", "d", "e"])
+        assert fake_client.embeddings.create.call_count == 2
+        embedder.token_tracker.record_embed.assert_called_once()
+        embedder.token_tracker.record_failure.assert_called_once()
+
+    def test_batches_share_deadline(self, fake_client, monkeypatch):
+        clock = SimpleNamespace(now=0.0)
+        monkeypatch.setattr(openai_embedder_module.time, "monotonic", lambda: clock.now)
+        fake_client.with_options.return_value = fake_client
+
+        def respond(**kwargs):
+            clock.now += 3
+            return _embedding_response([[0.1]])
+
+        fake_client.embeddings.create.side_effect = respond
+        embedder = openai_embedder_module.OpenAIEmbedder(
+            api_key="test", dimension=1, batch_size=1,
+        )
+        with pytest.raises(TimeoutError, match="deadline"):
+            embedder.embed_texts(["a", "b", "c"], timeout_seconds=5)
+        assert fake_client.embeddings.create.call_count == 2
+        assert [c.kwargs["timeout"] for c in fake_client.with_options.call_args_list] == [5, 2]
+
+    def test_batch_usage_scopes_compose_with_cache(self, fake_client):
+        from providers.token_tracker import distributed_usage_scope, _embedding_inputs
+
+        fake_client.embeddings.create.side_effect = lambda **kw: _embedding_response(
+            [[float(text)] for text in kw["input"]]
+        )
+        embedder = openai_embedder_module.CachedOpenAIEmbedder(
+            api_key="test", dimension=1, batch_size=2,
+        )
+        embedder.embed_texts(["1"])
+        scopes = []
+        embedder.token_tracker.record_embed = Mock(
+            side_effect=lambda *a, **kw: scopes.append(_embedding_inputs.get())
+        )
+        inputs = [(("run", str(i)), 1) for i in range(5)]
+        with distributed_usage_scope({}, inputs=inputs):
+            assert embedder.embed_texts(["0", "1", "2", "3", "4"]) == [
+                [float(i)] for i in range(5)
+            ]
+        assert scopes == [[inputs[0], inputs[2]], [inputs[3], inputs[4]]]
 
     def test_embed_texts_validates_embedding_dimension(self, fake_client: Mock):
         fake_client.embeddings.create.return_value = _embedding_response([[0.1]])

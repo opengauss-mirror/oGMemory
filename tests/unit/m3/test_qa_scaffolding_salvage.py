@@ -14,7 +14,28 @@ from __future__ import annotations
 
 import pytest
 
-from m3.qa import _PROTOCOL_SCAFFOLDING_RE, _salvage_scaffolding
+from m3.qa import _PROTOCOL_SCAFFOLDING_RE, _has_protocol_scaffolding, _salvage_scaffolding
+
+
+@pytest.mark.parametrize("text", [
+    'Search("where are the shoes?", top_k=3)',
+    'Answer(final_answer="on the table")',
+    '<tools>{"name":"Search","arguments":{"query":"shoes"}}</tools>',
+    '{"name": "Search", "arguments": {"query": "shoes"}}',
+    '<tool_call>{"name":"Answer","arguments":{}}</tool_call>',
+])
+def test_native_call_text_is_not_a_final_answer(text):
+    assert _has_protocol_scaffolding(text)
+    assert _salvage_scaffolding("[Answer] " + text) == ""
+
+
+@pytest.mark.parametrize("text", [
+    "They search for the shoes near the door.",
+    "The answer is on the table.",
+    "On the shelf beside the tools.",
+])
+def test_ordinary_prose_is_not_tool_scaffolding(text):
+    assert not _has_protocol_scaffolding(text)
 
 
 class TestSalvageScaffolding:

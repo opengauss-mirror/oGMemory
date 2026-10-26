@@ -97,10 +97,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
     The two backends diverge only on the extension bootstrap
     (in ``_ensure_table``):
 
-    - **openGauss** (1.x / 2.x / 3.x): the ``vector(N)`` type and
-      the HNSW ``vector_cosine_ops`` opclass are built in. The
-      ``CREATE EXTENSION`` statement is a syntax error on openGauss;
-      we catch and ignore it so the CREATE TABLE proceeds.
+    - **openGauss**: the configured dialect uses its built-in
+      ``vector(N)`` type and HNSW ``vector_cosine_ops`` opclass.
     - **PostgreSQL 15+ with pgvector**: requires the
       ``pgvector/pgvector:pg16`` Docker image (or the
       ``pgvector`` package installed server-side). The CREATE
@@ -178,11 +176,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
           no-op when the extension is already installed (e.g. via the
           ``pgvector/pgvector:pg16`` Docker image, where the bits are
           preloaded into ``shared_preload_libraries``).
-        - **openGauss**: openGauss has the ``vector(N)`` type and the
-          HNSW opclass built in (no extension to load). The
-          ``CREATE EXTENSION`` statement raises a syntax error which
-          we catch and ignore so the migration proceeds to the
-          regular CREATE TABLE step.
+        - **openGauss**: the configured dialect uses its built-in
+          ``vector(N)`` type and HNSW opclass directly.
 
         ``psycopg2`` talks the same wire protocol to both servers, so
         nothing else in this class needs to special-case the backend.
@@ -191,24 +186,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         dim = self._dimension
         conn = self._get_connection()
         try:
-            # ---- extension bootstrap (PostgreSQL + pgvector only) ----
-            # Best-effort: openGauss doesn't speak this statement and
-            # raises ``syntax error at or near "EXTENSION"``; we log
-            # and continue because openGauss ships vector(N) natively.
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                conn.commit()
-            except Exception as exc:
-                conn.rollback()
-                # Use DEBUG so a real PG deployment without pgvector
-                # installed surfaces loudly at the next failure (the
-                # CREATE TABLE below will error on the ``vector``
-                # type) without spamming a successful openGauss boot.
-                logger.debug(
-                    "CREATE EXTENSION vector skipped (expected on openGauss): %s",
-                    exc,
-                )
+            if self.sql_dialect.name == "postgresql":
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    conn.commit()
+                except Exception as exc:
+                    conn.rollback()
+                    logger.debug("CREATE EXTENSION vector unavailable: %s", exc)
             with conn.cursor() as cur:
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS {tbl} (
@@ -375,8 +360,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
         return psycopg2.connect(self._connection_string)
 
-    def _return_connection(self, conn):
-        """Return a connection to the pool, rolling back dirty transactions."""
+    @staticmethod
+    def _reset_connection(conn):
+        """End the index transaction before the connection becomes idle."""
         if conn.closed != 0:
             return
         try:
@@ -384,6 +370,17 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 conn.rollback()
         except Exception:
             conn.close()
+
+    def _return_shared_connection(self, conn):
+        try:
+            self._reset_connection(conn)
+        finally:
+            self._shared_pool.return_connection(conn)
+
+    def _return_connection(self, conn):
+        """Return a connection to the pool, rolling back dirty transactions."""
+        self._reset_connection(conn)
+        if conn.closed != 0:
             return
         if len(self._pool) < self._pool_size:
             self._pool.append(conn)

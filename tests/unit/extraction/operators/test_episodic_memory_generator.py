@@ -389,3 +389,49 @@ def test_disk_audio_and_truthful_flags(tmp_path, audio_node, video_node, frame_n
         assert base64.b64decode(audio[0]["input_audio"]["data"]) == b"RIFFtest"
     else:
         assert audio == []
+
+
+@pytest.mark.parametrize("source", ["bytes", "file", "base64"])
+@pytest.mark.parametrize("samples", [0, 1600])
+@pytest.mark.parametrize("streaming_header", [False, True])
+def test_wav_sample_count_not_container_size(
+    tmp_path, audio_node, video_node, frame_nodes, ctx, llm, source, samples,
+    streaming_header,
+):
+    import base64
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\0\0" * samples)
+    payload = buffer.getvalue()
+    if streaming_header:
+        payload = bytearray(payload)
+        payload[4:8] = b"\xff" * 4
+        data_offset = payload.index(b"data") + 4
+        payload[data_offset:data_offset + 4] = b"\xff" * 4
+        payload = bytes(payload)
+    assert payload  # Even a zero-sample WAV has a nonempty header.
+    audio_node.content = payload
+    if source == "file":
+        path = tmp_path / "clip.wav"
+        path.write_bytes(payload)
+        audio_node.content = b""
+        audio_node.metadata["source_path"] = str(path)
+    elif source == "base64":
+        audio_node.content = base64.b64encode(payload).decode("ascii")
+    result = EpisodicMemoryGenerator(llm=llm).extract(
+        video_node, ctx, frame_nodes=frame_nodes, audio_node=audio_node,
+    )
+    parts = llm._last_multimodal_messages[1]["content"]
+    audio_parts = [p for p in parts if p["type"] == "input_audio"]
+    assert len(audio_parts) == int(samples > 0)
+    assert result.extracted_content["audio_attached"] is (samples > 0)
+    assert result.extracted_content["has_audio"] is (samples > 0)
+    assert any(p["type"] == "image_url" for p in parts)
+    if samples:
+        assert base64.b64decode(audio_parts[0]["input_audio"]["data"]) == payload

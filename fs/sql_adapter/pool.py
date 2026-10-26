@@ -314,7 +314,7 @@ class PoolAdapterMixin:
             self._dialect = pool.sql_dialect
             self._sql_dialect = self._dialect.name
             self._get_connection = pool.get_connection
-            self._return_connection = pool.return_connection
+            self._return_connection = self._return_shared_connection
         else:
             if not connection_string:
                 raise ValueError("connection_string is required when pool is not provided")
@@ -325,6 +325,9 @@ class PoolAdapterMixin:
             self._pool: list = []
         from fs.sql_adapter.session_mutation import guard_pool_methods
         guard_pool_methods(self, self._connection_string)
+
+    def _return_shared_connection(self, conn):
+        self._shared_pool.return_connection(conn)
 
     @property
     def sql_dialect(self) -> SQLDialect:

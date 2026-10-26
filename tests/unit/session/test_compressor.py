@@ -16,6 +16,22 @@ def test_compress_with_llm(compressor, sample_messages):
     compressor.llm.complete_json.assert_called_once()
 
 
+@pytest.mark.parametrize("field", ["overview", "abstract"])
+@pytest.mark.parametrize("value", [{"topics": ["painting"]}, ["painting"], None, 42])
+def test_non_string_summary_uses_text_fallback(compressor, sample_messages, field, value):
+    response = {"overview": "Valid overview", "abstract": "Valid abstract"}
+    response[field] = value
+    compressor.llm.complete_json.return_value = response
+    overview, abstract = compressor.compress(
+        sample_messages, prev_abstract="Prior context",
+    )
+    assert isinstance(overview, str)
+    assert isinstance(abstract, str)
+    assert len(abstract) <= 100
+    assert "Prior context" in overview
+    assert "messages" in overview
+
+
 def test_compress_empty_messages(compressor_no_llm):
     """Test compression with empty message list."""
     overview, abstract = compressor_no_llm.compress([])

@@ -203,6 +203,34 @@ def test_pending_evidence_continues_after_success():
     assert next_job.node_uris == ("n3", "n2")
 
 
+def test_capacity_deferred_tail_continues_after_success():
+    store = InMemorySceneJobStore()
+    store.enqueue("acct", "user:a", ["n1", "n2", "n3", "n4"], token_count=100)
+    first = store.claim("worker")
+    store.mark_succeeded(first, reason="CREATE", remaining_uris=["n4"], deferred_uris=["n4"])
+    following = store.claim("worker")
+    assert following.node_uris == ("n4",)
+    assert following.retained_node_uris == ()
+    store.mark_waiting(following, reason="Additional evidence will complete this scene")
+    summary = store.summary("acct", "user:a")
+    assert (summary["pending_nodes"], summary["retained_nodes"]) == (0, 1)
+
+
+def test_claimed_retained_provenance_roundtrips_and_fresh_write_advances():
+    store = InMemorySceneJobStore()
+    store.enqueue("acct", "user:a", ["old"], token_count=1)
+    store.mark_waiting(store.claim("worker"))
+    store.enqueue("acct", "user:a", ["fresh"], token_count=1)
+    claimed = store.claim("worker")
+    assert claimed.retained_node_uris == ("old",)
+    assert job_from_dict(job_to_dict(claimed)) == claimed
+    store.enqueue("acct", "user:a", ["old"], token_count=1)
+    store.mark_waiting(claimed, remaining_uris=claimed.node_uris, deferred_uris=["old"])
+    refreshed = store.claim("worker")
+    assert refreshed.node_uris[0] == "old"
+    assert refreshed.retained_node_uris == ("fresh",)
+
+
 @pytest.mark.parametrize("action", ["CREATE", "UPDATE", "MERGE"])
 def test_successful_progress_continues_remaining_evidence_with_fresh_writes(action):
     store = InMemorySceneJobStore()

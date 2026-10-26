@@ -318,6 +318,7 @@ def build_embedder(
             base_url=base_url,
             model=model or "text-embedding-ada-002",
             dimension=dimension,
+            batch_size=runtime.embedding_batch_size,
         )
 
     if provider == "st":

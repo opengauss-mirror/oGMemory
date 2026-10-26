@@ -77,7 +77,6 @@ stages:
       backend: http
       min_confidence: 0.5
       max_faces: 20
-      cv_timeout: 30
 
   # ---- Real ASR (Whisper) + speaker diarization + ECAPA-TDNN ----
   #
