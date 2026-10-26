@@ -4,6 +4,7 @@ Orchestrates the write process: extraction → planning → building → writing
 """
 
 import hashlib
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -61,6 +62,20 @@ class ContextWriter:
         self._outbox_store = outbox_store
         self._directory_summary_enabled = directory_summary_enabled
         self._executed_ops: set[str] = set()
+        # Per-URI write locks: serialize plan→merge→write per target node
+        # within this process (see write_candidate). One entry per node URI;
+        # bounded by the number of distinct memory nodes written.
+        self._uri_locks: dict[str, threading.Lock] = {}
+        self._uri_locks_guard = threading.Lock()
+
+    def _lock_for_uri(self, uri: str) -> threading.Lock:
+        """Return the process-wide write lock for a target node URI."""
+        with self._uri_locks_guard:
+            lock = self._uri_locks.get(uri)
+            if lock is None:
+                lock = threading.Lock()
+                self._uri_locks[uri] = lock
+            return lock
 
     @staticmethod
     def _get_real_method(
@@ -153,95 +168,114 @@ class ContextWriter:
                 if plan.action == "skip":
                     return plan
 
-                # Step 1.5: Idempotency check - prevent duplicate operations
-                content_hash = hashlib.sha256(
-                    (candidate.content or "").encode()
-                ).hexdigest()[:16]
-                fp = self._operation_fingerprint(plan, ctx, content_hash)
-                if fp in self._executed_ops:
-                    logger.info(f"Skipping duplicate operation: {plan.target_uri}")
-                    return plan
+                # Serialize plan → build → write per target node within this
+                # process. The semantic content merge in Step 2 can take seconds
+                # (LLM call); without serialization, concurrent extractions that
+                # target the same shared node (e.g. the same entity or profile)
+                # each re-read a fresh version on retry but keep losing the
+                # optimistic-lock race while their own merge is in flight,
+                # eventually exhausting the retry budget and failing the whole
+                # extraction. Holding the per-URI lock closes that window:
+                # writes to the same node are ordered, writes to different
+                # nodes stay fully parallel, and the SQL CAS remains as the
+                # cross-process backstop (retry loop still applies).
+                with self._lock_for_uri(plan.target_uri):
+                    # Step 1 (locked): re-plan against fresh node state
+                    plan = self._policy_router.plan(candidate, ctx)
 
-                # Handle archive operation
-                if plan.action == WriteAction.ARCHIVE:
-                    self._executed_ops.add(fp)
-                    return self._handle_archive(plan, ctx)
+                    # Skip if action is skip
+                    if plan.action == "skip":
+                        return plan
 
-                # Handle delete operation
-                if plan.action == WriteAction.DELETE:
-                    self._executed_ops.add(fp)
-                    return self._handle_delete(plan, ctx)
+                    # Step 1.5: Idempotency check - prevent duplicate operations
+                    content_hash = hashlib.sha256(
+                        (candidate.content or "").encode()
+                    ).hexdigest()[:16]
+                    fp = self._operation_fingerprint(plan, ctx, content_hash)
+                    if fp in self._executed_ops:
+                        logger.info(f"Skipping duplicate operation: {plan.target_uri}")
+                        return plan
 
-                # Step 2: Build - construct ContextNode
-                node = self._archive_builder.build(candidate, plan, ctx)
+                    # Handle archive operation
+                    if plan.action == WriteAction.ARCHIVE:
+                        self._executed_ops.add(fp)
+                        return self._handle_archive(plan, ctx)
 
-                # Step 3+4: Write node + outbox event atomically (if supported)
-                atomic_write = self._get_real_method(self._fs, "write_node_with_outbox")
-                supports_atomic_write = self._get_real_method(
-                    self._fs,
-                    "supports_atomic_outbox_write",
-                )
-                build_write_event = self._get_real_method(
-                    self._outbox_store,
-                    "build_write_event",
-                )
-                atomic_write_allowed = (
-                    supports_atomic_write is None
-                    or bool(supports_atomic_write(node))
-                )
-                if self._is_code_resource(node) and (
-                    atomic_write is None
-                    or not atomic_write_allowed
-                    or build_write_event is None
-                ):
-                    raise RuntimeError(
-                        "code resource writes require an atomic Outbox backend"
+                    # Handle delete operation
+                    if plan.action == WriteAction.DELETE:
+                        self._executed_ops.add(fp)
+                        return self._handle_delete(plan, ctx)
+
+                    # Step 2: Build - construct ContextNode
+                    node = self._archive_builder.build(candidate, plan, ctx)
+
+                    # Step 3+4: Write node + outbox event atomically (if supported)
+                    atomic_write = self._get_real_method(self._fs, "write_node_with_outbox")
+                    supports_atomic_write = self._get_real_method(
+                        self._fs,
+                        "supports_atomic_outbox_write",
                     )
-                if (
-                    atomic_write is not None
-                    and atomic_write_allowed
-                    and build_write_event is not None
-                    and plan.action in ("create", "merge")
-                ):
-                    use_atomic = True
-                    outbox_event = build_write_event(node)
-                    atomic_write(node, ctx, outbox_event)
-                else:
-                    use_atomic = False
-                    # Generic non-code resources retain their legacy fallback.
-                    self._fs.write_node(node, ctx)
-
-                # Mark as executed only after successful write
-                self._executed_ops.add(fp)
-
-                # Step 4: Outbox - register event for async index synchronization
-                # Skip when atomic path already inserted the event in the same txn
-                if not use_atomic and self._outbox_store and plan.action in ("create", "merge"):
-                    try:
-                        self._outbox_store.register_write(node, ctx)
-                    except Exception as e:
-                        # Log error but don't fail the write
-                        logger.warning(
-                            "Failed to register outbox event for %s: %s",
-                            node.uri, e
+                    build_write_event = self._get_real_method(
+                        self._outbox_store,
+                        "build_write_event",
+                    )
+                    atomic_write_allowed = (
+                        supports_atomic_write is None
+                        or bool(supports_atomic_write(node))
+                    )
+                    if self._is_code_resource(node) and (
+                        atomic_write is None
+                        or not atomic_write_allowed
+                        or build_write_event is None
+                    ):
+                        raise RuntimeError(
+                            "code resource writes require an atomic Outbox backend"
                         )
+                    if (
+                        atomic_write is not None
+                        and atomic_write_allowed
+                        and build_write_event is not None
+                        and plan.action in ("create", "merge")
+                    ):
+                        use_atomic = True
+                        outbox_event = build_write_event(node)
+                        atomic_write(node, ctx, outbox_event)
+                    else:
+                        use_atomic = False
+                        # Generic non-code resources retain their legacy fallback.
+                        self._fs.write_node(node, ctx)
 
-                # Step 5: Directory - trigger directory summary update
-                # Skip for profile: parent is memories/, not a category directory
-                if (
-                    self._directory_summary_enabled
-                    and self._outbox_store
-                    and plan.action in ("create", "merge")
-                ):
-                    if candidate.category != "profile":
+                    # Mark as executed only after successful write
+                    self._executed_ops.add(fp)
+
+                    # Step 4: Outbox - register event for async index synchronization
+                    # Skip when atomic path already inserted the event in the same txn
+                    if not use_atomic and self._outbox_store and plan.action in ("create", "merge"):
                         try:
-                            self._outbox_store.register_directory(node, ctx)
+                            self._outbox_store.register_write(node, ctx)
                         except Exception as e:
                             # Log error but don't fail the write
                             logger.warning(
-                                "Failed to register directory event for %s: %s",
+                                "Failed to register outbox event for %s: %s",
                                 node.uri, e
                             )
+
+                    # Step 5: Directory - trigger directory summary update
+                    # Skip for profile: parent is memories/, not a category directory
+                    if (
+                        self._directory_summary_enabled
+                        and self._outbox_store
+                        and plan.action in ("create", "merge")
+                    ):
+                        if candidate.category != "profile":
+                            try:
+                                self._outbox_store.register_directory(node, ctx)
+                            except Exception as e:
+                                # Log error but don't fail the write
+                                logger.warning(
+                                    "Failed to register directory event for %s: %s",
+                                    node.uri, e
+                                )
 
                 return plan
 
