@@ -530,3 +530,41 @@ class TestVideoMode:
             EpisodicMemoryGenerator(video_llm, use_video=True, video_fps=0)
         with pytest.raises(ValueError, match="video_width"):
             EpisodicMemoryGenerator(video_llm, use_video=True, video_width=0)
+
+    def test_video_mode_fallback_skips_input_audio(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        """Video mode implies an input_audio-rejecting backend; the frames
+        fallback must not attach the audio part (transcript still flows)."""
+        self._patch_video(monkeypatch, fail=True)
+        from core.graph_models import create_raw_node
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes, audio_node=audio)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "input_audio"] == []
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+
+    def test_non_video_mode_still_attaches_audio(
+        self, ctx, video_llm, video_node, frame_nodes,
+    ):
+        from core.graph_models import create_raw_node
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen = EpisodicMemoryGenerator(video_llm)  # use_video=False
+
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes, audio_node=audio)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert len([p for p in parts if p.get("type") == "input_audio"]) == 1

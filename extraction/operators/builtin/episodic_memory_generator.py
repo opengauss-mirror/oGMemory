@@ -30,6 +30,7 @@ multimodal backend).
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -344,6 +345,14 @@ class EpisodicMemoryGenerator:
             raw_node, frames, audio_node,
             asr_segments=normalise_speech_transcript(asr_segments),
             video_part=video_part,
+            # Video mode implies a backend that takes whole-video input and
+            # rejects input_audio parts (e.g. Volcengine Ark minimax-m3).
+            # When we fall back to frames inside video mode, the audio part
+            # must be skipped too — the transcript block still carries the
+            # speech content.
+            include_audio=(
+                self._include_audio and not (self._use_video and video_part is None)
+            ),
         )
         try:
             # Note: complete_multimodal uses the OpenAI-compatible
@@ -412,8 +421,15 @@ class EpisodicMemoryGenerator:
         audio_node: RawNode | None,
         asr_segments: list[dict] | None = None,
         video_part: dict | None = None,
+        include_audio: bool | None = None,
     ) -> list[dict]:
-        """Construct the multimodal chat message list for the LLM call."""
+        """Construct the multimodal chat message list for the LLM call.
+
+        ``include_audio`` overrides the constructor's ``include_audio``
+        for this call (None → constructor value). Used by the video-mode
+        frames fallback to skip the ``input_audio`` part on backends
+        that reject it.
+        """
         # User prompt: text describing the task + clip metadata + the
         # actual frames (and optionally audio + ASR transcript).
         user_text_parts: list[str] = [
@@ -478,7 +494,8 @@ class EpisodicMemoryGenerator:
             image_part = _image_part_from_node(frame, self._image_detail)
             if image_part is not None:
                 content_parts.append(image_part)
-        if self._include_audio and audio_node is not None:
+        if (self._include_audio if include_audio is None else include_audio) \
+                and audio_node is not None:
             audio_part = _audio_part_from_node(audio_node)
             if audio_part is not None:
                 content_parts.append(audio_part)
@@ -614,6 +631,11 @@ def _audio_part_from_node(audio: RawNode) -> dict | None:
     }
 
 
+# Sub-second re-encodes (residual trim slices) are rejected by the
+# video-understanding API with an opaque 400 — fall back to frames.
+_MIN_LLM_VIDEO_SECONDS = 1.0
+
+
 def _prepare_llm_video(
     source_path: str,
     *,
@@ -665,7 +687,53 @@ def _prepare_llm_video(
     data = sidecar.read_bytes()
     if not data:
         raise RuntimeError(f"re-encoded video is empty: {sidecar}")
+    _ensure_video_stream(sidecar, ffmpeg_bin=ffmpeg_bin)
     return sidecar, base64.b64encode(data).decode("ascii")
+
+
+def _ensure_video_stream(sidecar: Path, *, ffmpeg_bin: str = "ffmpeg") -> None:
+    """Raise when the sidecar is unusable as LLM video input.
+
+    Two degenerate cases burn an API call on an opaque 400:
+
+    * No video stream at all (a streamless container, e.g. an
+      audio-only re-encode).
+    * A near-empty video — sources like a 0.17 s residual slice at a
+      trim boundary encode to a 1-frame clip that Ark's video
+      pipeline rejects. Require at least ``_MIN_LLM_VIDEO_SECONDS``.
+    """
+    import shutil
+    import subprocess
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        # ffprobe shipped with the ffmpeg apt package; if it is somehow
+        # absent, skip the guard (best effort).
+        return
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_type:format=duration",
+         "-of", "json", str(sidecar)],
+        capture_output=True, text=True, timeout=60,
+    )
+    try:
+        info = json.loads(probe.stdout or "{}")
+    except json.JSONDecodeError:
+        info = {}
+    if not (info.get("streams") or []):
+        raise RuntimeError(
+            f"re-encoded video has no video stream: {sidecar} "
+            f"(degenerate clip?)"
+        )
+    try:
+        duration = float((info.get("format") or {}).get("duration"))
+    except (TypeError, ValueError):
+        duration = None
+    if duration is not None and duration < _MIN_LLM_VIDEO_SECONDS:
+        raise RuntimeError(
+            f"re-encoded video is too short for LLM video input "
+            f"({duration:.2f}s < {_MIN_LLM_VIDEO_SECONDS}s): {sidecar}"
+        )
 
 
 def _video_part_from_source(
