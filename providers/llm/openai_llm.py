@@ -111,8 +111,16 @@ class OpenAILLM(LLM):
         reasoning_effort: str | None = None,
         is_reasoning_model: bool | None = None,
         extra_body: dict[str, Any] | None = None,
-        request_timeout_seconds: float = 120.0,
+        request_timeout_seconds: float | None = None,
     ):
+        # OGMEM_LLM_TIMEOUT (seconds): the default is too tight when many
+        # video pipelines hit the endpoint concurrently (queue wait +
+        # decode exceeds 120s -> non-retryable "Request timed out" ->
+        # per-clip flash failures). Explicit config still wins.
+        if request_timeout_seconds is None:
+            request_timeout_seconds = float(
+                os.environ.get("OGMEM_LLM_TIMEOUT", "120.0")
+            )
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise ValueError(
@@ -704,7 +712,6 @@ class OpenAILLM(LLM):
                     tool_choice=effective_tool_choice,
                     **self._completion_parameters(temperature),
                 )
-                usage = self._track_usage(response)
                 self._raise_if_tool_truncated(response)
 
                 message = response.choices[0].message
@@ -763,10 +770,18 @@ class OpenAILLM(LLM):
                             f"model={self._model}, prompt_sha={prompt_sha}",
                             tool_choice="required",
                         )
+                    # Accepted response (auto tool_choice legitimately
+                    # returned text): track usage only now, not on the
+                    # retried attempts above.
+                    self._track_usage(response)
                     return []
 
                 if effective_tool_choice == "required":
                     self._required_tool_choice_capability = "supported"
+                # Usage belongs to the accepted response only: tracking on
+                # every retry-loop attempt (and on the final raise) inflated
+                # the token counters.
+                usage = self._track_usage(response)
                 parsed_tool_calls = [
                     {
                         "tool": call.function.name,
