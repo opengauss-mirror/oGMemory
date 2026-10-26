@@ -13,8 +13,8 @@ from extraction.schemas.registry import SchemaRegistry
 from extraction.tools import Extractor
 
 
-def examples():
-    text = PromptManager().render("extraction", "examples")
+def examples(template="extraction"):
+    text = PromptManager().render(template, "examples")
     matches = re.findall(r"^.*extract_(entity|preference)[^\n]*:\n((?: {2,}[^\n]*\n)+)", text, re.M)
     return [(category, yaml.safe_load(fields)) for category, fields in matches]
 
@@ -36,3 +36,14 @@ def test_full_examples_fit_supported_topic_registry(tmp_path):
     prompt = extractor._build_prompt("en", "A short conversation.")
     assert extractor._prompt_manager.render("extraction", "examples") in prompt
     assert len(examples()) == 7
+
+
+@pytest.mark.parametrize("category,fields", examples("extraction_graph"))
+def test_graph_demonstrated_card_validates(category, fields):
+    from extraction.tool_builder import parse_tool_call
+    fields = dict(fields)
+    parsed = parse_tool_call("extract_" + category, fields, SchemaRegistry(), activation_enabled=True)
+    assert parsed is not None
+    candidate = parsed[2]
+    assert candidate.metadata["update_activation"] == fields["update_activation"]
+    validate_memory_card(validate_candidate(candidate))

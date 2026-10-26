@@ -63,12 +63,13 @@ def resolve_edges(proposals, candidates, plans, ctx, *, fs, uri_resolver=None):
     positional pairing unsafe. Multiple stored nodes for a key are ambiguous.
     """
     from core.models import RelationEdge
+    from commit.write_receipts import has_stored_target
 
     if len(candidates) != len(plans):
         return [], ["candidate_write_alignment_failed"] * len(proposals)
     refs = {}
     for candidate, plan in zip(candidates, plans, strict=True):
-        if plan.action in {"create", "merge", "append"}:
+        if has_stored_target(plan):
             # Reconciliation may rename a candidate after extract_relation
             # emitted its original key. Only verified aliases are accepted;
             # the sets below preserve ambiguity rejection across candidates.

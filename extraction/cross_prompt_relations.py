@@ -8,6 +8,7 @@ from typing import Any
 
 from core.interfaces import LLM
 from core.models import CandidateMemory, RelationEdge, RequestContext, WritePlan
+from commit.write_receipts import has_stored_target
 from index.activation_projection import build_activation_record
 
 def run_integrated_relations(messages, candidates, plans, ctx, *, fs,
@@ -25,7 +26,7 @@ def run_integrated_relations(messages, candidates, plans, ctx, *, fs,
                     "reason": "candidate_write_alignment_failed"}
     stored_candidates, stored_plans = [], []
     for candidate, plan in zip(candidates, plans, strict=True):
-        if plan.action not in {"create", "merge", "append"}:
+        if not has_stored_target(plan):
             continue
         try:
             node = fs.read_node(plan.target_uri, ctx)
@@ -115,7 +116,7 @@ def build_cross_prompt_relation_prompt(
             "source_ids": list(candidate.provenance_ids),
         }
         for candidate, plan in zip(candidates, plans, strict=True)
-        if plan.action != "skip"
+        if has_stored_target(plan)
     ]
     turns_json = json.dumps(
         current_turns, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -218,7 +219,7 @@ def generate_cross_prompt_relations(
             if str(source_id).strip()
         }
         for candidate, plan in zip(candidates, plans, strict=True)
-        if plan.action != "skip"
+        if has_stored_target(plan)
     }
     new_refs = set(new_sources_by_ref)
     historical_by_ref = {item.node_ref: item for item in historical}

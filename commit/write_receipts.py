@@ -12,6 +12,16 @@ from core.models import CandidateMemory, RequestContext, WritePlan
 RECEIPTS_KEY = "memory_write_receipts"
 
 
+def has_stored_target(plan: WritePlan) -> bool:
+    """A proven stored endpoint, not an unsuccessful or unverified skip.
+
+    Callers still authorize/hydrate target_uri before consuming its contents.
+    """
+    return bool(plan.target_uri) and (plan.action in {"create", "merge", "append"}
+        or (plan.action == "skip" and plan.merged_fields.get("status") in
+            {"operation_committed", "duplicate"}))
+
+
 class WriteNotStartedError(RuntimeError):
     """Planning, authorization or construction rejected before durable mutation."""
 

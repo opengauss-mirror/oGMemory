@@ -157,6 +157,43 @@ def test_unstored_or_skipped_candidate_cannot_trigger_relation_call(setup):
     embedder.embed_texts.assert_not_called()
 
 
+@pytest.mark.parametrize("status", ["operation_committed", "duplicate"])
+def test_confirmed_skip_preserves_relation_generation_and_recommendation(setup, status):
+    ctx, old, new, candidate, plan, fs, embedder, index = setup
+    recovered = replace(plan, action="skip", merged_fields={"status": status})
+    historical = RelationCandidateService(
+        AuthorizedVectorSearch(index, embedder, ContextReader(fs))
+    ).recommend([candidate], [recovered], ctx)[0]
+    assert [item.node_ref for item in historical] == [old.uri]
+    llm = Mock()
+    llm.complete_json.return_value = {"relations": [dict(source_node_ref=new.uri,
+        target_node_ref=old.uri, relation="extends", evidence_ids=["new-source", "old-source"])]}
+    edges, diagnostics = run_integrated_relations([], [candidate], [recovered], ctx,
+        fs=fs, vector_index=index, embedder=embedder, llm=llm, historical_candidates=historical)
+    assert len(edges) == 1 and edges[0].from_uri == new.uri, diagnostics
+    assert diagnostics["relation_accepted"] == 1
+    assert new.uri in llm.complete_json.call_args.args[0]
+
+
+@pytest.mark.parametrize("status", ["operation_committed", "duplicate", "failed", None])
+def test_native_relation_skip_uses_only_proven_actual_endpoint(setup, status):
+    from extraction.relation_proposals import resolve_edges
+    ctx, old, new, candidate, plan, fs, embedder, index = setup
+    actual = replace(new, uri=new.uri + "_timestamped")
+    nodes = {old.uri: old, actual.uri: actual}
+    fs.read_node.side_effect = lambda uri, ctx: nodes[uri]
+    recovered = replace(plan, target_uri=actual.uri, action="skip",
+        merged_fields={"status": status} if status else {})
+    proposal = dict(from_category="entity", from_routing_key="new", to_category="entity",
+        to_routing_key="old", relation_type="refers_to", weight=.8, reason="Related facts")
+    edges, rejected = resolve_edges([proposal], [candidate, replace(candidate, routing_key="old")],
+        [recovered, WritePlan("create", old.uri)], ctx, fs=fs)
+    if status in {"operation_committed", "duplicate"}:
+        assert len(edges) == 1 and edges[0].from_uri == actual.uri and not rejected
+    else:
+        assert not edges and rejected == ["missing_endpoint"]
+
+
 def test_historical_only_relation_is_rejected(setup):
     ctx, old, new, candidate, plan, fs, embedder, index = setup
     historical = recommend(setup)

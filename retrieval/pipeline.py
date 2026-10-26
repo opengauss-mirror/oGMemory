@@ -217,6 +217,17 @@ class RetrievalPipeline:
 
             # Take top-k seed nodes for expansion
             seeds = candidates[: self.cfg.graph_expand_top_k]
+            if type(self._graph_retriever) is OneHopRetriever:
+                # Index deletion is asynchronous and archiving need not change
+                # the node revision. Canonical hydration must gate anchors too.
+                visible_seeds = []
+                for seed in seeds:
+                    try:
+                        self._context_reader.read_authorized(strip_l2_suffix(seed.uri), ctx)
+                    except Exception:
+                        continue  # fail closed; preserve ordinary assembly
+                    visible_seeds.append(seed)
+                seeds = visible_seeds
             seed_hits = [
                 SeedHit(
                     uri=c.uri,

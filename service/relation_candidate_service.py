@@ -6,6 +6,7 @@ import json
 import time
 
 from core.models import CandidateMemory, RequestContext, WritePlan
+from commit.write_receipts import has_stored_target
 from extraction.cross_prompt_relations import (
     CrossPromptRelationDiagnostics,
     HistoricalNodeRecommendation,
@@ -38,7 +39,7 @@ class RelationCandidateService:
         eligible = [
             (candidate, plan)
             for candidate, plan in zip(candidates, plans, strict=True)
-            if plan.action in {"create", "merge", "append"}
+            if has_stored_target(plan)
         ]
         if getattr(ctx, "acl_enforced", False) and not ctx.visible_space_ids:
             return [], CrossPromptRelationDiagnostics(

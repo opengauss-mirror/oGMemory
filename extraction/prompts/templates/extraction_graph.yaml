@@ -251,8 +251,8 @@ examples: |
     routing_key: "andrew"
     update_activation: "Andrew loves animals and nature."
     abstract: "Andrew loves animals and nature"
-    overview: "## Person\n- **Name**: Andrew\n\n## Interests\n- Loves animals and nature"
-    content: "Andrew mentioned he loves animals and nature."
+    overview: "- Andrew loves animals and nature."
+    content: "# Andrew\n\n## Interests\n- Andrew loves animals and nature."
     who: "Andrew"
     confidence: 0.9
 
@@ -266,8 +266,8 @@ examples: |
     routing_key: "sarah"
     update_activation: "Sarah has worked as a software engineer at Google for five years."
     abstract: "Sarah is a software engineer at Google (5 years)"
-    overview: "## Person\n- **Name**: Sarah\n- **Occupation**: Software engineer\n- **Employer**: Google\n- **Tenure**: 5 years (as of session date)"
-    content: "Sarah has been a software engineer at Google for 5 years."
+    overview: "- Sarah is a software engineer at Google.\n- Her tenure is 5 years as of the session date."
+    content: "# Sarah\n\n## Career\n- Sarah is a software engineer at Google.\n- Her tenure is 5 years as of the session date."
     who: "Sarah"
     confidence: 0.85
 
@@ -281,13 +281,15 @@ examples: |
     routing_key: "friend"
     update_activation: "The speaker's friend plans to move."
     abstract: "User's friend plans to move"
+    overview: "- The speaker's friend plans to move."
+    content: "# Speaker's friend\n\n## Plans\n- The speaker's friend plans to move."
     who: "朋友"
     confidence: 0.7
 
   ❌ WRONG — extract_profile (friend is moving, not the user)
 
   ## preferences Example — One topic per call
-  Conversation: "I usually drink oat milk latte in the morning, commute by bike, and use Obsidian for notes."
+  Conversation: "I'm Caroline. I usually drink oat milk latte in the morning, commute by bike, and use Obsidian for notes."
 
   ❌ Bad — ONE call mixing unrelated facets:
     abstract: "User preferences: oat milk latte, bike commute, Obsidian notes"
@@ -298,24 +300,24 @@ examples: |
     routing_key: "beverage"
     update_activation: "The speaker habitually drinks an oat milk latte in the morning."
     abstract: "Beverage preference: Drinks oat milk latte in the morning"
-    overview: "## Topic\n- Beverage\n\n## Specific Preference\n- Drinks oat milk latte in the morning"
-    content: "Caroline habitually drinks oat milk latte in the morning."
+    overview: "- Caroline usually drinks oat milk latte in the morning."
+    content: "# Caroline's beverage preference\n\n- Caroline usually drinks oat milk latte in the morning."
     confidence: 0.9
 
   Call 2 — extract_preference:
     routing_key: "commute"
     update_activation: "The speaker commutes by bike."
     abstract: "Commute preference: Rides a bike"
-    overview: "## Topic\n- Commute\n\n## Specific Preference\n- Commutes by bike"
-    content: "Caroline commutes by bike."
+    overview: "- Caroline commutes by bike."
+    content: "# Caroline's commute preference\n\n- Caroline commutes by bike."
     confidence: 0.9
 
   Call 3 — extract_preference:
     routing_key: "note_taking"
     update_activation: "The speaker uses Obsidian for notes."
     abstract: "Note-taking preference: Uses Obsidian"
-    overview: "## Topic\n- Productivity tools\n\n## Specific Preference\n- Prefers Obsidian for note-taking"
-    content: "Caroline prefers Obsidian for taking notes."
+    overview: "- Caroline uses Obsidian for notes."
+    content: "# Caroline's note-taking preference\n\n- Caroline uses Obsidian for notes."
     confidence: 0.9
 
   ## entity Example — Zettelkasten style, rich details
@@ -325,8 +327,8 @@ examples: |
     routing_key: "ceramic_vase"
     update_activation: "Melanie makes hand-thrown ceramic vases with crackled blue glaze inspired by Japanese pottery and sells them at Portland Saturday Market."
     abstract: "Melanie's ceramic vase: crackled blue glaze, inspired by Japanese pottery"
-    overview: "## Basic Info\n- **Creator**: Melanie\n- **Object**: Ceramic vase\n\n## Key Attributes\n- Hand-thrown\n- Crackled blue glaze\n- Inspired by Japanese pottery\n\n## Related Facts\n- Sells at Portland Saturday Market"
-    content: "Melanie makes hand-thrown ceramic vases with crackled blue glaze inspired by Japanese pottery. Sells at Portland Saturday Market."
+    overview: "- Melanie makes hand-thrown ceramic vases with crackled blue glaze inspired by Japanese pottery.\n- Melanie sells them at Portland Saturday Market."
+    content: "# Melanie's ceramic vase\n\n## Appearance\n- Hand-thrown ceramic vase with crackled blue glaze inspired by Japanese pottery.\n\n## Sales\n- Melanie sells the vase at Portland Saturday Market."
     who: "Melanie"
     where: "Portland Saturday Market"
     confidence: 0.95

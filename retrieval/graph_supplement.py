@@ -55,10 +55,8 @@ class GraphSupplement:
         self.gate = OneHopRetriever(None, embedding_profile=self.profile)
 
     def read(self, uri, ctx):
-        allowed = (f"ctx://{ctx.account_id}/users/{ctx.user_id}/",
-                   f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/")
-        if not uri.startswith(allowed):
-            raise PermissionError("Graph supplement outside current user/agent scope")
+        # ContextReader applies backend-specific owner visibility, including
+        # explicitly shared Agents in SQL mode. Do not narrow it by URI prefix.
         block = self.reader.read_authorized(uri, ctx)
         lifecycle = block.metadata.get("status") or block.metadata.get("lifecycle_status") or block.metadata.get("visibility")
         if str(lifecycle or "").lower() in INACTIVE:
@@ -155,9 +153,8 @@ class GraphSupplement:
                     source, target = edge["source_uri"], edge["target_uri"]
                     if uri not in (source, target) or edge["relation_type"].lower() in ("supersedes", "conflict_alert"):
                         continue
-                    allowed = (f"ctx://{ctx.account_id}/users/{ctx.user_id}/",
-                               f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/")
-                    if not source.startswith(allowed) or not target.startswith(allowed):
+                    if not all(key in edge for key in
+                               ("edge_projection", "source_revision", "target_revision", "weight")):
                         continue
                     vector = self.gate._compatible_vector(RelationNeighbor(
                         uri=target, edge_projection=edge["edge_projection"],

@@ -275,6 +275,30 @@ These tests establish implementation contracts, not BEAM/LoCoMo accuracy parity:
 the current upstream extractor/prompt is intentionally retained. A fresh corpus
 benchmark is still required before claiming historical accuracy numbers.
 
+### Replay, authorization and lifecycle boundaries
+
+- Connection descriptors are graph annotations, not event/case occurrence identity.
+  Descriptor-only replays refresh the existing node with a versioned write; legacy
+  descriptor-bearing replay hashes remain readable. Exact durable operation
+  receipts still validate the complete accepted payload, including descriptors.
+- Explicit updates validate the extraction-time expected version before content
+  replay or descriptor refresh. A receipt-proven retry of an already committed
+  operation remains idempotent.
+- Relation generation retains actual stored URIs for receipt-confirmed and
+  duplicate-confirmed skips, with canonical endpoint reads. Unverified skips and
+  failed writes cannot contribute endpoints.
+- One-hop anchors are canonically authorized and lifecycle-checked before graph
+  lookup, even if stale vector records remain after archiving. Two-hop traversal
+  uses the existing backend-specific ContextReader ACL, including authorized SQL
+  shared-Agent memories, rather than limiting reads to the current Agent prefix.
+- Graph extraction's entity/preference examples obey the same card validator as
+  native extraction. Graph activation and relation instructions remain enabled.
+
+PR314 second-round selected verification (2026-10-26): **630 passed, 24 skipped**
+in the focused unit suite and **24 passed** against a disposable PostgreSQL/pgvector
+database. This includes archived anchors with still-present relation projections;
+it is not a full benchmark or a claim of new accuracy measurements.
+
 ### Local verification (2026-10-09)
 
 - Retrieval, service, extraction, index, server and commit regression selection:
