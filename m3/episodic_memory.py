@@ -51,6 +51,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import logging
@@ -62,6 +63,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
+from m3._parallel import UnitError, parallel_clips
 from m3.config import (
     M3BENCH_ACCOUNT_ID,
     M3BENCH_AGENT_ID,
@@ -554,6 +556,12 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
 
     only_videos = set(args.video.split(",")) if args.video else None
 
+    # Flatten into per-clip descriptors. Child resolution (graph reads)
+    # and pre-submit failure bookkeeping stay in the main thread so the
+    # failure-record shapes are unchanged; the multimodal LLM call
+    # dominates the worker unit. OpenAI client and SQL graph store are
+    # safe to share across workers; the read-only indexes are shared.
+    clips: list[dict] = []
     for line in manifest_lines:
         if not line.strip():
             continue
@@ -609,42 +617,59 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                 })
                 continue
 
-            try:
-                result, retry_count = _generate_with_retry(
-                    max_retries=args.max_retries,
-                    retry_base_seconds=args.retry_base_seconds,
-                    retry_max_seconds=args.retry_max_seconds,
-                    graph=graph, op_service=op_service, ctx=ctx,
-                    video_raw_node=video_node,
-                    frame_nodes=frame_nodes,
-                    audio_node=audio_node,
-                    llm=llm,
-                    max_frames=args.max_frames,
-                    include_audio=not args.no_audio,
-                    temperature=args.temperature,
-                    asr_segments=asr_index.get(key) or [],
-                    force=(retry_key in retry_targets if retry_targets is not None
-                           else getattr(args, "force", False)),
-                )
-                retries += retry_count
-            except Exception as exc:
-                logger.exception(
-                    "Episodic memory failed for %s clip %s",
-                    video_id, clip_id,
-                )
-                failed.append({
-                    "video_id": video_id,
-                    "clip_id": clip_id,
-                    "error": str(exc),
-                })
-                continue
+            clips.append({
+                "video_id": video_id,
+                "clip_id": clip_id,
+                "retry_key": retry_key,
+                "key": key,
+                "video_node": video_node,
+                "frame_nodes": frame_nodes,
+                "audio_node": audio_node,
+            })
 
-            output_lines.append(json.dumps(result, ensure_ascii=False))
-            total_chars += len(result.get("description") or "")
-            if not result["resumed"]:
-                total_extractions += 1
-            else:
-                resumed_clips += 1
+    def _unit(clip: dict) -> tuple[dict, int]:
+        clip_ctx = dataclasses.replace(
+            ctx, trace_id=f"{ctx.trace_id}-{clip['video_id']}-{clip['clip_id']}"
+        )
+        return _generate_with_retry(
+            max_retries=args.max_retries,
+            retry_base_seconds=args.retry_base_seconds,
+            retry_max_seconds=args.retry_max_seconds,
+            graph=graph, op_service=op_service, ctx=clip_ctx,
+            video_raw_node=clip["video_node"],
+            frame_nodes=clip["frame_nodes"],
+            audio_node=clip["audio_node"],
+            llm=llm,
+            max_frames=args.max_frames,
+            include_audio=not args.no_audio,
+            temperature=args.temperature,
+            asr_segments=asr_index.get(clip["key"]) or [],
+            force=(clip["retry_key"] in retry_targets if retry_targets is not None
+                   else getattr(args, "force", False)),
+        )
+
+    for clip, result in parallel_clips(clips, _unit):
+        if isinstance(result, UnitError):
+            logger.error(
+                "Episodic memory failed for %s clip %s: %s",
+                clip["video_id"], clip["clip_id"], result,
+                exc_info=result.exception,
+            )
+            failed.append({
+                "video_id": clip["video_id"],
+                "clip_id": clip["clip_id"],
+                "error": str(result),
+            })
+            continue
+
+        record, retry_count = result
+        retries += retry_count
+        output_lines.append(json.dumps(record, ensure_ascii=False))
+        total_chars += len(record.get("description") or "")
+        if not record["resumed"]:
+            total_extractions += 1
+        else:
+            resumed_clips += 1
 
     with output_jsonl.open("w", encoding="utf-8") as f:
         for line in output_lines:
