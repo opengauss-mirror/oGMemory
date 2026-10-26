@@ -413,17 +413,161 @@ class TestExtractorToolCallFallback:
         assert llm.complete_with_tools.call_count == 4
         llm.complete_json.assert_called_once()
 
-    def test_real_api_errors_are_not_hidden_when_both_native_runs_fail(self):
+    def test_llm_api_errors_drop_the_span_instead_of_raising(self):
+        """WS 4: real API errors must not abort the chunk.
+
+        The default pass exhausts its retry budget -> the span is dropped
+        (None) so the caller keeps the other spans; the error is logged,
+        not hidden. No JSON fallback fires (the JSON path is reserved for
+        tool-call protocol failures).
+        """
         llm = Mock()
         llm.complete_with_tools.side_effect = RuntimeError("rate limited")
+        extractor = Extractor(llm, span_retries=1)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert result is None
+        # 1 + 1 retry attempts on the default pass; the temp=0 pass is
+        # never reached once the default pass exhausts its budget.
+        assert llm.complete_with_tools.call_count == 2
+        llm.complete_json.assert_not_called()
+
+    def test_temp0_pass_failure_keeps_default_pass_output(self):
+        """WS 4: a partial dual-run beats losing the span."""
+        llm = Mock()
+        llm.complete_with_tools.side_effect = [
+            [self._preference("coffee")],
+            RuntimeError("rate limited"),
+            RuntimeError("rate limited"),
+        ]
+        extractor = Extractor(llm, span_retries=1)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert result is not None
+        assert result[0].routing_key == "coffee"
+        # default pass (1) + temp=0 pass (2 attempts) = 3 calls.
+        assert llm.complete_with_tools.call_count == 3
+        llm.complete_json.assert_not_called()
+
+    def test_multiple_spans_one_failing_span_is_dropped_not_fatal(self):
+        """WS 4: one span's LLM failure is logged and skipped; the rest
+        of the chunk keeps its candidates (partial extraction)."""
+        llm = Mock()
+
+        def complete_with_tools(*, prompt, **_kwargs):
+            if prompt == "failed span":
+                raise RuntimeError("rate limited")
+            return [self._preference("tea")]
+
+        llm.complete_with_tools.side_effect = complete_with_tools
+        extractor = Extractor(llm, span_retries=0)
+        prepared = [
+            _PreparedSpan(
+                span=_Span(start=0, end=0, message_ids=["msg-1"]),
+                prompt="failed span",
+                prompt_sha="a" * 64,
+            ),
+            _PreparedSpan(
+                span=_Span(start=1, end=1, message_ids=["msg-2"]),
+                prompt="successful span",
+                prompt_sha="b" * 64,
+            ),
+        ]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        result = extractor._structure_spans(
+            spans=[item.span for item in prepared],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+
+        assert {candidate.routing_key for candidate in result} == {"tea"}
+        # failed span: 1 call (default pass exhausted its budget, dual
+        # abandoned), successful span: 2 calls (dual).
+        assert llm.complete_with_tools.call_count == 3
+        llm.complete_json.assert_not_called()
+
+    def test_straggler_spans_are_dropped_after_timeout_budget(self):
+        """WS 4: spans that never complete within the pool budget are
+        dropped, not awaited forever."""
+        import threading
+        import time as _time
+
+        release = threading.Event()
+        llm = Mock()
+
+        def hanging(*args, **kwargs):
+            release.wait(timeout=30)
+            return [self._preference("slow")]
+
+        llm.complete_with_tools.side_effect = hanging
+        extractor = Extractor(llm, span_retries=0, span_timeout_seconds=0.2)
+        # Two spans: only the multi-span path uses the pool + wait budget
+        # (a single span runs the dual directly with no pool).
+        prepared = [
+            _PreparedSpan(
+                span=_Span(start=0, end=0, message_ids=["msg-1"]),
+                prompt="slow span",
+                prompt_sha="a" * 64,
+            ),
+            _PreparedSpan(
+                span=_Span(start=1, end=1, message_ids=["msg-2"]),
+                prompt="slow span 2",
+                prompt_sha="b" * 64,
+            ),
+        ]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        started = _time.monotonic()
+        result = extractor._structure_spans(
+            spans=[item.span for item in prepared],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+        try:
+            assert result == []
+            assert _time.monotonic() - started < 10
+        finally:
+            release.set()
+
+    def test_phase1_failure_falls_back_to_full_conversation_span(self):
+        """WS 4: Phase 1 LLM failure degrades to the fallback span instead
+        of aborting extract()."""
+        llm = Mock()
+        llm.complete_json.side_effect = [
+            RuntimeError("phase 1 down"),  # span identification fails
+            {"operations": [self._preference("coffee")]},  # JSON fallback
+        ]
+        llm.complete_with_tools.side_effect = ToolCallProtocolError(
+            "empty native result"
+        )
         extractor = Extractor(llm)
 
-        with pytest.raises(RuntimeError, match="rate limited"):
-            extractor._structure_prepared_span_dual(
-                self._prepared(), self._ctx(), archive_id=None
-            )
+        messages = [
+            {"role": "user", "content": "I drink coffee every morning " * 30},
+        ]
+        result = extractor.extract(
+            messages, self._ctx(), session_time=None, archive_id=None
+        )
 
-        llm.complete_json.assert_not_called()
+        # Phase 1 degraded to the fallback span; the JSON fallback ran.
+        assert result and result[0].routing_key == "coffee"
 
     def test_fallback_candidates_still_use_public_confidence_filter(self):
         llm = Mock()
