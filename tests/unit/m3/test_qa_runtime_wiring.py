@@ -72,6 +72,49 @@ def test_qa_only_resume_preserves_account(tmp_path, monkeypatch):
     assert "graph" not in runner.call_args.kwargs
 
 
+def test_qa_params_argv_maps_set_overrides():
+    """WS 6.4/6.3: --set qa.params.<name>=<value> → m3.qa argv pairs."""
+    from m3.resume import qa_params_argv
+
+    assert qa_params_argv([
+        "qa.params.transcript_top_k=20",
+        "qa.params.llm_base_url=http://x/v1?a=b",  # value may contain '='
+        "episodic.params.foo=1",                    # non-qa.params ignored
+        "malformed",                               # no '=' ignored
+        "qa.params.",                               # empty name ignored
+    ]) == [
+        "--transcript-top-k", "20",
+        "--llm-base-url", "http://x/v1?a=b",
+    ]
+    assert qa_params_argv(None) == []
+    assert qa_params_argv([]) == []
+
+
+def test_qa_only_resume_honors_set_qa_params(tmp_path, monkeypatch):
+    """WS 6.4: graph-aware QA-only resume must not silently drop
+    ``--set qa.params.*`` retrieval knobs — appended last so they override
+    the driver's own defaults (argparse last-occurrence wins)."""
+    from m3 import resume
+
+    runner = Mock(return_value=0)
+    monkeypatch.setattr("m3.qa.run_react_qa", runner)
+    monkeypatch.setattr(resume, "build_graph_service", lambda *args: (Mock(), "memory"))
+    resume.run_qa_only(
+        graph_store="memory", connection_string=None, account_id="custom-account",
+        config_path=tmp_path / "config.yaml", annotations_path=tmp_path / "ann.json",
+        video_id="v", work_dir=tmp_path,
+        qa_params=resume.qa_params_argv([
+            "qa.params.transcript_top_k=20",
+            "qa.params.top_k=3",
+        ]),
+    )
+    parsed = runner.call_args.args[0]
+    assert parsed.transcript_top_k == 20
+    # top_k=3 was appended AFTER the driver's own --top-k default path,
+    # so the explicit --set value wins.
+    assert parsed.top_k == 3
+
+
 def test_builtin_judge_keeps_config_and_does_not_limit_questions(tmp_path, monkeypatch):
     from scripts import run_m3_bench_subset as driver
 
