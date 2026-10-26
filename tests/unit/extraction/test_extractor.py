@@ -296,9 +296,71 @@ class TestExtractorToolCallFallback:
             self._prepared(), self._ctx(), archive_id=None
         )
 
-        assert len(result) == 1
+        # The dual returns the resolved but UNMERGED candidates (one per
+        # pass); the single global _merge_dual_run happens in
+        # _structure_spans.
+        assert len(result) == 2
+        assert all(c.routing_key == "coffee" for c in result)
         assert llm.complete_with_tools.call_count == 2
         llm.complete_json.assert_not_called()
+
+    def test_single_span_path_merges_dual_run_once(self):
+        """Pin: the single-span fast path merges the dual-run output once,
+        so callers always receive the merged candidate list."""
+        llm = Mock()
+        llm.complete_with_tools.return_value = [self._preference()]
+        extractor = Extractor(llm)
+        prepared = [self._prepared()]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        result = extractor._structure_spans(
+            spans=[prepared[0].span],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+
+        assert len(result) == 1
+        assert result[0].routing_key == "coffee"
+        assert llm.complete_with_tools.call_count == 2
+
+    def test_multi_span_duplicates_merge_once_globally(self):
+        """Pin (B2): the dual returns unmerged candidates and the ONE global
+        merge in _structure_spans collapses dual-run duplicates across all
+        spans — preserving the pre-parallel single-merge semantics."""
+        llm = Mock()
+        llm.complete_with_tools.return_value = [self._preference()]
+        extractor = Extractor(llm)
+        prepared = [
+            _PreparedSpan(
+                span=_Span(start=i, end=i, message_ids=[f"msg-{i}"]),
+                prompt=f"span {i}",
+                prompt_sha=chr(ord("a") + i) * 64,
+            )
+            for i in range(2)
+        ]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+
+        # 2 spans × 2 passes, all producing the same (category, routing_key)
+        # → a single candidate after the one global merge.
+        assert llm.complete_with_tools.call_count == 4
+        assert len(result) == 1
+        assert result[0].routing_key == "coffee"
 
     def test_one_native_success_skips_json_fallback(self):
         llm = Mock()

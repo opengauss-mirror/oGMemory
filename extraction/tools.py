@@ -604,14 +604,15 @@ class Extractor:
         failed: list[_Span] = []
 
         # Single span → run the dual directly (no pool; retry logic inside
-        # still applies).
+        # still applies), then merge once — the global merge in this method
+        # is the only merge for the whole chunk.
         if len(prepared_spans) == 1:
             result = self._structure_prepared_span_dual(
                 prepared_spans[0], ctx, archive_id
             )
             if result is None:
                 return []
-            return result
+            return self._merge_dual_run(result)
 
         pool = ThreadPoolExecutor(max_workers=self._max_workers)
         try:
@@ -690,6 +691,13 @@ class Extractor:
         kept (a partial dual-run beats losing the span). Tool-call
         protocol failures are not retried — the JSON fallback below is
         their recovery path.
+
+        Returns the *resolved but unmerged* candidate list: the single
+        global ``_merge_dual_run`` over all spans happens in the caller
+        (``_structure_spans``), preserving the pre-parallel single-merge
+        semantics — merging already-merged candidates is not equivalent
+        (the richness-upgrade and confidence branches behave differently
+        on merged content).
         """
         outcome = _NativeSpanOutcome(prepared=prepared)
         attempts = 1 + self._span_retries
@@ -741,9 +749,7 @@ class Extractor:
                         type(exc).__name__, exc,
                     )
                     break
-        return self._merge_dual_run(
-            self._resolve_native_span_outcome(outcome, ctx, archive_id)
-        )
+        return self._resolve_native_span_outcome(outcome, ctx, archive_id)
 
     def _resolve_native_span_outcome(
         self,
