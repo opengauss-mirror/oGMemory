@@ -111,6 +111,11 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
     # pool; shared pool binds its own methods at __init__ time).
     # ------------------------------------------------------------------
 
+    def _create_connection(self):
+        # Use this module's psycopg2 so unit tests that patch it at module
+        # level keep working (the mixin's default does a fresh import).
+        return psycopg2.connect(self._connection_string)
+
     # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------

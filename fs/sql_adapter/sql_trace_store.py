@@ -125,6 +125,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
+    def _create_connection(self):
+        # Use this module's psycopg2 so unit tests that patch it at module
+        # level keep working (the mixin's default does a fresh import).
+        return psycopg2.connect(self._connection_string)
+
     def _ensure_table(self) -> None:
         from fs.sql_adapter.schema import ensure_schema
 

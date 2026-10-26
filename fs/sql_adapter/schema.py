@@ -75,9 +75,19 @@ def ensure_schema(conn, dialect: str | SQLDialect = "postgresql") -> None:
                 if row and row[0]:
                     # db_schema.sql is one idempotent block: if the keystone
                     # table exists the whole schema is already applied.
+                    # ASSUMPTION (known trade-off): the DDL runs in
+                    # autocommit, so a historical crash mid-script could
+                    # leave graph_nodes present while later statements
+                    # (indexes, triggers, tables created after it) are
+                    # missing — that partially-applied state is NOT
+                    # detectable here and will never be repaired by this
+                    # short-circuit. Recovery in that case: drop/rename the
+                    # schema manually, or temporarily disable the
+                    # short-circuit (see AGENTS.md ops notes).
                     _schema_ensured.add(adapter.name)
                     logger.info(
-                        "Schema already applied (graph_nodes present, dialect=%s); DDL skipped",
+                        "Schema already applied (graph_nodes present, dialect=%s); "
+                        "DDL skipped (assumes fully-applied DDL history)",
                         adapter.name,
                     )
                     return

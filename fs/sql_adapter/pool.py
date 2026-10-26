@@ -360,6 +360,12 @@ class PoolAdapterMixin:
                 conn = pool.pop()
                 if conn.closed == 0:
                     return conn
+                # Defensive close for symmetry with the semaphore path
+                # (the conn may already be closed; never raise here).
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             return self._create_connection()
         if timeout is None:
             semaphore.acquire()
