@@ -234,7 +234,13 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     # to the same DSN as ``vector_db.connection_string``.
     vi_connection = _pick(vdb, "connection_string")
     vi_table = _pick(m3_vi, "table_name") or "m3_episodic_vectors"
-    vi_pool_size = _pick(m3_vi, "pool_size") or 5
+    # Env wins over YAML: parallel drivers may need a bigger pool than
+    # the YAML default (keep it >= the parallel worker count).
+    vi_pool_size = int(
+        os.environ.get("OGMEM_VECTOR_POOL_SIZE")
+        or _pick(m3_vi, "pool_size")
+        or 5
+    )
     vi_backend = _pick(m3_vi, "backend") or "opengauss"
 
     # Graph-store DSN: m3 override wins, otherwise follow storage.

@@ -88,7 +88,12 @@ def build_graph_service(
             )
         from providers.graph_store import SQLGraphStore
 
-        return GraphService(SQLGraphStore(connection_string=dsn)), "sql"
+        # OGMEM_GRAPH_POOL_SIZE (default 32): keep >= the parallel-clip
+        # worker count or worker threads serialize on pool checkout.
+        graph_pool_size = int(os.environ.get("OGMEM_GRAPH_POOL_SIZE") or 32)
+        return GraphService(
+            SQLGraphStore(connection_string=dsn, pool_size=graph_pool_size)
+        ), "sql"
 
     raise ValueError(f"Unknown graph store: {graph_store!r}")
 
