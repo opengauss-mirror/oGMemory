@@ -77,6 +77,7 @@ from pathlib import Path
 from typing import Any
 
 from core.models import RequestContext
+from m3._parallel import ThreadLocalModels, UnitError, parallel_clips
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
 from m3.index_episodic import build_embedder
@@ -523,33 +524,43 @@ def run(args: argparse.Namespace) -> int:
         temperature=args.temperature,
         config_path=args.config,
     )
-    adapter = OGMemoryControlAdapter(
-        llm=answer_llm,
-        graph=graph,
-        embedder=embedder,
-        max_iterations=args.max_iterations,
-        no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
-        candidate_k=getattr(args, "candidate_k", None),
-        transcript_top_k=getattr(args, "transcript_top_k", 0),
-        transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
-        context_k=getattr(args, "context_k", 0),
-        include_neighbors=getattr(args, "include_neighbors", 1),
-        timeout_seconds=args.timeout_seconds,
-        default_video_id=args.default_video_id,
-    )
+    # OGMemoryControlAdapter.run() is not re-entrant: each worker
+    # thread gets its own adapter over the shared thread-safe graph /
+    # embedder / answer LLM. The judge LLM is shared (thread-safe).
+    def _build_adapter() -> OGMemoryControlAdapter:
+        return OGMemoryControlAdapter(
+            llm=answer_llm,
+            graph=graph,
+            embedder=embedder,
+            max_iterations=args.max_iterations,
+            no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
+            candidate_k=getattr(args, "candidate_k", None),
+            transcript_top_k=getattr(args, "transcript_top_k", 0),
+            transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
+            context_k=getattr(args, "context_k", 0),
+            include_neighbors=getattr(args, "include_neighbors", 1),
+            timeout_seconds=args.timeout_seconds,
+            default_video_id=args.default_video_id,
+        )
+
+    adapter_factory = ThreadLocalModels(_build_adapter, name="eval_adapter")
 
     mode = "a" if args.resume else "w"
     all_results: list[QuestionResult] = []
     answered = failed = skipped = 0
-    with results_path.open(mode, encoding="utf-8") as f:
-        for q in questions:
-            key = (str(q["video_id"]), str(q["question_id"]))
-            if key in done_keys:
-                skipped += 1
-                continue
-            # Run the adapter on the question.
+    pending = []
+    for q in questions:
+        key = (str(q["video_id"]), str(q["question_id"]))
+        if key in done_keys:
+            skipped += 1
+            continue
+        pending.append(q)
+
+    def _answer_and_judge(q: dict) -> QuestionResult:
+        """Run the adapter then the judge for one question; never raises."""
+        try:
             qr = answer_with_adapter(
-                adapter=adapter,
+                adapter=adapter_factory.get(),
                 question=str(q["question"]),
                 video_id=str(q["video_id"]),
                 question_id=str(q["question_id"]),
@@ -577,6 +588,40 @@ def run(args: argparse.Namespace) -> int:
             qr.judge_score = score
             qr.judge_reasoning = reasoning
             qr.judge_error = judge_error
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Eval failed for %s/%s", q.get("video_id"), q.get("question_id"),
+            )
+            qr = QuestionResult(
+                video_id=str(q.get("video_id") or ""),
+                question_id=str(q.get("question_id") or ""),
+                question_index=q.get("question_index", 0),
+                question=str(q.get("question") or ""),
+                expected_answer=str(q.get("answer") or ""),
+                predicted_answer="",
+                error=str(exc),
+            )
+        return qr
+
+    with results_path.open(mode, encoding="utf-8") as f:
+        for q, qr in parallel_clips(pending, _answer_and_judge, label="question(s)"):
+            if isinstance(qr, UnitError):
+                # Safety net: _answer_and_judge catches its own
+                # exceptions; only a bug in the fallback itself lands here.
+                logger.error(
+                    "Eval failed for %s/%s: %s",
+                    q.get("video_id"), q.get("question_id"), qr,
+                    exc_info=qr.exception,
+                )
+                qr = QuestionResult(
+                    video_id=str(q.get("video_id") or ""),
+                    question_id=str(q.get("question_id") or ""),
+                    question_index=q.get("question_index", 0),
+                    question=str(q.get("question") or ""),
+                    expected_answer=str(q.get("answer") or ""),
+                    predicted_answer="",
+                    error=str(qr),
+                )
             if not qr.error:
                 answered += 1
             else:
@@ -671,41 +716,51 @@ def _run_judge_only(
     all_results: list[QuestionResult] = []
     answered = failed = skipped = 0
     missing = 0
-    with results_path.open(mode, encoding="utf-8") as f:
-        for q in questions:
-            key = (str(q["video_id"]), str(q["question_id"]))
-            if key in done_keys:
-                skipped += 1
-                continue
-            row = predictions.get(key)
-            # Annotation fields win over the input JSONL for question /
-            # expected_answer / type — the annotation is the canonical
-            # source for the ground truth. The input row is the
-            # canonical source for predicted_answer / search history /
-            # adapter metadata.
-            question_text = str(q.get("question") or "")
-            expected = str(q.get("answer") or "")
-            q_type = (
-                q.get("type") if isinstance(q.get("type"), str)
-                else ",".join(q.get("type") or [])
-            )
-            qr = QuestionResult(
-                video_id=str(q["video_id"]),
-                question_id=str(q["question_id"]),
-                question_index=q.get("question_index", 0),
-                question=question_text,
-                expected_answer=expected,
-                predicted_answer="",
-                type=q_type,
-                timestamp=q.get("timestamp"),
-                before_clip=q.get("before_clip"),
-            )
-            if row is not None:
-                qr.temporal_scope = dict(row.get("temporal_scope") or {})
-                qr.predicted_answer = str(
-                    row.get("predicted_answer") or row.get("answer") or ""
-                ).strip()
-                # Carry adapter-side metadata through if present in the row.
+    pending = []
+    for q in questions:
+        key = (str(q["video_id"]), str(q["question_id"]))
+        if key in done_keys:
+            skipped += 1
+            continue
+        pending.append(q)
+
+    def _judge_one(q: dict) -> tuple[QuestionResult, bool]:
+        """Judge one pre-existing prediction; returns (qr, was_missing).
+
+        Never raises — malformed rows fall back to an empty prediction.
+        """
+        key = (str(q["video_id"]), str(q["question_id"]))
+        row = predictions.get(key)
+        # Annotation fields win over the input JSONL for question /
+        # expected_answer / type — the annotation is the canonical
+        # source for the ground truth. The input row is the
+        # canonical source for predicted_answer / search history /
+        # adapter metadata.
+        question_text = str(q.get("question") or "")
+        expected = str(q.get("answer") or "")
+        q_type = (
+            q.get("type") if isinstance(q.get("type"), str)
+            else ",".join(q.get("type") or [])
+        )
+        qr = QuestionResult(
+            video_id=str(q["video_id"]),
+            question_id=str(q["question_id"]),
+            question_index=q.get("question_index", 0),
+            question=question_text,
+            expected_answer=expected,
+            predicted_answer="",
+            type=q_type,
+            timestamp=q.get("timestamp"),
+            before_clip=q.get("before_clip"),
+        )
+        was_missing = row is None
+        if row is not None:
+            qr.temporal_scope = dict(row.get("temporal_scope") or {})
+            qr.predicted_answer = str(
+                row.get("predicted_answer") or row.get("answer") or ""
+            ).strip()
+            # Carry adapter-side metadata through if present in the row.
+            try:
                 qr.iterations = int(row.get("iterations") or 0)
                 qr.finish_reason = str(row.get("finish_reason") or "")
                 rounds = row.get("search_rounds")
@@ -715,30 +770,60 @@ def _run_judge_only(
                 qr.search_history = list(row.get("search_history") or [])
                 qr.search_stats = dict(row.get("search_stats") or {})
                 qr.error = str(row.get("error") or "")
-            else:
-                missing += 1
-                qr.error = "missing_prediction"
+            except (TypeError, ValueError):
                 logger.warning(
-                    "no prediction for %s/%s — writing empty row", key[0], key[1],
+                    "malformed prediction row for %s/%s — treating as empty",
+                    key[0], key[1],
                 )
-
-            # Judge predicted vs expected (predicted_answer may be empty
-            # if the input row was missing — that's an adapter-side
-            # failure, judge_error=False, see judge_answer).
-            started = time.monotonic()
-            score, reasoning, judge_error = judge_answer(
-                judge_llm=judge_llm,
-                question=question_text,
-                expected=expected,
-                predicted=qr.predicted_answer,
+                qr.predicted_answer = ""
+                qr.error = "malformed_prediction_row"
+        else:
+            qr.error = "missing_prediction"
+            logger.warning(
+                "no prediction for %s/%s — writing empty row", key[0], key[1],
             )
-            qr.judge_score = score
-            qr.judge_reasoning = reasoning
-            qr.judge_error = judge_error
-            # In judge-only mode the only latency we have is the judge
-            # call itself; the adapter latency lives in the source row
-            # and isn't surfaced here.
-            qr.latency_seconds = time.monotonic() - started
+
+        # Judge predicted vs expected (predicted_answer may be empty
+        # if the input row was missing — that's an adapter-side
+        # failure, judge_error=False, see judge_answer).
+        started = time.monotonic()
+        score, reasoning, judge_error = judge_answer(
+            judge_llm=judge_llm,
+            question=question_text,
+            expected=expected,
+            predicted=qr.predicted_answer,
+        )
+        qr.judge_score = score
+        qr.judge_reasoning = reasoning
+        qr.judge_error = judge_error
+        # In judge-only mode the only latency we have is the judge
+        # call itself; the adapter latency lives in the source row
+        # and isn't surfaced here.
+        qr.latency_seconds = time.monotonic() - started
+        return qr, was_missing
+
+    with results_path.open(mode, encoding="utf-8") as f:
+        for q, judged in parallel_clips(pending, _judge_one, label="question(s)"):
+            if isinstance(judged, UnitError):
+                # Safety net: _judge_one catches its own exceptions.
+                logger.error(
+                    "Judge-only eval failed for %s/%s: %s",
+                    q.get("video_id"), q.get("question_id"), judged,
+                    exc_info=judged.exception,
+                )
+                qr = QuestionResult(
+                    video_id=str(q.get("video_id") or ""),
+                    question_id=str(q.get("question_id") or ""),
+                    question_index=q.get("question_index", 0),
+                    question=str(q.get("question") or ""),
+                    expected_answer=str(q.get("answer") or ""),
+                    predicted_answer="",
+                    error=str(judged),
+                )
+                judged = (qr, False)
+            qr, was_missing = judged
+            if was_missing:
+                missing += 1
             if not qr.error:
                 answered += 1
             else:
