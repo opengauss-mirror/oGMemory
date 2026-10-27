@@ -2207,7 +2207,7 @@ class MemoryService:
         return result
 
     @staticmethod
-    def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.15) -> list[dict]:
+    def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.10) -> list[dict]:
         """Truncate items at the largest score gap.
 
         Finds the biggest relative score drop between consecutive items.
@@ -5301,7 +5301,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 break
 
         # Threshold comes from unified config first; env fallback is handled by OgMemConfig.
-        threshold = _positive_int(getattr(self._cfg, "after_turn_threshold", 200), 200)
+        threshold = _positive_int(getattr(self._cfg, "after_turn_threshold", 400), 400)
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()

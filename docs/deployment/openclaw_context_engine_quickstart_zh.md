@@ -287,7 +287,7 @@ memory:
 - `vector_db.type: chroma` 提供本地持久化向量检索；
 - `dimension` 必须等于 Embedding 接口实际返回维度；
 - 上例 `text-embedding-v3` 按 1024 维配置；使用其他模型时必须同步修改；
-- `after_turn_threshold: 1` 便于教程立即观察记忆写入；正式环境可改回 `200` 或按成本调整。
+- `after_turn_threshold: 1` 便于教程立即观察记忆写入；正式环境可改为默认的 `400`，或按成本调整。
 
 检查解析后的配置。密钥会被遮蔽：
 

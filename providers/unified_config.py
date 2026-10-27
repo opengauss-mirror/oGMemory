@@ -653,7 +653,7 @@ class OgMemConfig:
 
     # -- Memory extraction -----------------------------------------------------
     extraction_mode: str = "eager"  # "eager" (prefetch + single-shot) or "lazy" (ReAct loop)
-    after_turn_threshold: int = 200
+    after_turn_threshold: int = 400
     rolling_compress_enabled: bool = True
     rolling_compress_fallback_enabled: bool = False
     compact_prepare_token_ttl: int = 300
@@ -2081,7 +2081,7 @@ class OgMemConfig:
             after_turn_threshold=_resolve(
                 memory.get("after_turn_threshold"),
                 "OGMEM_AFTER_TURN_THRESHOLD",
-                200,
+                400,
                 int,
             ),
             rolling_compress_enabled=_resolve_bool(

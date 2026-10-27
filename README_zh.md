@@ -587,7 +587,7 @@ result = write_api.commit_session(messages, ctx)
 | `SQL_CONNECTION_STRING` | — | SQL 数据库 DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
 | `OGMEM_CONFIG` | `ogmem.yaml` | YAML 配置文件路径 |
-| `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 触发 after_turn 自动抽取的待处理 token 阈值 |
+| `OGMEM_AFTER_TURN_THRESHOLD` | `400` | 触发 after_turn 自动抽取的待处理 token 阈值 |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 启用 Layer 2 滚动会话压缩 |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | LLM 压缩不可用时启用规则 fallback |
 | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | `prepareToken` 有效期，单位秒 |
