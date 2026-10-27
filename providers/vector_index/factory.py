@@ -52,6 +52,7 @@ def _create_opengauss(config) -> VectorIndex:
         dimension=config.opengauss_dimension,
         table_name=config.opengauss_table_name,
         pool_size=config.opengauss_pool_size,
+        dialect=getattr(config, "vector_db_dialect", None),
     )
 
 

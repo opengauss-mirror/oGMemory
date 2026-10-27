@@ -11,9 +11,9 @@ from uuid import uuid4
 
 import pytest
 
-from commit.sql_outbox_store import SQLOutboxStore
 from core.lexical import LexicalHit, lexical_record_from_index_record
 from core.models import ContextNode, RetrievalConfig, TypedQuery
+from commit.sql_outbox_store import SQLOutboxStore
 from fs.sql_adapter.pool import SharedConnectionPool
 from fs.sql_adapter.sql_context_fs import SQLContextFS
 from index.index_record_builder import build_index_records
@@ -181,7 +181,7 @@ def search_index(request, tmp_path, monkeypatch):
         dsn = request.getfixturevalue("sql_database")
         with closing(psycopg2.connect(dsn)) as conn, conn, conn.cursor() as cur:
             cur.execute("CREATE EXTENSION vector")
-        index = OpenGaussVectorIndex(connection_string=dsn, dimension=2)
+        index = OpenGaussVectorIndex(connection_string=dsn, dimension=2, dialect="postgresql")
     else:
         index = InMemoryVectorIndex()
     try:

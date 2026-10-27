@@ -436,3 +436,20 @@ def test_background_retry_preserves_governed_turn_source(ctx, tmp_path, restart)
     assert len(nodes(fs, "event")) == 1
     assert manager.get_or_create(ctx.session_id).request_completed("original")
     assert manager.get_or_create(ctx.session_id).runtime_extensions[ledger_key] == ledger
+
+
+def test_recovered_source_emits_completion_after_durable_receipt(ctx, caplog):
+    import logging
+
+    fs, service, writer, manager, identity = queued(ctx)
+    writer._pipeline.extract.side_effect = None
+    writer._pipeline.extract.return_value = [candidate()]
+    ready(manager, ctx)
+    with caplog.at_level(logging.INFO, logger="ogmem.service"):
+        assert service._extraction_retry.run_once(ctx, identity) is None
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
+    assert len(nodes(fs, "event")) == 1
+    assert len(nodes(fs, "session_archive")) == 1
+    completed = [r for r in caplog.records if "after_turn background extract done" in r.getMessage()]
+    assert len(completed) == 1
+    assert "session=" + ctx.session_id[:8] in completed[0].getMessage()

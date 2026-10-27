@@ -845,17 +845,26 @@ class MemoryService:
     def _use_sql(self) -> bool:
         return self._cfg.storage_backend == "sql" and _HAS_SQL and self._cfg.sql_connection_string
 
-    @_serialize_lazy_initialization("_sql_pool")
-    def _get_shared_sql_pool(self):
-        """Create (once) and return the shared connection pool for all SQL stores."""
-        if self._sql_pool is None and _HAS_SQL and self._cfg.sql_connection_string:
-            from fs.sql_adapter.pool import SharedConnectionPool
-            self._sql_pool = SharedConnectionPool(
-                connection_string=self._cfg.sql_connection_string,
-                pool_size=self._cfg.sql_pool_size,
-                dialect=self._cfg.sql_dialect,
-            )
-        return self._sql_pool
+    def _get_shared_sql_pool(self, *, deadline=None):
+        """Create the shared pool within the caller's optional acquisition budget."""
+        if self._sql_pool is not None:
+            return self._sql_pool
+        from fs.sql_adapter.pool import SharedConnectionPool, remaining_seconds
+        acquired = (self._init_lock.acquire() if deadline is None
+                    else self._init_lock.acquire(timeout=remaining_seconds(deadline)))
+        if not acquired:
+            raise TimeoutError("SQL pool initialization deadline elapsed")
+        try:
+            if self._sql_pool is None and _HAS_SQL and self._cfg.sql_connection_string:
+                self._sql_pool = SharedConnectionPool(
+                    connection_string=self._cfg.sql_connection_string,
+                    pool_size=self._cfg.sql_pool_size,
+                    dialect=self._cfg.sql_dialect,
+                    deadline=deadline,
+                )
+            return self._sql_pool
+        finally:
+            self._init_lock.release()
 
     def _get_context_fs(self):
         """Create the appropriate ContextFS implementation based on config."""
@@ -4980,12 +4989,20 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @contextmanager
     def _session_mutation_scope(self, ctx, *, refresh=True):
+        import time
         from fs.sql_adapter.session_mutation import active_session_guard
         from service.api import MemoryWriteAPI
         nested = active_session_guard() is not None
         if self._write_api is None and self._use_sql:
+            from psycopg2 import InterfaceError, OperationalError
+            deadline = time.monotonic() + 1.0
+            try:
+                pool = self._get_shared_sql_pool(deadline=deadline)
+            except (TimeoutError, InterfaceError, OperationalError) as exc:
+                raise SessionMutationBusyError("session mutation dialect discovery unavailable") from exc
             with SQLContextFS.configured_session_mutation_lock(
-                self._cfg.sql_connection_string, ctx, dialect=self._cfg.sql_dialect,
+                self._cfg.sql_connection_string, ctx, dialect=pool.sql_dialect.name,
+                timeout_seconds=max(0, deadline - time.monotonic()),
             ) as guard:
                 try:
                     if refresh and not nested:
@@ -5680,6 +5697,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         def _extract_synchronously():
             try:
+                recovering_source = (extraction_journal is not None
+                                     and is_frozen_source_retry(ctx, extraction_journal.batch))
                 check_deadline()
                 write_result = self._chunk_and_extract(
                     messages=extraction_messages,
@@ -5749,7 +5768,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     }
                 if commit_result.get("archived"):
                     _finish_archived_batch()
-                return _complete_request(
+                result = _complete_request(
                     {
                         "ok": True,
                         **write_result,
@@ -5759,6 +5778,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "commit": commit_result,
                     }
                 )
+                if result.get("status") == "completed" and recovering_source:
+                    logger.info(
+                        "after_turn background extract done: run=%s session=%s "
+                        "archive=%s request=%s extracted=%d writes=%d archived=%s recovery=true",
+                        extraction_run_id, session_id[:8], archive_id,
+                        extraction_journal_request_id,
+                        write_result.get("candidates_extracted", 0),
+                        write_result.get("writes_completed", 0), commit_result.get("archived"),
+                    )
+                return result
             except Exception as exc:
                 rewound = _rewind_failed_archive_watermark()
                 if (isinstance(exc, SessionMutationBusyError) and extraction_journal is not None

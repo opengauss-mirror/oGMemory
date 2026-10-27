@@ -496,6 +496,7 @@ class OgMemConfig:
 
     # -- Vector DB -------------------------------------------------------------
     vector_db_type: str = "chroma"
+    vector_db_dialect: str | None = None
     opengauss_connection_string: str | None = None
     opengauss_dimension: int = 1024
     opengauss_table_name: str = "vector_index"
@@ -596,7 +597,7 @@ class OgMemConfig:
 
     # -- Storage backend -------------------------------------------------------
     storage_backend: str = "agfs"  # "agfs" | "sql"
-    sql_dialect: str = "postgresql"  # "postgresql" | "opengauss"
+    sql_dialect: str | None = None  # Shared vector databases are identified at startup when omitted.
     sql_connection_string: str | None = None
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
@@ -749,7 +750,20 @@ class OgMemConfig:
             raise ValueError("node_processing_enabled must be a boolean")
         from fs.sql_adapter.dialect import normalize_sql_dialect
 
+        if self.sql_dialect is None:
+            shared_opengauss = (
+                str(self.vector_db_type).strip().casefold() == "opengauss"
+                and self.opengauss_connection_string
+                and (not self.sql_connection_string
+                     or self.sql_connection_string == self.opengauss_connection_string)
+            )
+            self.sql_dialect = "auto" if shared_opengauss else "postgresql"
         self.sql_dialect = normalize_sql_dialect(self.sql_dialect)
+        if self.vector_db_dialect is None:
+            shared = (not self.sql_connection_string
+                      or self.sql_connection_string == self.opengauss_connection_string)
+            self.vector_db_dialect = self.sql_dialect if shared else "opengauss"
+        self.vector_db_dialect = normalize_sql_dialect(self.vector_db_dialect)
         if not 2 <= self.trace_max_turn_events <= 1024:
             raise ValueError("trace_max_turn_events must be between 2 and 1024")
         filter_integer_settings = (
@@ -1230,6 +1244,7 @@ class OgMemConfig:
             # may be openGauss OR PostgreSQL+pgvector (see OpenGaussVectorIndex);
             # the historical OPENGAUSS_* spellings still work as legacy aliases.
             vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "chroma"),
+            vector_db_dialect=_resolve(vdb.get("dialect"), "VECTOR_DB_DIALECT", None),
             opengauss_connection_string=_resolve_with_alias(
                 vdb.get("connection_string"),
                 "VECTOR_DB_CONNECTION_STRING", "OPENGAUSS_CONNECTION_STRING",
@@ -1900,7 +1915,7 @@ class OgMemConfig:
             sql_dialect=_resolve(
                 storage.get("dialect"),
                 "SQL_DIALECT",
-                "postgresql",
+                None,
             ),
             sql_connection_string=_resolve_with_alias(
                 storage.get("connection_string"),
