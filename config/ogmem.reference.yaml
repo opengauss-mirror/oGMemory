@@ -201,7 +201,7 @@ memory:
     mode: eager                   # [all] eager / lazy (lazy = ReAct loop with read tools)
     node_processing_enabled: false # [all] eager or lazy extraction followed by topic node processing
     dual_pass_enabled: true       # [all] Run two native extraction passes per span
-  # after_turn_threshold: 200    # [all] tokens before auto-extraction
+  # after_turn_threshold: 400    # [all] tokens before auto-extraction
   # rolling_compress_enabled: true
   # compact_prepare_token_ttl: 300
   # directory_summary_enabled: false
