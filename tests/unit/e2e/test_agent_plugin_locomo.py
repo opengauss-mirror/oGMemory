@@ -13,10 +13,181 @@ import requests
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "tests" / "e2e"))
 
-from agent_plugin_locomo import ReadOnlyQaProxy
-from run_claude_code_plugin_locomo import ClaudeCodeHost
-from run_opencode_plugin_locomo import OpenCodeHost
+from agent_plugin_locomo import ReadOnlyQaProxy  # noqa: E402
 from eval import build_parser  # noqa: E402
+from run_claude_code_plugin_locomo import ClaudeCodeHost  # noqa: E402
+from run_opencode_plugin_locomo import OpenCodeHost  # noqa: E402
+from run_qwenpaw_plugin_locomo import QwenPawHost  # noqa: E402
+
+
+@pytest.mark.parametrize("reply_fields", [{"reply_id": "current"}, {"reply_context": {"reply_id": "current"}}])
+def test_qwenpaw_usage_in_independent_runner_environment(tmp_path, monkeypatch, reply_fields):
+    import builtins
+
+    args = build_parser("qwenpaw").parse_args(["qa", "locomo.json", "--output-dir", str(tmp_path)])
+    args.llm_api_key = args.ogmemory_api_key = ""
+    args.user_id = "alice:team"
+    host = QwenPawHost(args)
+    host.state = tmp_path / "data"
+    path = host.state / "workspaces/default/sessions/console/alice--team_qp-usage.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"agent": {"state": {**reply_fields, "context": [
+        {"id": "previous", "role": "assistant", "usage": {"input_tokens": 999, "output_tokens": 99}},
+        {"id": "current", "role": "assistant", "usage": {"input_tokens": 100, "output_tokens": 10}},
+        {"id": "current", "role": "assistant", "usage": {"input_tokens": 200, "output_tokens": 20}},
+    ]}}}))
+    original_import = builtins.__import__
+
+    def independent_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"qwenpaw", "agentscope"}:
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", independent_import)
+    assert host._turn_usage("qp-usage") == {"input_tokens": 300, "output_tokens": 30, "total_tokens": 330}
+
+
+def test_qwenpaw_host_uses_native_task_session_and_answer(tmp_path, monkeypatch):
+    pytest.importorskip("qwenpaw")
+    from qwenpaw.app.chats.session import session_filename
+
+    args = build_parser("qwenpaw").parse_args(
+        ["qa", "locomo.json", "--output-dir", str(tmp_path)]
+    )
+    args.llm_api_key = args.ogmemory_api_key = ""
+    host = QwenPawHost(args)
+    host.http = requests
+    host.state = tmp_path / "data"
+    session_path = host.state / "workspaces/default/sessions/console" / session_filename(
+        "qp-session", args.user_id
+    )
+    session_path.parent.mkdir(parents=True)
+    session_path.write_text(json.dumps({"agent": {"state": {
+        "reply_id": "reply-1", "context": [{"role": "assistant", "id": "reply-1",
+        "name": "qwenpaw", "content": [{"type": "text", "text": "Answer"}],
+        "usage": {"input_tokens": 30, "output_tokens": 5}}],
+    }}}))
+    host.base = "http://127.0.0.1:18891/api/agents/default/console"
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.payload
+
+    def post(url, **kwargs):
+        calls.append(kwargs["json"])
+        return Response({"task_id": "task-1"})
+
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({
+        "status": "finished", "result": {"status": "completed", "session_id": "qp-session",
+        "output": [{"role": "assistant", "content": [{"type": "text", "text": "May 7, 2023."}]}],
+        "usage": {"input_tokens": 30, "output_tokens": 5}},
+    }))
+    answer, usage = host.invoke("When?", "question-1")
+    assert answer == "May 7, 2023."
+    assert usage == {"input_tokens": 30, "output_tokens": 5, "total_tokens": 35}
+    assert host.sessions["question-1"] == "qp-session"
+    host.invoke("Why?", "question-1")
+    assert calls[-1]["session_id"] == "qp-session"
+
+
+def test_qwenpaw_is_available_in_shared_eval_parser():
+    args = build_parser().parse_args(["ingest", "locomo.json", "--agent", "qwenpaw"])
+    assert args.qwenpaw_command == "qwenpaw"
+    assert args.qwenpaw_port == 18891
+
+
+@pytest.mark.asyncio
+async def test_qwenpaw_usage_includes_all_tool_loop_model_calls(tmp_path):
+    pytest.importorskip("qwenpaw")
+    from agentscope.agent import Agent
+    from agentscope.formatter import OpenAIChatFormatter
+    from agentscope.message import TextBlock, ToolCallBlock, UserMsg
+    from agentscope.model import ChatModelBase, ChatResponse, ChatUsage
+    from agentscope.permission import PermissionMode
+    from agentscope.state import AgentState
+    from agentscope.tool import FunctionTool, Toolkit
+    from qwenpaw.app.chats.session import session_filename
+    from qwenpaw.runtime.envelope import Envelope
+
+    class UsageModel(ChatModelBase):
+        def __init__(self):
+            super().__init__(credential=None, model="fixture", parameters=self.Parameters(), stream=False)
+            self.calls = 0
+            self.formatter = OpenAIChatFormatter()
+
+        async def _call_api(self, model_name, messages, **kwargs):
+            self.calls += 1
+            content = ([ToolCallBlock(id="tool-1", name="lookup", input='{"query":"tea"}')]
+                       if self.calls == 1 else [TextBlock(text="Tea selected.")])
+            return ChatResponse(content=content, is_last=True,
+                                usage=ChatUsage(input_tokens=100*self.calls,
+                                                output_tokens=10*self.calls, time=0.01))
+
+    async def lookup(query: str) -> str:
+        """Look up a drink."""
+        return "Tea"
+
+    state = AgentState(session_id="qp-usage")
+    state.permission_context.mode = PermissionMode.BYPASS
+    agent = Agent(name="qwenpaw", system_prompt="Help.", model=UsageModel(), state=state,
+                  toolkit=Toolkit(tools=[FunctionTool(lookup)]))
+    envelope = Envelope(session_id="qp-usage")
+    async for event in agent.reply_stream(inputs=UserMsg(name="alice", content="Choose tea")):
+        _ = [item async for item in envelope.translate_event(event)]
+    output = [item async for item in envelope.finalize()]
+    result = output[-1].model_dump(mode="json")
+    assert result["usage"] == {"input_tokens": 200, "output_tokens": 20}
+
+    args = build_parser("qwenpaw").parse_args(["qa", "locomo.json", "--output-dir", str(tmp_path)])
+    args.llm_api_key = args.ogmemory_api_key = ""
+    args.user_id = "alice"
+    host = QwenPawHost(args)
+    host.state = tmp_path / "data"
+    session_path = host.state / "workspaces/default/sessions/console" / session_filename("qp-usage", "alice")
+    session_path.parent.mkdir(parents=True)
+    session_path.write_text(json.dumps({"agent": {"state": state.model_dump(mode="json")}}))
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, data):
+            payload = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.reply({"task_id": "task-usage"})
+
+        def do_GET(self):
+            self.reply({"status": "finished", "result": result})
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host.http = requests.Session()
+    host.http.trust_env = False
+    host.base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        text, usage = host.invoke("Choose tea", "usage")
+        assert text == "Tea selected."
+        assert usage == {"input_tokens": 300, "output_tokens": 30, "total_tokens": 330}
+    finally:
+        host.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_opencode_preserves_tool_steps_and_final_answer_usage_and_session(tmp_path, monkeypatch) -> None:

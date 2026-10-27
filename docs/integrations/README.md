@@ -16,13 +16,14 @@
 | Hermes Agent | [Hermes MemoryProvider](hermes.md) | Hermes Memory Provider Hook | Hermes Agent |
 | Deep Agents | [Deep Agents 中间件](deepagents.md) | LangChain AgentMiddleware | LangChain Python Deep Agents |
 | OpenClaw | [OpenClaw Context Engine](openclaw.md) | OpenClaw Context Engine | OpenClaw |
+| QwenPaw | [QwenPaw 插件](qwenpaw.md) | 官方中间件与 canonical Trace | QwenPaw 2.1.x |
 
 ## 选择规则
 
 - 自研 Agent：HTTP。
 - Python 进程内调用：Python API。
 - 客户端支持 MCP：本地用 stdio，远程用 Streamable HTTP，旧客户端用 SSE。
-- Claude Code、Codex、OpenCode、DeepSeek Harness、Hermes Agent、OpenClaw：使用对应插件。
+- Claude Code、Codex、OpenCode、DeepSeek Harness、Hermes Agent、OpenClaw、QwenPaw：使用对应插件。
 - LangChain Deep Agents：使用 `OGMemoryMiddleware`。
 
 ## 共用身份字段
