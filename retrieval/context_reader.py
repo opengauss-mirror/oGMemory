@@ -104,6 +104,7 @@ class ContextReader:
     def _hydrate(uri, node):
         """Share dev's complete canonical fields across public and graph reads."""
         return RetrievedBlock(uri=uri, level_hit="L2", category=node.category,
+            context_type=getattr(node, "context_type", ""),
             owner_space=node.owner_space, abstract=node.abstract, overview=node.overview,
             content_excerpt=node.content, metadata=dict(node.metadata or {}),
             has_overview=bool(node.overview), has_content=bool(node.content))

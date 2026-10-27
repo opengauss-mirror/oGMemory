@@ -263,6 +263,7 @@ class ResultRanker:
                     has_content=hit.has_content,
                     match_reason=item.reason,
                     metadata=dict(hit.metadata or {}),
+                    context_type=(hit.metadata or {}).get("context_type", ""),
                 )
             )
 
@@ -277,6 +278,7 @@ class ResultRanker:
                     content_block = context_reader.read(
                         block.uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
                     block.metadata.update(content_block.metadata or {})
+                    block.context_type = content_block.context_type
                     if content_block.overview:
                         block.overview = content_block.overview
                     if content_block.content_excerpt:

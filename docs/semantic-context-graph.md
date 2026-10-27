@@ -307,6 +307,39 @@ in the focused unit suite and **24 passed** against a disposable PostgreSQL/pgve
 database. This includes archived anchors with still-present relation projections;
 it is not a full benchmark or a claim of new accuracy measurements.
 
+### Snapshot, scope and disabled-worker boundaries (2026-10-27)
+
+- One-hop hits carry the projection's source and target revisions through
+  canonical hydration, final assembly and compose's later evidence read. A
+  changed, unavailable or archived endpoint rejects that graph addition. Two-hop
+  delivery rechecks every node on the selected path. These are request-bound
+  snapshot checks, not a serializable lock over the entire request.
+- The effective MEMORY scope is checked against canonical `context_type` on
+  results and traversal intermediates. An unrestricted direct traversal can
+  still follow cross-type edges. Canonical reads expose the node's type in the
+  additive `RetrievedBlock.context_type` field.
+- Lexical-only seed retrieval's empty vector is not reused as a valid graph
+  query vector. Graph supplementation falls back to the existing embedder when
+  a usable same-query vector is unavailable; no generative LLM is added.
+- With graph disabled, pending/leased `PROJECT_GRAPH` wakeups retain their
+  state and retry budget, while ordinary same-URI indexing can proceed. They
+  remain visible in public task counts and resume after graph is re-enabled.
+  Ordinary indexing readiness and `waitOutbox` exclude this paused work only
+  while graph is off. Existing FAILED/dead-letter work is not automatically
+  resurrected; the existing operator retry mechanism remains available.
+- Native relation proposals are collected before same-span run normalization
+  and cross-span reconciliation can discard a draft's metadata. Rejected
+  low-confidence spans cannot donate proposals. Content selection and graph
+  ranking/traversal policies remain unchanged.
+
+Selected unit regression: **4,757 passed, 40 skipped, 469 deselected**. MCP tests
+are excluded because the reused environment lacks MCP SDK/Starlette; optional
+and live tests retain their existing skip conditions. Disposable PostgreSQL/
+pgvector integration: **31 passed**, including updates between relation lookup
+and hydration, later assembly reads, MEMORY-to-SKILL bridges and graph-off/on
+queue recovery. These counts are separate unit/integration selections, not
+new benchmark accuracy measurements or a full-project test pass.
+
 ### Local verification (2026-10-09)
 
 - Retrieval, service, extraction, index, server and commit regression selection:

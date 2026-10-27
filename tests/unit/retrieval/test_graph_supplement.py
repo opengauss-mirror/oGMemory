@@ -29,6 +29,7 @@ def render(items, budget):
 
 def fixture():
     blocks = {ROOT+n: RetrievedBlock(uri=ROOT+n, abstract=n, overview=n,
+              context_type="MEMORY",
               content_excerpt="Memory " + n, owner_space="user:user", category="entity",
               metadata={"version": 1}) for n in "abcdef"}
     edges = []

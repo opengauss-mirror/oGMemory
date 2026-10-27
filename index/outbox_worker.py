@@ -977,6 +977,12 @@ class OutboxWorker:
     ) -> None:
         """Process already-claimed events and update acknowledgement state."""
         for node_uri, event in claimed_events:
+            # Old/custom claim implementations may not honor exclusions. A
+            # disabled feature is not a processing failure or a completed job.
+            if event.event_type == "PROJECT_GRAPH" and self._edge_projection_store is None:
+                outbox_store.release(event, node_uri)
+                stats["skipped"] += 1
+                continue
             if (event.event_type == "EXTRACT_AGENT_MEMORY"
                     and self._has_real_method(outbox_store, "claim_agent_event")):
                 self._process_agent_claim(event, outbox_store, stats, worker_id)
@@ -1208,6 +1214,10 @@ class OutboxWorker:
         """
         stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
         excluded_types = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
+        if self._edge_projection_store is None:
+            # The durable wakeup is needed when graph is enabled again. Leave
+            # its status, retry budget and projection job untouched while off.
+            excluded_types.append("PROJECT_GRAPH")
 
         # Fast path: SQL outbox with batch-claim support
         if self._supports_batch_claim(outbox_store):

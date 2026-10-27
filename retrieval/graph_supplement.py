@@ -12,6 +12,7 @@ from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
 from core.models import IndexRecord, RelationNeighbor
 from core.uri_parser import strip_l2_suffix
 from retrieval.graph_retriever import OneHopRetriever
+from retrieval.edge_retrieval_contract import graph_snapshot_matches, matches_context_type
 from retrieval.graph_selection import (
     HOP_DECAY, LOCAL_LANE_LIMIT, MAX_ANCHORS, MAX_DESTINATIONS,
     MAX_EXPANDED_NODES, MAX_GRAPH_NODES, MAX_HOPS, PREGRAPH_CANDIDATE_LIMIT,
@@ -97,7 +98,7 @@ class GraphSupplement:
         return result
 
     def select(self, query, pregraph, ordinary, ctx, *, query_vector=None, categories=None,
-               memory_directories=None):
+               memory_directories=None, context_type=None):
         audit = dict(protocol=PROTOCOL, reference_method=REFERENCE_METHOD,
             embedding_profile=dict(self.profile), query_sha256=digest(query), scope=binding(ctx),
             anchors=[], selected=[], decisions=[], expanded_nodes=[], authorization_rejections=0,
@@ -108,6 +109,7 @@ class GraphSupplement:
             final_selection="URI-unique semantic/query interleaving, semantic first",
             additional_embedding_calls=0, generative_llm_calls=0,
             categories=sorted(categories) if categories is not None else None,
+            context_type=context_type,
             memory_directories=list(memory_directories) if memory_directories is not None else None)
         if not pregraph:
             return audit
@@ -127,6 +129,8 @@ class GraphSupplement:
             if uri not in blocks:
                 try:
                     blocks[uri] = self.read(uri, ctx)
+                    if not matches_context_type(blocks[uri], context_type):
+                        raise NodeNotFoundError(uri)
                     if categories is not None and blocks[uri].category not in categories:
                         raise NodeNotFoundError(uri)
                     from core.memory_names import memory_directory
@@ -230,6 +234,7 @@ class GraphSupplement:
         excluded = {strip_l2_suffix(c.uri) for c in ordinary}
         selected = two_lane_order([r for u, r in records.items() if u not in excluded], nodes, query)[:MAX_GRAPH_NODES]
         audit["selected"] = [dict(r, selection_rank=rank, revision=revision(blocks[r["uri"]]),
+                                 graph_revision_bindings={uri: revision(blocks[uri]) for uri in r["path"]},
                                  body_sha256=digest(body(blocks[r["uri"]])))
                              for rank, r in enumerate(selected, 1)]
         audit["expanded_nodes"] = sorted(expanded)
@@ -279,6 +284,11 @@ class GraphSupplement:
             except EXPECTED_REJECTIONS:
                 marker["rejected_additions"].append("unavailable_or_unauthorized")
                 continue
+            receipt = dict(graph_revision_bindings=selected["graph_revision_bindings"],
+                           graph_context_type=audit.get("context_type"))
+            if not graph_snapshot_matches(block, receipt, ctx, self.read):
+                marker["rejected_additions"].append("path_changed_during_request")
+                continue
             if audit.get("categories") is not None and block.category not in audit["categories"]:
                 marker["rejected_additions"].append("category_outside_request")
                 continue
@@ -292,7 +302,7 @@ class GraphSupplement:
                 continue
             item = dict(uri=uri, **body(block), category=block.category, score=selected["score"],
                 when=block.metadata.get("when"), who=block.metadata.get("who"), where=block.metadata.get("where"),
-                metadata={**block.metadata, "retrieval_origin": "graph_neighbor", "graph_supplemental": True,
+                metadata={**block.metadata, **receipt, "retrieval_origin": "graph_neighbor", "graph_supplemental": True,
                           "graph_hop_distance": selected["hop"], "graph_path": selected["path"]})
             text = formatter(delivered+[item], full_budget(delivered+[item]))
             if len(text) > limit*4:

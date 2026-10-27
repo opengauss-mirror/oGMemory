@@ -367,6 +367,8 @@ class RetrievedBlock:
     has_content: bool = False
     match_reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Canonical node type, kept separate from caller/index metadata.
+    context_type: str = ""
 
 
 @dataclass

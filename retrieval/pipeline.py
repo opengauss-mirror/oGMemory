@@ -42,7 +42,9 @@ from scene.retrieval import SceneRanker, SceneSearchSource, select_scene_evidenc
 logger = logging.getLogger(__name__)
 from core.uri_parser import strip_l2_suffix
 from retrieval.graph_retriever import GraphRetrievalReport, OneHopRetriever
-from retrieval.edge_retrieval_contract import GraphExpansionOutcome, RetrievalOrigin
+from retrieval.edge_retrieval_contract import (
+    GraphExpansionOutcome, RetrievalOrigin, graph_snapshot_matches, matches_context_type,
+)
 
 
 class RetrievalPipeline:
@@ -151,14 +153,16 @@ class RetrievalPipeline:
                            if tq.text == query and sr.query_vector), None)
             all_leaf_hits = self._expand_by_graph(query, all_leaf_hits, ctx, trace,
                                                  query_vector=vector, categories=graph_categories,
-                                                 memory_directories=memory_directories)
+                                                 memory_directories=memory_directories,
+                                                 context_type="MEMORY")
         if (collect_graph_supplement and memory_round and self.cfg.enable_graph_expansion
                 and self.cfg.graph_supplement_enabled and self._graph_supplement):
             try:
                 vector = next((sr.query_vector for tq, sr in zip(typed_queries, all_seed_results)
-                               if tq.text == query), None)
+                               if tq.text == query and sr.query_vector), None)
                 trace.graph_expansion["two_hop_supplement"] = self._graph_supplement.select(
                     query, pregraph_hits, all_leaf_hits, ctx, query_vector=vector,
+                    context_type="MEMORY",
                     **({"categories": graph_categories} if graph_categories is not None else {}),
                     **({"memory_directories": memory_directories} if memory_directories is not None else {}))
             except Exception as exc:
@@ -199,6 +203,7 @@ class RetrievalPipeline:
         query_vector: list[float] | None = None,
         categories: set[str] | None = None,
         memory_directories: list[str] | None = None,
+        context_type: str | None = None,
     ) -> list[LeafHit]:
         """Expand candidates via the configured graph retriever (serial).
 
@@ -223,7 +228,9 @@ class RetrievalPipeline:
                 visible_seeds = []
                 for seed in seeds:
                     try:
-                        self._context_reader.read_authorized(strip_l2_suffix(seed.uri), ctx)
+                        block = self._context_reader.read_authorized(strip_l2_suffix(seed.uri), ctx)
+                        if not matches_context_type(block, context_type):
+                            continue
                     except Exception:
                         continue  # fail closed; preserve ordinary assembly
                     visible_seeds.append(seed)
@@ -315,6 +322,20 @@ class RetrievalPipeline:
                     logger.debug("[graph_expansion] hydration rejected %s: %s", hit.uri, exc)
                     report.hydration_rejection_count += 1
                     continue
+                if not matches_context_type(hydrated, context_type):
+                    report.hydration_rejection_count += 1
+                    continue
+                receipt = {}
+                if type(self._graph_retriever) is OneHopRetriever:
+                    # Bind both endpoints, not just the version returned by the
+                    # earlier SQL edge query. Carry the receipt past assembly.
+                    receipt = dict(graph_revision_bindings={
+                        strip_l2_suffix(hit.anchor_uri): hit.source_revision,
+                        norm: hit.target_revision,
+                    }, graph_context_type=context_type)
+                    if not graph_snapshot_matches(hydrated, receipt, ctx, self._context_reader.read_authorized):
+                        report.hydration_rejection_count += 1
+                        continue
                 if categories is not None and hydrated.category not in categories:
                     report.hydration_rejection_count += 1
                     continue
@@ -335,6 +356,8 @@ class RetrievalPipeline:
                         has_content=bool(hydrated.content_excerpt),
                         metadata={
                             **dict(hydrated.metadata or {}),
+                            **receipt,
+                            "context_type": hydrated.context_type,
                             "retrieval_origin": RetrievalOrigin.GRAPH_NEIGHBOR.value,
                             "graph_anchor_uri": hit.anchor_uri,
                             "graph_target_uri": hit.uri,
@@ -484,6 +507,12 @@ class RetrievalPipeline:
             st.input_count = len(leaf_hits)
             all_blocks = []
             seen_uris = set()
+            # Assembly may reread canonical content. Preserve the edge-bound
+            # snapshot independently of metadata returned by that later read.
+            graph_receipts = {strip_l2_suffix(hit.uri): {
+                key: hit.metadata[key] for key in ("graph_revision_bindings", "graph_context_type")
+                if key in hit.metadata}
+                for hit in leaf_hits if "graph_revision_bindings" in hit.metadata}
 
             # Run assembly for each typed query (e.g., memory/skill/resource)
             # and deduplicate results by URI
@@ -541,6 +570,18 @@ class RetrievalPipeline:
                 all_blocks = [block for block in all_blocks if id(block) in selected_ids]
                 all_blocks.extend(graph_blocks)
 
+            verified = []
+            for block in all_blocks:
+                receipt = graph_receipts.get(strip_l2_suffix(block.uri))
+                if receipt is not None:
+                    reader = getattr(self._context_reader, "read_authorized", None)
+                    if not graph_snapshot_matches(block, receipt, ctx, reader, recheck_target=True):
+                        trace.graph_expansion["final_snapshot_rejections"] = (
+                            trace.graph_expansion.get("final_snapshot_rejections", 0) + 1)
+                        continue
+                    block.metadata.update(receipt)
+                verified.append(block)
+            all_blocks = verified
             st.output_count = len(all_blocks)
         trace.add_stage(st)
         return all_blocks

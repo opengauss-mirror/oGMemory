@@ -3592,7 +3592,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             count_unfinished = getattr(outbox_store, "count_unfinished", None)
             if not callable(count_unfinished):
                 return False
-            state = count_unfinished(ctx.account_id)
+            if (_HAS_SQL and isinstance(outbox_store, SQLOutboxStore)
+                    and not self._graph_enabled()):
+                # Paused graph work remains visible to task/status APIs, but
+                # is not an outstanding ordinary/code indexing requirement.
+                state = count_unfinished(ctx.account_id, exclude_event_types=["PROJECT_GRAPH"])
+            else:
+                state = count_unfinished(ctx.account_id)
             if not isinstance(state, Mapping):
                 return False
             return (int(state.get("total", -1)) == 0
@@ -7104,11 +7110,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return max(0.0, timeout_seconds)
 
     def _wait_for_outbox_idle(self, ctx: RequestContext, timeout_seconds: float) -> dict:
-        """Poll outbox state without claiming events from the background worker."""
+        """Wait for active indexing work; paused graph jobs remain in task/status APIs."""
         import time as _time
 
         deadline = _time.monotonic() + timeout_seconds
-        last_counts = self._count_outbox_unfinished(ctx)
+        last_counts = self._count_outbox_unfinished(ctx, exclude_paused_graph=True)
         while True:
             # Idle does not mean successfully indexed. In particular, dead-lettered
             # events and an unavailable status store must never certify completion.
@@ -7121,13 +7127,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if _time.monotonic() >= deadline:
                 return {"idle": False, "outbox": last_counts}
             _time.sleep(min(1.0, max(0.0, deadline - _time.monotonic())))
-            last_counts = self._count_outbox_unfinished(ctx)
+            last_counts = self._count_outbox_unfinished(ctx, exclude_paused_graph=True)
 
-    def _count_outbox_unfinished(self, ctx: RequestContext) -> dict:
+    def _count_outbox_unfinished(self, ctx: RequestContext, *, exclude_paused_graph: bool = False) -> dict:
         try:
             fs = self._get_context_fs()
             outbox_store = self._get_outbox_store(fs) if fs is not None else None
             if outbox_store is not None and hasattr(outbox_store, "count_unfinished"):
+                if (exclude_paused_graph and _HAS_SQL and isinstance(outbox_store, SQLOutboxStore)
+                        and not self._graph_enabled()):
+                    return outbox_store.count_unfinished(
+                        account_id=ctx.account_id, exclude_event_types=["PROJECT_GRAPH"])
                 return outbox_store.count_unfinished(account_id=ctx.account_id)
             return {"pending": 0, "processing": 0, "total": 0, "supported": False}
         except Exception as exc:

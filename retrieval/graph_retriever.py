@@ -47,6 +47,8 @@ class GraphHit:
     edge_similarity: float | None = None
     edge_weight: float | None = None
     explanation: str | None = None
+    source_revision: int | None = None
+    target_revision: int | None = None
 
 
 @dataclass
@@ -363,6 +365,8 @@ class OneHopRetriever(BaseGraphRetriever):
                         edge_similarity=similarity,
                         edge_weight=weight,
                         explanation=nb.reason or None,
+                        source_revision=nb.source_revision,
+                        target_revision=nb.target_revision,
                     )
 
         ranked_neighbors = sorted(graph_hits.values(), key=lambda item: (-item.score, item.uri))

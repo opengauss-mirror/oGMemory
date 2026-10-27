@@ -66,8 +66,9 @@ def test_invalid_reused_vector_preserves_anchor(vector):
 def test_pipeline_reuses_only_same_embedder(same_embedder):
     graph, embedder = retriever()
     reader = Mock()
-    reader.read_authorized.return_value = RetrievedBlock(uri=ROOT+"b", overview="b",
-                                                         content_excerpt="content")
+    reader.read_authorized.side_effect = lambda uri, ctx: RetrievedBlock(
+        uri=uri, context_type="MEMORY", metadata={"version": 1},
+        overview="b", content_excerpt="content")
     pipeline = RetrievalPipeline(Mock(), SimpleNamespace(
         embedder=embedder if same_embedder else Mock()), None, Mock(),
         RetrievalConfig(enable_graph_expansion=True), graph_retriever=graph,
@@ -84,7 +85,8 @@ def test_pipeline_reuses_only_same_embedder(same_embedder):
 def test_full_pipeline_query_matching_and_graph_toggle(seed_text, enabled, embedding_calls):
     graph, embedder = retriever()
     reader = Mock()
-    reader.read_authorized.return_value = RetrievedBlock(uri=ROOT+"b", overview="b")
+    reader.read_authorized.side_effect = lambda uri, ctx: RetrievedBlock(
+        uri=uri, context_type="MEMORY", metadata={"version": 1}, overview="b")
     pipeline = RetrievalPipeline(Mock(), SimpleNamespace(embedder=embedder), None, Mock(),
         RetrievalConfig(enable_graph_expansion=enabled), graph_retriever=graph,
         context_reader=reader)

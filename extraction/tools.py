@@ -766,6 +766,12 @@ class Extractor:
     ) -> list[CandidateMemory]:
         """Reconcile independent updates only after choosing each span's snapshot."""
         check_deadline()
+        from extraction.relation_proposals import attach, take
+        # Source-occurrence and bound-update reconciliation may choose another
+        # draft's metadata too. Keep all accepted spans' proposals before either
+        # path runs; rejected low-confidence spans must not donate relations.
+        proposals = take([candidate for _, batch in span_results for candidate in batch
+                          if candidate.confidence >= _CONFIDENCE_THRESHOLD])
         updates: dict[str, list[tuple[_Span, CandidateMemory]]] = {}
         additions: list[CandidateMemory] = []
         topic_drafts: list[CandidateMemory] = []
@@ -893,7 +899,9 @@ class Extractor:
                     reconciled = self._repair_candidate_summaries([reconciled])[0]
                 validate_candidate(reconciled)
             result.append(reconciled)
-        return [*topic_drafts, *result]
+        result = [*topic_drafts, *result]
+        attach(result, proposals)
+        return result
 
     def _native_temperatures(self):
         return (None, 0) if getattr(self, "_dual_pass_enabled", True) else (None,)
@@ -928,7 +936,12 @@ class Extractor:
 
     def _finalize_span_outcome(self, outcome, ctx, archive_id):
         check_deadline()
+        from extraction.relation_proposals import attach, take
         candidates = self._resolve_native_span_outcome(outcome, ctx, archive_id)
+        # Exact run pairing can discard a draft's metadata before the flattened
+        # merge sees it. Retain native proposals independently of the winning
+        # occurrence wording, then reattach after all span reconciliation.
+        proposals = take(candidates)
         if None in outcome.native_runs and 0 in outcome.native_runs:
             normalizer = (normalize_same_span_occurrence_runs if self._reconcile_source_occurrences_enabled()
                           else normalize_same_span_case_runs)
@@ -963,9 +976,10 @@ class Extractor:
         mixed_profile = (any(candidate.target_uri for candidate in profiles)
                          and any(not candidate.target_uri for candidate in profiles))
         if len(targets) != len(set(targets)) or mixed_profile:
-            return self._merge_span_results([
+            candidates = self._merge_span_results([
                 (replace(prepared.span, source_context=source), candidates),
             ], ctx, archive_id, reconcile_additions=False)
+        attach(candidates, proposals)
         return candidates
 
     def _reconcile_source_occurrences_enabled(self):
