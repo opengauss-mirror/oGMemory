@@ -304,12 +304,13 @@ class AgentHost:
 
 
 def create_host(args: argparse.Namespace) -> AgentHost:
+    from run_claude_code_plugin_locomo import ClaudeCodeHost
+    from run_codex_plugin_locomo import CodexHost
+    from run_dsh_plugin_locomo import DshHost
+    from run_hermes_plugin_locomo import HermesHost
     from run_openclaw_plugin_locomo import OpenClawHost
     from run_opencode_plugin_locomo import OpenCodeHost
-    from run_claude_code_plugin_locomo import ClaudeCodeHost
-    from run_hermes_plugin_locomo import HermesHost
-    from run_dsh_plugin_locomo import DshHost
-    from run_codex_plugin_locomo import CodexHost
+    from run_qwenpaw_plugin_locomo import QwenPawHost
 
     hosts = {
         "openclaw": OpenClawHost,
@@ -318,6 +319,7 @@ def create_host(args: argparse.Namespace) -> AgentHost:
         "hermes": HermesHost,
         "dsh": DshHost,
         "codex": CodexHost,
+        "qwenpaw": QwenPawHost,
     }
     return hosts[args.agent](args)
 

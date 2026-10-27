@@ -25,6 +25,7 @@ flowchart TD
 | `--agent hermes --transport plugin` | `run_hermes_plugin_locomo.py` | Hermes MemoryProvider |
 | `--agent dsh --transport plugin` | `run_dsh_plugin_locomo.py` | DeepSeek Harness 插件 |
 | `--agent codex --transport plugin` | `run_codex_plugin_locomo.py` | Codex 插件与 Hooks |
+| `--agent qwenpaw --transport plugin` | `run_qwenpaw_plugin_locomo.py` | QwenPaw 官方中间件与 HTTP API |
 | `--agent openclaw --transport mcp` | `run_mcp_locomo.py` | Agent 通过 MCP 工具读写记忆 |
 | `--agent openclaw --transport ce` | `run_openclaw_plugin_locomo.py` | 已有 OpenClaw CE Gateway |
 | `--agent openclaw --transport gateway` | `run_mcp_locomo.py` | 已有 MCP Gateway |
@@ -239,9 +240,9 @@ run_suite() {
 
 `--read-only-qa` 在 plugin 接入中拦截 QA 生命周期写入，在托管 MCP 中只开放 query/read 和资源读取。召回与 Trace 继续记录；插件 QA 写入观察见 `artifacts/qa-write-observations.json`。
 
-## 4. 六个宿主与 MCP
+## 4. 七个宿主与 MCP
 
-托管评测按仓库插件准备隔离配置、工作目录和会话状态。插件源码分别位于 `plugins/openclaw`、`plugins/opencode`、`plugins/claude-code`、`plugins/hermes`、`plugins/deepseek-harness`、`plugins/ogmemory`；其他接入说明见 [Agent 插件](../integrations/agent-plugins.md)。
+托管评测按仓库插件准备隔离配置、工作目录和会话状态。插件源码分别位于 `plugins/openclaw`、`plugins/opencode`、`plugins/claude-code`、`plugins/hermes`、`plugins/deepseek-harness`、`plugins/ogmemory`、`plugins/qwenpaw`；其他接入说明见 [Agent 插件](../integrations/agent-plugins.md)。
 
 ### 4.1 OpenClaw CE 插件
 
@@ -351,7 +352,21 @@ run_suite codex --codex-command "$(command -v codex)"
 
 评测在隔离的 Codex home 中安装本仓库 marketplace 和 `ogmemory@ogmemory`，通过原生 Hooks 完成召回与写回。
 
-### 4.7 MCP：托管 OpenClaw Gateway
+### 4.7 QwenPaw
+
+需要 QwenPaw 2.1 或沿用相同插件接口的后续版本，Python 版本按所安装 QwenPaw 的要求选择，模型端点使用 Chat Completions。安装与服务连接见 [QwenPaw 对接](../integrations/qwenpaw.md)。
+
+评测进程与 QwenPaw 可使用不同的 Python 环境，通过 `--qwenpaw-command` 指定宿主环境中的可执行文件。
+
+```bash
+qwenpaw --version
+begin_run qwenpaw
+run_suite qwenpaw --qwenpaw-command "$(command -v qwenpaw)" --qwenpaw-port 18891
+```
+
+预检将仓库插件安装到独立 QwenPaw 工作目录，启动 Console API。四阶段复用上面的数据选择、身份、完成核验与判分流程。模型、服务地址、凭据和输出目录均由公共参数提供。可通过 `LOCOMO_CHAT_EXTRA_BODY` 指定提供方扩展 JSON。
+
+### 4.8 MCP：托管 OpenClaw Gateway
 
 先按第 4.1 节安装 OpenClaw。按 [MCP 接入](../integrations/mcp.md)配置并启动 MCP 服务；测试所用服务配置开放读写工具：
 
@@ -517,7 +532,7 @@ run_suite opencode --disable-host-tools \
 
 | 参数 | 默认值 | 用途 |
 | --- | --- | --- |
-| `--agent` | 入口宿主 | eval.py 可选 `openclaw`、`opencode`、`claude-code`、`hermes`、`dsh`、`codex`；专用入口固定宿主 |
+| `--agent` | 入口宿主 | eval.py 可选 `openclaw`、`opencode`、`claude-code`、`hermes`、`dsh`、`codex`、`qwenpaw`；专用入口固定宿主 |
 | `--transport` | 入口决定 | `ce`、`plugin`、`mcp`、`gateway`；支持范围见第 1 节；ce/mcp/gateway 使用 OpenClaw |
 | `--account-id` | `locomo-agent-eval` | 记忆账户；托管 MCP 采用 MCP 认证配置账户 |
 | `--user` / `--user-id` | `eval-1` | 本轮记忆用户与 Gateway 请求 user |
@@ -545,8 +560,8 @@ run_suite opencode --disable-host-tools \
 | `--agent-attempts` | `3` | qa：每题宿主调用尝试上限，N > 0；四阶段脚本设为 1 |
 | `-p` / `--parallel` / `--qa-parallel` | `2` | qa：每 sample 并发，N > 0 |
 | `--disable-host-tools` | 关闭 | OpenCode/DSH：通过原生配置关闭宿主内置模型工具 |
-| `--compose-timeout-ms` | `60000` | OpenCode：插件 compose 请求超时，100–60000 毫秒 |
-| `--trace-timeout-ms` | `60000` | OpenCode：插件 Trace 请求超时，100–60000 毫秒 |
+| `--compose-timeout-ms` | `60000` | OpenCode/QwenPaw：插件 compose 请求超时，100–60000 毫秒 |
+| `--trace-timeout-ms` | `60000` | OpenCode/QwenPaw：插件 Trace 请求超时，100–60000 毫秒 |
 | `--openclaw-command` | `openclaw` | plugin/mcp：可执行文件名或路径 |
 | `--openclaw-port` | `18791` | plugin/mcp：测试 Gateway 端口 |
 | `--openclaw-provider-api` | `openai-responses` | OpenClaw plugin：`openai-responses` 或 `openai-completions` |
@@ -557,6 +572,8 @@ run_suite opencode --disable-host-tools \
 | `--hermes-command` | `hermes` | Hermes 可执行文件名或路径 |
 | `--dsh-command` | `dsh` | DSH 可执行文件名或路径 |
 | `--codex-command` | `codex` | Codex 可执行文件名或路径 |
+| `--qwenpaw-command` | `qwenpaw` | QwenPaw 可执行文件名或路径 |
+| `--qwenpaw-port` | `18891` | QwenPaw Console 测试端口 |
 
 ce/gateway 的 HTTP 请求超时为 1800 秒，模型来自已有 Gateway；托管 MCP 的模型来自指定 OpenClaw 配置。
 
@@ -598,7 +615,7 @@ ce/gateway 的 HTTP 请求超时为 1800 秒，模型来自已有 Gateway；托�
 
 ### 9.1 会话与续跑
 
-同一 sample 的来源段按顺序进入逻辑会话 `ingest-<sample_id>`；每题使用独立逻辑会话 `qa-<sample_id>-q<题号>`。OpenClaw、OpenCode、Claude Code、Hermes、Codex 保存逻辑 key 到原生会话的映射；DSH 每次调用建立原生会话。ingest 和 QA 的配置、会话状态分别保存。记忆账户、用户和 Agent 将新 QA 会话关联到本轮已写入记忆。
+同一 sample 的来源段按顺序进入逻辑会话 `ingest-<sample_id>`；每题使用独立逻辑会话 `qa-<sample_id>-q<题号>`。OpenClaw、OpenCode、Claude Code、Hermes、Codex、QwenPaw 保存逻辑 key 到原生会话的映射；DSH 每次调用建立原生会话。ingest 和 QA 的配置、会话状态分别保存。记忆账户、用户和 Agent 将新 QA 会话关联到本轮已写入记忆。
 
 续跑保持 `OUT`、`RUN_ID`、身份、runtime 和输入数据：
 
