@@ -24,6 +24,8 @@ class Reconciler:
         self.response = dict.fromkeys(("abstract", "overview", "content"), NEW) if response is None else response
 
     def complete_json(self, prompt, schema):
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         self.payloads.append(json.loads(prompt.split("\n\n", 1)[1]))
         return self.response
 
@@ -100,6 +102,8 @@ class DualProfileProvider(Reconciler):
         return [{"tool": op["name"], "input": op["input"]}]
 
     def complete_json(self, prompt, schema):
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         if "spans" in schema.get("properties", {}):
             return {"spans": [{"start": 0, "end": 0, "categories": ["profile"]}]}
         return super().complete_json(prompt, schema)

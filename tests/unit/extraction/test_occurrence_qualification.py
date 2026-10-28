@@ -53,6 +53,9 @@ class QualificationProvider:
         return [], json.dumps([self.operation])
 
     def complete_json(self, prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         self.calls.append(prompt)
         if "operations" in schema.get("properties", {}):
             return {"operations": [{"tool": self.operation["name"],
@@ -337,6 +340,9 @@ def test_single_span_native_case_aliases_reconcile_one_complete_target_before_wr
         return [{"tool": operation["name"], "input": operation["input"]}]
 
     def complete_json(prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         llm.calls.append(prompt)
         if "valid" in schema["properties"]:
             return {"valid": True}
@@ -418,6 +424,9 @@ def test_existing_facts_in_native_event_revision_use_stored_evidence_before_sour
         return [{"tool": "extract_event", "input": fields}]
 
     def complete_json(prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         llm.calls.append(prompt)
         if "groups" in schema["properties"]:
             # These correct prior facts cannot be established by the new correction alone.
