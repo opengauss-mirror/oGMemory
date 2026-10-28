@@ -49,6 +49,9 @@ class SourceLLM:
         self.json_calls, self.native_calls = [], []
 
     def complete_json(self, prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         properties = set(schema["properties"])
         self.json_calls.append((properties, prompt, schema))
         if properties == {"spans"}:
@@ -218,6 +221,9 @@ def test_real_lazy_react_path_with_explicit_flag_makes_no_new_source_group_calls
 def test_identical_extraction_prompts_from_distinct_ranges_do_not_suppress_two_occurrences(ranges):
     class RepeatedPromptLLM(SourceLLM):
         def complete_json(self, prompt, schema):
+            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+            if set(schema.get("properties", {})) == {"categories"}:
+                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             if set(schema["properties"]) == {"spans"}:
                 self.json_calls.append(({"spans"}, prompt, schema))
                 return {"spans": [{"start": i, "end": i, "categories": ["event"]} for i in ranges]}
@@ -276,6 +282,9 @@ def test_actual_prompt_collision_comparison_preserves_distinct_text_and_gate_com
 def test_same_span_case_complementary_steps_and_full_fallback_origin_are_reconciled():
     class FallbackCaseLLM(SourceLLM):
         def complete_json(self, prompt, schema):
+            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+            if set(schema.get("properties", {})) == {"categories"}:
+                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             if set(schema["properties"]) == {"spans"}:
                 self.json_calls.append(({"spans"}, prompt, schema))
                 return {"spans": []}

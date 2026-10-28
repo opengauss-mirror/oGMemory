@@ -28,6 +28,9 @@ class ProfileLLM:
         self.calls = []
 
     def complete_json(self, prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         self.calls.append((json.loads(prompt.split("\n\n", 1)[1]), schema))
         return next(self.responses)
 

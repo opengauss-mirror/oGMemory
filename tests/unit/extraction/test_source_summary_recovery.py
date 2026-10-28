@@ -24,6 +24,9 @@ class SummaryLLM(SourceLLM):
         self.original = None
 
     def complete_json(self, prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         if set(schema["properties"]) == {"repairs"}:
             self.repair_calls += 1
             return self.repair if self.repair is not None else {

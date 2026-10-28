@@ -27,6 +27,10 @@ def operation(ids, *, target="", action="create", fact="Gift from Caroline's gra
 
 
 class NodeLLM:
+    def complete_json(self, prompt, schema):
+        assert set(schema["properties"]) == {"categories"}
+        return {"categories": schema["properties"]["categories"]["items"]["enum"]}
+
     def __init__(self, decide):
         self.decide, self.calls = decide, []
 
