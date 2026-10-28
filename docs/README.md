@@ -2,7 +2,7 @@
 
 ## 入门
 
-- [特性能力与使用指南](features.md)：记忆写入、检索、管理、学习复用等对外特性的介绍、操作步骤与效果验证。
+- [特性能力与使用指南](features.md)：记忆写入、检索、管理、关系网络、学习复用等对外特性的介绍、操作步骤与效果验证。
 - [快速开始](QUICKSTART.md)：本地 CLI 启动，以及 Compose、ARM64 和 OpenClaw 部署入口。
 - [客户端接入总览](integrations/README.md)：HTTP、Python、MCP 和 Agent 插件的选择规则。
 
