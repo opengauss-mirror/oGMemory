@@ -66,6 +66,20 @@ def _create_chroma(config) -> VectorIndex:
     )
 
 
+def _create_milvus(config) -> VectorIndex:
+    from providers.vector_index.milvus_index import MilvusVectorIndex
+
+    return MilvusVectorIndex(
+        uri=config.milvus_uri,
+        token=config.milvus_token,
+        collection_name=config.milvus_collection_name,
+        dimension=config.embedding_dimension,
+        db_name=config.milvus_db_name,
+        timeout=config.milvus_timeout,
+    )
+
+
+register_vector_provider("milvus", _create_milvus)
 register_vector_provider("memory", _create_memory)
 register_vector_provider("opengauss", _create_opengauss)
 register_vector_provider("chroma", _create_chroma)

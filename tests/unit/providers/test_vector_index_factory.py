@@ -110,7 +110,7 @@ def test_factory_rejects_unknown_provider():
         ValueError,
         match=(
             "Unknown vector_db_type: 'missing'; available providers: "
-            "chroma, memory, opengauss"
+            "chroma, memory, milvus, opengauss"
         ),
     ):
         factory.create_vector_index(_config("missing"))
