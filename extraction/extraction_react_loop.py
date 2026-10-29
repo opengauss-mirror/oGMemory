@@ -183,9 +183,6 @@ class ExtractionReActLoop(ReactLoop):
         self._prompt_manager = prompt_manager
 
         self._extraction_tools = build_extraction_tools(registry)
-        self._base_extraction_tools = self._extraction_tools
-        self._assembly_categories: frozenset[str] | None = None
-        self._offered_extraction_tools: list[dict] | None = None
         self._update_instruction = build_update_instruction(registry)
 
         # All available tools: read, list, relations, access_stats, and extraction tools
@@ -206,20 +203,8 @@ class ExtractionReActLoop(ReactLoop):
         conversation_text: str,
         ctx: RequestContext,
         prefetch_result: PrefetchResult | None = None,
-        *,
-        categories: frozenset[str] | None = None,
     ) -> ExtractionReActResult:
         check_deadline()
-        from extraction.prompt_assembly import select_categories, tools_for_categories, category_catalog
-        self._assembly_categories = (select_categories(
-            self._llm, self._registry, self._base_extraction_tools, conversation_text, ctx.user_id,
-        ) if categories is None else categories)
-        self._extraction_tools = tools_for_categories(
-            self._base_extraction_tools, self._registry, self._assembly_categories,
-        )
-        self._offered_extraction_tools = (self._extraction_tools if category_catalog(
-            self._registry, self._base_extraction_tools) else None)
-        self._all_tools = [_READ_TOOL, _LIST_TOOL, _RELATIONS_TOOL, _ACCESS_STATS_TOOL] + self._extraction_tools
         # Reset runtime state
         self._did_safety_reread = False
         self._read_versions = dict(prefetch_result.read_versions) if prefetch_result else {}
@@ -280,19 +265,7 @@ class ExtractionReActLoop(ReactLoop):
         examples = self._prompt_manager.render("extraction", "examples")
         output_instruction = self._prompt_manager.render("extraction", "output_instruction")
 
-        # Crop the two trusted template sections before joining any runtime data.
-        if self._assembly_categories is not None:
-            from extraction.prompt_assembly import crop_template_sections
-            try:
-                system_prompt, examples = crop_template_sections(
-                    str(system_prompt), str(examples), set(self._assembly_categories),
-                )
-            except (ValueError, IndexError):
-                # A custom template with unknown structure keeps its original contract.
-                self._extraction_tools = self._base_extraction_tools
-                self._offered_extraction_tools = (self._base_extraction_tools
-                                                 if self._offered_extraction_tools is not None else None)
-                self._all_tools = [_READ_TOOL, _LIST_TOOL, _RELATIONS_TOOL, _ACCESS_STATS_TOOL] + self._extraction_tools
+        # Build system prompt: system_prompt + identity + lazy_tools + examples + output
         system_content = f"{system_prompt}\n\n{identity_block}\n\n{lazy_tools}\n\n{examples}\n\n{output_instruction}"
         system_content += "\n\n" + self._update_instruction
 
@@ -413,9 +386,6 @@ class ExtractionReActLoop(ReactLoop):
 
         Unified parsing used by both _parse_output and _to_extraction_react_result.
         """
-        if self._offered_extraction_tools is not None:
-            from extraction.prompt_assembly import validate_offered_calls
-            validate_offered_calls([{"tool": tool_name}], self._offered_extraction_tools)
         if tool_name in INCREMENTAL_TOOLS:
             key = incremental_read_key(tool_input)
             parsed = parse_tool_call(
@@ -423,9 +393,6 @@ class ExtractionReActLoop(ReactLoop):
                 current_content=self._edit_contents.get(key),
             )
             candidate = parsed[2]
-            if self._offered_extraction_tools is not None:
-                from extraction.prompt_assembly import validate_offered_candidate
-                validate_offered_candidate(candidate, self._offered_extraction_tools)
             self._edit_contents[key] = candidate.content
             self._edit_candidates[id(candidate)] = candidate
             return candidate

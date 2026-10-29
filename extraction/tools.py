@@ -23,10 +23,7 @@ from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Optional
-
-if TYPE_CHECKING:
-    from extraction.prompt_assembly import AssemblyState, PromptParts
+from typing import Any, Optional
 
 from core.candidate_dedup import (
     merge_duplicate_event_sources,
@@ -281,9 +278,6 @@ class _Span:
     successful_read_versions: list[dict[str, int]] = field(default_factory=list)
     occurrence_source: dict = field(default_factory=dict)
     fallback_source_prompt: str = ""
-    prompt_parts: PromptParts | None = field(default=None, repr=False, compare=False)
-    fallback_prompt_parts: PromptParts | None = field(default=None, repr=False, compare=False)
-    tool_stats_attached: bool = False
 
 
 @dataclass
@@ -293,7 +287,6 @@ class _PreparedSpan:
     prompt: str
     prompt_sha: str
     source_context: str = ""
-    assembly_state: AssemblyState | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -1299,20 +1292,12 @@ class Extractor:
         temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Extract structured candidates from an already prepared span prompt."""
-        from extraction.prompt_assembly import assemble_prepared
-
-        prompt, tools = assemble_prepared(self, prepared, ctx)
         span = prepared.span
         if self._use_lazy_mode():
             return self._structure_span_lazy(
-                span, prompt, ctx, archive_id, focused_messages=span.focused_messages,
-                categories=frozenset(tool["name"].removeprefix("extract_") for tool in tools
-                                     if tool["name"].startswith("extract_")),
+                span, prepared.prompt, ctx, archive_id, focused_messages=span.focused_messages,
             )
-        return self._structure_span_eager(
-            span, prompt, ctx, _prompt_sha(prompt), archive_id,
-            temperature=temperature, extraction_tools=tools,
-        )
+        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, archive_id, temperature=temperature)
 
     def _build_span_prompt(
         self,
@@ -1339,17 +1324,17 @@ class Extractor:
             for message in focused
         )
 
-        attached_stats = tool_stats_text if span.end >= len(messages) - 3 else ""
-        span.tool_stats_attached = bool(attached_stats and attached_stats.strip())
         conversation = self._format_conversation(
-            focused, session_time, session_summary="", tool_stats_text=attached_stats,
+            focused, session_time,
+            session_summary="",
+            tool_stats_text=(
+                tool_stats_text if span.end >= len(messages) - 3 else ""
+            ),
         )
-        span.fallback_prompt_parts = self._build_prompt_parts(
+        span.fallback_source_prompt = self._build_prompt(
             language, conversation, session_summary, ctx=ctx, include_examples=False,
         )
-        span.fallback_source_prompt = span.fallback_prompt_parts.render()
-        span.prompt_parts = self._build_prompt_parts(language, conversation, session_summary, ctx=ctx)
-        return span.prompt_parts.render()
+        return self._build_prompt(language, conversation, session_summary, ctx=ctx)
 
     def _structure_span_eager(
         self,
@@ -1359,14 +1344,12 @@ class Extractor:
         prompt_sha: str,
         archive_id: str | None = None,
         temperature: float | None = None,
-        extraction_tools: list[dict] | None = None,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
         check_deadline()
-        tools = self._extraction_tools if extraction_tools is None else extraction_tools
         tool_calls = self._llm.complete_with_tools(
             prompt=prompt,
-            tools=tools,
+            tools=self._extraction_tools,
             tool_choice="required",
             temperature=temperature,
         )
@@ -1385,9 +1368,6 @@ class Extractor:
                 _short_sha(prompt_sha),
             )
 
-        from extraction.prompt_assembly import validate_offered_calls, validate_offered_candidate
-        if tools is not self._extraction_tools:
-            validate_offered_calls(tool_calls, tools)
         try:
             candidates = self._parse_candidate_calls(tool_calls, span.prefetch_result, ctx)
         except _CandidateValidationError as error:
@@ -1398,8 +1378,6 @@ class Extractor:
                 "native tool calls contained no schema-valid extraction operation",
                 tool_choice="required",
             )
-        for candidate in candidates:
-            validate_offered_candidate(candidate, tools)
         self._assign_provenance(candidates, span, archive_id)
         return candidates
 
@@ -1412,30 +1390,25 @@ class Extractor:
         errors: list[ToolCallProtocolError | LLMOutputTruncatedError] | None = None,
     ) -> list[CandidateMemory]:
         """Run one schema-validated JSON extraction fallback for a span."""
-        from extraction.prompt_assembly import assemble_prepared, compact_prepared_prompt, validate_offered_calls, validate_offered_candidate
-        prompt, tools = assemble_prepared(self, prepared, ctx)
-        categories = {tool["name"].removeprefix("extract_") for tool in tools
-                      if tool["name"].startswith("extract_")}
         check_deadline()
         fallback_prompt = build_extraction_fallback_prompt(
-            prompt, tools
+            prepared.prompt, self._extraction_tools
         )
-        schema = build_extraction_envelope_schema(tools)
+        schema = build_extraction_envelope_schema(self._extraction_tools)
         reads = prepared.span.prefetch_result
         truncated = any(isinstance(error, LLMOutputTruncatedError) for error in errors or [])
         if (truncated or not prompt_fits(fallback_prompt, schema)) and prepared.span.fallback_source_prompt:
-            compact = compact_prepared_prompt(prepared, categories)
+            compact = prepared.span.fallback_source_prompt
             reads = reads if reads and reads.messages else None
             fallback_prompt = build_extraction_fallback_prompt(
-                self._prefetch_prompt(compact, reads), tools,
+                self._prefetch_prompt(compact, reads), self._extraction_tools,
             )
             if truncated or not prompt_fits(fallback_prompt, schema):
                 compact += ("\n\nExtract only facts from this source within the output budget. "
                             "Extract complete source facts without target_uri or expected_version.")
-                source_tools = [tool for tool in tools
+                source_tools = [tool for tool in self._extraction_tools
                                 if tool["name"] not in {"edit_memory", "append_memory"}]
                 fallback_prompt = build_extraction_fallback_prompt(compact, source_tools)
-                tools = source_tools
                 schema = build_extraction_envelope_schema(source_tools)
                 reads = None
             logger.info("JSON extraction fallback compacted: span=%d-%d native_chars=%d "
@@ -1459,8 +1432,6 @@ class Extractor:
             raise ToolCallProtocolError(f"JSON fallback returned invalid JSON output: {exc}") from exc
         check_deadline()
         calls = [{"tool": operation.tool, "input": operation.input} for operation in envelope.operations]
-        if tools is not self._extraction_tools:
-            validate_offered_calls(calls, tools)
         try:
             candidates = self._parse_candidate_calls(calls, reads, ctx, output_label="JSON fallback")
         except _CandidateValidationError:
@@ -1472,8 +1443,6 @@ class Extractor:
                     "JSON fallback contained no schema-valid extraction operation"
                 )
             self._assign_provenance(candidates, prepared.span, archive_id)
-        for candidate in candidates:
-            validate_offered_candidate(candidate, tools)
         prepared.span.prefetch_result = reads
         logger.info(
             "Span %d-%d JSON extraction fallback produced %d candidates: "
@@ -1519,13 +1488,9 @@ class Extractor:
         ctx: RequestContext,
         archive_id: str | None = None,
         focused_messages: list[dict] | None = None,
-        categories: frozenset[str] | None = None,
     ) -> list[CandidateMemory]:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         check_deadline()
-        from extraction.prompt_assembly import tools_for_categories
-        tools = (self._extraction_tools if categories is None else
-                 tools_for_categories(self._extraction_tools, self._schema_registry, categories))
         try:
             from extraction.extraction_react_loop import ExtractionReActLoop
 
@@ -1546,7 +1511,7 @@ class Extractor:
                 timeout_seconds=self._react_timeout_seconds,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )
-            result = loop.run(prompt, ctx, prefetch_result, categories=categories)
+            result = loop.run(prompt, ctx, prefetch_result)
             if result.finish_reason == "llm_error":
                 # ReactLoop returns failures as data. Do not turn a truncated
                 # or failed model call into a successful zero-memory ingest.
@@ -1586,16 +1551,16 @@ class Extractor:
                 )
             source_prompt = prompt
             prompt = self._with_prefetch_context(attempt_span, source_prompt, ctx)
-            if not prompt_fits(prompt, {"tools": tools}):
+            if not prompt_fits(prompt, {"tools": self._extraction_tools}):
                 # Existing memories are optional context, while the complete new
                 # source and correction feedback must survive. Removing a read
                 # snapshot also removes its authority to bind a versioned update.
-                if not prompt_fits(source_prompt, {"tools": tools}):
+                if not prompt_fits(source_prompt, {"tools": self._extraction_tools}):
                     raise ExtractionIncompleteError("native validation recovery exceeds the context budget") from e
                 prompt = source_prompt
                 attempt_span.prefetch_result = None
             prompt_sha = _prompt_sha(prompt)
-            candidates = self._structure_span_eager(attempt_span, prompt, ctx, prompt_sha, archive_id, extraction_tools=tools)
+            candidates = self._structure_span_eager(attempt_span, prompt, ctx, prompt_sha, archive_id)
             span.successful_read_versions.append(
                 dict(attempt_span.prefetch_result.read_versions) if attempt_span.prefetch_result else {})
             span.prefetch_result = attempt_span.prefetch_result
@@ -1679,22 +1644,7 @@ class Extractor:
         *,
         include_examples: bool = True,
     ) -> str:
-        """Build extraction input from independently rendered template and data parts."""
-        return self._build_prompt_parts(
-            language, conversation, session_summary, ctx, include_examples=include_examples,
-        ).render()
-
-    def _build_prompt_parts(
-        self,
-        language: str,
-        conversation: str,
-        session_summary: str = "",
-        ctx: RequestContext | None = None,
-        *,
-        include_examples: bool = True,
-    ) -> PromptParts:
-        """Render template and data sections once, preserving their boundaries."""
-        from extraction.prompt_assembly import PromptParts
+        """Build extraction prompt from YAML template (Eager mode)."""
         system_prompt = self._prompt_manager.render(
             "extraction", "system_prompt",
             session_summary=session_summary,
@@ -1713,7 +1663,7 @@ class Extractor:
                 user_id=ctx.user_id,
             )
 
-        prefix = f"\n\n{identity_block}\n\n"
+        prefix = f"{system_prompt}\n\n{identity_block}\n\n"
         if session_summary:
             # Incremental batches often omit the earlier turn naming the project.
             # Supply saved context for reference resolution, never as new evidence.
@@ -1736,12 +1686,12 @@ class Extractor:
             f"{self._update_instruction}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"
         )
-        parts = PromptParts(system_prompt, prefix, examples, suffix, include_examples)
-        if not prompt_fits(parts.render(), {"tools": self._extraction_tools}):
+        prompt = prefix + examples + "\n\n" + suffix if include_examples else prefix + suffix
+        if not prompt_fits(prompt, {"tools": self._extraction_tools}):
             # Demonstrations are optional. Preserve the complete source and all
             # mandatory instructions, even if source text matches the template.
-            parts = replace(parts, include_examples=False)
-        return parts
+            prompt = prefix + suffix
+        return prompt
 
     @staticmethod
     def _content_to_str(content) -> str:
