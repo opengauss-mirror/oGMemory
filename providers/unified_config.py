@@ -705,6 +705,7 @@ class OgMemConfig:
     retrieval_candidate_pool_multiplier: int = 3
     retrieval_min_candidate_pool_size: int = 15
     retrieval_result_ranker_strategy: str = "semantic"
+    retrieval_decision_rerank_enabled: bool = False
     retrieval_global_result_rerank_enabled: bool = False
     retrieval_owner_scope_filter_enabled: bool = False
     retrieval_hybrid_enabled: bool = False
@@ -751,6 +752,10 @@ class OgMemConfig:
             self.decision = DecisionConfig.from_mapping(self.decision)
         elif self.decision is not None and not isinstance(self.decision, DecisionConfig):
             raise ValueError("decision must be DecisionConfig, a mapping, or null")
+        if type(self.retrieval_decision_rerank_enabled) is not bool:
+            raise ValueError("retrieval.decision_rerank_enabled must be a boolean")
+        if self.retrieval_decision_rerank_enabled and self.decision is None:
+            raise ValueError("retrieval.decision_rerank_enabled requires decision configuration")
         if type(self.source_occurrence_reconciliation_enabled) is not bool:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         if type(self.card_format_enabled) is not bool:
@@ -2309,6 +2314,10 @@ class OgMemConfig:
                 retrieval.get("result_ranker_strategy"),
                 "OGMEM_RETRIEVAL_RESULT_RANKER_STRATEGY",
                 "semantic",
+            ),
+            retrieval_decision_rerank_enabled=_resolve_bool(
+                retrieval.get("decision_rerank_enabled"),
+                "OGMEM_RETRIEVAL_DECISION_RERANK_ENABLED", False,
             ),
             retrieval_global_result_rerank_enabled=_resolve_bool(
                 retrieval.get("global_result_rerank_enabled"),

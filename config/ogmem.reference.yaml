@@ -297,6 +297,8 @@ skills:
 
 # ---- Retrieval [all] ----
 retrieval:
+  # Opt-in Jev-compatible evidence reranking; requires decision configuration.
+  decision_rerank_enabled: false
   # Service-instance setting; restart every worker after changing it.
   # false searches only L2 without roots, hierarchical expansion, or child
   # searches, including empty-result fallbacks. Existing ranking and public

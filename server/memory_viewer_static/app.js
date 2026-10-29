@@ -935,8 +935,8 @@ async function loadDashboardMetrics() {
   status.hidden = true;
   $('#metrics-updated').textContent = '最近 14 天';
   $('#metrics-scope').textContent = state.accountId
-    ? `${state.accountId} 的 LLM 与 Embedding Token 使用情况。`
-    : '当前账户的 LLM 与 Embedding Token 使用情况。';
+    ? `${state.accountId} 的 LLM、Embedding 与 Decision Token 使用情况。`
+    : '当前账户的 LLM、Embedding 与 Decision Token 使用情况。';
   $('#token-trend-chart').innerHTML = '<div class="metrics-empty">正在加载模型用量…</div>';
   setLoading(true);
   try {
@@ -961,15 +961,21 @@ function renderModelMetrics(metrics) {
   const status = $('#metrics-status');
   status.hidden = !missingUsageCalls;
   status.textContent = missingUsageCalls
-    ? `${missingUsageCalls} 次成功调用未返回 Token 用量；已计入调用次数，Token 总量仅包含已报告部分。`
+    ? `${missingUsageCalls} 次调用未返回完整 Token 用量；已计入调用次数，Token 总量仅包含已报告部分。`
     : '';
   const llm = cumulative.llm || {};
   const embedding = cumulative.embedding || {};
+  const decision = cumulative.decision || {};
   const todayLlm = Number(today.llm_input || 0) + Number(today.llm_output || 0);
   const embeddingCalls = Number(embedding.calls || 0);
   setMetricText('metrics-today-total', today.total);
   setMetricText('metrics-today-llm', todayLlm);
   setMetricText('metrics-today-embedding', today.embedding_input);
+  setMetricText('metrics-today-decision', Number(today.decision_input || 0) + Number(today.decision_output || 0));
+  for (const field of ['input_tokens', 'output_tokens', 'total_tokens', 'calls', 'failed_calls', 'missing_usage_calls']) {
+    setMetricText(`metrics-decision-${field}`, decision[field]);
+  }
+  $('#metrics-decision-model').textContent = metrics.models?.decision || '未配置模型';
   setMetricText('metrics-llm-total', llm.total_tokens);
   setMetricText('metrics-llm-input', llm.input_tokens);
   setMetricText('metrics-llm-output', llm.output_tokens);
@@ -1093,6 +1099,8 @@ function renderTokenTrend(series) {
     ['llm_input', 'llm-input', 'LLM 输入'],
     ['llm_output', 'llm-output', 'LLM 输出'],
     ['embedding_input', 'embedding', 'Embedding'],
+    ['decision_input', 'decision-input', 'Decision 输入'],
+    ['decision_output', 'decision-output', 'Decision 输出'],
   ];
   const maxValue = Math.max(1, ...series.flatMap((item) => keys.map(([key]) => Number(item[key] || 0))));
   const x = (index) => padding.left + (series.length === 1 ? plotWidth / 2 : index * plotWidth / (series.length - 1));

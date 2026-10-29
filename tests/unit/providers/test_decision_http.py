@@ -97,3 +97,26 @@ def test_redirect_is_not_replayed_or_forwarded(serve, status, cross_origin):
     if cross_origin:
         assert target.received == []
     assert caught.value.status_code == status and "synthetic-key" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"answers": {}},
+        {"answers": {"q": {"type": "noul", "noul": 0.8}}, "usage": {"truncated": True}},
+    ],
+)
+def test_late_protocol_error_propagates_deadline(monkeypatch, raw):
+    clock = [100.0]
+    monkeypatch.setattr(deadline, "monotonic", lambda: clock[0])
+
+    def respond(payload):
+        clock[0] = 102.0
+        return raw
+
+    obj = JevDecisionClient(
+        DecisionConfig(base_url="http://example.invalid", model="test"), transport=respond
+    )
+    with deadline.operation_deadline(1), pytest.raises(OperationDeadlineExceededError):
+        obj.evaluate({}, QUESTION)
+    assert obj.token_tracker.snapshot().llm_calls == 1

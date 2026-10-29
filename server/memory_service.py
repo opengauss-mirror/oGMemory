@@ -680,6 +680,8 @@ class MemoryService:
         self._default_agent_id = cfg.agent_id
 
         self._llm = None
+        self._decision_client = None
+        self._decision_client_lock = threading.Lock()
         self._write_api = None
         self._read_api = None
         self._code_resource_lifecycle_service: CodeResourceLifecycleService | None = None
@@ -2873,6 +2875,26 @@ class MemoryService:
             self._lexical_backfill = None
             self._vector_index = None
 
+    def get_decision_client(self):
+        """One optional protocol client shared by retrieval and lazy extraction."""
+        config = getattr(self._cfg, "decision", None)
+        if config is None:
+            return None
+        with self._decision_client_lock:
+            if self._decision_client is None:
+                from providers.decision import JevDecisionClient
+                self._decision_client = self._bind_model_usage(JevDecisionClient(config))
+            return self._decision_client
+
+    def _rerank_decision_evidence(self, query, working_set):
+        if not self._cfg.retrieval_decision_rerank_enabled:
+            return working_set, None
+        client = self.get_decision_client()
+        if client is None:
+            return working_set, None
+        from retrieval.decision_reranker import rerank_evidence
+        return rerank_evidence(query, working_set, client)
+
     @_serialize_lazy_initialization("_llm")
     def get_llm(self):
         if self._llm is None:
@@ -4410,6 +4432,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 working_set, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs), ctx,
             )
             search_stats["evidence_delivery"] = delivery_stats
+            working_set, decision_stats = self._rerank_decision_evidence(query, working_set)
+            if decision_stats is not None:
+                search_stats["decision_rerank"] = decision_stats
 
         # Each step degrades independently — a failure in one doesn't kill the rest
 
@@ -7124,8 +7149,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     if self._provider_cfg.embedding_provider == 'st'
                     else self._provider_cfg.openai_embedding_model
                 )
+            if not metrics["models"].get("decision"):
+                metrics["models"]["decision"] = self._cfg.decision.model if self._cfg.decision else ""
             return metrics
+        decision_tracker = getattr(self._decision_client, "token_tracker", None)
         trackers = {
+            "decision": decision_tracker,
             "llm": getattr(self._llm, "token_tracker", None) if self._llm else None,
             "embedding": (
                 getattr(self._embedder, "token_tracker", None) if self._embedder else None
@@ -7145,10 +7174,15 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "llm_input": 0,
                         "llm_output": 0,
                         "embedding_input": 0,
+                        "decision_input": 0,
+                        "decision_output": 0,
                         "total": 0,
                     },
                 )
-                if source == "llm":
+                if source == "decision":
+                    item["decision_input"] = int(row["input_tokens"])
+                    item["decision_output"] = int(row["output_tokens"])
+                elif source == "llm":
                     item["llm_input"] = int(row["input_tokens"])
                     item["llm_output"] = int(row["output_tokens"])
                 else:
@@ -7156,7 +7190,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         series = [series_by_date[key] for key in sorted(series_by_date)]
         for item in series:
-            item["total"] = item["llm_input"] + item["llm_output"] + item["embedding_input"]
+            item["total"] = (item["llm_input"] + item["llm_output"] + item["embedding_input"]
+                             + item["decision_input"] + item["decision_output"])
 
         llm_snapshot = (
             trackers["llm"].scoped_snapshot(account_id, owner_spaces)
@@ -7168,6 +7203,21 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if trackers["embedding"] and account_id
             else trackers["embedding"].snapshot() if trackers["embedding"] else None
         )
+        decision_snapshot = (
+            decision_tracker.scoped_snapshot(account_id, owner_spaces)
+            if decision_tracker and account_id
+            else decision_tracker.snapshot() if decision_tracker else None
+        )
+        decision = {
+            "input_tokens": decision_snapshot.input_tokens if decision_snapshot else 0,
+            "output_tokens": decision_snapshot.output_tokens if decision_snapshot else 0,
+            "total_tokens": (decision_snapshot.input_tokens + decision_snapshot.output_tokens
+                             if decision_snapshot else 0),
+            "calls": decision_snapshot.llm_calls if decision_snapshot else 0,
+            **(decision_tracker.decision_status(account_id, owner_spaces) if decision_tracker else {
+                "failed_calls": 0, "missing_usage_calls": 0,
+            }),
+        }
         llm = {
             "input_tokens": llm_snapshot.input_tokens if llm_snapshot else 0,
             "output_tokens": llm_snapshot.output_tokens if llm_snapshot else 0,
@@ -7190,6 +7240,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "llm_input": 0,
                 "llm_output": 0,
                 "embedding_input": 0,
+                "decision_input": 0,
+                "decision_output": 0,
                 "total": 0,
             }
         )
@@ -7212,12 +7264,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return {
             "enabled": True,
             "scope": {"account_id": account_id, "owner_spaces": list(owner_spaces)},
-            "models": {"llm": llm_model, "embedding": embedding_model},
+            "models": {"llm": llm_model, "embedding": embedding_model,
+                       "decision": (getattr(decision_tracker, "model", None)
+                                    or (self._cfg.decision.model if self._cfg.decision else ""))},
             "today": today,
             "cumulative": {
-                "total_tokens": llm["total_tokens"] + embedding["total_tokens"],
+                "total_tokens": llm["total_tokens"] + embedding["total_tokens"] + decision["total_tokens"],
                 "llm": llm,
                 "embedding": embedding,
+                "decision": decision,
+                "missing_usage_calls": decision["missing_usage_calls"],
+                "failed_calls": decision["failed_calls"],
             },
             "series": series,
         }
