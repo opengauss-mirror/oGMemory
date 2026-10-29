@@ -44,10 +44,6 @@ class MockLLM(LLM):
         self._call_count += 1
         prompt_lower = prompt.lower()
 
-        # Shared prompt assembly selection keeps all compatible categories in this mock.
-        if set(schema.get("properties", {})) == {"categories"}:
-            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
-
         # Schema-validated extraction fallback. Native tool extraction tests use
         # an empty operation list by default.
         if "operations" in schema.get("properties", {}):

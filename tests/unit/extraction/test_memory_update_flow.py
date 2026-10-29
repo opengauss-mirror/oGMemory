@@ -194,9 +194,6 @@ class CrossSpanProvider(ExtractionProvider):
         return [{"tool": op["name"], "input": op["input"]}]
 
     def complete_json(self, prompt, schema):
-        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-        if set(schema.get("properties", {})) == {"categories"}:
-            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         self.reconciliations.append(json.loads(prompt.split("\n\n", 1)[1]))
         return dict(abstract=self.combined, overview=self.combined, content=self.combined)
 
@@ -278,9 +275,6 @@ def test_span_reconciliation_orders_corrections_and_binds_current_version():
 
     class CorrectionProvider:
         def complete_json(self, prompt, schema):
-            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-            if set(schema.get("properties", {})) == {"categories"}:
-                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             payload = json.loads(prompt.split("\n\n", 1)[1])
             assert payload["existing"]["content"] == "Prefers sweet green tea."
             assert [item["evidence"] for item in payload["updates"]] == [
@@ -330,9 +324,6 @@ def test_invalid_span_reconciliation_leaves_original_memory_intact(response):
 
     class InvalidProvider:
         def complete_json(self, prompt, schema):
-            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-            if set(schema.get("properties", {})) == {"categories"}:
-                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             return response
 
     extractor = Extractor(InvalidProvider(), schema_registry=registry, fs=fs)
@@ -374,9 +365,6 @@ def test_low_confidence_span_does_not_suppress_supported_update():
 
     class Provider:
         def complete_json(self, prompt, schema):
-            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-            if set(schema.get("properties", {})) == {"categories"}:
-                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             return dict.fromkeys(("abstract", "overview", "content"), supported.content)
 
     extractor = Extractor(Provider(), schema_registry=registry, fs=fs)

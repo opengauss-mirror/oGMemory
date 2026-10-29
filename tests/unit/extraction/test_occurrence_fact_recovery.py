@@ -104,9 +104,6 @@ def test_source_repair_preserves_each_members_evidence_and_source_indices():
 
     class RepairLLM(SourceLLM):
         def complete_json(self, prompt, schema):
-            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-            if set(schema.get("properties", {})) == {"categories"}:
-                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             properties = set(schema['properties'])
             if properties == {'valid'}:
                 self.json_calls.append((properties, prompt, schema))

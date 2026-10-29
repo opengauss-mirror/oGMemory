@@ -26,10 +26,6 @@ def prepare(*, old_chars=64000, bound=False, mode="eager", source=SOURCE, exampl
         fields.pop("target_uri")
         fields.pop("expected_version")
     llm.complete_json.return_value = {"operations": [{"tool": "extract_profile", "input": fields}]}
-    llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["profile"]} if set(schema["properties"]) == {"categories"}
-        else llm.complete_json.return_value
-    )
     extractor = Extractor(llm, mode=mode, schema_registry=registry, fs=fs,
                           vector_index=index, embedder=embedder, uri_resolver=URIResolver(registry))
     if examples is not None:
@@ -53,7 +49,7 @@ def test_complete_source_recovery_with_large_existing_memory(mode):
     assert candidate.content == SOURCE and SOURCE in prompt
     assert prompt_fits(prompt, llm.complete_json.call_args.kwargs["schema"])
     assert candidate.target_uri == "" and prepared.span.prefetch_result is None
-    assert llm.complete_json.call_count == 2
+    assert llm.complete_json.call_count == 1
 
 
 @pytest.mark.parametrize("old_chars", [34, 500])
@@ -68,7 +64,7 @@ def test_complete_read_snapshot_authorizes_fallback_update(old_chars):
     assert (candidate.target_uri, candidate.expected_version) == (uri, 1)
     assert prepared.span.prefetch_result.read_versions == {uri: 1}
     assert candidate.content == snapshot.content + SOURCE
-    assert llm.complete_json.call_count == 2
+    assert llm.complete_json.call_count == 1
 
 
 def test_summary_repair_fallback_uses_its_final_read_snapshot():
@@ -78,14 +74,13 @@ def test_summary_repair_fallback_uses_its_final_read_snapshot():
         "tool": operation["tool"], "input": {**operation["input"], "abstract": "x" * 201},
     }]
     llm.complete_json.side_effect = [
-        {"categories": ["profile"]},
         {"repairs": [{"operation_index": 0, "abstract": "x" * 201}]},
         {"operations": [operation]},
     ]
     candidate, = extractor._structure_prepared_span_dual(prepared, ctx, "archive")
     assert candidate.content == SOURCE
     assert prepared.span.prefetch_result is None and prepared.span.successful_read_versions == [{}]
-    assert llm.complete_json.call_count == 3
+    assert llm.complete_json.call_count == 2
 
 
 def test_source_equal_to_a_template_example_is_preserved():
@@ -109,4 +104,4 @@ def test_truncated_native_output_recovers_complete_source_facts(mode):
     assert (candidate.target_uri, candidate.expected_version) == ("", None)
     assert SOURCE in llm.complete_json.call_args.args[0]
     assert prepared.span.prefetch_result is None
-    assert llm.complete_json.call_count == 2
+    assert llm.complete_json.call_count == 1
