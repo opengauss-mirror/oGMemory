@@ -32,6 +32,17 @@ llm:
   # extra_body:                  # [all] arbitrary OpenAI-compatible provider options
   #   thinking: {type: enabled}
 
+# ---- Decision model [all, optional] ----
+# Omit or use null to preserve native behavior. Credentials alone do not enable it.
+# The Jev protocol supports official Jev, Vercel and self-hosted Laya.
+# decision:
+#   provider: jev
+#   base_url: "https://ai-gateway.vercel.sh/typesafe"
+#   model: "typesafe-ai/jev"       # self-hosted Laya: multilingual
+#   # Omit api_key to read OGMEM_DECISION_API_KEY; no YAML placeholder expansion.
+#   # api_key: ""                  # explicit empty string for services without auth
+#   timeout_seconds: 30
+
 # ---- Embedding Configuration [all] ----
 embedding:
   # provider: null               # [all] defaults to llm.provider

@@ -21,6 +21,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from providers.decision.config import DecisionConfig
+
 # Auto-load .env from config/ directory so API keys are available
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _dotenv_path = os.path.join(_project_root, "config", ".env")
@@ -735,11 +737,18 @@ class OgMemConfig:
     dual_pass_enabled: bool = True
     node_processing_enabled: bool = False
 
+    # Explicit opt-in, independent of the generative LLM and eager/lazy mode.
+    decision: DecisionConfig | None = None
+
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if isinstance(self.decision, dict):
+            self.decision = DecisionConfig.from_mapping(self.decision)
+        elif self.decision is not None and not isinstance(self.decision, DecisionConfig):
+            raise ValueError("decision must be DecisionConfig, a mapping, or null")
         if type(self.source_occurrence_reconciliation_enabled) is not bool:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         if type(self.card_format_enabled) is not bool:
@@ -1193,7 +1202,13 @@ class OgMemConfig:
             )
         )
 
+        decision_raw = raw.get("decision")
+        if isinstance(decision_raw, dict) and decision_raw:
+            decision_raw = {**decision_raw, "api_key": _resolve(decision_raw.get("api_key"), "OGMEM_DECISION_API_KEY", "")}
+        decision_config = DecisionConfig.from_mapping(decision_raw)
+
         cfg = cls(
+            decision=decision_config,
             # LLM
             provider=_resolve(llm.get("provider"), "CONTEXTENGINE_PROVIDER", "mock"),
             openai_api_key=llm_api_key,
