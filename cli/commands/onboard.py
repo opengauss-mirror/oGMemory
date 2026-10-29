@@ -134,8 +134,10 @@ def _step4_database(args) -> tuple[dict, dict]:
     if getattr(args, "non_interactive", False):
         vdb_type = getattr(args, "vector_db", None) or "opengauss"
     else:
-        vdb_type = ["opengauss", "chroma"][
-            select("Vector database:", ["openGauss", "Chroma"], default=1 if getattr(args, "vector_db", None) == "chroma" else 0)
+        vector_types = ["opengauss", "chroma", "milvus"]
+        requested = getattr(args, "vector_db", None) or "opengauss"
+        vdb_type = vector_types[
+            select("Vector database:", ["openGauss", "Chroma", "Milvus"], default=vector_types.index(requested))
         ]
 
     vdb = {"type": vdb_type}
@@ -200,7 +202,7 @@ def _step4_database(args) -> tuple[dict, dict]:
     # OpenGauss vector and SQL storage both require a reachable database.
     # Docker quickstart creates and checks its own OpenGauss container.
     if (storage_backend == "sql" or vdb_type == "opengauss") and getattr(args, "mode", None) != "docker":
-        from cli.lib.db_setup import check_postgresql, check_opengauss_compatibility, init_schema
+        from cli.lib.db_setup import check_opengauss_compatibility, check_postgresql, init_schema
 
         # Probe each distinct database; never silently replace a separate vector DSN.
         if vdb_type == "opengauss" and (storage_backend != "sql" or vector_conn != conn_str):
@@ -265,8 +267,8 @@ def _step_install_deps(args, embedding: dict, vdb: dict) -> bool:
     extras = []
     if embedding.get("provider") == "st":
         extras.append("sentence-transformers")
-    if vdb.get("type") == "chroma":
-        extras.append("chroma")
+    if vdb.get("type") in {"chroma", "milvus"}:
+        extras.append(vdb["type"])
 
     if shutil.which("uv"):
         cmd = ["uv", "sync"]
@@ -310,7 +312,11 @@ def _step_docker_setup(args, llm: dict, embedding: dict, vdb: dict) -> dict:
     instance_name = getattr(args, "instance_name", None) or "ogmem"
 
     _print_header(6, "Generate deploy.env")
-    from cli.lib.deploy_helpers import deploy_quickstart, generate_quickstart_env, quickstart_shell_command
+    from cli.lib.deploy_helpers import (
+        deploy_quickstart,
+        generate_quickstart_env,
+        quickstart_shell_command,
+    )
 
     try:
         generate_quickstart_env(
@@ -449,7 +455,7 @@ def run(args) -> int:
         from cli.commands.plugin_config import run as export_plugin_config
         return export_plugin_config(args)
 
-    from cli.lib.onboard_config import read_config, existing_defaults
+    from cli.lib.onboard_config import existing_defaults, read_config
     from cli.lib.process import find_project_root
     root = find_project_root()
     from cli.lib.local_config import resolve_local_config_path
@@ -515,11 +521,13 @@ def run(args) -> int:
         if db_config.get("backend") == "sql" and not db_config.get("reachable", False):
             print(fail("Database is not reachable; local OpenGauss mode cannot continue"))
             return 1
-        from cli.lib.onboard_config import merge_config, save_config, changed_fields
-        from cli.lib.local_runtime import require_stopped, runtime_lock
-        from cli.lib.local_config import load_local_config
         import tempfile
+
         import yaml
+
+        from cli.lib.local_config import load_local_config
+        from cli.lib.local_runtime import require_stopped, runtime_lock
+        from cli.lib.onboard_config import changed_fields, merge_config, save_config
         value = merge_config(existing, _build_config(llm_config, embedding_config, vdb_config, db_config, port=args.port))
         changes = changed_fields(existing, value)
         print(info("Changed fields (values hidden): " + (", ".join(changes) or "none")))

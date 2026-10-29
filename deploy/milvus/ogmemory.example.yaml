@@ -1,0 +1,40 @@
+llm:
+  provider: openai
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  # Supply OGMEM_API_KEY through your environment / secret manager.
+embedding:
+  provider: openai
+  base_url: https://api.openai.com/v1
+  model: text-embedding-3-small
+vector_db:
+  type: milvus
+  dimension: 1536
+  milvus_uri: http://host.docker.internal:19530
+  milvus_collection: contextengine
+  milvus_db_name: default
+  milvus_timeout: 30
+storage:
+  backend: agfs
+agfs:
+  base_url: http://127.0.0.1:1833
+  mount_prefix: /local
+index:
+  interval: 1
+  workers: 1
+service:
+  http_port: 8090
+  workers: 1
+  threads: 4
+identity:
+  account_id: milvus-demo
+  user_id: demo-user
+  agent_id: demo-agent
+auth:
+  role_control_enabled: true
+  # Supply OG_ROOT_API_KEY and OG_ADMIN_API_KEYS=milvus-demo:<random-admin-key>.
+  # admin_api_keys bootstraps the account; provision user/agent credentials via the admin API.
+mcp:
+  enabled: false
+agent_memory:
+  enabled: true

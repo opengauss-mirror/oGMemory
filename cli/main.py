@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument("--embedding-dimension", type=int, help="Embedding output dimension")
     p_onboard.add_argument(
         "--vector-db",
-        choices=["chroma", "opengauss"],
+        choices=["chroma", "opengauss", "milvus"],
         help="Vector DB type (local mode defaults to opengauss)",
     )
     p_onboard.add_argument("--port", type=int, default=8090, action=ExplicitStore, help="HTTP port")

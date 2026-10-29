@@ -97,6 +97,12 @@ storage:
 # openGauss container's internal port (VECTOR_DB_PORT). Same reason as
 # STORAGE_DB_HOST_PORT above.
 vector_db:
+  # Milvus: set type: milvus and install .[milvus]. Embedding dimension must match.
+  # milvus_uri: "http://localhost:19530"    # MILVUS_URI
+  # milvus_collection: "contextengine"     # MILVUS_COLLECTION
+  # milvus_db_name: "default"              # MILVUS_DB_NAME
+  # milvus_timeout: 30                     # MILVUS_TIMEOUT (seconds)
+  # Supply credentials via MILVUS_TOKEN instead of committing them to YAML.
   type: opengauss
   connection_string: "host=${VECTOR_DB_HOST} port=${VECTOR_DB_HOST_PORT} dbname=${VECTOR_DB_NAME} user=${VECTOR_DB_USER} password=${VECTOR_DB_PASSWORD}"
   dimension: 1024
