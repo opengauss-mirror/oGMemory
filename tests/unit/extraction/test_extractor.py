@@ -475,6 +475,7 @@ class TestExtractorToolCallFallback:
                     {"start": 0, "end": 0, "reason": "preference", "categories": ["preference"]}
                 ]
             },
+            {"categories": ["preference"]},
             {"operations": [self._preference("coffee", confidence=0.3)]},
         ]
         llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")
@@ -487,7 +488,7 @@ class TestExtractorToolCallFallback:
         )
 
         assert result == []
-        assert llm.complete_json.call_count == 2
+        assert llm.complete_json.call_count == 3
 
 
 class TestExtractorSinglePreference:
