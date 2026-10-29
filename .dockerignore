@@ -116,3 +116,6 @@ config/README.md
 # ---- Embedded git ----
 *.gemspec
 .git
+
+# Private Milvus deployment configuration
+/deploy/milvus/ogmemory.yaml
