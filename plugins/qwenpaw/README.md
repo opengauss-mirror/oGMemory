@@ -14,7 +14,6 @@ Installation, configuration and cross-session examples: [QwenPaw integration](..
 - When compression changes the context, the plugin writes captured conversation text and calls `compact` to extract accumulated memory regardless of the ordinary turn threshold. During a reply this runs at reply completion; standalone compression flushes immediately. Pending writes and compaction are retried on the next reply. QwenPaw keeps its own compressed context.
 - The native `/compact` command uses a separate runtime path. A `PRE_DISPATCH` hook persists an extraction marker in QwenPaw's session, submits pending conversation writes, and requests extraction before QwenPaw handles the command. Memory service failures retain pending work while QwenPaw continues compression. The next reply or `/compact` retries it, including after a restart.
 - Compression records its boundaries. Shutdown and uninstall drain the bounded Trace queue and dispose sessions.
-- Explicit `ogmemory_search` uses QwenPaw's current request identity, including when its stream advances across heartbeat tasks.
 
 QwenPaw retains ownership of its local context, model, tools and session persistence. oGMemory retains ownership of memory extraction, indexing, retrieval and Trace storage.
 
