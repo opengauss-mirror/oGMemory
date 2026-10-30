@@ -869,15 +869,17 @@ async def test_compaction_retries_after_service_recovers():
         state.context = [UserMsg(name="summary", content="Atlas schedule discussed.")]
 
     await middleware.on_compress_context(agent, {}, compress)
-    assert state.middle_context["ogmemory"]["compact_pending"] is True
+    assert state.middle_context["ogmemory"]["compact_retry"] is True
     available = True
     _ = [item async for item in agent.reply_stream(inputs=UserMsg(name="alice", content="Continue."))]
     await client.close()
     assert state.middle_context["ogmemory"].get("compact_pending", False) is False
+    assert state.middle_context["ogmemory"].get("compact_retry", False) is False
     assert calls.count("/api/v1/compact") == 2
 
 @pytest.mark.asyncio
-async def test_manual_compact_dispatch_extracts_before_command():
+async def test_manual_compact_dispatch_extracts_before_command(tmp_path):
+    from qwenpaw.app.chats.session import SafeJSONSession
     from qwenpaw.runtime.hooks import HookRegistry
     from qwenpaw.runtime.phases import Phase
     from qwenpaw.runtime.slash_command_registry import CommandSpec, SlashCommandRegistry
@@ -906,11 +908,179 @@ async def test_manual_compact_dispatch_extracts_before_command():
     registry.register(CommandSpec(name="compact", handler=compact, category="conversation"))
     ctx = context()
     ctx.input_msgs = [UserMsg(name="alice", content="/compact keep decisions")]
-    ctx.workspace = SimpleNamespace(plugins=SimpleNamespace(slash_command_registry=registry))
+    session = SafeJSONSession(str(tmp_path))
+    await session.update_session_state(session_id=ctx.session_id, user_id="alice",
+        key="agent.state", value=AgentState().model_dump(mode="json"))
+    ctx.workspace = SimpleNamespace(session=session,
+        plugins=SimpleNamespace(slash_command_registry=registry))
     await hooks.run(Phase.PRE_DISPATCH, ctx)
     await registry.dispatch(ctx.input_msgs[0].get_text_content(), ctx)
     await integration.client.close()
     assert calls.index("/api/v1/compact") < calls.index("native_compact")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_path", ["bootstrap", "after_turn", "compact"])
+async def test_manual_compact_preserves_retry_across_restart(tmp_path, failure_path):
+    from agentscope.agent import ContextConfig
+    from agentscope.message import AssistantMsg
+    from qwenpaw.app.chats.session import SafeJSONSession
+    from qwenpaw.runtime.hooks import HookRegistry
+    from qwenpaw.runtime.phases import Phase
+    from qwenpaw.runtime.slash_command_registry import CommandSpec, SlashCommandRegistry
+
+    calls = []
+    available = False
+
+    def handle(request):
+        body = json.loads(request.content)
+        calls.append((request.url.path, body))
+        if not available and request.url.path in {f"/api/v1/{failure_path}", "/api/v1/compact"}:
+            return httpx.Response(500, json={"ok": False, "error": "Extraction unavailable"})
+        return httpx.Response(200, json={"ok": True})
+
+    async def install():
+        integration = plugin.OGMemoryPlugin()
+        hooks = HookRegistry()
+        api = SimpleNamespace(config={}, register_runtime_hook=hooks.register,
+            register_middleware=lambda factory: None, register_shutdown_hook=lambda *args: None,
+            register_uninstall_hook=lambda *args: None, register_tool=lambda *args, **kwargs: None)
+        integration.register(api)
+        await integration.client.http.aclose()
+        integration.client.http = httpx.AsyncClient(base_url="http://memory",
+            transport=httpx.MockTransport(handle))
+        return integration, hooks
+
+    session = SafeJSONSession(str(tmp_path))
+    ctx = context()
+    ctx.request.channel = "console"
+    ctx.input_msgs = [UserMsg(name="alice", content="/compact")]
+    session_args = {"session_id": ctx.session_id, "user_id": "alice", "channel": "console"}
+    original = "Atlas releases Thursday."
+    batch = {"clientRequestId": "original-turn", "messages": [{"role": "user", "content": original}],
+             "forceExtract": False}
+    state = AgentState(session_id=ctx.session_id, context=[
+        UserMsg(name="alice", content=original, metadata={"qwenpaw_tag": "external_user_query"}),
+        AssistantMsg(name="qwenpaw", content="Understood."),
+    ], middle_context={"ogmemory": {"pending": [batch]}})
+    await session.update_session_state(**session_args, key="agent", value={
+        "state": state.model_dump(mode="json"), "mode_state": {"coding": {"active": True}},
+        "scroll": {"checkpoint": "saved"},
+    })
+
+    class SummaryModel(Model):
+        async def generate_structured_output(self, messages, structured_model, **kwargs):
+            return SimpleNamespace(finished_reason="stop",
+                content={key: original for key in structured_model["properties"]})
+
+    async def compact(ctx, args):
+        saved = await session.get_session_state_dict(**session_args)
+        restored = AgentState.model_validate(saved["agent"]["state"])
+        agent = Agent(name="qwenpaw", system_prompt="Help.", model=SummaryModel(), state=restored)
+        cfg = ContextConfig().model_copy(update={"trigger_ratio": 0, "reserve_ratio": 0})
+        await agent.compress_context(cfg)
+        await session.update_session_state(**session_args, key="agent.state",
+            value=restored.model_dump(mode="json"))
+        return AssistantMsg(name="qwenpaw", content="Compact complete.")
+
+    registry = SlashCommandRegistry()
+    registry.register(CommandSpec(name="compact", handler=compact, category="conversation"))
+    ctx.workspace = SimpleNamespace(session=session,
+        plugins=SimpleNamespace(slash_command_registry=registry))
+    integration, hooks = await install()
+    await hooks.run(Phase.PRE_DISPATCH, ctx)
+    result = await registry.dispatch("/compact", ctx)
+    assert result.get_text_content() == "Compact complete."
+    saved = await session.get_session_state_dict(**session_args)
+    assert original in saved["agent"]["state"]["summary"]
+    retry_state = saved["agent"]["state"]["middle_context"]["ogmemory"]
+    assert retry_state.get("compact_pending") or retry_state.get("compact_retry")
+    assert saved["agent"]["mode_state"] == {"coding": {"active": True}}
+    assert saved["agent"]["scroll"] == {"checkpoint": "saved"}
+    if failure_path == "after_turn":
+        assert saved["agent"]["state"]["middle_context"]["ogmemory"]["pending"] == [batch]
+    await integration.client.close()
+
+    available = True
+    integration, _ = await install()
+    session = SafeJSONSession(str(tmp_path))
+    saved = await session.get_session_state_dict(**session_args)
+    restored = AgentState.model_validate(saved["agent"]["state"])
+    agent = Agent(name="qwenpaw", system_prompt="Help.", model=Model(), state=restored,
+                  middlewares=[plugin.OGMemoryMiddleware(integration.client, ctx)])
+    _ = [item async for item in agent.reply_stream(inputs=UserMsg(name="alice", content="Continue."))]
+    await session.update_session_state(**session_args, key="agent.state",
+        value=restored.model_dump(mode="json"))
+    saved = await session.get_session_state_dict(**session_args)
+    retry_state = saved["agent"]["state"]["middle_context"]["ogmemory"]
+    assert retry_state.get("compact_pending", False) is False
+    assert retry_state.get("compact_retry", False) is False
+    assert retry_state["pending"] == []
+    assert restored.context[-1].get_text_content() == "Tea selected."
+    recovered_paths = [path for path, _ in calls if path in {"/api/v1/after_turn", "/api/v1/compact"}]
+    assert recovered_paths[-1] == ("/api/v1/compact" if failure_path == "after_turn" else "/api/v1/after_turn")
+    replayed = [{key: body[key] for key in batch} for path, body in calls if path.endswith("after_turn")
+                and body["clientRequestId"] == "original-turn"]
+    assert replayed == [batch] * (2 if failure_path == "after_turn" else 1)
+    await integration.client.close()
+
+@pytest.mark.asyncio
+async def test_compact_recovery_finishes_service_batch_before_new_turn():
+    from dataclasses import replace
+
+    from core.errors import ExtractionIncompleteError
+    from core.models import RequestContext
+    from service.lifecycle_checkpoint import lifecycle_kind
+    from tests.unit.commit.test_memory_identity import MemoryFS
+    from tests.unit.server.test_extraction_batch_recovery import candidate, setup_service
+
+    ctx = RequestContext(account_id="test-account", user_id="alice", agent_id="qwenpaw",
+                         session_id="session-1", trace_id="compact-recovery")
+    fs = MemoryFS()
+    available = False
+
+    def extract(**kwargs):
+        if not available:
+            raise ExtractionIncompleteError("Extraction service recovering")
+        return [replace(candidate(body="Atlas ships Thursday."),
+                        provenance_ids=[f"prov:1:archive:{kwargs['archive_id']}:msg-one"])]
+
+    service, _, manager = setup_service(fs, ctx, extract=extract)
+    service._cfg.after_turn_threshold = 10000
+    service.after_turn({"sessionId": ctx.session_id, "clientRequestId": "original",
+        "messages": [{"role": "user", "content": "Atlas ships Thursday."}], "_ctx": ctx})
+    calls = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        try:
+            result = (service.compact({**body, "_ctx": ctx}) if request.url.path.endswith("compact")
+                      else service.after_turn({**body, "_ctx": ctx}))
+            response = httpx.Response(200, json=result)
+        except ExtractionIncompleteError as exc:
+            response = httpx.Response(500, json={"ok": False, "error": str(exc)})
+        calls.append((request.url.path, response.json()))
+        return response
+
+    client = plugin.MemoryClient(transport=httpx.MockTransport(handle))
+    identity = client.identity(context())
+    state = {"pending": [], "compact_pending": True}
+    await plugin.flush_pending(client, identity, state)
+    assert state["compact_retry"] is True
+    assert lifecycle_kind(manager.get_or_create(ctx.session_id, ctx=ctx)) == "compaction"
+
+    state = json.loads(json.dumps(state))
+    state["pending"].append({"clientRequestId": "next-turn",
+                            "messages": [{"role": "user", "content": "Continue."}]})
+    available = True
+    await plugin.flush_pending(client, identity, state)
+    assert [path for path, _ in calls] == ["/api/v1/compact", "/api/v1/compact", "/api/v1/after_turn"]
+    assert calls[1][1]["compacted"] is True
+    assert calls[2][1]["status"] == "accumulating"
+    assert state == {"pending": []}
+    assert [node.content for node in fs.nodes.values() if node.category == "event"] == ["Atlas ships Thursday."]
+    await client.close()
+
 
 @pytest.mark.asyncio
 async def test_native_agent_compression_flushes_original_text():

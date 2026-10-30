@@ -21,6 +21,24 @@ MAX_TOOL_TRACE_CHARS = 65536
 EXPLICIT_MEMORY_MARKERS = ("remember", "记住", "记下", "保存到记忆")
 
 
+async def flush_pending(client, identity, state, checkpoint=None):
+    try:
+        if state.get("compact_retry"):
+            await client.post("/api/v1/compact", identity)
+            state.pop("compact_retry")
+        while state["pending"]:
+            await client.post("/api/v1/after_turn", identity, state["pending"][0])
+            state["pending"].pop(0)
+        if state.pop("compact_pending", False):
+            state["compact_retry"] = True
+            if checkpoint:
+                await checkpoint()
+            await client.post("/api/v1/compact", identity)
+            state.pop("compact_retry")
+    except Exception as exc:
+        logger.warning("oGMemory write retained for retry: %s", type(exc).__name__)
+
+
 class OGMemoryMiddleware(MiddlewareBase):
     def __init__(self, client, ctx):
         self.client = client
@@ -164,15 +182,7 @@ class OGMemoryMiddleware(MiddlewareBase):
                         for marker in EXPLICIT_MEMORY_MARKERS
                     ),
                 })
-        try:
-            while pending:
-                await self.client.post("/api/v1/after_turn", self.identity, pending[0])
-                pending.pop(0)
-            if state.get("compact_pending"):
-                await self.client.post("/api/v1/compact", self.identity)
-                state.pop("compact_pending")
-        except Exception as exc:
-            logger.warning("oGMemory write retained for retry: %s", type(exc).__name__)
+        await flush_pending(self.client, self.identity, state)
 
     def capture_event(self, agent, item):
         if isinstance(item, ToolResultStartEvent):
@@ -306,9 +316,33 @@ class OGMemoryPlugin:
                               if msg.role == "user"), "")
                 command = ctx.workspace.plugins.slash_command_registry.resolve(query)
                 if command and command[0].name == "compact":
+                    session = ctx.workspace.session
+                    session_args = {
+                        "session_id": ctx.session_id,
+                        "user_id": getattr(ctx.request, "user_id", "") or ctx.session_id,
+                        "channel": getattr(ctx.request, "channel", "") or "",
+                    }
+                    saved = await session.get_session_state_dict(**session_args)
+                    agent_state = saved.get("agent", {}).get("state")
+                    if agent_state is None:
+                        return HookResult()
+                    state = agent_state.setdefault("middle_context", {}).setdefault(
+                        "ogmemory", {"pending": []},
+                    )
+                    state["compact_pending"] = True
+                    state_key = ["agent", "state", "middle_context", "ogmemory"]
+
+                    async def checkpoint():
+                        await session.update_session_state(**session_args, key=state_key, value=state)
+
+                    await checkpoint()
                     identity = client.identity(ctx)
-                    await client.ensure_session(identity)
-                    await client.post("/api/v1/compact", identity)
+                    try:
+                        await client.ensure_session(identity)
+                    except Exception as exc:
+                        logger.warning("oGMemory bootstrap failed: %s", type(exc).__name__)
+                    await flush_pending(client, identity, state, checkpoint)
+                    await checkpoint()
                 return HookResult()
 
         api.register_runtime_hook(CompactHook())
