@@ -229,6 +229,7 @@ async def test_plugin_registers_native_interfaces_and_search():
     registered = {}
     api = SimpleNamespace(
         config={},
+        register_runtime_hook=lambda hook: registered.update(runtime_hook=hook),
         register_middleware=lambda factory: registered.update(factory=factory),
         register_shutdown_hook=lambda name, callback: registered.update(shutdown=callback),
         register_uninstall_hook=lambda name, callback: registered.update(uninstall=callback),
@@ -279,6 +280,9 @@ async def test_compaction_preserves_turn_and_emits_boundaries():
         body["event"]["event_type"] for path, body, _ in requests if path == "/api/v1/trace/events"
     ]
     assert kinds[-2:] == ["pre_compact", "post_compact"]
+    assert [path for path, _, _ in requests if path != "/api/v1/trace/events"] == [
+        "/api/v1/after_turn", "/api/v1/compact",
+    ]
 
 
 @pytest.mark.asyncio
@@ -784,3 +788,151 @@ async def test_explicit_memory_request_extracts_below_threshold(prompt):
     saved = [node for node in fs.nodes.values() if node.category == "event"]
     assert len(saved) == 1
     assert ContextReader(fs).read(saved[0].uri, new_ctx).content_excerpt == prompt
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_reply", [False, True])
+async def test_compaction_extracts_accumulated_short_turns(during_reply):
+    from core.models import RequestContext
+    from tests.unit.commit.test_memory_identity import MemoryFS
+    from tests.unit.server.test_extraction_batch_recovery import candidate, setup_service
+
+    ctx = RequestContext(account_id="test-account", user_id="alice", agent_id="qwenpaw",
+                         session_id="session-1", trace_id="compact")
+    fs = MemoryFS()
+    service, writer, manager = setup_service(fs, ctx, entries=[candidate(body="Atlas ships Thursday.")])
+    service._cfg.after_turn_threshold = 10000
+    calls = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        result = {"ok": True}
+        if request.url.path == "/api/v1/after_turn":
+            result = service.after_turn({**body, "_ctx": ctx})
+        elif request.url.path == "/api/v1/compact":
+            result = service.compact({**body, "_ctx": ctx})
+        calls.append((request.url.path, body, result))
+        return httpx.Response(200, json=result)
+
+    client = plugin.MemoryClient({"account_id": ctx.account_id}, transport=httpx.MockTransport(handle))
+    state = AgentState(session_id="session-1")
+    middleware = plugin.OGMemoryMiddleware(client, context())
+    agent = Agent(name="qwenpaw", system_prompt="Help.", model=Model(), state=state,
+                  middlewares=[middleware])
+    _ = [item async for item in agent.reply_stream(inputs=UserMsg(
+        name="alice", content="Atlas ships Thursday.", metadata={"qwenpaw_tag": "external_user_query"},
+    ))]
+    assert next(result for path, _, result in calls if path.endswith("after_turn"))["status"] == "accumulating"
+
+    async def compress(**kwargs):
+        state.context = [UserMsg(name="summary", content="Atlas schedule discussed.")]
+
+    if during_reply:
+        async def reply(**kwargs):
+            await middleware.on_compress_context(agent, {}, compress)
+            from agentscope.event import ReplyEndEvent
+            yield ReplyEndEvent(session_id="session-1", reply_id="reply", finished_reason="completed")
+        _ = [item async for item in middleware.on_reply(agent, {}, reply)]
+    else:
+        state = AgentState.model_validate_json(state.model_dump_json())
+        agent.state = state
+        middleware = plugin.OGMemoryMiddleware(client, context())
+        await middleware.on_compress_context(agent, {}, compress)
+    await client.close()
+    writer._pipeline.extract.assert_called_once()
+    assert [node.content for node in fs.nodes.values() if node.category == "event"] == ["Atlas ships Thursday."]
+    assert sum(path.endswith("after_turn") for path, _, _ in calls) == 1
+    assert sum(path.endswith("compact") for path, _, _ in calls) == 1
+
+@pytest.mark.asyncio
+async def test_compaction_retries_after_service_recovers():
+    from agentscope.message import AssistantMsg
+
+    calls = []
+    available = False
+
+    def handle(request):
+        calls.append(request.url.path)
+        if request.url.path.endswith("compact") and not available:
+            raise httpx.ConnectError("Service reconnecting", request=request)
+        return httpx.Response(200, json={"ok": True})
+
+    client = plugin.MemoryClient(transport=httpx.MockTransport(handle))
+    state = AgentState(session_id="session-1", context=[
+        UserMsg(name="alice", content="Atlas ships Thursday.", metadata={"qwenpaw_tag": "external_user_query"}),
+        AssistantMsg(name="qwenpaw", content="Understood."),
+    ])
+    middleware = plugin.OGMemoryMiddleware(client, context())
+    agent = Agent(name="qwenpaw", system_prompt="Help.", model=Model(), state=state,
+                  middlewares=[middleware])
+
+    async def compress(**kwargs):
+        state.context = [UserMsg(name="summary", content="Atlas schedule discussed.")]
+
+    await middleware.on_compress_context(agent, {}, compress)
+    assert state.middle_context["ogmemory"]["compact_pending"] is True
+    available = True
+    _ = [item async for item in agent.reply_stream(inputs=UserMsg(name="alice", content="Continue."))]
+    await client.close()
+    assert state.middle_context["ogmemory"].get("compact_pending", False) is False
+    assert calls.count("/api/v1/compact") == 2
+
+@pytest.mark.asyncio
+async def test_manual_compact_dispatch_extracts_before_command():
+    from qwenpaw.runtime.hooks import HookRegistry
+    from qwenpaw.runtime.phases import Phase
+    from qwenpaw.runtime.slash_command_registry import CommandSpec, SlashCommandRegistry
+
+    calls = []
+
+    def handle(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    integration = plugin.OGMemoryPlugin()
+    hooks = HookRegistry()
+    api = SimpleNamespace(config={}, register_runtime_hook=hooks.register,
+        register_middleware=lambda factory: None,
+        register_shutdown_hook=lambda *args: None, register_uninstall_hook=lambda *args: None,
+        register_tool=lambda *args, **kwargs: None)
+    integration.register(api)
+    await integration.client.http.aclose()
+    integration.client.http = httpx.AsyncClient(base_url="http://memory", transport=httpx.MockTransport(handle))
+    registry = SlashCommandRegistry()
+
+    async def compact(ctx, args):
+        calls.append("native_compact")
+        return UserMsg(name="system", content="Compacted.")
+
+    registry.register(CommandSpec(name="compact", handler=compact, category="conversation"))
+    ctx = context()
+    ctx.input_msgs = [UserMsg(name="alice", content="/compact keep decisions")]
+    ctx.workspace = SimpleNamespace(plugins=SimpleNamespace(slash_command_registry=registry))
+    await hooks.run(Phase.PRE_DISPATCH, ctx)
+    await registry.dispatch(ctx.input_msgs[0].get_text_content(), ctx)
+    await integration.client.close()
+    assert calls.index("/api/v1/compact") < calls.index("native_compact")
+
+@pytest.mark.asyncio
+async def test_native_agent_compression_flushes_original_text():
+    from agentscope.agent import ContextConfig
+    from agentscope.message import AssistantMsg
+
+    class SummaryModel(Model):
+        async def generate_structured_output(self, messages, structured_model, **kwargs):
+            return SimpleNamespace(finished_reason="stop",
+                content={key: "Atlas schedule" for key in structured_model["properties"]})
+
+    client, requests = make_client()
+    state = AgentState(session_id="session-1", context=[
+        UserMsg(name="alice", content="Atlas ships Thursday.", metadata={"qwenpaw_tag": "external_user_query"}),
+        AssistantMsg(name="qwenpaw", content="Understood."),
+    ])
+    agent = Agent(name="qwenpaw", system_prompt="Help.", model=SummaryModel(), state=state,
+                  middlewares=[plugin.OGMemoryMiddleware(client, context())])
+    cfg = ContextConfig().model_copy(update={"trigger_ratio": 0, "reserve_ratio": 0})
+    await agent.compress_context(cfg)
+    await client.close()
+    assert state.summary
+    writes = [body for path, body, _ in requests if path.endswith("after_turn")]
+    assert writes[0]["messages"][0]["content"] == "Atlas ships Thursday."
+    assert sum(path.endswith("compact") for path, _, _ in requests) == 1

@@ -293,7 +293,8 @@ qwenpaw plugin info ogmemory
 | 对话完成 | `after_turn` 保存用户和助手文本，记录 `turn_end` |
 | 工具执行 | 记录 `tool_start`、`tool_success`、`tool_failure` |
 | 工具确认 | 记录 `permission_request`，确认恢复后由原生回复结束事件关闭轮次 |
-| 上下文压缩 | 记录 `pre_compact`、`post_compact` |
+| 上下文压缩 | 上下文实际改变后，写回压缩前采集的对话并调用 `compact` 抽取待处理记忆，记录 `pre_compact`、`post_compact` |
+| 手动 `/compact` | 通过运行时钩子先抽取服务端已积累的对话，再执行 QwenPaw 原生命令；抽取失败时恢复服务后重试命令 |
 | 关闭或卸载插件 | 排空 Trace 队列，记录 `session_end` 并提交会话 |
 
 Trace 使用现有 `/api/v1/trace/events` 协议，可用于会话重建和 Skill 沉淀。检索内容作为外部数据注入。Trace 正文在本地脱敏和限长。
