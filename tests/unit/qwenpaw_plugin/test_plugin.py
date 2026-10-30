@@ -224,7 +224,7 @@ async def test_trace_redaction_and_canonical_size():
 
 
 @pytest.mark.asyncio
-async def test_plugin_registers_native_interfaces_and_search():
+async def test_plugin_registers_native_interfaces():
     client, requests = make_client()
     registered = {}
     api = SimpleNamespace(
@@ -233,23 +233,17 @@ async def test_plugin_registers_native_interfaces_and_search():
         register_middleware=lambda factory: registered.update(factory=factory),
         register_shutdown_hook=lambda name, callback: registered.update(shutdown=callback),
         register_uninstall_hook=lambda name, callback: registered.update(uninstall=callback),
-        register_tool=lambda name, callback, **kwargs: registered.update(
-            tool=callback, tool_name=name
-        ),
     )
     integration = plugin.OGMemoryPlugin()
     integration.register(api)
     await integration.client.close()
     integration.client = client
     middleware = registered["factory"](context(), None)
-    integration.request_identity = lambda: middleware.identity
-    result = await registered["tool"]("drink preference")
+    assert middleware.identity == client.identity(context())
+    assert registered["runtime_hook"].name == "ogmemory_compact"
+    await registered["uninstall"]()
     await client.close()
-    assert result.state.value == "success"
-    assert "Alice prefers tea." in result.content[0].text
-    assert registered["tool_name"] == "ogmemory_search"
-    assert registered["tool"].__name__ == "ogmemory_search"
-    registered["tool"]._tool_descriptor = "runtime registration"
+
 
 
 @pytest.mark.asyncio
@@ -613,23 +607,6 @@ async def test_deep_json_tool_trace_allows_agent_reply_to_complete():
 
 
 @pytest.mark.asyncio
-async def test_search_returns_readable_placeholder_for_unrenderable_json():
-    def handle(request):
-        return httpx.Response(200, json={"messages": [
-            {"_ogmem": True, "content": "["*10000 + "0" + "]"*10000},
-        ]})
-
-    client = plugin.MemoryClient(transport=httpx.MockTransport(handle))
-    integration = plugin.OGMemoryPlugin()
-    integration.client = client
-    integration.request_identity = lambda: client.identity(context())
-    result = await integration.search("nested memory")
-    await client.close()
-    assert result.content[0].text == "[DEPTH_LIMIT]"
-    assert result.state.value == "success"
-
-
-@pytest.mark.asyncio
 async def test_shutdown_delivers_end_events_beyond_queue_capacity():
     client, requests = make_client()
     for index in range(300):
@@ -894,8 +871,7 @@ async def test_manual_compact_dispatch_extracts_before_command(tmp_path):
     hooks = HookRegistry()
     api = SimpleNamespace(config={}, register_runtime_hook=hooks.register,
         register_middleware=lambda factory: None,
-        register_shutdown_hook=lambda *args: None, register_uninstall_hook=lambda *args: None,
-        register_tool=lambda *args, **kwargs: None)
+        register_shutdown_hook=lambda *args: None, register_uninstall_hook=lambda *args: None)
     integration.register(api)
     await integration.client.http.aclose()
     integration.client.http = httpx.AsyncClient(base_url="http://memory", transport=httpx.MockTransport(handle))
@@ -944,7 +920,7 @@ async def test_manual_compact_preserves_retry_across_restart(tmp_path, failure_p
         hooks = HookRegistry()
         api = SimpleNamespace(config={}, register_runtime_hook=hooks.register,
             register_middleware=lambda factory: None, register_shutdown_hook=lambda *args: None,
-            register_uninstall_hook=lambda *args: None, register_tool=lambda *args, **kwargs: None)
+            register_uninstall_hook=lambda *args: None)
         integration.register(api)
         await integration.client.http.aclose()
         integration.client.http = httpx.AsyncClient(base_url="http://memory",

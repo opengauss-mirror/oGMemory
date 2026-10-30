@@ -12,7 +12,6 @@ from agentscope.event import (
 )
 from agentscope.message import Msg, TextBlock, ToolResultState, UserMsg
 from agentscope.middleware import MiddlewareBase
-from agentscope.tool import ToolChunk
 
 from .client import MemoryClient, event_id, memory_context
 
@@ -350,60 +349,8 @@ class OGMemoryPlugin:
         api.register_shutdown_hook("ogmemory_close", self.client.close)
         api.register_uninstall_hook("ogmemory_uninstall", self.uninstall)
 
-        async def ogmemory_search(query: str) -> ToolChunk:
-            """Search long-term memory for prior work, preferences and decisions."""
-            return await self.search(query)
-
-        api.register_tool(
-            "ogmemory_search",
-            ogmemory_search,
-            enabled=True,
-            description="Search oGMemory for prior work, preferences and decisions.",
-        )
-
     async def uninstall(self, **kwargs):
         await self.client.close()
-
-    async def search(self, query: str) -> ToolChunk:
-        """Search long-term memory for information relevant to query."""
-        try:
-            identity = self.request_identity()
-            result = await self.client.post(
-                "/api/v1/compose",
-                identity,
-                {"prompt": query, "messages": []},
-                timeout=self.client.compose_timeout,
-            )
-            text = memory_context(result) or "No relevant memory found."
-            try:
-                json.loads(text)
-            except RecursionError:
-                text = "[DEPTH_LIMIT]"
-            except ValueError:
-                pass
-            return ToolChunk(content=[TextBlock(text=text)], state=ToolResultState.SUCCESS)
-        except Exception as exc:
-            logger.warning("oGMemory search failed: %s", type(exc).__name__)
-            return ToolChunk(
-                content=[TextBlock(text="Memory search unavailable.")], state=ToolResultState.ERROR
-            )
-
-    def request_identity(self):
-        from qwenpaw.app.agent_context import (  # type: ignore[import-untyped]
-            get_current_agent_id,
-            get_current_session_id,
-            get_current_user_id,
-        )
-
-        session_id = get_current_session_id()
-        if not session_id:
-            raise RuntimeError("oGMemory requires an active QwenPaw request")
-        return {
-            "accountId": self.client.account,
-            "userId": self.client.user or get_current_user_id() or "default",
-            "agentId": self.client.agent or get_current_agent_id(),
-            "sessionId": session_id,
-        }
 
 
 plugin = OGMemoryPlugin()
