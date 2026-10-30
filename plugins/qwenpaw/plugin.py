@@ -21,6 +21,24 @@ MAX_TOOL_TRACE_CHARS = 65536
 EXPLICIT_MEMORY_MARKERS = ("remember", "记住", "记下", "保存到记忆")
 
 
+async def flush_pending(client, identity, state, checkpoint=None):
+    try:
+        if state.get("compact_retry"):
+            await client.post("/api/v1/compact", identity)
+            state.pop("compact_retry")
+        while state["pending"]:
+            await client.post("/api/v1/after_turn", identity, state["pending"][0])
+            state["pending"].pop(0)
+        if state.pop("compact_pending", False):
+            state["compact_retry"] = True
+            if checkpoint:
+                await checkpoint()
+            await client.post("/api/v1/compact", identity)
+            state.pop("compact_retry")
+    except Exception as exc:
+        logger.warning("oGMemory write retained for retry: %s", type(exc).__name__)
+
+
 class OGMemoryMiddleware(MiddlewareBase):
     def __init__(self, client, ctx):
         self.client = client
@@ -35,6 +53,7 @@ class OGMemoryMiddleware(MiddlewareBase):
         self.initial_text = {}
         self.input_ids = set()
         self.query = None
+        self.reply_active = False
 
     def capture(self, messages):
         for msg in messages:
@@ -106,6 +125,7 @@ class OGMemoryMiddleware(MiddlewareBase):
             (m.id for m in reversed(agent.state.context) if m.role == "user"), agent.state.reply_id
         )
         state = agent.state.middle_context.setdefault("ogmemory", {"pending": []})
+        self.reply_active = True
         status = None
         try:
             try:
@@ -124,28 +144,12 @@ class OGMemoryMiddleware(MiddlewareBase):
             raise
         finally:
             self.capture(agent.state.context)
-            pending = state["pending"]
-            if self.messages:
-                messages = list(self.messages.values())
-                request_id = event_id(
-                    *self.identity.values(), self.turn_id, json.dumps(messages, ensure_ascii=False)
-                )
-                if all(item["clientRequestId"] != request_id for item in pending):
-                    pending.append({
-                        "clientRequestId": request_id,
-                        "messages": messages,
-                        "forceExtract": any(
-                            marker in msg["content"].lower()
-                            for msg in messages if msg["role"] == "user"
-                            for marker in EXPLICIT_MEMORY_MARKERS
-                        ),
-                    })
+            state["captured"] = [
+                [msg.id, msg.created_at, msg.get_text_content()] for msg in agent.state.context
+            ]
+            self.reply_active = False
             try:
-                while pending:
-                    await self.client.post("/api/v1/after_turn", self.identity, pending[0])
-                    pending.pop(0)
-            except Exception as exc:
-                logger.warning("oGMemory write retained for retry: %s", type(exc).__name__)
+                await self.flush(agent)
             finally:
                 if status is not None:
                     final_text = "\n".join(
@@ -159,6 +163,26 @@ class OGMemoryMiddleware(MiddlewareBase):
                         assistant_message=final_text or "[No assistant text]",
                         turn_id=self.turn_id,
                     )
+
+    async def flush(self, agent):
+        state = agent.state.middle_context.setdefault("ogmemory", {"pending": []})
+        pending = state["pending"]
+        if self.messages:
+            messages = list(self.messages.values())
+            request_id = event_id(
+                *self.identity.values(), self.turn_id, json.dumps(messages, ensure_ascii=False)
+            )
+            if all(item["clientRequestId"] != request_id for item in pending):
+                pending.append({
+                    "clientRequestId": request_id,
+                    "messages": messages,
+                    "forceExtract": any(
+                        marker in msg["content"].lower()
+                        for msg in messages if msg["role"] == "user"
+                        for marker in EXPLICIT_MEMORY_MARKERS
+                    ),
+                })
+        await flush_pending(self.client, self.identity, state)
 
     def capture_event(self, agent, item):
         if isinstance(item, ToolResultStartEvent):
@@ -254,11 +278,21 @@ class OGMemoryMiddleware(MiddlewareBase):
         return await next_handler(**input_kwargs)
 
     async def on_compress_context(self, agent, input_kwargs, next_handler):
+        state = agent.state.middle_context.setdefault("ogmemory", {"pending": []})
+        if not self.reply_active:
+            self.messages.clear()
+            self.initial_text = {(mid, created): text for mid, created, text in state.get("captured", [])}
         self.capture(agent.state.context)
         before = [(msg.id, msg.get_text_content()) for msg in agent.state.context]
         await next_handler(**input_kwargs)
         after = [(msg.id, msg.get_text_content()) for msg in agent.state.context]
         if after != before:
+            state["compact_pending"] = True
+            if not self.reply_active:
+                await self.flush(agent)
+                state["captured"] = [
+                    [msg.id, msg.created_at, msg.get_text_content()] for msg in agent.state.context
+                ]
             marker = event_id(self.turn_id, *(msg_id for msg_id, _ in before))
             self.client.emit(self.identity, "pre_compact", marker, turn_id=self.turn_id)
             self.client.emit(self.identity, "post_compact", marker, turn_id=self.turn_id)
@@ -266,7 +300,52 @@ class OGMemoryMiddleware(MiddlewareBase):
 
 class OGMemoryPlugin:
     def register(self, api):
+        from qwenpaw.runtime.hooks import HookBase, HookResult  # type: ignore[import-untyped]
+        from qwenpaw.runtime.phases import Phase  # type: ignore[import-untyped]
+
         self.client = MemoryClient(api.config)
+        client = self.client
+
+        class CompactHook(HookBase):
+            phase = Phase.PRE_DISPATCH
+            name = "ogmemory_compact"
+            priority = 1000
+
+            async def run(self, ctx):
+                query = next((msg.get_text_content() for msg in reversed(ctx.input_msgs)
+                              if msg.role == "user"), "")
+                command = ctx.workspace.plugins.slash_command_registry.resolve(query)
+                if command and command[0].name == "compact":
+                    session = ctx.workspace.session
+                    session_args = {
+                        "session_id": ctx.session_id,
+                        "user_id": getattr(ctx.request, "user_id", "") or ctx.session_id,
+                        "channel": getattr(ctx.request, "channel", "") or "",
+                    }
+                    saved = await session.get_session_state_dict(**session_args)
+                    agent_state = saved.get("agent", {}).get("state")
+                    if agent_state is None:
+                        return HookResult()
+                    state = agent_state.setdefault("middle_context", {}).setdefault(
+                        "ogmemory", {"pending": []},
+                    )
+                    state["compact_pending"] = True
+                    state_key = ["agent", "state", "middle_context", "ogmemory"]
+
+                    async def checkpoint():
+                        await session.update_session_state(**session_args, key=state_key, value=state)
+
+                    await checkpoint()
+                    identity = client.identity(ctx)
+                    try:
+                        await client.ensure_session(identity)
+                    except Exception as exc:
+                        logger.warning("oGMemory bootstrap failed: %s", type(exc).__name__)
+                    await flush_pending(client, identity, state, checkpoint)
+                    await checkpoint()
+                return HookResult()
+
+        api.register_runtime_hook(CompactHook())
         api.register_middleware(lambda ctx, config: OGMemoryMiddleware(self.client, ctx))
         api.register_shutdown_hook("ogmemory_close", self.client.close)
         api.register_uninstall_hook("ogmemory_uninstall", self.uninstall)
