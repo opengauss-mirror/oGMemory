@@ -1690,23 +1690,24 @@ def _safe_inline_code_metadata(value: object, *, max_chars: int) -> str:
     return rendered[:max_chars]
 
 
-def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str]]:
+def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str, dict]]:
     raw_hits = result.get("evidence")
     if not isinstance(raw_hits, list):
         raw_hits = result.get("results")
     if not isinstance(raw_hits, list):
         return []
 
-    blocks: list[tuple[str, str]] = []
+    blocks: list[tuple[str, str, dict]] = []
     seen: set[tuple[str, int | None, int | None, str, str, str]] = set()
+    related_seen: set[str] = set()
     for raw_hit in raw_hits:
         if not isinstance(raw_hit, Mapping):
             continue
         path, start_line, end_line = _safe_code_hit_locator(raw_hit)
         if not path:
             continue
-        excerpt = str(raw_hit.get("excerpt") or raw_hit.get("content") or "").strip()
-        if not excerpt:
+        excerpt = str(raw_hit.get("excerpt") or raw_hit.get("content") or "").rstrip()
+        if not excerpt.strip():
             continue
         symbol = _safe_inline_code_metadata(raw_hit.get("symbol"), max_chars=200)
         signature = _safe_inline_code_metadata(raw_hit.get("signature"), max_chars=500)
@@ -1715,17 +1716,51 @@ def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str]]:
             continue
         seen.add(dedupe_key)
 
-        locator = path
-        if start_line is not None and end_line is not None:
-            locator = f"{path} (lines {start_line}-{end_line})"
+        # Keep the copyable edit locator separate from display metadata.
+        locator = "edit_target: " + json.dumps({"locator": path}, ensure_ascii=False)
         qualifiers = []
+        if start_line is not None and end_line is not None:
+            qualifiers.append(f"lines {start_line}-{end_line}")
         if symbol:
             qualifiers.append(f"symbol={symbol}")
         if signature and signature != symbol:
             qualifiers.append(f"signature={signature}")
         if qualifiers:
-            locator = f"{locator} {' '.join(qualifiers)}"
-        blocks.append((locator, excerpt))
+            locator = f"{locator}\n# {' '.join(qualifiers)}"
+        related = []
+        edges = raw_hit.get("graph_context")
+        for edge in edges if isinstance(edges, (list, tuple)) else ():
+            if len(related_seen) >= 3:
+                break
+            if not isinstance(edge, Mapping) or not isinstance(edge.get("target_locator"), str):
+                continue
+            if any(ord(c) < 32 or ord(c) == 127 for c in edge["target_locator"]):
+                continue
+            try:
+                root, file_path = _parse_code_edit_locator(edge["target_locator"])
+            except ValueError:
+                continue
+            target = f"{root}/{file_path}"
+            if target != path and target not in related_seen and len(target) <= 200:
+                related_seen.add(target)
+                related.append(target)
+        if related:
+            locator += "\n# related_files: " + json.dumps(related, ensure_ascii=False)
+        coverage = raw_hit.get("coverage")
+        safe_coverage = {}
+        if isinstance(coverage, Mapping):
+            for key in ("truncated", "implementation_complete"):
+                if type(coverage.get(key)) is bool:
+                    safe_coverage[key] = coverage[key]
+            def valid_range(value):
+                return (isinstance(value, (list, tuple)) and len(value) == 2
+                        and all(type(n) is int for n in value) and 0 < value[0] <= value[1])
+            if valid_range(coverage.get("source_lines")):
+                safe_coverage["source_lines"] = coverage["source_lines"]
+            ranges = coverage.get("read_lines")
+            if isinstance(ranges, (list, tuple)) and len(ranges) <= 2 and all(valid_range(v) for v in ranges):
+                safe_coverage["read_lines"] = ranges
+        blocks.append((locator, excerpt, safe_coverage))
     return blocks
 
 
@@ -1742,6 +1777,38 @@ def _clip_code_excerpt(excerpt: str, max_chars: int) -> str:
     )
 
 
+def _code_search_retry_hint(result: Mapping[str, Any]) -> str:
+    """Explain bounded empty searches using counts, never private source paths."""
+    diagnostics = result.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return ""
+    corpus = diagnostics.get("corpus") or {}
+    discovery = diagnostics.get("discovery") or {}
+    if not isinstance(corpus, Mapping) or not isinstance(discovery, Mapping):
+        return ""
+    hint = ""
+    if discovery.get("scope_path_count", 0) and corpus.get("files_scope_checked") == 0:
+        hint += (
+            "# no_files_in_scope: No source files were inspected under the requested scope. "
+            "scope.paths uses workspace-relative paths without the root slug shown in edit locators: "
+            "for locator ROOT/src/module.py use paths=['src/module.py']. "
+            "Check the path, or omit paths to search the registered workspace.\n"
+        )
+    if corpus.get("grep_term_count", 0) and corpus.get("files_scope_checked", 0) and not corpus.get("files_grep_matched"):
+        hint = (
+            "# no_same_file_grep_match: Within the files inspected, no file's source content contains all scope.grep_terms. "
+            "These are case-insensitive literal AND filters within one file, not alternative terms, regexes or semantic concepts. "
+            "Paths, metadata and generated summaries do not satisfy these filters. "
+            "Retry with one known literal, omit grep_terms, or search independent targets separately.\n"
+        )
+    if any(discovery.get(k) for k in ("pool_limit_reached", "file_limit_reached", "entry_limit_reached", "deadline_reached", "read_limit_reached")):
+        hint += (
+            "# bounded_search: Only a bounded candidate subset was inspected; zero hits do not prove "
+            "absence from the workspace. Retry with a more specific workspace-relative file or directory in scope.paths.\n"
+        )
+    return hint
+
+
 def _render_code_search_result(
     result: Mapping[str, Any],
     *,
@@ -1755,23 +1822,43 @@ def _render_code_search_result(
         status = "error"
     safe_query = " ".join(str(query or "").split())
     blocks = _code_search_hit_blocks(result)
+    retry_hint = _code_search_retry_hint(result) if not blocks else ""
 
-    # Reserve the fixed header with the largest possible shown-count width so
-    # adding blocks can never force a previously complete block over the cap.
-    reserved_header = (
-        f"# code_search status: {status}\n"
-        f"# query: {safe_query}\n"
-        f"# hit_count: {len(blocks)}\n"
-        f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
-    )
+    def header_for(count):
+        return (
+            f"# code_search status: {status}\n"
+            f"# query: {safe_query}\n"
+            f"# hit_count: {count}\n"
+            f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
+            f"{retry_hint}"
+        )
+
+    # Reserve the largest hit-count width before fitting blocks.
+    reserved_header = header_for(len(blocks))
     if len(reserved_header) >= max_chars:
         return reserved_header[:max_chars]
 
     selected: list[str] = []
     used = len(reserved_header)
-    for index, (locator, excerpt) in enumerate(blocks, start=1):
-        prefix = f"\n# hit {index}\n{locator}\n"
+    for index, (locator, excerpt, coverage) in enumerate(blocks, start=1):
+        def prefix_for(locator, coverage):
+            note = "# coverage: " + json.dumps(coverage, separators=(",", ":")) + "\n" if coverage else ""
+            return f"\n# hit {index}\n{locator}\n{note}"
+        prefix = prefix_for(locator, coverage)
         remaining = max_chars - used
+        if "\n# related_files:" in locator and len(prefix) + len(excerpt) > remaining:
+            locator = locator.split("\n# related_files:", 1)[0]
+            prefix = prefix_for(locator, coverage)
+        clipped = len(prefix) + len(excerpt) > remaining
+        if clipped:
+            # Transport truncation invalidates completeness and displayed line spans.
+            span = re.search(r"(?m)^# lines (\d+)-(\d+)", locator)
+            source_lines = coverage.get("source_lines") or ([int(n) for n in span.groups()] if span else None)
+            coverage = {"truncated": True}
+            if source_lines:
+                coverage["read_lines"] = [source_lines]
+            locator = re.sub(r"(?m)^# lines \d+-\d+ ?", "# ", locator)
+            prefix = prefix_for(locator, coverage)
         if remaining <= len(prefix):
             break
         clipped_excerpt = _clip_code_excerpt(excerpt, remaining - len(prefix))
@@ -1780,16 +1867,10 @@ def _render_code_search_result(
         block = prefix + clipped_excerpt
         selected.append(block)
         used += len(block)
-        if len(clipped_excerpt) < len(excerpt):
+        if clipped:
             break
 
-    header = (
-        f"# code_search status: {status}\n"
-        f"# query: {safe_query}\n"
-        f"# hit_count: {len(selected)}\n"
-        f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
-    )
-    rendered = header + "".join(selected)
+    rendered = header_for(len(selected)) + "".join(selected)
     return rendered[:max_chars]
 
 

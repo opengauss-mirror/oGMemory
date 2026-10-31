@@ -809,7 +809,7 @@ def test_legacy_search_projection_drops_unreadable_persisted_evidence(monkeypatc
 def test_symbolic_query_terms_apply_length_stopword_and_dedup_rules():
     assert _extract_code_query_terms(
         "x xy Abc abc ABC _id _ID method FILE callable max_length"
-    ) == ["Abc", "_id", "callable", "max_length"]
+    ) == ["xy", "Abc", "_id", "callable", "max_length"]
 
 
 def test_symbolic_ranking_prioritizes_exact_identifier_and_survives_route_top_k(monkeypatch):
@@ -1148,7 +1148,8 @@ def test_active_search_returns_bounded_safe_evidence_and_uses_persisted_scope(mo
     assert outcome.status == "ok"
     assert len(outcome.evidence) == 1
     assert outcome.evidence[0].uri == selected.uri
-    assert outcome.evidence[0].locator == "repo/src/config.py:10-14"
+    assert outcome.evidence[0].locator == "repo/src/config.py:10-10"
+    assert outcome.evidence[0].coverage["truncated"] is True
     assert len(outcome.evidence[0].excerpt) <= 12
     assert outcome.diagnostics.scope_match_count == 1
     assert outcome.diagnostics.clipped_count == 1
@@ -1591,7 +1592,8 @@ def test_focused_snippet_requires_exact_account_code_uri_and_reuses_hydrator(mon
     evidence = service.read_focused_snippet(uri=uri, ctx=_ctx(), max_chars=99)
 
     assert evidence.uri == uri
-    assert evidence.locator == "repo/src/focused.py:4-6"
+    assert evidence.locator == "repo/src/focused.py:4-4"
+    assert evidence.coverage["truncated"] is True
     assert len(evidence.excerpt) <= 12
     assert fs.read_calls == [uri]
 

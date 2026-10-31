@@ -15,7 +15,21 @@ SQL 配置使用当前 dev 的 `storage.backend=sql`、`storage.dialect=opengaus
 
 因此，本参考实现测量代码检索、编辑与可选输出过滤的组合效果，不是 openGauss 向量索引性能或通用长期记忆效果。AGFS 暂不提供方案选项。
 
-代码搜索的 `scope.paths` 使用仓库相对路径，例如 `pylint/checkers/misc.py`，不要直接传入带工作区前缀、行号或符号说明的 locator。`grep_terms` 是同一代码片段必须同时满足的过滤条件，不是多个备选关键词；一般将相关词写入 `query` 即可。零命中不代表文件不存在，应检查路径和过滤条件，必要时缩减关键词后重新搜索。
+MCP 工具描述指导模型用 `ogm_search_code` 定位代码、复用片段和 `edit_target.locator`，用文件读取工具补读缺失行；编辑时保留缩进和换行，完成后检查 diff，失败时按反馈修正参数。这些指导通过工具列表提供，无需额外配置 `CLAUDE.md`，不限制搜索次数或替代任务验证。对比版本时应记录工具描述变化，避免重复添加指导。
+
+代码搜索与编辑遵循以下约定：
+
+- `scope` 仅接受 `paths`、`glob_patterns`、`grep_terms`。搜索路径为仓库相对路径：定位符 `ROOT/src/module.py` 对应 `paths=["src/module.py"]`；编辑则复制完整定位符，不附加行号或符号说明。省略 `paths` 可搜索已注册工作区。
+- `grep_terms` 是不区分大小写的字面 AND：所有词须出现在同一文件的完整源码中，可位于注释或跨越分块边界；每个返回块仍须包含至少一个完整过滤词。仅命中未分块的注释时可能无结果。路径、元数据和摘要不计入，也不跨文件匹配。它不支持正则或备选词；语义描述写入 `query`。
+- `coverage` 中的 `truncated` 表示省略了源码，`implementation_complete` 在边界可靠时说明 Python 函数实现是否完整，`read_lines` 给出可补读的闭区间。符号或实现查询优先返回实现，即使同时提到文档；纯文档查询和字面过滤保留相应命中。跨块、超长行和响应截断均保守标记完整性并提示补读；实现完整时 `read_lines` 可为空，即使声明或文档被省略。无需每次读取所有提示行。
+- `related_files` 每次响应最多提供三个去重的关联路径，带工作区前缀，不展开源码。先读取或搜索关联文件再编辑；用于 `scope.paths` 时去掉前缀。
+- 代码工具集的 `ogm_read_memory` 用原始 URI 恢复被过滤的工具输出，不读取源码文件。参数仅有 `uri`、`max_chars`（1–50000）和固定为 `true` 的 `recover_original`；通用记忆工具集不变。
+
+两种检索模式和融合方式均最多优先保留两个候选：匹配明确标识符的符号命中，以及同时位于符号或 BM25 前三名的语义首位命中。去重后其余候选保持融合顺序，禁用或零权重通道不参与保护；数量、长度限制和原始融合分数不变，分数不表示保护后的输出顺序。明确标识符包括下划线名称、非首位含大写字母的名称、反引号名称、点号限定名称及单独查询的名称；普通单词仅首字母大写不触发保护。BM25 在查询和索引两侧均保留完整单词并拆分驼峰和缩写边界，不任意拆分小写子串，不改变权重或预算。
+
+`full` 每文件保存一份完整源码快照，不作为额外向量索引文本，源码变更后须刷新；`candidate_local` 使用本次请求读取的源码，不持久化该快照。`full` 使用 `grep_terms` 时，快照缺失返回 `source_snapshot_required`，同文件快照内容冲突返回 `source_snapshot_conflict`，均需管理员逐文件刷新。未使用 `grep_terms` 时不做此检查；本测试脚本使用 `candidate_local`，无需迁移旧索引。
+
+管理员可通过现有认证调用 `POST /api/v1/resources/code/refresh`，正文如 `{"root_slug":"ROOT","path":"src/module.py"}`，分别填写已注册工作区名称和相对文件路径。普通增量同步可能跳过未修改文件；`bootstrap` 仅用于首次导入，不清理旧块，不能代替刷新。零命中不代表仓库中不存在目标，应检查路径、快照和过滤条件，必要时减少过滤词或缩小范围重试。
 
 流程为：
 
@@ -276,7 +290,7 @@ Token 不等同于账单费用，不包含 Embedding、服务运行或官方评�
 | 解题前项目安装失败或超时 | setup.sh、setup.log、构建依赖网络；必要时调整 evaluation.setup_timeout_seconds |
 | SQL 启动失败 | http.log、mcp.log、数据库镜像、Embedding 设置和本机端口 |
 | MCP 连接失败 | 当前源码及 MCP 依赖版本、Streamable HTTP、临时鉴权；不回退成 baseline |
-| MCP 编辑失败 | 核对 locator、精确匹配文本和匹配范围，结合 mcp.log 定位错误后重试；当前产品版本可能只返回通用错误，脚本不补充产品错误反馈；失败调用仍计入统计 |
+| MCP 编辑失败 | 复制 `edit_target.locator` 原值，按错误反馈核对定位符、精确文本和匹配范围后重试；未知内部错误查看 mcp.log。失败调用仍计入统计 |
 | MCP 调用成功但搜索显示 partial_failure | 查看返回状态和候选检索诊断；连接成功、工具无异常不代表所有检索路径正常。分别核对候选文件读取、Embedding 和检索路径状态 |
 | 镜像启动 exec format error | Docker 架构与 QEMU/binfmt 注册 |
 | 本地缺少 Python 模块 | 是否使用题目容器中的 testbed 环境 |

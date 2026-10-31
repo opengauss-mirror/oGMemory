@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.code_search_helpers import deterministic_code_tokenizer  # noqa: F401
+
 from commit.code_resource_events import (
     build_code_resource_delete_event,
     build_code_resource_write_event,
@@ -512,6 +514,72 @@ def test_missing_refresh_is_pending_and_idempotent(tmp_path):
     assert first["nodes_deleted"] == 1
     assert second["nodes_deleted"] == 0
     assert fs.deleted == [old.uri]
+
+
+def test_refresh_updates_source_snapshot_when_only_unindexed_comment_changes(tmp_path):
+    path = tmp_path / "sample.py"
+    source = "# before\ndef actual(): pass\n"
+    path.write_text(source)
+    fs = FakeContextFS()
+    service = CodeResourceLifecycleService(context_fs=fs, outbox_store=FakeOutbox(), config=_config())
+    service.refresh(path=path.name, workspace_root=str(tmp_path), name="repo", ctx=_ctx())
+    original_uris = set(fs.nodes)
+    # The storage fake does not assign versions like the atomic backend does.
+    for node in fs.nodes.values():
+        node.metadata["version"] = 1
+    source = source.replace("before", "after")
+    path.write_text(source)
+    service.refresh(path=path.name, workspace_root=str(tmp_path), name="repo", ctx=_ctx())
+    assert set(fs.nodes) == original_uris  # Chunk content and identity did not change.
+    assert [n.metadata["file_source"] for n in fs.nodes.values() if "file_source" in n.metadata] == [source]
+    service.delete_path(path=path.name, workspace_root=str(tmp_path), name="repo", ctx=_ctx())
+    assert not fs.nodes
+
+
+def test_per_file_refresh_repairs_reimport_snapshot_conflict_and_delete_cleans_up(tmp_path):
+    from core.errors import ValidationError
+    from retrieval.code_retrieval import ActiveCodeSearchRequest, CodeRetrievalService, CodeSearchScope
+    from service.code_workspace_sync import ResolvedCodeWorkspace
+
+    path = tmp_path / "sample.py"
+    fs = FakeContextFS()
+    lifecycle = CodeResourceLifecycleService(context_fs=fs, outbox_store=FakeOutbox(), config=_config())
+    workspace = ResolvedCodeWorkspace("root", "repo", compute_root_fingerprint(tmp_path), tmp_path, 300, {})
+
+    def search(mode, marker):
+        # Reload persisted state, as after the facade invalidates its retrieval cache.
+        retrieval = CodeRetrievalService(
+            context_fs=fs, workspace_resolver=SimpleNamespace(resolve=lambda **kwargs: workspace),
+            config=SimpleNamespace(code_retrieval_enabled=True, code_retrieval_mode=mode,
+                                   code_retrieval_route_enabled=lambda route: route == "symbolic"),
+        )
+        return retrieval.search_active(ActiveCodeSearchRequest("parse_payload", scope=CodeSearchScope(
+            paths=(path.name,), grep_terms=(marker, "parse_payload"))), _ctx())
+
+    path.write_text("# before_marker\ndef parse_payload(): return 1\n")
+    lifecycle.bootstrap(path=str(tmp_path), name="repo", ctx=_ctx())
+    old_uris = set(fs.nodes)
+    source = "# after_marker\ndef parse_payload(): return 2\n"
+    path.write_text(source)
+    lifecycle.bootstrap(path=str(tmp_path), name="repo", ctx=_ctx())
+    assert sum("file_source" in n.metadata for n in fs.nodes.values()) == 2
+    for marker in ("before_marker", "after_marker"):
+        with pytest.raises(ValidationError) as error:
+            search("full", marker)
+        assert error.value.field == "scope.source_snapshot_conflict"
+
+    for node in fs.nodes.values():
+        node.metadata["version"] = 1  # The fake does not assign backend versions.
+    lifecycle.refresh(path=path.name, workspace_root=str(tmp_path), name="repo", ctx=_ctx())
+    assert old_uris.isdisjoint(fs.nodes)
+    assert [n.metadata["file_source"] for n in fs.nodes.values() if "file_source" in n.metadata] == [source]
+    outcomes = [search(mode, "after_marker") for mode in ("full", "candidate_local")]
+    assert all(o.status == "ok" for o in outcomes)
+    assert [e.excerpt for e in outcomes[0].evidence] == [e.excerpt for e in outcomes[1].evidence]
+    assert all(search(mode, "before_marker").status == "zero_result" for mode in ("full", "candidate_local"))
+    lifecycle.delete_path(path=path.name, workspace_root=str(tmp_path), name="repo", ctx=_ctx())
+    assert not fs.nodes
+    assert search("full", "after_marker").status == "zero_result"
 
 
 def test_refresh_outbox_failure_keeps_the_complete_old_collection(tmp_path):

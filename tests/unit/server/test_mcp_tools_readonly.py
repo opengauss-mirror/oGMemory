@@ -741,7 +741,7 @@ def test_search_code_renders_safe_deduplicated_edit_evidence():
 
     assert payload.count("# hit ") == 1
     assert "# code_search status: partial_failure" in payload
-    assert "\nrepo/src/service.py (lines 10-18)" in payload
+    assert 'edit_target: {"locator": "repo/src/service.py"}\n# lines 10-18' in payload
     assert "symbol=run_service" in payload
     assert "signature=def run_service(value: str) -> str:" in payload
     assert payload.count("def run_service(value: str) -> str:") == 2
@@ -774,7 +774,7 @@ def test_search_code_marks_malicious_source_as_untrusted_before_content():
     assert payload.index(CODE_EVIDENCE_UNTRUSTED_NOTICE) < payload.index(malicious_comment)
     rendered_lines = payload.splitlines()
     assert rendered_lines[rendered_lines.index("# hit 1") + 1] == (
-        "repo/src/auth.py (lines 1-2)"
+        'edit_target: {"locator": "repo/src/auth.py"}'
     )
 
 
@@ -808,9 +808,11 @@ def test_search_code_enforces_response_cap_with_complete_hit_header():
     assert len(payload) <= 260
     assert CODE_EVIDENCE_UNTRUSTED_NOTICE in payload
     assert "# hit_count: 1" in payload
-    assert "\nrepo/src/service.py (lines 1-99)" in payload
+    assert 'edit_target: {"locator": "repo/src/service.py"}' in payload
+    assert '# lines 1-99' not in payload
+    assert '"read_lines":[[1,99]]' in payload
     assert "# hit 2" not in payload
-    assert "... [excerpt clipped] ..." in payload
+    assert '"truncated":true' in payload
 
 
 def test_search_code_clamps_an_implicit_snippet_to_batch_budget():
@@ -958,11 +960,9 @@ def test_edit_file_round_trips_exact_rendered_locator_through_registered_workspa
     )
     search_payload = search_code(service, query="run_service")
     rendered_lines = search_payload.splitlines()
-    locator = rendered_lines[rendered_lines.index("# hit 1") + 1]
-    assert locator == (
-        "repo/src/service.py (lines 10-18) symbol=run_service "
-        "signature=def run_service(value: str) -> str:"
-    )
+    target_line = rendered_lines[rendered_lines.index("# hit 1") + 1]
+    locator = json.loads(target_line.removeprefix("edit_target: "))["locator"]
+    assert locator == "repo/src/service.py"
     assert not locator.startswith("#")
 
     payload = edit_file(
@@ -1896,3 +1896,22 @@ def test_read_memory_recovery_rejects_limit_smaller_than_fixed_envelope():
             max_chars=500,
             agent_id="bot",
         )
+
+
+@pytest.mark.parametrize("cap", [1000, 320])
+def test_search_coverage_preserves_indentation_and_invalidates_completeness_on_transport_cut(cap):
+    excerpt = "    result = value + 1\n" * 12 + "    return result"
+    service = _CodeAdapterService(cfg=OgMemConfig(mcp_max_response_chars=cap), result={
+        "status": "ok", "evidence": [dict(relative_path="api.py", root_slug="repo",
+            start_line=20, end_line=32, excerpt=excerpt, coverage=dict(
+                source_lines=[1, 32], truncated=True, implementation_complete=True, read_lines=[]))]})
+    payload = search_code(service, query="compute")
+    assert len(payload) <= cap
+    if cap == 1000:
+        assert excerpt in payload and '"implementation_complete":true' in payload
+        assert '"read_lines":[]' in payload
+    else:
+        assert '"implementation_complete":true' not in payload
+        assert '"read_lines":[[1,32]]' in payload
+        assert "# lines 20-32" not in payload
+        assert "[excerpt clipped]" in payload

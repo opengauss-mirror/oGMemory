@@ -62,6 +62,35 @@ def _workspace(root) -> ResolvedCodeWorkspace:
     )
 
 
+def test_symbolic_hits_survive_a_full_bm25_semantic_shortlist():
+    records = [{"uri": f"ctx://acct/resources/{i}", "content": "code"} for i in range(21)]
+    corpus = SimpleNamespace(records=records, file_ranks={})
+    service = CodeRetrievalService(config=SimpleNamespace(code_retrieval_candidate_semantic_limit=4))
+    selected = service._candidate_semantic_records(corpus, {"bm25": records[:20], "symbolic": [records[-1]]})
+    assert records[-1]["uri"] in {r["uri"] for r in selected}
+    assert len(selected) == 4
+    assert len({r["uri"] for r in selected}) == 4
+
+
+def test_assignment_definitions_outrank_incidental_short_identifier_mentions(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "test_tree.py").write_text("a1 = Node()\na2 = Node()\na21 = Node(a1)\n")
+    for i in range(30):
+        (root / f"test_other_{i}.py").write_text(f"def test_other_{i}():\n    assert a1 != a2\n")
+    service = CodeRetrievalService(
+        workspace_resolver=SimpleNamespace(resolve=lambda **kwargs: _workspace(root)),
+        config=SimpleNamespace(code_retrieval_enabled=True, code_retrieval_mode="candidate_local",
+                               code_retrieval_route_enabled=lambda route: route == "symbolic"),
+    )
+    result = service.search_active(
+        ActiveCodeSearchRequest("Definition of a1 a2 a21 in test_tree.py"),
+        RequestContext("acct", "user", "agent", "session", "trace"),
+    )
+    assert result.evidence[0].relative_path == "test_tree.py"
+    assert "a21 = Node(a1)" in result.evidence[0].excerpt
+
+
 def test_candidate_active_search_is_request_local_and_never_touches_full_dependencies(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
