@@ -368,6 +368,8 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 
 ---
 
+## oGMemory Evaluation Results
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
   <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
