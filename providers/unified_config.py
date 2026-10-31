@@ -607,6 +607,8 @@ class OgMemConfig:
 
     # -- Scene memory ---------------------------------------------------------
     scene_enabled: bool = False
+    scene_generation_enabled: bool = True
+    scene_retrieval_enabled: bool = True
     scene_options: dict[str, Any] = field(default_factory=dict)
 
     # -- Agent skill sedimentation --------------------------------------------
@@ -1952,6 +1954,12 @@ class OgMemConfig:
             ),
             scene_enabled=_resolve_bool(
                 (raw.get("scene") or {}).get("enabled"), "OGMEM_SCENE_ENABLED", False,
+            ),
+            scene_generation_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("generation_enabled"), "OGMEM_SCENE_GENERATION_ENABLED", True,
+            ),
+            scene_retrieval_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("retrieval_enabled"), "OGMEM_SCENE_RETRIEVAL_ENABLED", True,
             ),
             scene_options=dict((raw.get("scene") or {}).get("options") or {}),
             skill_sedimentation_enabled=_resolve_bool(

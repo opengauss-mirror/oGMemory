@@ -52,6 +52,7 @@ class RetrievalPipeline:
         access_tracker=None,
         scene_ranker: SceneRanker | None = None,
         scene_source: SceneSearchSource | None = None,
+        scene_enabled: bool = True,
     ) -> None:
         self.planner = planner
         self.seed_retriever = seed_retriever
@@ -60,6 +61,7 @@ class RetrievalPipeline:
         self.cfg = config or RetrievalConfig()
         self._context_reader = context_reader
         self._access_tracker = access_tracker
+        self._scene_enabled = scene_enabled
         self._scene_stage = (
             SceneRetrievalStage(scene_source, scene_ranker)
             if scene_source is not None and scene_ranker is not None else None
@@ -81,7 +83,11 @@ class RetrievalPipeline:
         context_type: str | None = None,
         resource_type: str | None = None,
         memory_directories: list[str] | None = None,
+        use_scene: bool | None = None,
     ) -> SearchMemoryResult:
+        if use_scene is not None and not isinstance(use_scene, bool):
+            raise ValueError("use_scene must be boolean")
+        scene_enabled = self._scene_enabled if use_scene is None else use_scene
         t0 = time.monotonic()
         trace = RetrievalTrace()
 
@@ -110,7 +116,8 @@ class RetrievalPipeline:
         # Stage 3
         all_leaf_hits: list[LeafHit] = []
         query_results = []
-        scene_stage = self._scene_stage.bind(ctx, typed_queries, trace) if self._scene_stage else None
+        scene_stage = (self._scene_stage.bind(ctx, typed_queries, trace)
+                       if scene_enabled and self._scene_stage else None)
         for tq, sr in zip(typed_queries, all_seed_results):
             reserve = None
             leaves = self._run_expand(
@@ -133,7 +140,7 @@ class RetrievalPipeline:
         blocks = self._run_assembly(
             typed_queries, all_leaf_hits, merged_seed, trace, ctx,
             fill_content_for_top_k=fill_content_for_top_k,
-            query_results=query_results if self._scene_stage is not None else None,
+            query_results=query_results if scene_stage is not None else None,
         )
 
         trace.total_ms = (time.monotonic() - t0) * 1000

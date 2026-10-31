@@ -2678,7 +2678,8 @@ class MemoryService:
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
-                memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
+                memory_projection_handler=self._scene_projection_changed
+                    if self._cfg.scene_enabled and self._cfg.scene_generation_enabled else None,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2792,7 +2793,8 @@ class MemoryService:
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
                 agent_memory_handler=self._process_agent_memory,
-                memory_projection_handler=self._scene_projection_changed if self._cfg.scene_enabled else None,
+                memory_projection_handler=self._scene_projection_changed
+                    if self._cfg.scene_enabled and self._cfg.scene_generation_enabled else None,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2960,7 +2962,8 @@ class MemoryService:
                 scene_service = SceneService(
                     repository, adapter, manager, provider, self._get_shared_embedder(),
                 )
-                manager.start()
+                if self._cfg.scene_generation_enabled:
+                    manager.start()
             except Exception:
                 candidate_index.close()
                 raise
@@ -2976,6 +2979,8 @@ class MemoryService:
         return self._scene_service
 
     def _scene_projection_changed(self, event, ctx):
+        if not self._cfg.scene_enabled or not self._cfg.scene_generation_enabled:
+            return
         from urllib.parse import urlsplit
 
         from core.errors import NodeNotFoundError
@@ -3214,6 +3219,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 context_reader=context_reader,
                 scene_ranker=self._scene_ranker,
                 scene_source=self._scene_source,
+                scene_enabled=self._cfg.scene_retrieval_enabled,
             )
 
             self._read_api = ReadAPI(
@@ -6798,7 +6804,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         params = params or {}
         started = time.monotonic()
         result = self._wait_until_session_idle(params)
-        if (not result.get("idle") or not self._cfg.scene_enabled
+        if (not result.get("idle") or not self._cfg.scene_enabled or not self._cfg.scene_generation_enabled
                 or not self._param_bool(params, "waitScenes", "wait_scenes", default=False)):
             return result
         self._ensure_scene_runtime()

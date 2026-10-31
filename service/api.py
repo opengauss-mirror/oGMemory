@@ -736,6 +736,7 @@ class ReadAPI:
         context_type: str | None = None,
         resource_type: str | None = None,
         memory_directories: list[str] | None = None,
+        use_scene: bool | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -759,6 +760,7 @@ class ReadAPI:
             context_type=context_type,
             resource_type=resource_type,
             memory_directories=memory_directories,
+            **({"use_scene": use_scene} if use_scene is not None else {}),
         )
 
         if not include_debug:
