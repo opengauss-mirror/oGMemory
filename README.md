@@ -13,19 +13,10 @@ Documentation: [docs/README.md](docs/README.md)
 
 ---
 
-## Proof it works
-
-oGMemory + OpenClaw CE has been evaluated on multi-turn agent tasks in **tau2-bench**. Full results, configuration and version details are in the [benchmark report](docs/benchmarks/tau2-bench/README.md).
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
   <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
 </picture>
-
-- **Agent experience (tau2-bench)**: memory lifts task success from **72.50% to 81.56%** in Retail (**+9.06pp**) and from **65.00% to 70.63%** in Airline (**+5.63pp**). Weighted overall success rises from **70.00% to 77.92%** (**+7.92pp**).
-- **Evaluation setup**: `doubao-seed-2.1-lite`, thinking disabled, agent memory enabled, single-pass extraction; 40 Retail and 20 Airline tasks, eight repeats per arm, **960 scored rollouts** with complete raw-score verification.
-
-Measured on runtime `3b8c5ee` with a benchmark CE adapter using a 32K compose budget and injected-memory history deduplication. See the report for the exact evaluated configuration and its relationship to this branch.
 
 ---
 
