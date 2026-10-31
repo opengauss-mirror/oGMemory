@@ -181,3 +181,26 @@ def test_real_concurrent_first_startup(index):
             index._client.drop_collection(collection_name=name)
         for client in clients:
             client.close()
+
+
+def test_real_get_record_reindex_preserves_filter_only_scope(index):
+    item = make_record("filter-roundtrip")
+    item.filters.update(
+        video_id="video-1", extractor_type="episodic_memory_generator", space_id="space-1"
+    )
+    # Persisted scalar scope columns must win over stale metadata copies.
+    item.metadata["video_id"] = "stale"
+    index.upsert([item])
+    saved = index.get_record(item.id)
+    assert saved.filters["video_id"] == "video-1"
+    assert saved.metadata["video_id"] == "video-1"
+    assert saved.filters["extractor_type"] == "episodic_memory_generator"
+    index.upsert([saved])
+    scope = {
+        "account_id": "a",
+        "video_id": "video-1",
+        "space_id": "space-1",
+        "extractor_type": "episodic_memory_generator",
+    }
+    assert index.count(scope) == 1
+    assert index.search_by_vector([1.0, 0.0, 0.0], scope, 1)[0].uri == item.uri

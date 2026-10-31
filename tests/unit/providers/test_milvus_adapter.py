@@ -159,12 +159,20 @@ def _schema():
     return {
         "auto_id": False,
         "fields": [
-            {"name": "id", "type": DataType.VARCHAR, "is_primary": True},
+            {
+                "name": "id",
+                "type": DataType.VARCHAR,
+                "is_primary": True,
+                "params": {"max_length": 512},
+            },
             {"name": "embedding", "type": DataType.FLOAT_VECTOR, "params": {"dim": 3}},
-            {"name": "text", "type": DataType.VARCHAR},
+            {"name": "text", "type": DataType.VARCHAR, "params": {"max_length": 65535}},
             {"name": "metadata", "type": DataType.JSON},
             {"name": "level", "type": DataType.INT64},
-            *[{"name": key, "type": DataType.VARCHAR} for key in _SCOPE_FIELDS],
+            *[
+                {"name": key, "type": DataType.VARCHAR, "params": {"max_length": 8192}}
+                for key in _SCOPE_FIELDS
+            ],
         ],
     }
 
@@ -265,3 +273,58 @@ def test_delete_scope_uses_server_filter_without_materializing_ids(index):
         "timeout": 7.0,
     }
     index._client.query_iterator.assert_not_called()
+
+
+def test_get_record_preserves_scope_when_reindexed(index):
+    item = record(video_id="stale", extractor_type="stale")
+    item.filters.update(
+        video_id="video-1",
+        extractor_type="episodic_memory_generator",
+        space_id="space-1",
+        resource_type="code",
+        category="entity",
+        context_type="MEMORY",
+    )
+    index.upsert([item])
+    original = dict(index._client.upsert.call_args.kwargs["data"][0])
+    index._client.get.return_value = [original]
+    saved = index.get_record(item.id)
+    assert saved.filters["video_id"] == "video-1"
+    assert saved.metadata["video_id"] == "video-1"
+    assert saved.filters["extractor_type"] == "episodic_memory_generator"
+    index.upsert([saved])
+    rewritten = index._client.upsert.call_args.kwargs["data"][0]
+    for key in (
+        "account_id",
+        "owner_space",
+        "space_id",
+        "video_id",
+        "extractor_type",
+        "resource_type",
+        "category",
+        "context_type",
+    ):
+        assert rewritten[key] == original[key]
+
+
+@pytest.mark.parametrize("name,limit", [("id", 511), ("text", 65534), ("account_id", 8191)])
+def test_existing_short_varchar_schema_is_rejected(monkeypatch, name, limit):
+    client = _client(monkeypatch)
+    client.has_collection.return_value = True
+    schema = _schema()
+    next(field for field in schema["fields"] if field["name"] == name)["params"]["max_length"] = (
+        limit
+    )
+    client.describe_collection.return_value = schema
+    client.list_indexes.return_value = ["embedding"]
+    with pytest.raises(ValueError, match="schema"):
+        MilvusVectorIndex(dimension=3)
+    client.load_collection.assert_not_called()
+    client.close.assert_called_once()
+
+
+@pytest.mark.parametrize("vector", [[1e100, 0.0, 0.0], [1e-100, 0.0, 0.0]])
+def test_float32_overflow_or_zero_after_conversion_is_rejected(index, vector):
+    with pytest.raises(ValueError, match="finite and non-zero"):
+        index.upsert([record(_embedding=vector)])
+    index._client.upsert.assert_not_called()

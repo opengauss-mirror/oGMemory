@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from array import array
 from typing import Any
 
 from core.interfaces import VectorIndex
@@ -30,6 +31,7 @@ _SCOPE_FIELDS = (
 )
 _JSON_FILTERS = {"node_status", "extracted_node_id", "clip_id"}
 _BATCH_SIZE = 128
+_VARCHAR_LIMITS = {"id": 512, "text": 65535, **dict.fromkeys(_SCOPE_FIELDS, 8192)}
 
 
 class MilvusVectorIndex(VectorIndex):
@@ -55,13 +57,15 @@ class MilvusVectorIndex(VectorIndex):
         try:
             if not self._rpc("has_collection", collection_name=collection_name):
                 schema = self._client.create_schema(auto_id=False, enable_dynamic_field=False)
-                schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=512)
+                schema.add_field(
+                    "id", DataType.VARCHAR, is_primary=True, max_length=_VARCHAR_LIMITS["id"]
+                )
                 schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=dimension)
-                schema.add_field("text", DataType.VARCHAR, max_length=65535)
+                schema.add_field("text", DataType.VARCHAR, max_length=_VARCHAR_LIMITS["text"])
                 schema.add_field("metadata", DataType.JSON)
                 schema.add_field("level", DataType.INT64)
                 for field in _SCOPE_FIELDS:
-                    schema.add_field(field, DataType.VARCHAR, max_length=8192)
+                    schema.add_field(field, DataType.VARCHAR, max_length=_VARCHAR_LIMITS[field])
                 self._create_if_absent(
                     "create_collection",
                     collection_name=collection_name,
@@ -106,6 +110,10 @@ class MilvusVectorIndex(VectorIndex):
             or not fields.get("id", {}).get("is_primary")
             or any(fields.get(key, {}).get("type") != dtype for key, dtype in expected.items())
             or int(fields.get("embedding", {}).get("params", {}).get("dim", 0)) != self._dimension
+            or any(
+                int(fields.get(name, {}).get("params", {}).get("max_length", 0)) < limit
+                for name, limit in _VARCHAR_LIMITS.items()
+            )
         ):
             raise ValueError(
                 "Existing Milvus collection has an incompatible oGMemory schema/dimension"
@@ -143,10 +151,15 @@ class MilvusVectorIndex(VectorIndex):
     def _vector(self, values) -> list[float]:
         if values is None or len(values) != self._dimension:
             raise ValueError(f"Milvus requires an embedding of dimension {self._dimension}")
-        vector = [float(value) for value in values]
+        # Validate what Milvus actually stores, not just the Python FLOAT64 input.
+        # Finite values can overflow to infinity or all underflow to zero in FLOAT32.
+        try:
+            vector = array("f", (float(value) for value in values))
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError("Milvus COSINE embeddings must be finite and non-zero") from exc
         if not all(math.isfinite(value) for value in vector) or not any(vector):
             raise ValueError("Milvus COSINE embeddings must be finite and non-zero")
-        return vector
+        return vector.tolist()
 
     @staticmethod
     def _build_filter(filters: dict[str, Any]) -> str:
@@ -202,11 +215,7 @@ class MilvusVectorIndex(VectorIndex):
                 embedding=self._vector(record.metadata.get("_embedding")),
             )
             # Validate locally before any batch is written.
-            for name, limit in {
-                "id": 512,
-                "text": 65535,
-                **dict.fromkeys(_SCOPE_FIELDS, 8192),
-            }.items():
+            for name, limit in _VARCHAR_LIMITS.items():
                 if len(row[name].encode("utf-8")) > limit:
                     raise ValueError(f"Milvus {name} exceeds {limit} UTF-8 bytes")
             if (
@@ -330,13 +339,23 @@ class MilvusVectorIndex(VectorIndex):
         if not rows:
             return None
         row = rows[0]
+        scope = {key: row.get(key, "") for key in _SCOPE_FIELDS}
         return IndexRecord(
             id=row["id"],
             uri=row["uri"],
             level=row["level"],
             text=row["text"],
-            filters={key: row[key] for key in ("account_id", "owner_space")},
-            metadata={**row["metadata"], "_embedding": list(row["embedding"])},
+            filters={
+                key: value
+                for key, value in scope.items()
+                if key not in {"uri", "memory_directory"}
+                and (value or key in {"account_id", "owner_space"})
+            },
+            metadata={
+                **row["metadata"],
+                **scope,
+                "_embedding": [float(value) for value in row["embedding"]],
+            },
         )
 
     def count(self, filters: dict[str, Any] | None = None) -> int:

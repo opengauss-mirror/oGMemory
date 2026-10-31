@@ -25,7 +25,7 @@ vector_db:
 ```
 
 凭据通过 `MILVUS_TOKEN` 注入，不提交到配置文件。数据库须预先存在；集合和缺失的索引会在启动时创建。
-当前使用 HNSW/COSINE，已有集合的字段和维度必须兼容。
+当前使用 HNSW/COSINE，已有集合的字段类型、维度和 VARCHAR 字节容量必须兼容。
 
 沿用 oGMemory 现有服务启动方式和部署配置，无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
 Milvus 服务由外部部署管理；配置其可达地址。容器中的 `127.0.0.1` 指向容器自身，跨容器连接应使用可解析的服务名或其他可达入口。
@@ -48,7 +48,8 @@ YAML 中显式配置的字段优先于环境变量。向量后端切换不会自
 - 支持幂等 upsert、向量检索、子节点检索、embedding 复用、记录读取和账户/owner 范围删除。
 - 租户、owner、URI、层级、目录和资源类型在 Milvus 内过滤后再执行 top-k。
 - 读取采用 Strong consistency，每个适配器 RPC 显式传递超时；启动支持索引缺失恢复及并发创建。
-- 写入前校验 embedding 和 UTF-8 字节上限，超限明确报错，不静默截断；范围删除不将全部 ID 拉回应用内存。
+- embedding 转换为实际存储的 FLOAT32 后校验有限且非零，写入前检查 UTF-8 字节上限；超限明确报错，不静默截断。范围删除不将全部 ID 拉回应用内存。
+- `get_record` 恢复已持久化的范围字段，标量列优先于元数据中的旧副本，避免读取后重写改变隔离或检索范围。
 - 保留 JSON 元数据和 grounding。AGFS/SQL 存储配置由现有 `storage` 段独立决定，Milvus 只负责向量索引。
 
 目前实测组合为 Milvus 2.6.13 + pymilvus 2.6.17、ARM64 Standalone。
