@@ -24,7 +24,7 @@ def resolve_config(tmp_path, overrides, template=None):
     resolver = resolver.replace('"/tmp/ogmem.resolved.yaml"', repr(str(output)))
     env = {
         key: value for key, value in os.environ.items()
-        if not key.startswith(("VECTOR_DB_", "OPENGAUSS_", "STORAGE_DB_"))
+        if not key.startswith(("VECTOR_DB_", "OPENGAUSS_", "STORAGE_DB_")) and key != "STORAGE_BACKEND"
     }
     env.update(OGMEM_CONFIG=str(source), EXTERNAL_STORAGE_DSN="host=storage")
     env.update(overrides)
@@ -236,3 +236,53 @@ def test_explicit_empty_vector_password_does_not_reuse_legacy_secret(tmp_path):
 
     config = resolve_config(tmp_path, {"VECTOR_DB_PASSWORD": "", "OPENGAUSS_PASSWORD": "legacy-secret"})
     assert parse_dsn(config["vector_db"]["connection_string"])["password"] == ""
+
+
+@pytest.mark.parametrize("section", ["", "vector_db: null\n"])
+@pytest.mark.parametrize("backend", ["milvus", "chroma", "memory"])
+def test_env_non_sql_vector_backend_ignores_stale_sql_overrides(tmp_path, section, backend):
+    config = resolve_config(tmp_path, {"VECTOR_DB_TYPE": backend, "VECTOR_DB_PASSWORD": "stale",
+                                      "OPENGAUSS_HOST": "legacy"}, section + "llm: {provider: mock}\n")
+    assert config.get("vector_db") is None
+
+
+@pytest.mark.parametrize("template", ["llm: {provider: mock}\n", "vector_db: null\nstorage: null\n"])
+def test_env_sql_backends_create_missing_override_sections(tmp_path, template):
+    from psycopg2.extensions import parse_dsn
+
+    config = resolve_config(tmp_path, {"VECTOR_DB_TYPE": "opengauss", "VECTOR_DB_HOST": "vector-db",
+        "STORAGE_BACKEND": "sql", "STORAGE_DB_HOST": "storage-db"}, template)
+    assert parse_dsn(config["vector_db"]["connection_string"])["host"] == "vector-db"
+    assert parse_dsn(config["storage"]["connection_string"])["host"] == "storage-db"
+
+
+@pytest.mark.parametrize("storage", ["", "storage: null\n", "storage: {backend: agfs}\n"])
+def test_agfs_storage_ignores_leftover_sql_host(tmp_path, storage):
+    config = resolve_config(tmp_path, {"STORAGE_BACKEND": "agfs", "STORAGE_DB_HOST": "stale"},
+                            storage + "llm: {provider: mock}\n")
+    assert "connection_string" not in (config.get("storage") or {})
+
+
+def test_yaml_backend_selection_wins_over_conflicting_environment(tmp_path):
+    config = resolve_config(tmp_path, {"VECTOR_DB_TYPE": "opengauss", "VECTOR_DB_HOST": "stale",
+        "STORAGE_BACKEND": "sql", "STORAGE_DB_HOST": "stale"},
+        "vector_db: {type: milvus}\nstorage: {backend: agfs}\n")
+    assert config["vector_db"] == {"type": "milvus"}
+    assert config["storage"] == {"backend": "agfs"}
+
+
+def test_default_backends_ignore_unused_sql_environment(tmp_path):
+    config = resolve_config(tmp_path, {"VECTOR_DB_PASSWORD": "stale", "STORAGE_DB_HOST": "stale"},
+                            "llm: {provider: mock}\n")
+    assert "vector_db" not in config
+    assert "storage" not in config
+
+
+def test_yaml_sql_backends_override_non_sql_environment(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    config = resolve_config(tmp_path, {"VECTOR_DB_TYPE": "milvus", "VECTOR_DB_HOST": "vector",
+        "STORAGE_BACKEND": "agfs", "STORAGE_DB_HOST": "storage"},
+        "vector_db: {type: opengauss}\nstorage: {backend: sql}\n")
+    assert parse_dsn(config["vector_db"]["connection_string"])["host"] == "vector"
+    assert parse_dsn(config["storage"]["connection_string"])["host"] == "storage"

@@ -290,7 +290,7 @@ def test_get_record_preserves_scope_when_reindexed(index):
     index._client.get.return_value = [original]
     saved = index.get_record(item.id)
     assert saved.filters["video_id"] == "video-1"
-    assert saved.metadata["video_id"] == "video-1"
+    assert saved.metadata["video_id"] == "stale"  # Preserve the original JSON payload.
     assert saved.filters["extractor_type"] == "episodic_memory_generator"
     index.upsert([saved])
     rewritten = index._client.upsert.call_args.kwargs["data"][0]
@@ -328,3 +328,30 @@ def test_float32_overflow_or_zero_after_conversion_is_rejected(index, vector):
     with pytest.raises(ValueError, match="finite and non-zero"):
         index.upsert([record(_embedding=vector)])
     index._client.upsert.assert_not_called()
+
+
+@pytest.mark.parametrize("capacity", [65387, 65536])
+def test_metadata_at_capacity_does_not_grow_after_read_and_rewrite(index, capacity):
+    item = record()
+    item.filters.update(
+        video_id="video-1", space_id="space-1", extractor_type="episodic_memory_generator"
+    )
+    item.metadata["payload"] = ""
+    index.upsert([item])
+    empty = index._client.upsert.call_args.kwargs["data"][0]["metadata"]
+    overhead = len(json.dumps(empty, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+    item.metadata["payload"] = "x" * (capacity - overhead)
+    index.upsert([item])
+    original = dict(index._client.upsert.call_args.kwargs["data"][0])
+    assert len(json.dumps(original["metadata"], ensure_ascii=False).encode("utf-8")) == capacity
+    for _ in range(3):
+        index._client.get.return_value = [original]
+        saved = index.get_record(item.id)
+        assert {k: v for k, v in saved.metadata.items() if k != "_embedding"} == original[
+            "metadata"
+        ]
+        index.upsert([saved])
+        rewritten = index._client.upsert.call_args.kwargs["data"][0]
+        assert rewritten["metadata"] == original["metadata"]
+        assert rewritten["space_id"] == "space-1"
+        assert rewritten["video_id"] == "video-1"

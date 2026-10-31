@@ -49,7 +49,7 @@ YAML 中显式配置的字段优先于环境变量。向量后端切换不会自
 - 租户、owner、URI、层级、目录和资源类型在 Milvus 内过滤后再执行 top-k。
 - 读取采用 Strong consistency，每个适配器 RPC 显式传递超时；启动支持索引缺失恢复及并发创建。
 - embedding 转换为实际存储的 FLOAT32 后校验有限且非零，写入前检查 UTF-8 字节上限；超限明确报错，不静默截断。范围删除不将全部 ID 拉回应用内存。
-- `get_record` 恢复已持久化的范围字段，标量列优先于元数据中的旧副本，避免读取后重写改变隔离或检索范围。
+- `get_record` 通过 `filters` 恢复已持久化的范围字段，写回时以这些字段为准；metadata 保留原始 JSON，不重复补入范围列，避免读取后重写突破容量上限。
 - 保留 JSON 元数据和 grounding。AGFS/SQL 存储配置由现有 `storage` 段独立决定，Milvus 只负责向量索引。
 
 目前实测组合为 Milvus 2.6.13 + pymilvus 2.6.17、ARM64 Standalone。

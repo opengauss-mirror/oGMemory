@@ -35,6 +35,24 @@ def expand(value):
 
 config = expand(config)
 
+
+def selected_backend(section, field, env_name, default):
+    # Match OgMemConfig: an explicit YAML value wins, otherwise use env/default.
+    # Missing or null sections are valid for environment-only configuration.
+    values = config.get(section)
+    if values is None:
+        values = {}
+    if not isinstance(values, dict):
+        raise ValueError(f"{section} configuration must be a mapping")
+    value = values.get(field)
+    if value is None:
+        value = os.environ.get(env_name, default)
+    return str(value).strip().casefold()
+
+
+vector_type = selected_backend("vector_db", "type", "VECTOR_DB_TYPE", "chroma")
+storage_backend = selected_backend("storage", "backend", "STORAGE_BACKEND", "agfs")
+
 # VECTOR_DB_HOST_PORT is the host-published port; VECTOR_DB_PORT is the
 # container-internal port and must not be used on the host network path.
 # Legacy OPENGAUSS_* names remain fallbacks. Preserve mounted SQL DSNs unless
@@ -44,27 +62,23 @@ vector_overrides = (
     "VECTOR_DB_USER", "VECTOR_DB_PASSWORD", "OPENGAUSS_HOST",
     "OPENGAUSS_PORT", "OPENGAUSS_DBNAME", "OPENGAUSS_USER", "OPENGAUSS_PASSWORD",
 )
-if any(name in os.environ for name in vector_overrides):
-    vector = config.get("vector_db")
-    if not isinstance(vector, dict):
-        raise ValueError("database overrides require vector_db configuration")
-    vector_type = vector.get("type") or os.environ.get("VECTOR_DB_TYPE", "opengauss")
-    if str(vector_type).strip().casefold() == "opengauss":
-        vector["connection_string"] = make_dsn(
-            host=os.environ.get("VECTOR_DB_HOST") or os.environ.get("OPENGAUSS_HOST", "127.0.0.1"),
-            port=os.environ.get("VECTOR_DB_HOST_PORT") or os.environ.get("OPENGAUSS_PORT", "5432"),
-            dbname=os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres"),
-            user=os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb"),
-            password=os.environ.get("VECTOR_DB_PASSWORD", os.environ.get("OPENGAUSS_PASSWORD", "")),
-        )
-        print("[entrypoint] Patched vector_db.connection_string from environment overrides")
+if vector_type == "opengauss" and any(name in os.environ for name in vector_overrides):
+    vector = config.get("vector_db") or {}
+    config["vector_db"] = vector
+    vector["connection_string"] = make_dsn(
+        host=os.environ.get("VECTOR_DB_HOST") or os.environ.get("OPENGAUSS_HOST", "127.0.0.1"),
+        port=os.environ.get("VECTOR_DB_HOST_PORT") or os.environ.get("OPENGAUSS_PORT", "5432"),
+        dbname=os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres"),
+        user=os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb"),
+        password=os.environ.get("VECTOR_DB_PASSWORD", os.environ.get("OPENGAUSS_PASSWORD", "")),
+    )
+    print("[entrypoint] Patched vector_db.connection_string from environment overrides")
 
 # Storage is configured independently from the vector provider, including
 # deployments using Milvus with SQL context storage.
-if os.environ.get("STORAGE_DB_HOST"):
-    storage = config.get("storage")
-    if not isinstance(storage, dict):
-        raise ValueError("database overrides require storage configuration")
+if storage_backend == "sql" and os.environ.get("STORAGE_DB_HOST"):
+    storage = config.get("storage") or {}
+    config["storage"] = storage
     storage["connection_string"] = make_dsn(
         host=os.environ["STORAGE_DB_HOST"],
         port=os.environ.get("STORAGE_DB_HOST_PORT", "5432"),

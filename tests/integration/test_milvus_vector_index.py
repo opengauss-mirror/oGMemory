@@ -188,12 +188,12 @@ def test_real_get_record_reindex_preserves_filter_only_scope(index):
     item.filters.update(
         video_id="video-1", extractor_type="episodic_memory_generator", space_id="space-1"
     )
-    # Persisted scalar scope columns must win over stale metadata copies.
+    # Reindexing must use persisted scalar filters without expanding the JSON payload.
     item.metadata["video_id"] = "stale"
     index.upsert([item])
     saved = index.get_record(item.id)
     assert saved.filters["video_id"] == "video-1"
-    assert saved.metadata["video_id"] == "video-1"
+    assert saved.metadata["video_id"] == "stale"  # Preserve the original JSON payload.
     assert saved.filters["extractor_type"] == "episodic_memory_generator"
     index.upsert([saved])
     scope = {
@@ -204,3 +204,25 @@ def test_real_get_record_reindex_preserves_filter_only_scope(index):
     }
     assert index.count(scope) == 1
     assert index.search_by_vector([1.0, 0.0, 0.0], scope, 1)[0].uri == item.uri
+
+
+def test_real_metadata_at_capacity_survives_read_and_reindex(index):
+    import json
+
+    item = make_record("metadata-capacity")
+    item.filters.update(video_id="video-1", space_id="space-1")
+    item.metadata["payload"] = ""
+    metadata = {
+        "abstract": item.text[:200],
+        **{k: v for k, v in item.metadata.items() if k != "_embedding"},
+    }
+    overhead = len(json.dumps(metadata, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+    item.metadata["payload"] = "x" * (65536 - overhead)
+    index.upsert([item])
+    for _ in range(2):
+        saved = index.get_record(item.id)
+        metadata = {k: v for k, v in saved.metadata.items() if k != "_embedding"}
+        assert len(json.dumps(metadata, ensure_ascii=False).encode("utf-8")) == 65536
+        assert saved.filters["space_id"] == "space-1"
+        index.upsert([saved])
+    assert index.count({"account_id": "a", "space_id": "space-1", "video_id": "video-1"}) == 1

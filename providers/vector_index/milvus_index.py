@@ -352,8 +352,9 @@ class MilvusVectorIndex(VectorIndex):
                 and (value or key in {"account_id", "owner_space"})
             },
             metadata={
+                # Restore scalar scope in filters only. Copying it into JSON
+                # would grow a valid near-limit payload during read/rewrite.
                 **row["metadata"],
-                **scope,
                 "_embedding": [float(value) for value in row["embedding"]],
             },
         )
