@@ -1060,6 +1060,7 @@ def query_memory(
     types: list[str] | None = None,
     top_k: int = 5,
     score_threshold: float | None = None,
+    use_scene: bool | None = None,
     session_id: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
@@ -1073,6 +1074,8 @@ def query_memory(
     if top_k < 1 or top_k > 20:
         raise ValueError("top_k must be between 1 and 20")
 
+    if use_scene is not None and not isinstance(use_scene, bool):
+        raise ValueError("use_scene must be boolean")
     requested_types = types or []
     unknown = sorted(t for t in requested_types if t not in MEMORY_TYPES)
     if unknown:
@@ -1117,6 +1120,7 @@ def query_memory(
                 include_debug=False,
                 fill_content_for_top_k=min(top_k, 3),
                 **type_filters,
+                **({"use_scene": use_scene} if use_scene is not None else {}),
             )
     except Exception as exc:
         recorder = getattr(service, "record_retrieval_metric", None)

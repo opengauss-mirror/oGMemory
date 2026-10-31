@@ -252,6 +252,8 @@ def test_yaml_scene_settings_enable_runtime(monkeypatch):
     })
     config = OgMemConfig.load("scene-test.yaml")
     assert config.scene_enabled is True
+    assert config.scene_generation_enabled is True
+    assert config.scene_retrieval_enabled is True
     assert config.scene_options == {"analysis_trigger_tokens": 256}
 
 
@@ -380,3 +382,43 @@ def test_lexical_configuration_hot_enable_reuses_existing_scene_projection(runti
     assert lexical.events.count("publish") == 1
     runtime.service._scene_manager.process_next("projection-check")
     assert runtime.repository.lexical_revisions["acme", "user:alice"] == 1
+
+
+@pytest.mark.parametrize("generation,retrieval", [(True, True), (True, False), (False, True), (False, False)])
+def test_scene_modes_preserve_members_and_query_selection(runtime, monkeypatch, generation, retrieval):
+    runtime.service._cfg.scene_generation_enabled = generation
+    runtime.service._cfg.scene_retrieval_enabled = retrieval
+    node, _, _ = _index(runtime, monkeypatch)
+    scenes = runtime.service.get_scene_service()
+    scenes.save(runtime.ctx, {
+        "revision": 0, "title": node.abstract, "description": node.overview,
+        "member_uris": [node.uri],
+    })
+    before = runtime.repository.load_snapshot("acme", "user:alice")
+    api = runtime.service.get_read_api(start_outbox_worker=False)
+    assert runtime.service._scene_manager.running is generation
+    assert len(runtime.starts) == int(generation)
+    from retrieval.identity import canonical_uri
+    for selection in (None, True, False, None):
+        result = api.search_memory(node.content, runtime.ctx, top_k=5, fill_content_for_top_k=5,
+                                   score_threshold=0.0, include_debug=True, use_scene=selection)
+        assert [canonical_uri(hit.uri) for hit in result.hits] == [node.uri]
+        expected = retrieval if selection is None else selection
+        assert bool(result.hits[0].metadata.get("scene_match")) is expected
+    assert runtime.repository.load_snapshot("acme", "user:alice") == before
+    status = runtime.service._scene_manager.jobs.summary("acme", "user:alice")
+    assert status["pending_nodes"] == int(generation)
+
+
+@pytest.mark.parametrize("generation,retrieval", [(True, False), (False, True), (True, True)])
+def test_yaml_and_environment_scene_modes(monkeypatch, generation, retrieval):
+    monkeypatch.setattr("providers.unified_config._load_yaml", lambda path: {
+        "scene": {"enabled": True, "generation_enabled": generation, "retrieval_enabled": retrieval},
+    })
+    config = OgMemConfig.load("scene-test.yaml")
+    assert (config.scene_generation_enabled, config.scene_retrieval_enabled) == (generation, retrieval)
+    monkeypatch.setattr("providers.unified_config._load_yaml", lambda path: {"scene": {"enabled": True}})
+    monkeypatch.setenv("OGMEM_SCENE_GENERATION_ENABLED", str(not generation).lower())
+    monkeypatch.setenv("OGMEM_SCENE_RETRIEVAL_ENABLED", str(not retrieval).lower())
+    config = OgMemConfig.load("scene-test.yaml")
+    assert (config.scene_generation_enabled, config.scene_retrieval_enabled) == (not generation, not retrieval)

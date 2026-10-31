@@ -614,6 +614,7 @@ def handle_query_memory():
                 types=params.get("types"),
                 top_k=_memory_tool_integer(params, "top_k", 5),
                 score_threshold=params.get("score_threshold"),
+                use_scene=params.get("use_scene", params.get("useScene")),
                 session_id=params.get("sessionId") or params.get("session_id"),
                 agent_id=ctx.agent_id,
                 request_context=ctx,

@@ -285,6 +285,10 @@ def create_mcp_server(
             float | None,
             Field(description="Optional minimum relevance score; omit to use server defaults."),
         ] = None,
+        use_scene: Annotated[
+            bool | None,
+            Field(description="Use scene memory for this query; omit to use the server default."),
+        ] = None,
         session_id: Annotated[
             str | None,
             BeforeValidator(_raw_string_argument),
@@ -313,6 +317,7 @@ def create_mcp_server(
             types=types,
             top_k=top_k,
             score_threshold=score_threshold,
+            use_scene=use_scene,
             session_id=session_id,
             agent_id=agent_id,
             **_auth_kwargs_from_context(ctx),
