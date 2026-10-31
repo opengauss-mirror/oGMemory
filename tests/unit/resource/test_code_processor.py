@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import ast
+from collections import Counter
 
 import pytest
 
@@ -17,6 +19,89 @@ def test_detect_language_from_extension():
     assert detect_language("index.ts") == "typescript"
     assert detect_language("main.go") == "go"
     assert detect_language("setup.sh") == "shell"
+
+
+def test_large_class_preserves_method_boundaries_and_decorators():
+    source = "class Container:\n" + "    # padding\n" * 40 + (
+        "    @staticmethod\n"
+        "    def target():\n"
+        '        """Target documentation."""\n'
+        "        return important_value\n\n"
+        "    async def other(self):\n"
+        "        return 2\n"
+    )
+    chunks = CodeFileChunker(max_chars=400).chunk(source, "sample.py", "python")
+    target = next(c for c in chunks if c.symbol == "Container.target")
+    assert "@staticmethod" in target.content and "return important_value" in target.content
+    assert "other" not in target.content
+    assert target.signature == "target()"
+    assert target.metadata["implementation_start_line"] == target.end_line
+    assert any(c.symbol == "Container.other" and c.symbol_kind == "async_function" for c in chunks)
+    assert all(len(c.content) <= 400 for c in chunks)
+    covered = {i for c in chunks for i in range(c.start_line, c.end_line + 1)}
+    assert {i for i, line in enumerate(source.splitlines(), 1) if line.strip()} <= covered
+    for c in chunks:
+        assert c.content.strip() == "\n".join(source.splitlines()[c.start_line - 1:c.end_line]).strip()
+
+
+def test_module_assignment_names_are_searchable_without_changing_source():
+    source = "a1, a2 = make_pair()\na21: object = make_child(a1)\n"
+    chunks = CodeFileChunker().chunk(source, "sample.py", "python")
+    assert chunks[0].signature == "a1, a2, a21"
+    assert chunks[0].content == source.rstrip()
+
+
+def test_interleaved_module_signatures_use_linear_top_level_traversal(monkeypatch):
+    source = "".join(
+        f"a{i}, b{i} = pair()\na{i}: int = 1\n\ndef f{i}(): return 0\n\n"
+        for i in range(40)
+    )
+    tree = ast.parse(source)
+
+    class CountedNodes(list):
+        visits = 0
+
+        def __iter__(self):
+            for node in super().__iter__():
+                self.visits += 1
+                yield node
+
+    tree.body = CountedNodes(tree.body)
+    monkeypatch.setattr(ast, "parse", lambda *a, **kw: tree)
+    chunks = CodeFileChunker().chunk(source, "sample.py", "python")
+    modules = [c for c in chunks if c.symbol_kind == "module"]
+    assert [c.signature for c in modules] == [f"a{i}, b{i}" for i in range(40)]
+    assert all(c.content == "\n".join(source.splitlines()[c.start_line - 1:c.end_line]) for c in chunks)
+    assert tree.body.visits <= 8 * len(tree.body)
+
+
+@pytest.mark.parametrize("gap", ["", "    # retained comment"])
+def test_split_class_extracts_graph_once_and_keeps_relations_on_one_chunk(monkeypatch, gap):
+    from extraction import code_processor
+
+    source = "class Large(Base):\n" + "    # header\n" * 60 + f"\n{gap}\n".join(
+        f"    def method_{i}(self):\n        return call_{i}()\n" for i in range(80)
+    )
+    original = code_processor._build_python_graph_metadata
+    calls = Counter()
+
+    def graph(node, imports):
+        calls[type(node)] += 1
+        return original(node, imports)
+
+    monkeypatch.setattr(code_processor, "_build_python_graph_metadata", graph)
+    chunks = CodeFileChunker(max_chars=400).chunk(source, "large.py", "python")
+    assert calls[ast.ClassDef] == 1
+    assert calls[ast.FunctionDef] == 80
+    class_chunks = [c for c in chunks if c.symbol_kind == "type"]
+    assert sum(len(c.metadata["graph"]["contains"]) for c in class_chunks) == 80
+    assert sum(len(c.metadata["graph"]["calls"]) for c in class_chunks) == 80
+    for i in range(80):
+        method = next(c for c in chunks if c.symbol == f"Large.method_{i}")
+        assert method.metadata["graph"]["symbol"] == method.symbol
+        assert method.metadata["graph"]["calls"] == [f"call_{i}"]
+    covered = {i for c in chunks for i in range(c.start_line, c.end_line + 1)}
+    assert {i for i, line in enumerate(source.splitlines(), 1) if line.strip()} <= covered
 
 
 def test_explicit_language_hint_overrides_extension_and_is_validated():
@@ -87,7 +172,7 @@ def test_large_python_module_range_uses_overlapping_line_windows():
 
     covered_lines: set[int] = set()
     for chunk in module_chunks:
-        expected_content = "\n".join(source_lines[chunk.start_line - 1 : chunk.end_line]).strip()
+        expected_content = "\n".join(source_lines[chunk.start_line - 1 : chunk.end_line]).rstrip()
         covered_lines.update(range(chunk.start_line, chunk.end_line + 1))
         assert chunk.content == expected_content
         assert chunk.chunk_hash == hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()
@@ -180,3 +265,18 @@ def test_read_code_source_replaces_invalid_utf8_and_rejects_binary(tmp_path):
         assert "binary" in str(exc)
     else:
         raise AssertionError("binary source must be rejected")
+
+
+@pytest.mark.parametrize("async_prefix", ["", "async "])
+def test_split_function_preserves_symbol_span_and_partial_line_metadata(async_prefix):
+    source = (f"@decorator\n{async_prefix}def compute(value):\n    \"\"\"Documentation.\"\"\"\n" +
+              "    value += 1\n" * 35 + "    return '" + "x" * 500 + "'\n")
+    chunks = CodeFileChunker(max_chars=150, target_chars=120).chunk(source, "sample.py", "python")
+    assert len(chunks) > 3
+    assert any(c.metadata.get("partial_source_line") for c in chunks)
+    for chunk in chunks:
+        assert chunk.metadata["symbol_start_line"] == 1
+        assert chunk.metadata["symbol_end_line"] == len(source.splitlines())
+        assert chunk.metadata["implementation_start_line"] == 4
+        if not chunk.metadata.get("partial_source_line"):
+            assert chunk.content == "\n".join(source.splitlines()[chunk.start_line - 1:chunk.end_line]).rstrip()

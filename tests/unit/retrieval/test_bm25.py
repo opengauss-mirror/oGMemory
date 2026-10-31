@@ -326,6 +326,24 @@ class TestBm25Index:
         assert [hit.id for hit in hits] == ["scoped"]
 
 
+def test_code_camel_components_reach_symbol_route_without_substring_matches():
+    index = Bm25Index()
+    index.bulk_upsert([
+        Bm25Document(name, body, {"account_id": account}, fields={"symbol": name, "body": body})
+        for name, body, account in [
+            ("TestWidgetParser", "generic body", "acme"),
+            ("Other", "WidgetParser", "acme"),
+            ("WidgetParser", "", "other"),
+            ("Bitmap", "", "acme"),
+        ]
+    ])
+    hits = index.search_code("WidgetParser", filters={"account_id": "acme"})
+    assert [hit.id for hit in hits] == ["TestWidgetParser", "Other"]
+    assert index.search_code("Map", filters={"account_id": "acme"}) == []
+    # Whole-name lookup remains available even when the query loses case.
+    assert index.search_code("testwidgetparser")[0].id == "TestWidgetParser"
+
+
 class TestVectorAnchoredFusion:
     def test_fuse_pure_vector(self):
         """No BM25 hits -> scores unchanged."""

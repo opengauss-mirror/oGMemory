@@ -31,6 +31,122 @@ def _workspace(root) -> ResolvedCodeWorkspace:
     )
 
 
+def test_file_and_predicate_is_ranked_before_selected_file_cap(tmp_path, monkeypatch):
+    for i in range(3):
+        (tmp_path / f"target_{i}.py").write_text("first = 1\n" * 10)
+    (tmp_path / "z.py").write_text("first = second = 1\n")
+    monkeypatch.setattr(code_candidate_local, "_run_rg_argv", lambda *a, **k: pytest.fail("AND scope needs only one full-source scan"))
+    outcome = discover_candidate_files(
+        workspace=_workspace(tmp_path),
+        scope=SimpleNamespace(paths=(), glob_patterns=(), grep_terms=("first", "second")),
+        query_terms=("target",),
+        budget=CandidateDiscoveryBudget(4, 1, 1024 * 1024, time.monotonic() + 5),
+    )
+    assert [f.relative_path for f in outcome.files] == ["z.py"]
+    assert outcome.diagnostics["files_matching_all_grep_terms"] == 1
+    assert outcome.diagnostics["file_limit_reached"] is True
+    assert outcome.diagnostics["read_bytes"] <= 1024 * 1024
+
+
+@pytest.mark.parametrize("read_passes,expected_files", [(1, 0), (2, 4)])
+def test_file_scope_leaves_canonical_read_budget(tmp_path, monkeypatch, read_passes, expected_files):
+    from retrieval.code_retrieval import CodeSearchScope, CodeRetrievalService
+
+    size = 8192
+    head = 'def target():\n    return "needle"\n#'
+    for i in range(4):
+        (tmp_path / f"module_{i}.py").write_text(head + "x" * (size - len(head)), encoding="utf-8")
+    monkeypatch.setattr(code_candidate_local, "_run_rg_argv", lambda *a, **k: pytest.fail("Redundant ripgrep scan"))
+    scope = CodeSearchScope(grep_terms=("target", "needle"))
+    budget = CandidateDiscoveryBudget(4, 4, 4 * size * read_passes, time.monotonic() + 10)
+    discovery = discover_candidate_files(workspace=_workspace(tmp_path), scope=scope,
+        query_terms=("target",), budget=budget)
+    assert discovery.read_meter.used == 4 * size
+    assert discovery.diagnostics["files_matching_all_grep_terms"] == 4
+    assert discovery.diagnostics["backend"] == "literal_scan"
+    corpus = build_candidate_corpus(workspace=_workspace(tmp_path), discovery=discovery,
+        account_id="acct", scope=scope, query_terms=("target",), snippet_limit=10,
+        deadline=budget.deadline, record_matches_scope=CodeRetrievalService._record_matches_scope)
+    assert corpus.diagnostics["files_read"] == expected_files
+    assert len(corpus.records) == expected_files
+    assert discovery.read_meter.used == budget.read_bytes
+    assert corpus.diagnostics["read_limit_reached"] is (read_passes == 1)
+
+
+@pytest.mark.parametrize("paths,globs,expected", [
+    (("z/target.py",), (), {"z/target.py"}),
+    (("z",), (), {"z/target.py", "z/other.py"}),
+    ((), ("z/*.py",), {"z/target.py", "z/other.py"}),
+    (("z",), ("*/target.py",), {"z/target.py"}),
+    (("z/target.py", "a.py"), ("z/*.py",), {"z/target.py"}),
+])
+def test_scoped_files_keep_read_budget_with_outside_files(tmp_path, paths, globs, expected):
+    from retrieval.code_retrieval import CodeSearchScope, CodeRetrievalService
+
+    source = 'def target():\n    return "needle"\n'
+    for name in ("a.py", "a/target.py", "z/other.py", "z/target.py"):
+        path = tmp_path / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    scope = CodeSearchScope(paths=paths, glob_patterns=globs, grep_terms=("needle",))
+    budget = CandidateDiscoveryBudget(10, 10, 2 * len(source) * len(expected), time.monotonic() + 10)
+    discovery = discover_candidate_files(workspace=_workspace(tmp_path), scope=scope,
+        query_terms=("target",), budget=budget)
+    assert {f.relative_path for f in discovery.files} == expected
+    assert discovery.read_meter.used == len(source) * len(expected)
+    corpus = build_candidate_corpus(workspace=_workspace(tmp_path), discovery=discovery,
+        account_id="acct", scope=scope, query_terms=("target",), snippet_limit=10,
+        deadline=budget.deadline, record_matches_scope=CodeRetrievalService._record_matches_scope)
+    assert len(corpus.records) == len(expected)
+    assert discovery.read_meter.used == budget.read_bytes
+    assert not corpus.partial_failure
+
+
+@pytest.mark.parametrize("scope_override,expected", [
+    ({}, True),
+    ({"grep_terms": ("def atoms", "Atom")}, True),
+    ({"grep_terms": ("def atoms", "absent_source_term")}, False),
+    ({"root_slugs": ("other",)}, False),
+    ({"paths": ("other",)}, False),
+    ({"glob_patterns": ("other/*.py",)}, False),
+])
+def test_file_grep_scope_survives_method_chunking(tmp_path, scope_override, expected):
+    from retrieval.code_retrieval import CodeSearchScope, CodeRetrievalService
+
+    source = tmp_path / "basic.py"
+    source.write_text(
+        "class Basic:\n"
+        "    def atoms(self):\n        return {Atom()}\n" +
+        "".join(f"    def method_{i}(self):\n        return self.args\n" for i in range(180)),
+        encoding="utf-8",
+    )
+    # Terms in a different file must never satisfy this file's AND predicate.
+    (tmp_path / "other.py").write_text("absent_source_term = 1\n")
+    scope = CodeSearchScope(**{
+        "root_slugs": ("repo",), "paths": ("basic.py",),
+        "grep_terms": ("def atoms", "Atom", "args"), **scope_override,
+    })
+    discovery = CandidateDiscoveryOutcome(
+        files=(CandidateFile("basic.py", 0, 0, 0, ("walker",)),),
+        paths_by_relative={"basic.py": source}, literal_matches={},
+        read_meter=CandidateReadMeter(cap=1024 * 1024), diagnostics={},
+    )
+    corpus = build_candidate_corpus(
+        workspace=_workspace(tmp_path), discovery=discovery, account_id="acct",
+        scope=scope, query_terms=("atoms",), snippet_limit=500,
+        deadline=time.monotonic() + 10,
+        record_matches_scope=CodeRetrievalService._record_matches_scope,
+    )
+    targets = [r for r in corpus.records if r["metadata"]["symbol"] == "Basic.atoms"]
+    assert bool(targets) is expected
+    if expected:
+        assert "args" not in targets[0]["content"]
+        assert CodeRetrievalService._record_matches_scope(targets[0], scope)
+        assert all("_file_grep_terms" not in node.metadata for node in corpus.nodes_by_uri.values())
+        if scope.grep_terms == ("def atoms", "Atom"):
+            assert not any(r["metadata"]["symbol"].startswith("Basic.method_") for r in corpus.records)
+
+
 @pytest.fixture(autouse=True)
 def _patch_bm25_tokenizer(monkeypatch):
     """Keep candidate unit tests independent of unavailable NLTK corpora."""
