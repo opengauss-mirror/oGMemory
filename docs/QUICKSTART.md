@@ -37,10 +37,6 @@ ogmem stop local
 - [用户一键部署与体验指南](../deploy/user-quickstart/README_zh.md)
 - [记忆评测教程](testing/memory-evaluation-guide-zh.md#10-一键部署实例)
 
-## OpenClaw 源码部署
-
-需要直接运行 OpenClaw 和 oGMemory 时，按[源码部署教程](deployment/openclaw_context_engine_quickstart_zh.md)执行。
-
 ## 客户端接入
 
 服务启动后，按客户端类型选择[集成总览](integrations/README.md)：

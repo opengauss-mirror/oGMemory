@@ -60,7 +60,6 @@ Deep Agents 中间件的导入路径为 `integrations.deepagents`。各客户端
 | --- | --- |
 | `docs/architecture/` | 仓库布局、存储格式、抽取流程和异步索引设计 |
 | `docs/integrations/` | HTTP、Python、MCP 和 Agent 客户端接入 |
-| `docs/deployment/` | 镜像构建、源码部署和运维操作 |
 | `docs/testing/` | LoCoMO 评测和 Jenkins 测试方案 |
 
 [文档总览](../README.md)提供快速开始、配置和各专题入口。
