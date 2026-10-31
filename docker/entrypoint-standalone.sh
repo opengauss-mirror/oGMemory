@@ -6,79 +6,80 @@ CONFIG_SRC="${OGMEM_CONFIG:-/etc/ogmem/config.yaml}"
 CONFIG_WORK="/tmp/ogmem.resolved.yaml"
 
 python3 << 'PYEOF'
-import json, re, os, sys
+import os
+import re
+
+import yaml
+from psycopg2.extensions import make_dsn
 
 path_src = os.environ.get("OGMEM_CONFIG", "/etc/ogmem/config.yaml")
 path_dst = "/tmp/ogmem.resolved.yaml"
 
-with open(path_src) as f:
-    content = f.read()
+# Parse before interpolation: values containing quotes, newlines or YAML syntax
+# remain scalar data, and connection overrides do not depend on field layout.
+with open(path_src) as stream:
+    config = yaml.safe_load(stream)
+if not isinstance(config, dict):
+    raise ValueError("configuration must be a YAML mapping")
 
-def replace_env(m):
-    var = m.group(1)
-    val = os.environ.get(var)
-    if val is not None:
-        return val
-    return m.group(0)
 
-content = re.sub(r'\$\{(\w+)\}', replace_env, content)
-
-def dsn_value(value):
-    # libpq needs its own escaping, independently of YAML and regex escaping.
-    if any(c.isspace() or c in "\\'\"" for c in value):
-        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+def expand(value):
+    if isinstance(value, str):
+        return re.sub(r'\$\{(\w+)\}', lambda m: os.environ.get(m[1], m[0]), value)
+    if isinstance(value, list):
+        return [expand(item) for item in value]
+    if isinstance(value, dict):
+        return {key: expand(item) for key, item in value.items()}
     return value
 
 
-# Patch vector_db.connection_string from VECTOR_DB_* env vars. The legacy
-# OPENGAUSS_* spellings still work as fallbacks for older deploy scripts.
-# VECTOR_DB_HOST_PORT (not VECTOR_DB_PORT) is the port we dial: compose
-# runs ogmem on the host network namespace, so we reach the bridge-
-# networked opengauss sibling via loopback on the HOST port (the one
-# compose forwards to the openGauss container's internal port). The
-# legacy OPENGAUSS_PORT env var (pre-rename) carries the same value.
-# Do not replace a mounted YAML DSN unless connection overrides were supplied.
+config = expand(config)
+
+# VECTOR_DB_HOST_PORT is the host-published port; VECTOR_DB_PORT is the
+# container-internal port and must not be used on the host network path.
+# Legacy OPENGAUSS_* names remain fallbacks. Preserve mounted SQL DSNs unless
+# a connection override was supplied; non-SQL vector providers are untouched.
 vector_overrides = (
     "VECTOR_DB_HOST", "VECTOR_DB_HOST_PORT", "VECTOR_DB_NAME",
     "VECTOR_DB_USER", "VECTOR_DB_PASSWORD", "OPENGAUSS_HOST",
     "OPENGAUSS_PORT", "OPENGAUSS_DBNAME", "OPENGAUSS_USER", "OPENGAUSS_PASSWORD",
 )
 if any(name in os.environ for name in vector_overrides):
-    og_host   = os.environ.get("VECTOR_DB_HOST") or os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
-    og_port   = os.environ.get("VECTOR_DB_HOST_PORT") or os.environ.get("OPENGAUSS_PORT", "5432")
-    og_dbname = os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres")
-    og_user   = os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb")
-    og_pass   = os.environ.get("VECTOR_DB_PASSWORD") or os.environ.get("OPENGAUSS_PASSWORD", "")
-    og_conn = f"host={og_host} port={og_port} dbname={og_dbname} user={og_user} password={dsn_value(og_pass)}"
-    # Match the connection_string that comes right after the `vector_db:` line.
-    content = re.sub(
-        r'(vector_db:\s*\n\s*type:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
-        lambda m: m.group(1) + json.dumps(og_conn),
-        content,
-    )
-    print(f"[entrypoint] Patched vector_db.connection_string: {og_host}:{og_port}/{og_dbname}")
+    vector = config.get("vector_db")
+    if not isinstance(vector, dict):
+        raise ValueError("database overrides require vector_db configuration")
+    vector_type = vector.get("type") or os.environ.get("VECTOR_DB_TYPE", "opengauss")
+    if str(vector_type).strip().casefold() == "opengauss":
+        vector["connection_string"] = make_dsn(
+            host=os.environ.get("VECTOR_DB_HOST") or os.environ.get("OPENGAUSS_HOST", "127.0.0.1"),
+            port=os.environ.get("VECTOR_DB_HOST_PORT") or os.environ.get("OPENGAUSS_PORT", "5432"),
+            dbname=os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres"),
+            user=os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb"),
+            password=os.environ.get("VECTOR_DB_PASSWORD", os.environ.get("OPENGAUSS_PASSWORD", "")),
+        )
+        print("[entrypoint] Patched vector_db.connection_string from environment overrides")
 
-# Patch storage.connection_string from STORAGE_DB_* env vars (postgres).
-# Only when STORAGE_DB_HOST is set — otherwise leave the YAML value as-is.
-# STORAGE_DB_HOST_PORT is the host port we dial (mirrors VECTOR_DB_HOST_PORT
-# above); the postgres container-internal port is hardcoded 5432, so there
-# is no STORAGE_DB_PORT variable on this path.
+# Storage is configured independently from the vector provider, including
+# deployments using Milvus with SQL context storage.
 if os.environ.get("STORAGE_DB_HOST"):
-    pg_host   = os.environ.get("STORAGE_DB_HOST")
-    pg_port   = os.environ.get("STORAGE_DB_HOST_PORT", "5432")
-    pg_dbname = os.environ.get("STORAGE_DB_NAME", "ogmem")
-    pg_user   = os.environ.get("STORAGE_DB_USER", "ogmem")
-    pg_pass   = os.environ.get("STORAGE_DB_PASSWORD", "")
-    pg_conn = f"host={pg_host} port={pg_port} dbname={pg_dbname} user={pg_user} password={dsn_value(pg_pass)}"
-    content = re.sub(
-        r'(storage:\s*\n\s*backend:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
-        lambda m: m.group(1) + json.dumps(pg_conn),
-        content,
+    storage = config.get("storage")
+    if not isinstance(storage, dict):
+        raise ValueError("database overrides require storage configuration")
+    storage["connection_string"] = make_dsn(
+        host=os.environ["STORAGE_DB_HOST"],
+        port=os.environ.get("STORAGE_DB_HOST_PORT", "5432"),
+        dbname=os.environ.get("STORAGE_DB_NAME", "ogmem"),
+        user=os.environ.get("STORAGE_DB_USER", "ogmem"),
+        password=os.environ.get("STORAGE_DB_PASSWORD", ""),
     )
-    print(f"[entrypoint] Patched storage.connection_string: {pg_host}:{pg_port}/{pg_dbname}")
+    print("[entrypoint] Patched storage.connection_string from environment overrides")
 
-with open(path_dst, "w") as f:
-    f.write(content)
+# Resolved YAML contains credentials. Tighten permissions before writing even
+# when the path already exists from a previous startup.
+fd = os.open(path_dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as stream:
+    os.fchmod(stream.fileno(), 0o600)
+    yaml.safe_dump(config, stream, allow_unicode=True)
 
 print(f"[entrypoint] Config resolved: {path_src} -> {path_dst}")
 PYEOF
