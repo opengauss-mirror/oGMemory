@@ -13,6 +13,22 @@
 
 ---
 
+## 效果验证
+
+oGMemory + OpenClaw CE 已完成 **tau2-bench** 多轮 Agent 任务评测。完整结果、配置及版本说明见[评测报告](docs/benchmarks/tau2-bench/README.md)。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
+  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
+</picture>
+
+- **Agent 经验记忆（tau2-bench）**：Retail 任务成功率由 **72.50% 提升至 81.56%（+9.06 个百分点）**，Airline 由 **65.00% 提升至 70.63%（+5.63 个百分点）**；加权合计由 **70.00% 提升至 77.92%（+7.92 个百分点）**。
+- **评测配置**：`doubao-seed-2.1-lite`、thinking 关闭、agent 记忆开启、单轮抽取；Retail 40 题、Airline 20 题，每组各重复 8 次，共 **960 次 rollout**，完整覆盖并通过原始评分核验。
+
+实测运行版为 `3b8c5ee`，CE 评测适配包含 32K 上下文组装预算及历史注入记忆去重。具体配置及其与本分支的版本关系见评测报告。
+
+---
+
 ## 问题：Token 预算是瓶颈
 
 每个 CLI Agent 运行在**固定的 token 预算**上。上下文窗口既是最昂贵的，也是最稀缺的资源。
