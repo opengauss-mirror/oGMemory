@@ -13,13 +13,6 @@ Documentation: [docs/README.md](docs/README.md)
 
 ---
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
-  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
-</picture>
-
----
-
 ## The Problem: Token Budget is the Bottleneck
 
 Every CLI Agent runs on a **fixed token budget**. The context window is both the most expensive and the most scarce resource.
@@ -372,6 +365,13 @@ ContextEngine is not "vector RAG with extra steps." The fundamental differences 
 | **Compression** | Signal scoring + protected nodes + summary chain (Phase 2) | None | None |
 
 The core distinction: ContextEngine treats context as a **managed lifecycle**, not a store-and-retrieve problem. Write policies are not configuration — they're architectural decisions derived from information semantics. Retrieval is not a single operation — it's a three-stage decision process with budget awareness. And the system is designed to run continuously across sessions, not just serve queries.
+
+---
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
+  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
+</picture>
 
 ---
 

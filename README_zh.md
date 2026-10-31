@@ -13,13 +13,6 @@
 
 ---
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
-  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
-</picture>
-
----
-
 ## 问题：Token 预算是瓶颈
 
 每个 CLI Agent 运行在**固定的 token 预算**上。上下文窗口既是最昂贵的，也是最稀缺的资源。
@@ -372,6 +365,13 @@ L0 → L1 → L2：每个层级产生信号浓度不同的 embedding。短文本
 | **异步索引** | Outbox 模式，至少一次投递，死信队列 | 通常同步写入 | 同步写入 |
 
 核心区别：ContextEngine 把上下文当作有生命周期的数据来管理，而不是当作一堆需要向量化的文本。
+
+---
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
+  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
+</picture>
 
 ---
 
