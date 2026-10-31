@@ -736,7 +736,7 @@ ContextFS / SQL 存储 + 向量索引
 | [Codex 对接](docs/integrations/codex.md) | Codex 插件安装与全生命周期 Hooks 配置 |
 | [DeepSeek Harness 对接](docs/integrations/deepseek-harness.md) | DSH 插件安装、配置与跨会话体验 |
 | [Hermes Agent 对接](docs/integrations/hermes.md) | Hermes MemoryProvider 安装、配置与体验 |
-| [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
+| [部署指南](docs/deployment.md) | 部署方式与入口 |
 | [OpenClaw + oGMemory Context Engine 单机部署](docs/deployment/openclaw_context_engine_quickstart_zh.md) | 拉取 `dev` 分支后的可验收部署教程 |
 | [OpenClaw + oGMemory 双接入镜像部署](deploy/ogmem_opengauss_deploy.md) | 一键复用 Context Engine、独立配置 MCP 的验证教程 |
 | [OpenClaw 插件](plugins/openclaw/README.md) | 集成搭建 |

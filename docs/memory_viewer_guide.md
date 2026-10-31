@@ -165,4 +165,3 @@ docker logs --tail 100 ogmem
 ## 相关文档
 
 - [openGauss 部署指南](../deploy/ogmem_opengauss_deploy.md)
-- [部署与运维指南](deployment/deployment_operations_guide.md)
