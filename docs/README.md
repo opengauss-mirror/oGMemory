@@ -3,7 +3,7 @@
 ## 入门
 
 - [特性能力与使用指南](features.md)：记忆写入、检索、管理、关系网络、学习复用等对外特性的介绍、操作步骤与效果验证。
-- [快速开始](QUICKSTART.md)：本地 CLI 启动，以及 Compose 和 ARM64 部署入口。
+- [快速开始](QUICKSTART.md)：本地 CLI 启动，以及 Compose、ARM64 和 OpenClaw 部署入口。
 - [客户端接入总览](integrations/README.md)：HTTP、Python、MCP 和 Agent 插件的选择规则。
 
 ## 配置
@@ -14,7 +14,10 @@
 ## 部署与运维
 
 - [Compose 部署](../deploy/compose/README_zh.md)：openGauss、oGMemory、HTTP 和 MCP 的容器部署。
-- [部署方式选择](deployment.md)：Compose 和 ARM64 部署入口。
+- [部署运维指南](deployment/deployment_operations_guide.md)：OpenClaw 容器部署、日志、健康检查和故障处理。
+- [Docker 部署说明](deployment/docker_deployment_guide.md)：镜像构建和容器运行参考。
+- [OpenClaw Context Engine 部署](deployment/openclaw_context_engine_quickstart_zh.md)：OpenClaw 单机接入。
+- [部署方式选择](deployment.md)：Compose、ARM64、源码和镜像部署。
 - [Memory Viewer 使用指南](memory_viewer_guide.md)：连接账户、浏览记忆和查看运行状态。
 
 ## 集成
