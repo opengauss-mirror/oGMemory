@@ -104,9 +104,39 @@ export OGMEM_CONFIG="${CONFIG_WORK}"
 CONFIG_ENV=$(python3 /opt/ogmem/scripts/yaml_to_env.py)
 eval "$CONFIG_ENV"
 
+# Keep the shell as PID 1 so signals reach every managed service. Register
+# cleanup before starting children, including bundled AGFS readiness checks.
+API_PID=""
+INDEX_PID=""
+MCP_PID=""
+AGFS_PID=""
+cleanup() {
+  status=$?
+  trap - EXIT
+  trap '' TERM INT
+  echo "[entrypoint] Shutting down..."
+  # Keep storage available until API, MCP and index workers have drained.
+  for pid in "$API_PID" "$MCP_PID" "$INDEX_PID"; do
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "$API_PID" "$MCP_PID" "$INDEX_PID"; do
+    if [ -n "$pid" ]; then
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  if [ -n "$AGFS_PID" ]; then
+    kill -TERM "$AGFS_PID" 2>/dev/null || true
+    wait "$AGFS_PID" 2>/dev/null || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+
 # Legacy configurations default to AGFS. Preserve their mounted /data/agfs;
 # never silently switch an existing deployment to an empty SQL database.
-AGFS_PID=""
 if [ "${OGMEM_START_BUNDLED_AGFS:-false}" = "true" ]; then
   if [ ! -x /opt/agfs/agfs-server ]; then
     echo "[entrypoint] Local AGFS storage requires the standalone-agfs build target. For standalone-no-agfs, configure storage.backend: sql or an external AGFS server." >&2
@@ -142,7 +172,6 @@ python3 /opt/ogmem/scripts/run_index_service.py &
 INDEX_PID=$!
 
 # --- 3. Start MCP streamable HTTP server (background, optional) ---
-MCP_PID=""
 if [ "${OGMEM_MCP_ENABLED:-true}" = "true" ] || [ "${OGMEM_MCP_ENABLED:-true}" = "1" ] || [ "${OGMEM_MCP_ENABLED:-true}" = "yes" ]; then
   OGMEM_MCP_BIND_HOST="${OGMEM_MCP_HOST:-0.0.0.0}"
   OGMEM_MCP_BIND_PORT="${OGMEM_MCP_PORT:-8091}"
@@ -158,32 +187,13 @@ else
   echo "[entrypoint] MCP server disabled"
 fi
 
-# --- 4. Trap signals for graceful shutdown ---
-cleanup() {
-  echo "[entrypoint] Shutting down..."
-  if [ -n "${MCP_PID}" ]; then
-    kill $MCP_PID 2>/dev/null || true
-  fi
-  kill $INDEX_PID 2>/dev/null || true
-  if [ -n "${AGFS_PID}" ]; then
-    kill "$AGFS_PID" 2>/dev/null || true
-    wait "$AGFS_PID" 2>/dev/null || true
-  fi
-  if [ -n "${MCP_PID}" ]; then
-    wait $MCP_PID 2>/dev/null || true
-  fi
-  wait $INDEX_PID 2>/dev/null || true
-  exit 0
-}
-trap cleanup TERM INT
-
-# --- 5. Start oG-Memory HTTP API (foreground, main process) ---
+# --- 4. Start and wait for the oGMemory HTTP API ---
 # cd ensures perf_logs/ and other relative paths resolve under /opt/ogmem (writable by ogmem user)
 cd /opt/ogmem
 OGMEM_PORT=${OGMEM_HTTP_PORT:-8090}
 OGMEM_THREADS=${OGMEM_THREADS:-${OGMEM_WORKERS:-2}}
 echo "[entrypoint] Starting oGMemory HTTP server on :${OGMEM_PORT} with 1 process and ${OGMEM_THREADS} threads..."
-exec python3 -m gunicorn \
+python3 -m gunicorn \
   --config python:server.gunicorn_config \
   --bind "0.0.0.0:${OGMEM_PORT}" \
   --workers 1 \
@@ -191,4 +201,12 @@ exec python3 -m gunicorn \
   --threads "${OGMEM_THREADS}" \
   --timeout "${OGMEM_GUNICORN_TIMEOUT:-900}" \
   --access-logfile - \
-  server.app:app
+  server.app:app &
+API_PID=$!
+# A failed foreground service must retain its exit status while EXIT cleans
+# up its siblings. Waiting as a builtin also lets TERM/INT interrupt promptly.
+if wait "$API_PID"; then
+  exit 0
+else
+  exit "$?"
+fi
