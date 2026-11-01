@@ -97,8 +97,9 @@ storage:
 # openGauss container's internal port (VECTOR_DB_PORT). Same reason as
 # STORAGE_DB_HOST_PORT above.
 vector_db:
-  type: opengauss  # memory / chroma / opengauss / milvus
-  # Milvus: set type: milvus and install .[milvus]. Embedding dimension must match.
+  type: opengauss
+  # Manual Milvus setup: set type: milvus and install .[milvus].
+  # Docker onboarding/quickstart uses opengauss. Embedding dimension must match.
   # milvus_uri: "http://localhost:19530"    # MILVUS_URI
   # milvus_collection: "contextengine"     # MILVUS_COLLECTION
   # milvus_db_name: "default"              # MILVUS_DB_NAME

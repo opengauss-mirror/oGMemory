@@ -27,7 +27,9 @@ vector_db:
 凭据通过 `MILVUS_TOKEN` 注入，不提交到配置文件。数据库须预先存在；集合和缺失的索引会在启动时创建。
 当前使用 HNSW/COSINE，已有集合的字段类型、维度和 VARCHAR 字节容量必须兼容。
 
-沿用 oGMemory 现有服务启动方式和部署配置，无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
+CLI 的 `onboard --mode local` 和 `onboard --mode headless` 支持 `--vector-db milvus`；`onboard --mode docker` 及其 Docker quickstart 仅支持 openGauss。
+
+手动配置容器时，使用包含 Milvus 可选依赖的运行镜像并挂载上述 YAML 配置；无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
 Milvus 服务由外部部署管理；配置其可达地址。容器中的 `127.0.0.1` 指向容器自身，跨容器连接应使用可解析的服务名或其他可达入口。
 现有运行镜像如果未包含 pymilvus，需要在该运行环境安装上述可选依赖。
 

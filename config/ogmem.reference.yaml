@@ -56,12 +56,13 @@ embedding:
 
 # ---- Vector Database [all] ----
 vector_db:
-  type: chroma                   # [all] memory / chroma / opengauss / milvus
+  type: chroma                   # [local] memory (quickstart) / chroma / opengauss / milvus
                                   # [docker] opengauss (recommended for production)
   # --- Chroma (local) ---
   chroma_persist_dir: ".ogmem_data/chroma"  # [local]
   # chroma_collection: "contextengine"
   # --- Milvus (external service; install .[milvus]) ---
+  # Local/headless or manually configured containers; Docker quickstart uses opengauss.
   # Selected by vector_db.type: milvus, through the same provider factory.
   # See docs/integrations/milvus.md. Embedding dimension must match.
   # milvus_uri: "http://localhost:19530"    # MILVUS_URI
