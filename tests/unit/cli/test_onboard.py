@@ -242,3 +242,45 @@ def test_local_database_failure_stops_before_install_or_config(
         assert calls == ["schema", "install", "config"]
     if not compatible:
         assert "schema" not in calls
+
+
+@pytest.mark.parametrize("backend", ["chroma", "milvus"])
+@pytest.mark.parametrize("non_interactive", [False, True])
+def test_docker_rejects_unsupported_vector_before_other_steps(monkeypatch, capsys, backend, non_interactive):
+    args = build_parser().parse_args(["onboard", "--mode", "docker", "--vector-db", backend])
+    args.non_interactive = non_interactive
+    monkeypatch.setattr(onboard, "_step5_target", lambda args: "docker")
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("must reject before system checks or model prompts")
+
+    monkeypatch.setattr(onboard, "_step1_check", unexpected)
+    monkeypatch.setattr(onboard, "_step2_llm", unexpected)
+    assert onboard.run(args) == 1
+    output = capsys.readouterr().out
+    assert backend in output and "only openGauss" in output
+    assert "--mode local" in output and "--mode headless" in output
+
+
+def test_docker_interactive_vector_menu_only_offers_opengauss(monkeypatch):
+    args = build_parser().parse_args(["onboard", "--mode", "docker"])
+    monkeypatch.setattr(onboard, "_print_header", lambda *args: None)
+    monkeypatch.setattr(onboard, "input_validated", lambda *args: "host=db")
+    monkeypatch.setattr(onboard, "confirm", lambda *args, **kwargs: True)
+    seen = []
+
+    def choose(prompt, options, **kwargs):
+        if prompt == "Vector database:":
+            seen.append(options)
+        return 0
+
+    monkeypatch.setattr(onboard, "select", choose)
+    vdb, _ = onboard._step4_database(args)
+    assert vdb["type"] == "opengauss"
+    assert seen == [["openGauss"]]
+
+
+@pytest.mark.parametrize("mode", ["local", "headless"])
+def test_local_vector_choices_keep_chroma_and_milvus(mode):
+    args = build_parser().parse_args(["onboard", "--mode", mode, "--vector-db", "milvus"])
+    assert onboard._vector_db_choices(args) == ["opengauss", "chroma", "milvus"]

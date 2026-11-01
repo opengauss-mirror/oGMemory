@@ -126,18 +126,34 @@ def _step3_embedding(args, llm_config: dict) -> dict:
     }
 
 
+def _vector_db_choices(args) -> list[str]:
+    choices = (
+        ["opengauss"] if getattr(args, "mode", None) == "docker"
+        else ["opengauss", "chroma", "milvus"]
+    )
+    requested = getattr(args, "vector_db", None) or "opengauss"
+    if requested not in choices:
+        raise ValueError(
+            f"Docker quickstart supports only openGauss; requested {requested!r}. "
+            "Use --mode local or --mode headless for Chroma/Milvus."
+        )
+    return choices
+
+
 def _step4_database(args) -> tuple[dict, dict]:
     """Vector DB + SQL storage configuration and schema init."""
     _print_header(5, "Database Configuration")
 
-    # Vector DB type
+    # Restrict choices to the selected deployment before prompting.
+    vector_types = _vector_db_choices(args)
     if getattr(args, "non_interactive", False):
         vdb_type = getattr(args, "vector_db", None) or "opengauss"
     else:
-        vector_types = ["opengauss", "chroma", "milvus"]
         requested = getattr(args, "vector_db", None) or "opengauss"
+        labels = {"opengauss": "openGauss", "chroma": "Chroma", "milvus": "Milvus"}
         vdb_type = vector_types[
-            select("Vector database:", ["openGauss", "Chroma", "Milvus"], default=vector_types.index(requested))
+            select("Vector database:", [labels[name] for name in vector_types],
+                   default=vector_types.index(requested))
         ]
 
     vdb = {"type": vdb_type}
@@ -303,7 +319,10 @@ def _step_docker_setup(args, llm: dict, embedding: dict, vdb: dict) -> dict:
     root = find_project_root()
     result = {}
     if vdb.get("type", "opengauss") != "opengauss":
-        print(fail("Docker quickstart requires OpenGauss; Chroma is only supported by local mode"))
+        print(fail(
+            f"Docker quickstart supports only openGauss; requested {vdb['type']!r}. "
+            "Use --mode local or --mode headless for Chroma/Milvus."
+        ))
         result["deploy_failed"] = True
         return result
     state_root = root / ".ogmem_data" / "onboard-docker"
@@ -454,6 +473,12 @@ def run(args) -> int:
     if deployment == "plugin":
         from cli.commands.plugin_config import run as export_plugin_config
         return export_plugin_config(args)
+
+    try:
+        _vector_db_choices(args)
+    except ValueError as exc:
+        print(fail(str(exc)))
+        return 1
 
     from cli.lib.onboard_config import existing_defaults, read_config
     from cli.lib.process import find_project_root
