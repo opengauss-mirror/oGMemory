@@ -668,7 +668,13 @@ class SQLContextFS(PoolAdapterMixin):
         if guard is not None:
             self._ensure_accessible(directory, ctx)
             guard.check_database(self._connection_string, self.sql_dialect.name)
-            with guard.identity_lock(key, ctx, 1.0 if active else _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS):
+            timeout = 1.0 if active else _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS
+            if active and getattr(active, "wait_for_identity_lock", False):
+                from core.operation_deadline import remaining_seconds
+                remaining = remaining_seconds()
+                timeout = (_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS if remaining is None
+                           else min(_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS, remaining))
+            with guard.identity_lock(key, ctx, timeout):
                 yield
             return
         with self.tool_output_mutation_lock(

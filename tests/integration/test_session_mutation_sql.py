@@ -39,7 +39,10 @@ def database():
     created = []
 
     def make():
-        pool = SharedConnectionPool(dsn, pool_size=1)
+        pool = SharedConnectionPool(
+            dsn, pool_size=1,
+            dialect=os.environ.get("OGMEM_IDENTITY_TEST_DIALECT", "postgresql"),
+        )
         fs = SQLContextFS(pool=pool)
         outbox = SQLOutboxStore(pool=pool, fs=fs)
         archive = SQLSessionArchiveStore(pool=pool)
