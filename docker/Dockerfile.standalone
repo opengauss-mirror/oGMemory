@@ -106,6 +106,7 @@ ENTRYPOINT ["/opt/entrypoint.sh"]
 
 # Opt-in compatibility stages; BuildKit skips these for the default target.
 FROM golang:1.25-bookworm AS agfs-builder
+ARG GOPROXY=https://proxy.golang.org,direct
 WORKDIR /src/agfs
 COPY agfs/ ./
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /agfs-server ./cmd/server
