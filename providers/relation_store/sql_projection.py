@@ -137,10 +137,12 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
-                # Also scrub pre-upgrade orphan payloads. New physical deletes
-                # are covered atomically by the context_nodes delete trigger.
+                # Scrub only unfinished pre-upgrade orphan payloads. Completed
+                # history must not be revisited on every claim. New physical
+                # deletes are covered atomically by the node delete trigger.
                 cur.execute("""DELETE FROM edge_projection_jobs j
-                    WHERE j.account_id=%s AND (
+                    WHERE j.account_id=%s
+                      AND j.status IN ('PENDING', 'FAILED', 'PROCESSING') AND (
                         NOT EXISTS (SELECT 1 FROM context_nodes s
                                     WHERE s.account_id=j.account_id AND s.uri=j.source_uri)
                         OR NOT EXISTS (SELECT 1 FROM context_nodes t
@@ -237,6 +239,24 @@ class SQLEdgeProjectionStore(PoolAdapterMixin):
             conn.rollback()
             raise
         finally:
+            self._return_connection(conn)
+
+    def has_due_work(self, account_id: str) -> bool:
+        """Tenant-bound indexed probe, excluding all COMPLETE job history."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute("""SELECT 1 FROM edge_projection_jobs
+                    WHERE account_id=%s
+                      AND status IN ('PENDING', 'FAILED', 'PROCESSING')
+                      AND (status='PENDING'
+                           OR (status='FAILED' AND (next_retry_at IS NULL OR next_retry_at<=NOW()))
+                           OR (status='PROCESSING' AND updated_at<=NOW()-INTERVAL '5 minutes'))
+                    LIMIT 1""", (account_id,))
+                return cur.fetchone() is not None
+        finally:
+            conn.rollback()
             self._return_connection(conn)
 
     def drain_sync(

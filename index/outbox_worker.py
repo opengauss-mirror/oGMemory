@@ -19,6 +19,7 @@ import logging
 import re
 import uuid
 from contextlib import ExitStack, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
@@ -121,15 +122,30 @@ class OutboxWorker:
         self._agent_memory_handler = agent_memory_handler
         self._memory_projection_handler = memory_projection_handler
         self._edge_projection_store, self._edge_projection_profile = edge_projection_components or (None,None)
-        self._graph_accounts = set()
+        self._graph_poll_accounts = ContextVar("graph_projection_poll_accounts", default=None)
+
+    def _project_graph_account(self, account):
+        """Bound work to one due drain per account in this polling context.
+
+        Durable PROJECT_GRAPH events retain retry/restart discovery; there is
+        no lifetime cache of tenants. Standalone process_event calls also work.
+        """
+        polled = self._graph_poll_accounts.get()
+        if polled is not None:
+            if account in polled:
+                return 0
+            polled.add(account)
+        store = self._edge_projection_store
+        if self._has_real_method(store, "has_due_work") and not store.has_due_work(account):
+            return 0
+        return store.drain_sync(account, self._embedder, self._edge_projection_profile)
 
     def _drain_graph(self, accounts, stats):
         if self._edge_projection_store is None:
             return
-        self._graph_accounts.update(accounts)
-        for account in sorted(self._graph_accounts):
+        for account in sorted(set(accounts)):
             try:
-                count = self._edge_projection_store.drain_sync(account,self._embedder,self._edge_projection_profile)
+                count = self._project_graph_account(account)
                 stats["edge_projections"] = stats.get("edge_projections",0) + count
             except Exception:
                 stats["edge_projection_failures"] = stats.get("edge_projection_failures",0) + 1
@@ -214,8 +230,7 @@ class OutboxWorker:
                 resolved_ctx = ctx or self._build_request_context(event)
                 if resolved_ctx is None:
                     raise ValueError("Missing graph projection account")
-                count = self._edge_projection_store.drain_sync(
-                    resolved_ctx.account_id,self._embedder,self._edge_projection_profile)
+                count = self._project_graph_account(resolved_ctx.account_id)
                 if self._edge_projection_store.unfinished(resolved_ctx.account_id,event.payload["edge_id"]):
                     raise RuntimeError("Graph projection is pending; retain durable wakeup for retry")
                 return WorkerResult(event_id=event.event_id,success=True,records_upserted=count)
@@ -1195,6 +1210,20 @@ class OutboxWorker:
                 self._handle_processing_result(event, node_uri, outbox_store, failure, stats)
 
     def run_once(
+        self,
+        outbox_store,
+        account_ids: list[str],
+        worker_id: str = "default",
+    ) -> dict:
+        # Context-local state is reset even on errors and cannot suppress a
+        # future retry, another worker, or a concurrent polling context.
+        token = self._graph_poll_accounts.set(set())
+        try:
+            return self._run_once(outbox_store, account_ids, worker_id)
+        finally:
+            self._graph_poll_accounts.reset(token)
+
+    def _run_once(
         self,
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
         account_ids: list[str],

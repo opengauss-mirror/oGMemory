@@ -205,6 +205,9 @@ class OneHopRetriever(BaseGraphRetriever):
         )
         self._expansion_limit = self._config.get("expansion_limit", 5)
         self._edges_per_node = self._config.get("edges_per_node", 3)
+        # SQL's weight-ordered limit bounds candidate IO, not valid results.
+        # Look past rejected/duplicate edges without reading an unbounded graph.
+        self._candidate_limit = max(128, self._edges_per_node)
         self._min_weight = self._config.get("min_weight", 0.0)
         self._similarity_threshold = self._config.get("edge_similarity_threshold", 0.35)
 
@@ -243,7 +246,7 @@ class OneHopRetriever(BaseGraphRetriever):
 
     def _relation_neighbors(self, uri: str, ctx: RequestContext) -> list[RelationNeighbor]:
         return self._read_relation_neighbors(
-            uri, ctx, limit=self._edges_per_node, min_weight=self._min_weight
+            uri, ctx, limit=self._candidate_limit, min_weight=self._min_weight
         )
 
     async def search(
@@ -319,7 +322,7 @@ class OneHopRetriever(BaseGraphRetriever):
                 continue
 
             report.candidate_edge_count += len(neighbors)
-
+            anchor_neighbors: dict[str, GraphHit] = {}
             for nb in neighbors:
                 if categories is not None and nb.category not in categories:
                     report.hydration_rejection_count += 1
@@ -349,11 +352,11 @@ class OneHopRetriever(BaseGraphRetriever):
                     continue
                 report.accepted_edge_count += 1
                 graph_score = similarity * weight
-                existing = graph_hits.get(normalized)
+                existing = anchor_neighbors.get(normalized)
                 if existing is not None:
                     report.deduplicated_target_count += 1
                 if existing is None or graph_score > existing.score:
-                    graph_hits[normalized] = GraphHit(
+                    anchor_neighbors[normalized] = GraphHit(
                         uri=nb_uri,
                         score=graph_score,
                         hop_distance=1,
@@ -368,6 +371,17 @@ class OneHopRetriever(BaseGraphRetriever):
                         source_revision=nb.source_revision,
                         target_revision=nb.target_revision,
                     )
+
+            # Apply the per-anchor quota only after authorization (store),
+            # category/projection/similarity checks and target deduplication.
+            valid = sorted(anchor_neighbors.values(), key=lambda item: (-item.score, item.uri))
+            for candidate in valid[:self._edges_per_node]:
+                normalized = strip_l2_suffix(candidate.uri)
+                existing = graph_hits.get(normalized)
+                if existing is not None:
+                    report.deduplicated_target_count += 1
+                if existing is None or candidate.score > existing.score:
+                    graph_hits[normalized] = candidate
 
         ranked_neighbors = sorted(graph_hits.values(), key=lambda item: (-item.score, item.uri))
         # ``top_k`` bounds graph additions; anchors are an additive mandatory
