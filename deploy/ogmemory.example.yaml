@@ -99,7 +99,7 @@ storage:
 vector_db:
   type: opengauss
   # Manual Milvus setup: set type: milvus and install .[milvus].
-  # Docker onboarding/quickstart uses opengauss. Embedding dimension must match.
+  # Docker onboarding/quickstart also supports Milvus. Embedding dimension must match.
   # milvus_uri: "http://localhost:19530"    # MILVUS_URI
   # milvus_collection: "contextengine"     # MILVUS_COLLECTION
   # milvus_db_name: "default"              # MILVUS_DB_NAME

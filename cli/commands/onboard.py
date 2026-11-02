@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import shutil
 import subprocess
 import sys
@@ -127,24 +129,14 @@ def _step3_embedding(args, llm_config: dict) -> dict:
 
 
 def _vector_db_choices(args) -> list[str]:
-    choices = (
-        ["opengauss"] if getattr(args, "mode", None) == "docker"
-        else ["opengauss", "chroma", "milvus"]
-    )
-    requested = getattr(args, "vector_db", None) or "opengauss"
-    if requested not in choices:
-        raise ValueError(
-            f"Docker quickstart supports only openGauss; requested {requested!r}. "
-            "Use --mode local or --mode headless for Chroma/Milvus."
-        )
-    return choices
+    return ["opengauss", "chroma", "milvus"]
 
 
 def _step4_database(args) -> tuple[dict, dict]:
     """Vector DB + SQL storage configuration and schema init."""
     _print_header(5, "Database Configuration")
 
-    # Restrict choices to the selected deployment before prompting.
+    # All supported providers use the same configuration path.
     vector_types = _vector_db_choices(args)
     if getattr(args, "non_interactive", False):
         vdb_type = getattr(args, "vector_db", None) or "opengauss"
@@ -157,6 +149,20 @@ def _step4_database(args) -> tuple[dict, dict]:
         ]
 
     vdb = {"type": vdb_type}
+    if vdb_type == "milvus":
+        default_uri = getattr(args, "milvus_uri", None) or os.environ.get("MILVUS_URI") or (
+            "http://host.docker.internal:19530" if getattr(args, "mode", None) == "docker"
+            else "http://localhost:19530"
+        )
+        vdb["milvus_uri"] = (default_uri if getattr(args, "non_interactive", False)
+                             else input_validated("Milvus URI", default_uri))
+        vdb["milvus_collection"] = getattr(args, "milvus_collection", None) or os.environ.get("MILVUS_COLLECTION", "contextengine")
+        vdb["milvus_db_name"] = getattr(args, "milvus_db_name", None) or os.environ.get("MILVUS_DB_NAME", "default")
+        timeout = getattr(args, "milvus_timeout", None)
+        timeout = float(timeout if timeout is not None else os.environ.get("MILVUS_TIMEOUT", "30"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Milvus timeout must be finite and positive")
+        vdb["milvus_timeout"] = timeout
     storage_backend = getattr(args, "storage_backend", None) or "sql"
 
     database_required = storage_backend == "sql" or vdb_type == "opengauss"
@@ -318,13 +324,6 @@ def _step_docker_setup(args, llm: dict, embedding: dict, vdb: dict) -> dict:
 
     root = find_project_root()
     result = {}
-    if vdb.get("type", "opengauss") != "opengauss":
-        print(fail(
-            f"Docker quickstart supports only openGauss; requested {vdb['type']!r}. "
-            "Use --mode local or --mode headless for Chroma/Milvus."
-        ))
-        result["deploy_failed"] = True
-        return result
     state_root = root / ".ogmem_data" / "onboard-docker"
     env_path = state_root / "ogmemory.env"
     runtime_env_path = state_root / "ogmemory-runtime.env"
@@ -341,6 +340,7 @@ def _step_docker_setup(args, llm: dict, embedding: dict, vdb: dict) -> dict:
         generate_quickstart_env(
             llm,
             embedding,
+            vector_config=vdb,
             instance_name=instance_name,
             opengauss_port=args.opengauss_port,
             ogmem_http_port=args.port,
@@ -474,12 +474,6 @@ def run(args) -> int:
         from cli.commands.plugin_config import run as export_plugin_config
         return export_plugin_config(args)
 
-    try:
-        _vector_db_choices(args)
-    except ValueError as exc:
-        print(fail(str(exc)))
-        return 1
-
     from cli.lib.onboard_config import existing_defaults, read_config
     from cli.lib.process import find_project_root
     root = find_project_root()
@@ -522,7 +516,11 @@ def run(args) -> int:
         return 1
 
     # Database (Vector DB + SQL storage)
-    vdb_config, db_config = _step4_database(args)
+    try:
+        vdb_config, db_config = _step4_database(args)
+    except ValueError as exc:
+        print(fail(str(exc)))
+        return 1
 
     if deployment == "docker":
         docker_setup = _step_docker_setup(args, llm_config, embedding_config, vdb_config)

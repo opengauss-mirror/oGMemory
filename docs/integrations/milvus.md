@@ -27,7 +27,14 @@ vector_db:
 凭据通过 `MILVUS_TOKEN` 注入，不提交到配置文件。数据库须预先存在；集合和缺失的索引会在启动时创建。
 当前使用 HNSW/COSINE，已有集合的字段类型、维度和 VARCHAR 字节容量必须兼容。
 
-CLI 的 `onboard --mode local` 和 `onboard --mode headless` 支持 `--vector-db milvus`；`onboard --mode docker` 及其 Docker quickstart 仅支持 openGauss。
+CLI 的 local、headless 和 Docker 向导均支持 `--vector-db milvus`。例如：
+
+```bash
+ogmem onboard --mode docker --vector-db milvus \
+  --milvus-uri http://host.docker.internal:19530 --milvus-collection contextengine
+```
+
+Docker quickstart 根据选择生成后端配置：openGauss 创建配套数据库，Chroma 持久化到实例目录，Milvus 连接外部服务。Chroma/Milvus 默认通过现有 `docker/Dockerfile.standalone` 构建包含所选依赖的镜像；也可在部署环境文件中设置 `OGMEM_IMAGE` 使用已构建镜像。切换已有实例的后端或 Milvus 集合需使用新实例并重建索引。
 
 手动配置容器时，使用包含 Milvus 可选依赖的运行镜像并挂载上述 YAML 配置；无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
 Milvus 服务由外部部署管理；配置其可达地址。容器中的 `127.0.0.1` 指向容器自身，跨容器连接应使用可解析的服务名或其他可达入口。
@@ -49,12 +56,13 @@ YAML 中显式配置的字段优先于环境变量。向量后端切换不会自
 
 - 支持幂等 upsert、向量检索、子节点检索、embedding 复用、记录读取和账户/owner 范围删除。
 - 租户、owner、URI、层级、目录和资源类型在 Milvus 内过滤后再执行 top-k。
-- 读取采用 Strong consistency，每个适配器 RPC 显式传递超时；启动支持索引缺失恢复及并发创建。
-- embedding 转换为实际存储的 FLOAT32 后校验有限且非零，写入前检查 UTF-8 字节上限；超限明确报错，不静默截断。范围删除不将全部 ID 拉回应用内存。
+- 读取采用 Strong consistency；直接使用带超时的 query 和主键游标分页，避开 SDK QueryIterator 的无超时初始化 RPC，不依赖 offset 上限。启动支持索引缺失恢复及并发创建。
+- 为 account_id、owner_space、level、parent_uri、uri 补建标量 AUTOINDEX；已有标量索引保留。性能收益需按部署数据量与过滤选择率压测。
+- embedding 转换为实际存储的 FLOAT32 后校验有限且非零，写入前检查 UTF-8 字节上限；正文按 UTF-8 边界拆入 5 个 VARCHAR 字段，覆盖现有 256 KiB Skill 容量，读取和 embedding 原文校验会完整拼回。超出总容量明确报错，不静默截断。范围删除不将全部 ID 拉回应用内存。
 - `get_record` 通过 `filters` 恢复已持久化的范围字段，写回时以这些字段为准；metadata 保留原始 JSON，不重复补入范围列，避免读取后重写突破容量上限。
 - 保留 JSON 元数据和 grounding。AGFS/SQL 存储配置由现有 `storage` 段独立决定，Milvus 只负责向量索引。
 
-目前实测组合为 Milvus 2.6.13 + pymilvus 2.6.17、ARM64 Standalone。
+当前实现要求 Milvus 2.6 系列及 pymilvus >=2.6.17,<2.7，实测组合为 Milvus 2.6.13 + pymilvus 2.6.17、ARM64 Standalone。升级时应先停止旧版写入进程：启动会向旧集合补建 4 个 nullable 正文字段及缺失的标量索引，需要相应 schema/index 权限；旧数据不重写。旧版适配器无法读回新写入的大正文。
 可选依赖的 SDK 版本范围不代表服务端兼容矩阵；其他版本、Lite、Distributed/Kubernetes 和托管服务需分别验证。
 
 ## 自动化测试

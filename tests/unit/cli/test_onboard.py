@@ -246,23 +246,26 @@ def test_local_database_failure_stops_before_install_or_config(
 
 @pytest.mark.parametrize("backend", ["chroma", "milvus"])
 @pytest.mark.parametrize("non_interactive", [False, True])
-def test_docker_rejects_unsupported_vector_before_other_steps(monkeypatch, capsys, backend, non_interactive):
+def test_docker_passes_selected_vector_to_deployment(monkeypatch, backend, non_interactive):
     args = build_parser().parse_args(["onboard", "--mode", "docker", "--vector-db", backend])
     args.non_interactive = non_interactive
     monkeypatch.setattr(onboard, "_step5_target", lambda args: "docker")
+    monkeypatch.setattr(onboard, "_step1_check", lambda args: True)
+    monkeypatch.setattr(onboard, "_step2_llm", lambda args: {"provider": "openai", "model": "test"})
+    monkeypatch.setattr(onboard, "_step3_embedding", lambda *args: {"dimension": 3})
+    monkeypatch.setattr(onboard, "_step4_database", lambda args: ({"type": backend}, {}))
+    received = []
 
-    def unexpected(*args, **kwargs):
-        raise AssertionError("must reject before system checks or model prompts")
+    def deploy(args, llm, embedding, vdb):
+        received.append(vdb)
+        return {"env_path": "/tmp/test.env"}
 
-    monkeypatch.setattr(onboard, "_step1_check", unexpected)
-    monkeypatch.setattr(onboard, "_step2_llm", unexpected)
-    assert onboard.run(args) == 1
-    output = capsys.readouterr().out
-    assert backend in output and "only openGauss" in output
-    assert "--mode local" in output and "--mode headless" in output
+    monkeypatch.setattr(onboard, "_step_docker_setup", deploy)
+    assert onboard.run(args) == 0
+    assert received == [{"type": backend}]
 
 
-def test_docker_interactive_vector_menu_only_offers_opengauss(monkeypatch):
+def test_docker_interactive_vector_menu_offers_supported_providers(monkeypatch):
     args = build_parser().parse_args(["onboard", "--mode", "docker"])
     monkeypatch.setattr(onboard, "_print_header", lambda *args: None)
     monkeypatch.setattr(onboard, "input_validated", lambda *args: "host=db")
@@ -277,10 +280,33 @@ def test_docker_interactive_vector_menu_only_offers_opengauss(monkeypatch):
     monkeypatch.setattr(onboard, "select", choose)
     vdb, _ = onboard._step4_database(args)
     assert vdb["type"] == "opengauss"
-    assert seen == [["openGauss"]]
+    assert seen == [["openGauss", "Chroma", "Milvus"]]
 
 
 @pytest.mark.parametrize("mode", ["local", "headless"])
 def test_local_vector_choices_keep_chroma_and_milvus(mode):
     args = build_parser().parse_args(["onboard", "--mode", mode, "--vector-db", "milvus"])
     assert onboard._vector_db_choices(args) == ["opengauss", "chroma", "milvus"]
+
+
+def test_milvus_defaults_survive_wizard_rerun_and_explicit_changes(monkeypatch):
+    from cli.lib.onboard_config import merge_config
+
+    args = build_parser().parse_args(["onboard", "--mode", "docker", "--non-interactive"])
+    raw = {"vector_db": {"type": "milvus", "milvus_uri": "http://existing:19530",
+                         "milvus_collection": "existing", "milvus_db_name": "tenantdb",
+                         "milvus_timeout": 9}}
+    existing_defaults(args, raw)
+    monkeypatch.setattr(onboard, "_print_header", lambda *args: None)
+    vdb, _ = onboard._step4_database(args)
+    assert vdb == raw["vector_db"]
+    changed = {**vdb, "milvus_uri": "http://new:19530", "milvus_collection": "new"}
+    assert merge_config(raw, {"vector_db": changed})["vector_db"] == changed
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_invalid_milvus_timeout_is_rejected_before_deployment(value):
+    args = build_parser().parse_args(["onboard", "--mode", "docker", "--non-interactive",
+                                     "--vector-db", "milvus", "--milvus-timeout", value])
+    with pytest.raises(ValueError, match="finite and positive"):
+        onboard._step4_database(args)

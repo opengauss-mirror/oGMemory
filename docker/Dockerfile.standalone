@@ -16,6 +16,15 @@ RUN pip install --no-cache-dir \
     pydantic python-dotenv json-repair networkx "jsonschema>=4.20.0" rank-bm25 nltk \
     "mcp[cli]==2.0.0" "volcengine-python-sdk[ark]"
 
+# The shared image can include the selected optional vector SDK at build time.
+ARG VECTOR_DB_EXTRA=opengauss
+RUN case "$VECTOR_DB_EXTRA" in \
+      opengauss) ;; \
+      chroma) pip install --no-cache-dir 'chromadb>=0.5.0' ;; \
+      milvus) pip install --no-cache-dir 'pymilvus>=2.6.17,<2.7' ;; \
+      *) echo "Unsupported VECTOR_DB_EXTRA: $VECTOR_DB_EXTRA" >&2; exit 1 ;; \
+    esac
+
 # Copy oGMemory source
 COPY core/       /opt/ogmem/core/
 COPY retrieval/  /opt/ogmem/retrieval/
