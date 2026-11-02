@@ -69,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument(
         "--vector-db",
         choices=["chroma", "opengauss", "milvus"],
-        help="Vector DB type (default: opengauss; also supports chroma and external milvus)",
+        help="Vector DB type (default: opengauss; external milvus supported; chroma requires local/headless mode)",
     )
     p_onboard.add_argument("--port", type=int, default=8090, action=ExplicitStore, help="HTTP port")
     p_onboard.add_argument("--instance-name", default="ogmem", help="Docker quickstart instance name")

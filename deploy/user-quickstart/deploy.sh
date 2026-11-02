@@ -250,8 +250,8 @@ source "$ENV_FILE"
 
 VECTOR_DB_TYPE="${VECTOR_DB_TYPE:-opengauss}"
 case "$VECTOR_DB_TYPE" in
-  opengauss|chroma|milvus) ;;
-  *) fail "VECTOR_DB_TYPE 仅支持 opengauss、chroma 或 milvus" ;;
+  opengauss|milvus) ;;
+  *) fail "VECTOR_DB_TYPE 仅支持 opengauss 或 milvus（Chroma 请使用 local/headless 模式）" ;;
 esac
 MILVUS_URI="${MILVUS_URI:-http://host.docker.internal:19530}"
 MILVUS_COLLECTION="${MILVUS_COLLECTION:-contextengine}"
@@ -479,9 +479,9 @@ elif [[ -z "${OGMEM_IMAGE:-}" ]]; then
     -f "$source_root/docker/Dockerfile.standalone" -t "$OGMEM_IMAGE" "$source_root"
 fi
 ensure_image "$OGMEM_IMAGE"
-if [[ "$VECTOR_DB_TYPE" != opengauss ]]; then
+if [[ "$VECTOR_DB_TYPE" == milvus ]]; then
   docker run --rm --entrypoint python "$OGMEM_IMAGE" -c \
-    "import $([[ "$VECTOR_DB_TYPE" == milvus ]] && echo pymilvus || echo chromadb); from providers.vector_index.${VECTOR_DB_TYPE}_index import $([[ "$VECTOR_DB_TYPE" == milvus ]] && echo MilvusVectorIndex || echo ChromaVectorIndex)" \
+    "import pymilvus; from providers.vector_index.milvus_index import MilvusVectorIndex" \
     || fail "镜像缺少所选向量后端实现或依赖"
 fi
 ensure_image "$OPENCLAW_IMAGE"
@@ -597,7 +597,6 @@ embedding:
 
 vector_db:
   type: "${VECTOR_DB_TYPE}"
-  chroma_persist_dir: "/data/vector/chroma"
   milvus_uri: "${MILVUS_URI}"
   milvus_collection: "${MILVUS_COLLECTION}"
   milvus_db_name: "${MILVUS_DB_NAME}"
@@ -650,8 +649,6 @@ agent_memory:
 YAML
 chmod 644 "$STACK_DIR/ogmemory.yaml"
 
-mkdir -p "$STACK_DIR/vector"
-chmod 777 "$STACK_DIR/vector"
 
 echo "创建 oGMemory..."
 docker run -d \
@@ -690,7 +687,6 @@ docker run -d \
   -e NO_PROXY='*' -e no_proxy='*' \
   -v "$STACK_DIR/ogmemory.yaml:/etc/ogmem/config.yaml:ro" \
   -v "$STACK_DIR/agfs:/data/agfs" \
-  -v "$STACK_DIR/vector:/data/vector" \
   "$OGMEM_IMAGE" >/dev/null
 
 wait_http \

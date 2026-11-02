@@ -34,7 +34,7 @@ ogmem onboard --mode docker --vector-db milvus \
   --milvus-uri http://host.docker.internal:19530 --milvus-collection contextengine
 ```
 
-Docker quickstart 根据选择生成后端配置：openGauss 创建配套数据库，Chroma 持久化到实例目录，Milvus 连接外部服务。Chroma/Milvus 默认通过现有 `docker/Dockerfile.standalone` 构建包含所选依赖的镜像；也可在部署环境文件中设置 `OGMEM_IMAGE` 使用已构建镜像。切换已有实例的后端或 Milvus 集合需使用新实例并重建索引。
+Docker quickstart 支持 openGauss 与外部 Milvus：openGauss 创建配套数据库，Milvus 连接外部服务。Milvus 默认通过现有 `docker/Dockerfile.standalone` 构建包含所选依赖的镜像；也可在部署环境文件中设置 `OGMEM_IMAGE` 使用已构建镜像。切换已有实例的后端或 Milvus 集合需使用新实例并重建索引。
 
 手动配置容器时，使用包含 Milvus 可选依赖的运行镜像并挂载上述 YAML 配置；无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
 Milvus 服务由外部部署管理；配置其可达地址。容器中的 `127.0.0.1` 指向容器自身，跨容器连接应使用可解析的服务名或其他可达入口。

@@ -244,7 +244,7 @@ def test_local_database_failure_stops_before_install_or_config(
         assert "schema" not in calls
 
 
-@pytest.mark.parametrize("backend", ["chroma", "milvus"])
+@pytest.mark.parametrize("backend", ["opengauss", "milvus"])
 @pytest.mark.parametrize("non_interactive", [False, True])
 def test_docker_passes_selected_vector_to_deployment(monkeypatch, backend, non_interactive):
     args = build_parser().parse_args(["onboard", "--mode", "docker", "--vector-db", backend])
@@ -280,7 +280,7 @@ def test_docker_interactive_vector_menu_offers_supported_providers(monkeypatch):
     monkeypatch.setattr(onboard, "select", choose)
     vdb, _ = onboard._step4_database(args)
     assert vdb["type"] == "opengauss"
-    assert seen == [["openGauss", "Chroma", "Milvus"]]
+    assert seen == [["openGauss", "Milvus"]]
 
 
 @pytest.mark.parametrize("mode", ["local", "headless"])
@@ -310,3 +310,19 @@ def test_invalid_milvus_timeout_is_rejected_before_deployment(value):
                                      "--vector-db", "milvus", "--milvus-timeout", value])
     with pytest.raises(ValueError, match="finite and positive"):
         onboard._step4_database(args)
+
+
+@pytest.mark.parametrize("non_interactive", [False, True])
+def test_docker_rejects_chroma_before_database_prompts(monkeypatch, non_interactive):
+    args = build_parser().parse_args(["onboard", "--mode", "docker", "--vector-db", "chroma"])
+    args.non_interactive = non_interactive
+    monkeypatch.setattr(onboard, "select", lambda *a, **kw: pytest.fail("unexpected prompt"))
+    with pytest.raises(ValueError, match="Chroma requires local/headless"):
+        onboard._step4_database(args)
+
+
+def test_docker_environment_rejects_chroma(tmp_path):
+    with pytest.raises(ValueError, match="Unsupported Docker vector provider"):
+        generate_quickstart_env({}, {}, vector_config={"type": "chroma"},
+                                output_path=tmp_path / "unsupported.env")
+    assert not (tmp_path / "unsupported.env").exists()

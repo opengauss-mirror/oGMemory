@@ -57,7 +57,7 @@ embedding:
 # ---- Vector Database [all] ----
 vector_db:
   type: chroma                   # [local] memory (quickstart) / chroma / opengauss / milvus
-                                  # [docker] opengauss / chroma / milvus (opengauss recommended for production)
+                                  # [docker] opengauss / milvus (opengauss recommended for production)
   # --- Chroma (local) ---
   chroma_persist_dir: ".ogmem_data/chroma"  # [local]
   # chroma_collection: "contextengine"

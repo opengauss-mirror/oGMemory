@@ -238,7 +238,7 @@ def test_documented_docker_command_consumes_all_explicit_model_settings(monkeypa
                          "base_url": values["EMBEDDING_BASE_URL"], "model": values["EMBEDDING_MODEL"], "dimension": 1024}
 
 
-@pytest.mark.parametrize("backend", ["opengauss", "chroma", "milvus"])
+@pytest.mark.parametrize("backend", ["opengauss", "milvus"])
 def test_selected_backend_and_milvus_parameters_reach_environment(tmp_path, backend, monkeypatch):
     monkeypatch.setenv("MILVUS_TOKEN", "dummy-token")
     envfile = deploy_helpers.generate_quickstart_env(
@@ -255,8 +255,8 @@ def test_selected_backend_and_milvus_parameters_reach_environment(tmp_path, back
 
 
 @pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
-@pytest.mark.parametrize("backend", ["opengauss", "chroma", "milvus"])
-def test_real_quickstart_renders_selected_backend_and_persistent_mount(tmp_path, backend):
+@pytest.mark.parametrize("backend", ["opengauss", "milvus"])
+def test_real_quickstart_renders_selected_backend(tmp_path, backend):
     from string import Template
 
     import yaml
@@ -310,7 +310,7 @@ exit 0
     assert config["vector_db"]["milvus_uri"] == "http://milvus.example:19530"
     commands = capture.read_text()
     assert f"VECTOR_DB_TYPE={backend}" in commands
-    assert "/vector:/data/vector" in commands
+    assert "/vector:/data/vector" not in commands
     assert ("--name ogmem_opengauss" in commands) == (backend == "opengauss")
     if backend != "opengauss":
         assert "--entrypoint python test-current-image" in commands

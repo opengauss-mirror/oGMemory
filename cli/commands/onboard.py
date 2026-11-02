@@ -129,6 +129,8 @@ def _step3_embedding(args, llm_config: dict) -> dict:
 
 
 def _vector_db_choices(args) -> list[str]:
+    if getattr(args, "mode", None) == "docker":
+        return ["opengauss", "milvus"]
     return ["opengauss", "chroma", "milvus"]
 
 
@@ -138,6 +140,11 @@ def _step4_database(args) -> tuple[dict, dict]:
 
     # All supported providers use the same configuration path.
     vector_types = _vector_db_choices(args)
+    requested = getattr(args, "vector_db", None) or "opengauss"
+    if requested not in vector_types:
+        raise ValueError(
+            "Docker supports openGauss or external Milvus; Chroma requires local/headless mode"
+        )
     if getattr(args, "non_interactive", False):
         vdb_type = getattr(args, "vector_db", None) or "opengauss"
     else:

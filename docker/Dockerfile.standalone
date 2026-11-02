@@ -20,7 +20,6 @@ RUN pip install --no-cache-dir \
 ARG VECTOR_DB_EXTRA=opengauss
 RUN case "$VECTOR_DB_EXTRA" in \
       opengauss) ;; \
-      chroma) pip install --no-cache-dir 'chromadb>=0.5.0' ;; \
       milvus) pip install --no-cache-dir 'pymilvus>=2.6.17,<2.7' ;; \
       *) echo "Unsupported VECTOR_DB_EXTRA: $VECTOR_DB_EXTRA" >&2; exit 1 ;; \
     esac

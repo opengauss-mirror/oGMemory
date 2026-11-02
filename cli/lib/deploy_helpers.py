@@ -49,7 +49,7 @@ def generate_quickstart_env(
 
     vector_config = vector_config or {"type": "opengauss"}
     backend = vector_config.get("type", "opengauss")
-    if backend not in {"opengauss", "chroma", "milvus"}:
+    if backend not in {"opengauss", "milvus"}:
         raise ValueError(f"Unsupported Docker vector provider: {backend!r}")
     values = {
         "VECTOR_DB_TYPE": backend,
