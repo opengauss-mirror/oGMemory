@@ -1,0 +1,69 @@
+{
+  "tau2_commit": "79dbf0c18ac7637aedf869cb3122babcd57aaf17",
+  "openviking_reference_commit": "b7aa01d227c249407971c6693f73ef71c436f439",
+  "runtime_commit": "3b8c5ee7acfb37bc8737311225b90047bdeb6e11",
+  "runtime_files": {
+    "providers/unified_config.py": "eb6632c9796e3bd62d9fe457a23b84a97461c35fdda98a541d2320c4202a0926",
+    "providers/llm/openai_llm.py": "fc6818873405c99ebc5077f2c0f90eb36591959a92e53f6168f7dc5a3ec62a10",
+    "extraction/tools.py": "302b2e05703af5217f020b83f24209418cad73a2ca6f919118d65adb402e7789",
+    "server/memory_service.py": "5414b94ad6a505ad2c8cf2bb049103cfd0cf9c12c0d91ab71f95daba66cf621f",
+    "service/api.py": "52061247cc042cba29aaa705dc710a6075c0d61e9122ce7fc8b21fd18e651c8f"
+  },
+  "ce_plugin_sha256": "8480a8a417364a775f7a4abdcc24bd89fddc44eb6d157ca98098df6d0bf2e33c",
+  "requested_model": "doubao-seed-2.1-lite",
+  "provider_model": "doubao-seed-2-1-lite",
+  "model_probe": {
+    "status": 200,
+    "model": "doubao-seed-2-1-lite",
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 48,
+      "total_tokens": 49,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "error": null
+  },
+  "extraction": "eager single pass, dual_pass_enabled=false",
+  "agent_memory_schemas_enabled": [
+    "case",
+    "skill",
+    "pattern",
+    "tool"
+  ],
+  "protocol": {
+    "domains": {
+      "retail": {
+        "train": 74,
+        "test": 40
+      },
+      "airline": {
+        "train": 30,
+        "test": 20
+      }
+    },
+    "repeats": 8,
+    "seeds": [
+      300,
+      301,
+      302,
+      303,
+      304,
+      305,
+      306,
+      307
+    ],
+    "temperature": 0,
+    "max_steps": 200,
+    "first_user": "shared cached first-user fixture per scenario; subsequent turns live",
+    "train": "same-agent successful train trajectories; one train rollout per task",
+    "test_memory": "read-only via OGMEM_AFTER_TURN_ENABLED=false",
+    "expected_rollouts": 960
+  },
+  "treatment": "real OpenClaw external tools with oGMemory native CE compose/prefetch",
+  "comparison_scope": "Within-run paired OpenClaw baseline versus CE. Model and memory implementation differ from published OpenViking numbers."
+}

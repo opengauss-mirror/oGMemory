@@ -247,15 +247,17 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     scope_schema = search_schema["$defs"]["CodeSearchScopeInput"]
     assert scope_schema["additionalProperties"] is False
     assert set(scope_schema["properties"]) == {"paths", "glob_patterns", "grep_terms"}
-    assert scope_schema["properties"]["paths"]["description"] == (
-        "Optional repository-relative files or directories."
-    )
+    path_description = scope_schema["properties"]["paths"]["description"]
+    assert "repository-relative POSIX" in path_description
+    assert "without the edit locator's root slug" in path_description
+    assert "paths=['src/module.py']" in path_description
     assert scope_schema["properties"]["glob_patterns"]["description"] == (
         "Optional glob patterns to narrow candidate files before ranking."
     )
-    assert scope_schema["properties"]["grep_terms"]["description"] == (
-        "Optional keywords or symbols to narrow candidate files before ranking."
-    )
+    grep_description = scope_schema["properties"]["grep_terms"]["description"]
+    assert "case-insensitive literal substrings (AND)" in grep_description
+    assert "same file's complete source content" in grep_description
+    assert "Paths, metadata and generated summaries do not count" in grep_description
     for field in ("paths", "glob_patterns", "grep_terms"):
         array_schema = scope_schema["properties"][field]["anyOf"][0]
         assert array_schema == {"items": {"type": "string"}, "type": "array"}
@@ -270,7 +272,15 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
         "exclusiveMinimum": 0,
         "type": "integer",
     }
-    assert search_tool.description == "Search code and return compact editable snippets."
+    for guidance in (
+        "compact editable snippets",
+        "symbols in query",
+        "scope.paths for known files",
+        "edit_target.locator",
+        "complete implementations",
+        "read_lines",
+    ):
+        assert guidance in search_tool.description
     assert "recover_original" in read_tool.input_schema.get("properties", {})
 
 
@@ -783,17 +793,23 @@ def test_create_mcp_server_registers_code_edit_tool_only_under_independent_capab
     assert {tool.name for tool in tools} == _READ_TOOLS | {EDIT_FILE_TOOL_NAME}
     assert "ctx" not in properties
     assert set(properties) == {"locator", "old_string", "new_string", "replace_all"}
-    assert "standalone locator" in properties["locator"]["description"].lower()
+    assert "edit_target.locator" in properties["locator"]["description"]
+    assert "not the JSON object" in properties["locator"]["description"]
     old_string_description = properties["old_string"]["description"].lower()
     assert "smallest unique exact text" in old_string_description
     assert "whole file, class, or complete search excerpt" in old_string_description
     assert "replacement for old_string only" in properties["new_string"]["description"].lower()
     assert "smallest unique old_string" in edit_tool.description.lower()
+    for guidance in (
+        "Reuse the locator",
+        "preserve indentation and line breaks",
+        "combined diff",
+        "error feedback",
+    ):
+        assert guidance in edit_tool.description
     assert SEARCH_CODE_TOOL_NAME in mcp.instructions
     assert EDIT_FILE_TOOL_NAME in mcp.instructions
-    assert "old_string must be the smallest unique exact text" in mcp.instructions
-    assert "new_string replaces only that fragment" in mcp.instructions
-    assert "whole file, class, or complete search excerpt" in mcp.instructions
+    assert "without searching again" in mcp.instructions
 
 
 def test_code_edit_tool_is_not_implied_by_generic_write_or_code_only_profile(monkeypatch):
@@ -806,6 +822,60 @@ def test_code_edit_tool_is_not_implied_by_generic_write_or_code_only_profile(mon
     assert {tool.name for tool in anyio.run(mcp.list_tools)} == _READ_TOOLS | {
         "ogm_write_memory"
     } | _SKILL_WRITE_TOOLS
+
+
+@pytest.mark.parametrize("field,code", [
+    ("scope.source_snapshot", "source_snapshot_required"),
+    ("scope.source_snapshot_conflict", "source_snapshot_conflict"),
+])
+def test_mcp_search_requires_source_snapshot_with_actionable_private_feedback(monkeypatch, field, code):
+    from core.errors import ValidationError
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    def search(service, **kwargs):
+        raise ValidationError(field, "/private/source.py")
+    monkeypatch.setattr("server.mcp_server.search_code_tool", search)
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+    with pytest.raises(ToolError, match=code) as error:
+        anyio.run(mcp.call_tool, SEARCH_CODE_TOOL_NAME, {"query": "sample.py"})
+    assert "refresh the affected code files individually" in str(error.value)
+    assert "bootstrap is for initial import" in str(error.value)
+    assert "/private/source.py" not in str(error.value)
+
+
+@pytest.mark.parametrize("tool,adapter,arguments", [
+    (SEARCH_CODE_TOOL_NAME, "search_code_tool", {"query": "sample.py"}),
+    (EDIT_FILE_TOOL_NAME, "edit_file_tool", {"locator": "repo/file.py", "old_string": "old", "new_string": "new"}),
+])
+@pytest.mark.parametrize("failure", [ValueError, RuntimeError, FileNotFoundError])
+def test_mcp_code_unexpected_errors_remain_private(monkeypatch, caplog, tool, adapter, arguments, failure):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    def fail(service, **kwargs):
+        raise failure("private backend path /srv/private-secret")
+    monkeypatch.setattr(f"server.mcp_server.{adapter}", fail)
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig(mcp_enable_code_edit_tools=True))
+    with pytest.raises(ToolError, match="internal_error") as error:
+        anyio.run(mcp.call_tool, tool, arguments)
+    assert "private-secret" not in str(error.value)
+    assert any(r.name == "ogmem.mcp" and r.exc_info and "private-secret" in str(r.exc_info[1]) for r in caplog.records)
+
+
+@pytest.mark.parametrize("tool,adapter,arguments", [
+    (SEARCH_CODE_TOOL_NAME, "search_code_tool", {"query": "sample.py"}),
+    (EDIT_FILE_TOOL_NAME, "edit_file_tool", {"locator": "repo/file.py", "old_string": "old", "new_string": "new"}),
+])
+def test_mcp_code_preserves_protocol_errors(monkeypatch, tool, adapter, arguments):
+    from mcp.shared.exceptions import MCPError
+
+    failure = MCPError(-32003, "temporarily_unavailable", data={"retryable": True})
+    def fail(service, **kwargs):
+        raise failure
+    monkeypatch.setattr(f"server.mcp_server.{adapter}", fail)
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig(mcp_enable_code_edit_tools=True))
+    with pytest.raises(MCPError) as error:
+        anyio.run(mcp.call_tool, tool, arguments)
+    assert error.value is failure
 
 
 def test_create_mcp_server_code_toolset_isolates_search_read_and_enabled_edit():
@@ -861,7 +931,7 @@ def test_code_toolset_read_memory_only_delegates_filtered_output_recovery(monkey
         ValueError,
         match="only supports ogm_read_memory with recover_original=true",
     ):
-        tool.fn(uri="ogmemory://memories/preference/editor")
+        tool.fn(uri="ogmemory://memories/preference/editor", recover_original=False)
     with pytest.raises(
         ValueError,
         match="only supports filtered-output memory URI recovery",
@@ -875,7 +945,12 @@ def test_code_toolset_read_memory_only_delegates_filtered_output_recovery(monkey
         "ctx://acct/agents/bot/memories/tool_outputs/"
         "tool_output_read_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     )
-    result = tool.fn(uri=recovery_uri, recover_original=True)
+    schema = next(t for t in anyio.run(mcp.list_tools) if t.name == "ogm_read_memory").input_schema
+    assert set(schema["properties"]) == {"uri", "max_chars", "recover_original"}
+    assert schema["properties"]["recover_original"]["const"] is True
+    assert schema["properties"]["max_chars"]["minimum"] == 1
+    assert schema["properties"]["max_chars"]["maximum"] == 50000
+    result = tool.fn(uri=recovery_uri)
 
     assert result == {"ok": True, "memory_uri": recovery_uri, "original": "full"}
     assert calls == [

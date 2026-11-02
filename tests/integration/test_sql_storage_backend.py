@@ -366,6 +366,7 @@ def test_sql_pgvector_roundtrip_via_memory_service(
         embedder = MockEmbedder(dimension=1536)
         index = OpenGaussVectorIndex(
             connection_string=pgvector_dsn,
+            dialect="postgresql",
             dimension=1536,
             table_name="vector_index",
         )

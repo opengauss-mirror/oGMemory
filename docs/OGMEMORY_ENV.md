@@ -101,7 +101,7 @@ identity:
   agent_id: "main"
 
 memory:
-  after_turn_threshold: 200
+  after_turn_threshold: 400
   rolling_compress_enabled: true
   rolling_compress_fallback_enabled: false
   compact_prepare_token_ttl: 300
@@ -205,7 +205,7 @@ cache:
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
-| `memory.after_turn_threshold` | `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 否 | 会话缓冲区待处理 token 达到阈值后触发 after_turn 增量抽取 |
+| `memory.after_turn_threshold` | `OGMEM_AFTER_TURN_THRESHOLD` | `400` | 否 | 会话缓冲区待处理 token 达到阈值后触发 after_turn 增量抽取 |
 | `memory.rolling_compress_enabled` | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 否 | 启用 Layer 2 滚动会话压缩 |
 | `memory.rolling_compress_fallback_enabled` | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | 否 | LLM 压缩不可用时使用规则 fallback |
 | `memory.compact_prepare_token_ttl` | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | 否 | `prepare_compaction` 返回 token 的有效期，单位秒 |

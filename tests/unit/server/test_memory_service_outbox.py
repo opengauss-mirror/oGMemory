@@ -79,6 +79,7 @@ def test_shared_sql_pool_receives_configured_dialect(monkeypatch):
         connection_string="host=storage dbname=test",
         pool_size=5,
         dialect="opengauss",
+        deadline=None,
     )
 
 

@@ -75,9 +75,7 @@ def test_pipeline_adds_low_similarity_member_with_canonical_content(setup):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_pipeline_scene_switch_selects_expected_evidence(setup, enabled):
-    if not enabled:
-        setup.pipeline._scene_stage = None
-    result = search(setup)
+    result = search(setup, use_scene=enabled)
     expected = {setup.direct.uri, setup.related.uri} if enabled else {setup.direct.uri}
     assert evidence_uris(result) == expected
 
@@ -395,3 +393,22 @@ def test_multiple_queries_preserve_scene_quota_after_global_ranking(
     if global_rerank:
         scores = [hit.ranking_score for hit in result.hits]
         assert scores == sorted(scores, reverse=True)
+
+
+def test_concurrent_scene_queries_keep_request_selection(setup):
+    from concurrent.futures import ThreadPoolExecutor
+
+    selections = [True, False] * 12
+    with ThreadPoolExecutor(max_workers=6) as callers:
+        results = list(callers.map(lambda enabled: search(setup, use_scene=enabled), selections))
+    for enabled, result in zip(selections, results):
+        expected = {setup.direct.uri, setup.related.uri} if enabled else {setup.direct.uri}
+        assert evidence_uris(result) == expected
+    assert evidence_uris(search(setup)) == {setup.direct.uri, setup.related.uri}
+
+
+def test_request_selection_overrides_retrieval_default(setup):
+    setup.pipeline._scene_enabled = False
+    assert evidence_uris(search(setup)) == {setup.direct.uri}
+    assert evidence_uris(search(setup, use_scene=True)) == {setup.direct.uri, setup.related.uri}
+    assert evidence_uris(search(setup)) == {setup.direct.uri}

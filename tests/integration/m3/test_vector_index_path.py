@@ -20,9 +20,10 @@ from pathlib import Path
 
 import pytest
 
-from core.models import RequestContext
+from core.models import IndexRecord, RequestContext
 from m3.config import M3BENCH_ACCOUNT_ID
 from m3.index_episodic import parse_args, run
+from m3.index_status import episodic_uri
 from providers.graph_store import MemoryGraphStore
 from providers.vector_index import OpenGaussVectorIndex
 from service.graph_service import GraphService
@@ -74,23 +75,32 @@ def _write_episodic(path: Path, n: int = 3) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _seed_graph(graph: GraphService, ctx: RequestContext, n: int) -> None:
-    for i in range(n):
-        from core.graph_models import create_extracted_node
-        ext_id = f"extvid_{i}".ljust(32, "x")
+def _seed_graph(graph: GraphService, ctx: RequestContext, path: Path) -> None:
+    from core.graph_models import create_extracted_node
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
         node = create_extracted_node(
-            source_raw_id=f"vidraw_{i}".ljust(32, "x"),
+            source_raw_id=row["video_raw_node_id"],
             extractor_type="episodic_memory_generator",
             extraction_schema="m3_bench_v1",
             account_id=ctx.account_id,
             extracted_content={
-                "description": f"Episode {i}",
-                "source_video_id": f"vid_{i}",
-                "source_clip_id": i,
+                "description": row["description"],
+                "source_video_id": row["video_id"],
+                "source_clip_id": row["clip_id"],
             },
-            node_id=ext_id,
+            node_id=row["extracted_node_id"],
         )
         graph._store.create_node(node.serialize(), ctx)
+
+
+def _query_vector(index, ctx: RequestContext, video_id: str, clip_id: int):
+    record = index.get_record(IndexRecord.generate_id(
+        episodic_uri(ctx.account_id, video_id, clip_id), level=2,
+    ))
+    assert record is not None
+    return list(record.metadata["_embedding"])
 
 
 @pytest.fixture
@@ -102,11 +112,12 @@ def vector_index():
     # NOT EXISTS) so repeated invocations are safe.
     table = f"m3_test_vec_{uuid.uuid4().hex[:12]}"
     idx = OpenGaussVectorIndex(
-        connection_string=dsn, table_name=table, dimension=16, pool_size=2,
+        connection_string=dsn, table_name=table, dimension=16, pool_size=2, dialect="postgresql",
     )
     try:
         yield idx
     finally:
+        idx.close()
         # Clean up the per-test table so we don't accumulate cruft.
         import psycopg2
         with psycopg2.connect(dsn) as conn:
@@ -124,7 +135,7 @@ def test_index_and_search_round_trip(tmp_path: Path, vector_index):
 
     graph = GraphService(MemoryGraphStore(), vector_index=vector_index)
     ctx = _ctx()
-    _seed_graph(graph, ctx, n=3)
+    _seed_graph(graph, ctx, episodic_path)
 
     rc = run(parse_args([
         "--episodic-jsonl", str(episodic_path),
@@ -136,21 +147,7 @@ def test_index_and_search_round_trip(tmp_path: Path, vector_index):
     assert rc == 0
     assert vector_index.count() == 3
 
-    # Issue a vector search through GraphService — it must route
-    # through the VectorIndex (proves the wiring is correct, not
-    # just that the index is populated).
-    target_record = vector_index.get_record(
-        # The id we computed in the upsert: sha256(uri+":2")[:16].
-        # We rely on IndexRecord.generate_id so the test isn't
-        # coupled to the exact sha256 output.
-        # ID is computed via IndexRecord.generate_id; we re-derive
-        # it inline here so the test doesn't need to import the
-        # exact constant.
-        __import__("core.models", fromlist=["IndexRecord"]).IndexRecord.generate_id(
-            "m3://vid_0/clips/0/episodic", level=2,
-        )
-    )
-    query_emb = list(target_record.metadata["_embedding"])
+    query_emb = _query_vector(vector_index, ctx, "vid_0", 0)
     hits = graph.search_by_embedding(
         query_emb, ctx, top_k=3, extractor_types=("episodic_memory_generator",),
     )
@@ -181,7 +178,7 @@ def test_scope_columns_push_down_to_sql(tmp_path: Path, vector_index):
 
     graph = GraphService(MemoryGraphStore(), vector_index=vector_index)
     ctx = _ctx()
-    _seed_graph(graph, ctx, n=3)
+    _seed_graph(graph, ctx, episodic_path)
 
     run(parse_args([
         "--episodic-jsonl", str(episodic_path),
@@ -193,7 +190,7 @@ def test_scope_columns_push_down_to_sql(tmp_path: Path, vector_index):
 
     from service.graph_service import ClipScope
     hits = graph.search_by_embedding(
-        [0.0] * 16, ctx,
+        _query_vector(vector_index, ctx, "vid_b", 0), ctx,
         top_k=10,
         scope=ClipScope(video_id="vid_b"),
     )
@@ -223,7 +220,7 @@ def test_before_clip_filter_drops_future_clips(tmp_path: Path, vector_index):
 
     graph = GraphService(MemoryGraphStore(), vector_index=vector_index)
     ctx = _ctx()
-    _seed_graph(graph, ctx, n=3)
+    _seed_graph(graph, ctx, episodic_path)
 
     run(parse_args([
         "--episodic-jsonl", str(episodic_path),
@@ -235,14 +232,14 @@ def test_before_clip_filter_drops_future_clips(tmp_path: Path, vector_index):
 
     from service.graph_service import ClipScope
     hits = graph.search_by_embedding(
-        [0.0] * 16, ctx,
+        _query_vector(vector_index, ctx, "vid_a", 0), ctx,
         top_k=10,
         scope=ClipScope(before_clip=0),
     )
     # Only clip_id == 0 should be visible (clip 1 and 2 are filtered
     # by the SQL ``before_clip <= 0`` clause).
     clip_ids = {h.clip_id for h in hits}
-    assert clip_ids <= {0}, f"before_clip=0 leaked future clips: {clip_ids}"
+    assert clip_ids == {0}
 
 
 def test_schema_migration_adds_m3_columns(vector_index):

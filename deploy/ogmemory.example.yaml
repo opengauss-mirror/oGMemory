@@ -185,7 +185,7 @@ sharing:
 
 # ---- 记忆提取 ----
 memory:
-  # after_turn_threshold: 200
+  # after_turn_threshold: 400
   # rolling_compress_enabled: true
   # rolling_compress_fallback_enabled: false
   # compact_prepare_token_ttl: 300

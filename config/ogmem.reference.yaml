@@ -32,6 +32,17 @@ llm:
   # extra_body:                  # [all] arbitrary OpenAI-compatible provider options
   #   thinking: {type: enabled}
 
+# ---- Decision model [all, optional] ----
+# Omit or use null to preserve native behavior. Credentials alone do not enable it.
+# The Jev protocol supports official Jev, Vercel and self-hosted Laya.
+# decision:
+#   provider: jev
+#   base_url: "https://ai-gateway.vercel.sh/typesafe"
+#   model: "typesafe-ai/jev"       # self-hosted Laya: multilingual
+#   # Omit api_key to read OGMEM_DECISION_API_KEY; no YAML placeholder expansion.
+#   # api_key: ""                  # explicit empty string for services without auth
+#   timeout_seconds: 30
+
 # ---- Embedding Configuration [all] ----
 embedding:
   # provider: null               # [all] defaults to llm.provider
@@ -201,7 +212,7 @@ memory:
     mode: eager                   # [all] eager / lazy (lazy = ReAct loop with read tools)
     node_processing_enabled: false # [all] eager or lazy extraction followed by topic node processing
     dual_pass_enabled: true       # [all] Run two native extraction passes per span
-  # after_turn_threshold: 200    # [all] tokens before auto-extraction
+  # after_turn_threshold: 400    # [all] tokens before auto-extraction
   # rolling_compress_enabled: true
   # compact_prepare_token_ttl: 300
   # directory_summary_enabled: false

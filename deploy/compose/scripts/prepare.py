@@ -49,7 +49,7 @@ def _prepare_locked(env, root):
         if not env.get(key) or any(x in env[key] for x in ['替换为', '你的']):
             raise ValueError('missing configuration: ' + key)
     dimension = int(env['EMBEDDING_DIMENSION'])
-    threshold = int(env.get('OGMEM_AFTER_TURN_THRESHOLD', '800'))
+    threshold = int(env.get('OGMEM_AFTER_TURN_THRESHOLD', '400'))
     if dimension < 1 or threshold < 1:
         raise ValueError('dimension and threshold must be positive')
     enabled = env.get('OGMEM_MCP_ENABLED', 'true').lower()

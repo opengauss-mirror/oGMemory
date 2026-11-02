@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +98,8 @@ def build_code_resource_nodes(
     description: str | None = None,
     chunker: CodeFileChunker | None = None,
     language_hint: str | None = None,
+    source_filter: Callable[[str], bool] | None = None,
+    retain_file_source: bool = True,
 ) -> tuple[str, str, list[ContextNode]]:
     """Build the complete deterministic node set for one source file.
 
@@ -127,6 +129,9 @@ def build_code_resource_nodes(
     file_slug = digest_slug(file_key)
     language = detect_language(source_path, language_hint=normalized_hint)
     source = read_code_source(source_path)
+    # Reuse the chunker source for request-local filtering without another read.
+    if source_filter is not None and not source_filter(source):
+        return file_key, file_slug, []
     chunks = (chunker or CodeFileChunker()).chunk(source, source_path, language)
     if not chunks:
         raise ValueError("code source produced no indexable chunks")
@@ -162,6 +167,9 @@ def build_code_resource_nodes(
             "chunk_key": chunk_key,
             "graph": _graph_metadata(chunk),
         }
+        for key in ("implementation_start_line", "symbol_start_line", "symbol_end_line", "partial_source_line"):
+            if key in (chunk.metadata or {}):
+                metadata[key] = chunk.metadata[key]
         if normalized_tags:
             metadata["tags"] = normalized_tags
         if description:
@@ -180,6 +188,9 @@ def build_code_resource_nodes(
             )
         )
     nodes.sort(key=lambda node: node.uri)
+    if retain_file_source:
+        # Store one bounded file snapshot outside index metadata; chunks may omit source.
+        nodes[0].metadata["file_source"] = source
     return file_key, file_slug, nodes
 
 

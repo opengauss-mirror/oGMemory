@@ -1,0 +1,132 @@
+{
+  "validated_at": "2026-10-30T12:42:06.792723+00:00",
+  "state": "complete_verified",
+  "scored_rollouts": 960,
+  "scores": {
+    "retail": {
+      "baseline": {
+        "success": 232,
+        "total": 320,
+        "success_rate": 0.725
+      },
+      "ce": {
+        "success": 261,
+        "total": 320,
+        "success_rate": 0.815625
+      },
+      "paired": {
+        "ce_only_success": 52,
+        "baseline_only_success": 23,
+        "both_success": 209,
+        "both_failure": 36
+      },
+      "delta_pp": 9.062500000000007
+    },
+    "airline": {
+      "baseline": {
+        "success": 104,
+        "total": 160,
+        "success_rate": 0.65
+      },
+      "ce": {
+        "success": 113,
+        "total": 160,
+        "success_rate": 0.70625
+      },
+      "paired": {
+        "ce_only_success": 26,
+        "baseline_only_success": 17,
+        "both_success": 87,
+        "both_failure": 30
+      },
+      "delta_pp": 5.625000000000002
+    }
+  },
+  "weighted_overall": {
+    "baseline_success": 336,
+    "ce_success": 374,
+    "trials_per_arm": 480,
+    "baseline_success_rate": 0.7,
+    "ce_success_rate": 0.7791666666666667,
+    "delta_pp": 7.916666666666667
+  },
+  "configuration": {
+    "model": "doubao-seed-2.1-lite",
+    "thinking": "disabled",
+    "agent_memory_types": [
+      "case",
+      "pattern",
+      "skill",
+      "tool"
+    ],
+    "extraction": "single-pass eager",
+    "extraction_output_token_limit": 16384,
+    "ce_compose_token_budget": 32768,
+    "memory_history_deduplication": true,
+    "seed_range": [
+      300,
+      307
+    ],
+    "train_split": "train",
+    "test_split": "test",
+    "test_memory_writes": false
+  },
+  "training_ingest": {
+    "retail": {
+      "successful_train_trajectories": 53,
+      "settled_and_index_drained": 53
+    },
+    "airline": {
+      "successful_train_trajectories": 17,
+      "settled_and_index_drained": 17
+    }
+  },
+  "provider_reasoning_audit": {
+    "scope": "All logged gateway agent and user-simulator provider calls in the four scored cells, including interrupted attempts",
+    "logged_calls": 18375,
+    "calls_with_usage": 18354,
+    "calls_with_reasoning_counter": 18354,
+    "reasoning_tokens": 0,
+    "nonzero_reasoning_calls": 0
+  },
+  "score_audit": {
+    "retail": {
+      "baseline": {
+        "complete": true,
+        "completed": 320,
+        "expected": 320,
+        "success": 232.0,
+        "raw_scores_verified": true
+      },
+      "ce": {
+        "complete": true,
+        "completed": 320,
+        "expected": 320,
+        "success": 261.0,
+        "raw_scores_verified": true
+      }
+    },
+    "airline": {
+      "baseline": {
+        "complete": true,
+        "completed": 160,
+        "expected": 160,
+        "success": 104.0,
+        "raw_scores_verified": true
+      },
+      "ce": {
+        "complete": true,
+        "completed": 160,
+        "expected": 160,
+        "success": 113.0,
+        "raw_scores_verified": true
+      }
+    }
+  },
+  "runtime_manifest": "manifest.json",
+  "limitations": [
+    "The measured CE treatment uses a benchmark adapter with a 32768-token compose budget and injected-memory history deduplication; the initial default treatment failed and is retained as diagnostic evidence only.",
+    "The native memory service uses the existing 3b8c5ee runtime checkout and the schema selection described above, rather than the current main workspace.",
+    "The evaluation protocol follows the local OpenViking fixed-first-user full8 setup; the model and memory implementation differ from the published OpenViking result."
+  ]
+}

@@ -699,7 +699,7 @@ def test_shared_pool_dialect_selects_vector_bootstrap(monkeypatch, dialect, firs
     returned = []
     monkeypatch.setattr(pool, "return_connection", returned.append)
 
-    index = OpenGaussVectorIndex(pool=pool, dimension=3)
+    index = OpenGaussVectorIndex(pool=pool, dimension=3, dialect=dialect)
 
     assert index.sql_dialect.name == dialect
     assert index._shared_pool is pool

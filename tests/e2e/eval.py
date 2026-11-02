@@ -405,10 +405,12 @@ def build_parser(
     parser.add_argument("--hermes-command", default="hermes")
     parser.add_argument("--dsh-command", default="dsh")
     parser.add_argument("--codex-command", default="codex")
+    parser.add_argument("--qwenpaw-command", default="qwenpaw")
+    parser.add_argument("--qwenpaw-port", type=int, default=18891)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--agent",
-        choices=(agent,) if agent else ("openclaw", "opencode", "claude-code", "hermes", "dsh", "codex"),
+        choices=(agent,) if agent else ("openclaw", "opencode", "claude-code", "hermes", "dsh", "codex", "qwenpaw"),
         default=default_agent,
     )
     parser.add_argument(

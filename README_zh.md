@@ -368,6 +368,15 @@ L0 → L1 → L2：每个层级产生信号浓度不同的 embedding。短文本
 
 ---
 
+## oGMemory 评测效果
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
+  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
+</picture>
+
+---
+
 ## 快速开始
 
 ### 前置条件
@@ -587,7 +596,7 @@ result = write_api.commit_session(messages, ctx)
 | `SQL_CONNECTION_STRING` | — | SQL 数据库 DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
 | `OGMEM_CONFIG` | `ogmem.yaml` | YAML 配置文件路径 |
-| `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 触发 after_turn 自动抽取的待处理 token 阈值 |
+| `OGMEM_AFTER_TURN_THRESHOLD` | `400` | 触发 after_turn 自动抽取的待处理 token 阈值 |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 启用 Layer 2 滚动会话压缩 |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | LLM 压缩不可用时启用规则 fallback |
 | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | `prepareToken` 有效期，单位秒 |

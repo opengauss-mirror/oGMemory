@@ -18,6 +18,7 @@ from rank_bm25 import BM25Okapi
 
 from core.memory_names import memory_directory
 from core.models import IndexRecord
+from retrieval.code_ordering import code_source_key
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,16 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _tokenize_code_field(text: str) -> list[str]:
-    """Tokenize identifiers and paths after making separators searchable."""
-    return _tokenize(re.sub(r"[^A-Za-z0-9]+", " ", str(text or "")))
+    """Keep whole identifiers and expose camel-case components on both sides."""
+    words = re.findall(r"[A-Za-z0-9]+", str(text or ""))
+    expanded = []
+    for word in words:
+        parts = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", word)
+        parts = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", parts)
+        expanded.append(word)
+        if parts != word:
+            expanded.append(parts)
+    return _tokenize(" ".join(expanded))
 
 
 @dataclass
@@ -532,7 +541,7 @@ class Bm25Index:
                     fields=dict(fields),
                 )
             )
-        scored.sort(key=lambda hit: (-hit.score, str(hit.metadata.get("uri") or hit.id)))
+        scored.sort(key=lambda hit: (-hit.score, code_source_key({"id": hit.id, "metadata": hit.metadata})))
         return scored[: max(0, top_k)]
 
     @property

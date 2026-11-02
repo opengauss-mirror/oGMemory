@@ -166,6 +166,7 @@ def test_create_vector_index_builds_opengauss_index(monkeypatch: pytest.MonkeyPa
         dimension=16,
         table_name="vectors",
         pool_size=9,
+        dialect=None,
     )
 
 

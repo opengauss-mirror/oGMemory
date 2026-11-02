@@ -41,6 +41,7 @@ def test_factory_builds_opengauss_provider(monkeypatch):
         "dimension": 16,
         "table_name": "vectors",
         "pool_size": 9,
+        "dialect": None,
     }
 
 

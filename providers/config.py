@@ -57,6 +57,7 @@ class ProviderConfig:
 
     # Vector database configuration
     vector_db_type: VectorDbType = "chroma"
+    vector_db_dialect: str | None = None
     opengauss_connection_string: str | None = None
     opengauss_dimension: int = 1024
     opengauss_table_name: str = "vector_index"
@@ -129,6 +130,7 @@ class ProviderConfig:
             embedding_provider=cfg.embedding_provider,
             st_model=cfg.st_model,
             vector_db_type=cfg.vector_db_type,
+            vector_db_dialect=cfg.vector_db_dialect,
             opengauss_connection_string=cfg.opengauss_connection_string,
             opengauss_dimension=cfg.opengauss_dimension,
             opengauss_table_name=cfg.opengauss_table_name,
@@ -246,6 +248,7 @@ class ProviderConfig:
             table_name=self.opengauss_table_name,
             pool_size=self.opengauss_pool_size,
             pool=pool,
+            dialect=self.vector_db_dialect or pool.sql_dialect,
         )
 
     def create_llm(self) -> LLM:
@@ -309,6 +312,7 @@ class ProviderConfig:
             embedding_max_input_chars=self.embedding_max_input_chars,
             embedding_batch_size=self.embedding_batch_size,
             vector_db_type=self.vector_db_type,
+            vector_db_dialect=self.vector_db_dialect,
             opengauss_connection_string=self.opengauss_connection_string,
             opengauss_dimension=self.opengauss_dimension,
             opengauss_table_name=self.opengauss_table_name,

@@ -127,6 +127,8 @@ class CodeFileChunker:
         file_imports = _extract_python_imports(tree)
         chunks: list[CodeChunk] = []
         module_index = 1
+        statements = iter(tree.body)
+        statement = next(statements, None)
         for start, end in _python_module_ranges(tree.body):
             content = _slice_lines(lines, start, end)
             if not content.strip():
@@ -138,6 +140,14 @@ class CodeFileChunker:
                 "node_type": "Module",
                 "imports": file_imports,
             }
+            # Index assignment names while preserving source and module identity.
+            defined = []
+            while statement is not None and statement.lineno <= end:
+                if start <= statement.lineno and isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    defined.extend(n.id for target in targets for n in ast.walk(target) if isinstance(n, ast.Name))
+                statement = next(statements, None)
+            module_signature = ", ".join(dict.fromkeys(defined))
             if len(content) > self.max_chars:
                 sub_chunks = self._chunk_line_windows(
                     content,
@@ -149,7 +159,8 @@ class CodeFileChunker:
                     symbol_kind="module",
                 )
                 for sub_chunk in sub_chunks:
-                    sub_chunk.metadata = {"graph": graph}
+                    sub_chunk.metadata = {**sub_chunk.metadata, "graph": graph}
+                    sub_chunk.signature = module_signature
                 chunks.extend(sub_chunks)
                 module_index += 1
                 continue
@@ -162,19 +173,19 @@ class CodeFileChunker:
                     symbol_kind="module",
                     language=language,
                     chunk_hash=_hash_text(content),
+                    signature=module_signature,
                     metadata={"graph": graph},
                 )
             )
             module_index += 1
 
-        for node in tree.body:
-            if not _is_python_symbol_node(node):
-                continue
-            start = getattr(node, "lineno", 1)
-            end = getattr(node, "end_lineno", start)
+        class_graphs: dict[ast.AST, dict[str, Any]] = {}
+        for node, start, end, symbol in _python_symbol_spans(tree.body, lines, self.max_chars):
             if start < 1 or end < start:
                 continue
-            symbol = getattr(node, "name", f"symbol_{len(chunks) + 1}")
+            content = _slice_lines(lines, start, end)
+            if not content.strip():
+                continue
             if isinstance(node, ast.AsyncFunctionDef):
                 symbol_kind = "async_function"
             elif isinstance(node, ast.FunctionDef):
@@ -182,10 +193,24 @@ class CodeFileChunker:
             else:
                 symbol_kind = "type"
             signature = _build_python_signature(node)
-            graph = _build_python_graph_metadata(node, file_imports)
-            content = _slice_lines(lines, start, end)
-            if not content.strip():
-                continue
+            if node in class_graphs:
+                # Whole-class relations belong to its first fragment only.
+                graph = {**class_graphs[node], "calls": [], "contains": []}
+            else:
+                graph = _build_python_graph_metadata(node, file_imports)
+                if isinstance(node, ast.ClassDef):
+                    class_graphs[node] = graph
+            graph = {**graph, "symbol": symbol}
+            chunk_metadata = {"graph": graph}
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                chunk_metadata.update(symbol_start_line=start, symbol_end_line=end)
+                body = node.body
+                if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                    body = body[1:]
+                if body:
+                    chunk_metadata["implementation_start_line"] = min(
+                        [body[0].lineno] + [d.lineno for d in getattr(body[0], "decorator_list", ())]
+                    )
             if len(content) > self.max_chars:
                 sub_chunks = self._chunk_line_windows(
                     content,
@@ -196,9 +221,11 @@ class CodeFileChunker:
                     base_start_line=start,
                     symbol_kind=symbol_kind,
                 )
-                for sub_chunk in sub_chunks:
+                for index, sub_chunk in enumerate(sub_chunks):
                     sub_chunk.signature = signature
-                    sub_chunk.metadata = {"graph": graph}
+                    sub_chunk.metadata = {**sub_chunk.metadata, **chunk_metadata}
+                    if isinstance(node, ast.ClassDef) and index:
+                        sub_chunk.metadata["graph"] = {**graph, "calls": [], "contains": []}
                 chunks.extend(sub_chunks)
                 continue
             chunks.append(
@@ -211,7 +238,7 @@ class CodeFileChunker:
                     language=language,
                     chunk_hash=_hash_text(content),
                     signature=signature,
-                    metadata={"graph": graph},
+                    metadata=chunk_metadata,
                 )
             )
         # Python sorting is stable, so fragments from one logical line retain
@@ -253,7 +280,7 @@ class CodeFileChunker:
                             symbol_kind=symbol_kind or "code",
                             language=language,
                             chunk_hash=_hash_text(content),
-                            metadata={"graph": _empty_graph_metadata()},
+                            metadata={"graph": _empty_graph_metadata(), "partial_source_line": True},
                         )
                     )
                     chunk_index += 1
@@ -269,8 +296,8 @@ class CodeFileChunker:
                 end_index += 1
                 if current_chars >= self.max_chars:
                     break
-            content = "\n".join(lines[start_index:end_index]).strip()
-            if content:
+            content = "\n".join(lines[start_index:end_index]).rstrip()
+            if content.strip():
                 start_line = base_start_line + start_index
                 end_line = base_start_line + end_index - 1
                 chunks.append(
@@ -295,6 +322,31 @@ class CodeFileChunker:
 
 def _is_python_symbol_node(node: ast.AST) -> bool:
     return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+
+
+def _python_symbol_spans(nodes, lines, max_chars, prefix=""):
+    """Split oversized classes at member boundaries, preserving all source lines."""
+    for node in nodes:
+        if not _is_python_symbol_node(node):
+            continue
+        start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+        end = node.end_lineno
+        symbol = prefix + node.name
+        members = [child for child in node.body if _is_python_symbol_node(child)]
+        if not isinstance(node, ast.ClassDef) or not members or len(_slice_lines(lines, start, end)) <= max_chars:
+            yield node, start, end, symbol
+            continue
+        cursor = start
+        part = 0
+        for child in members:
+            child_start = min([child.lineno] + [d.lineno for d in child.decorator_list])
+            if cursor < child_start:
+                part += 1
+                yield node, cursor, child_start - 1, f"{symbol}.__class_body_{part}"
+            yield from _python_symbol_spans([child], lines, max_chars, symbol + ".")
+            cursor = child.end_lineno + 1
+        if cursor <= end:
+            yield node, cursor, end, f"{symbol}.__class_body_{part + 1}"
 
 
 def _python_module_ranges(nodes: list[ast.stmt]) -> list[tuple[int, int]]:

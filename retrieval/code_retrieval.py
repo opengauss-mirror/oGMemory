@@ -33,6 +33,7 @@ from retrieval.code_candidate_local import (
     candidate_discovery_budget,
     discover_candidate_files,
 )
+from retrieval.code_ordering import code_source_key
 from service.code_workspace_sync import (
     CodeWorkspaceRegistryResolver,
     WorkspaceResolutionError,
@@ -198,7 +199,7 @@ def _normalize_scope_component(value: str, *, field_name: str, allow_glob: bool)
 
 @dataclass(frozen=True)
 class CodeSearchScope:
-    """Logical filters shared by full and request-local code retrieval."""
+    """Shared filters; grep_terms are case-insensitive source literals ANDed per file."""
 
     root_slugs: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
@@ -316,6 +317,7 @@ class CodeEvidence:
     focused_read_available: bool = True
     retrieval_source: str = ""
     score_kind: str = ""
+    coverage: dict[str, Any] = field(default_factory=dict)
 
     @property
     def content(self) -> str:
@@ -374,6 +376,7 @@ class CodeEvidence:
             "retrieval_source": self.retrieval_source,
             "score_kind": self.score_kind,
             "metadata": metadata,
+            "coverage": dict(self.coverage),
         }
 
 
@@ -496,12 +499,12 @@ def _route_tokens(*parts: object) -> set[str]:
 
 
 def _extract_code_query_terms(query: str) -> list[str]:
-    raw_terms = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query or "")
+    raw_terms = re.findall(r"[A-Za-z_][A-Za-z0-9_]+", query or "")
     seen: set[str] = set()
     terms: list[str] = []
     for term in raw_terms:
         lowered = term.lower()
-        if lowered in _CODE_QUERY_STOPWORDS or lowered in seen:
+        if lowered in _CODE_QUERY_STOPWORDS or lowered in {"of", "in", "to", "is", "an", "as", "by", "on", "or", "at", "be", "it"} or lowered in seen:
             continue
         seen.add(lowered)
         terms.append(term)
@@ -515,18 +518,17 @@ def _focused_candidate_excerpt(
     source_start_line: int | None,
     primary_terms: Sequence[str],
     fallback_terms: Sequence[str],
+    implementation_start_line: int | None = None,
+    prefer_implementation: bool = False,
 ) -> tuple[str, int | None, int | None]:
     """Clip candidate evidence to a bounded line window around the best match."""
 
     if max_chars <= 0:
         return "", None, None
+    valid_start = isinstance(source_start_line, int) and not isinstance(source_start_line, bool) and source_start_line > 0
     if len(content) <= max_chars:
         line_count = max(1, len(content.splitlines()))
-        if (
-            isinstance(source_start_line, int)
-            and not isinstance(source_start_line, bool)
-            and source_start_line > 0
-        ):
+        if valid_start:
             return content, source_start_line, source_start_line + line_count - 1
         return content, None, None
 
@@ -534,23 +536,31 @@ def _focused_candidate_excerpt(
     if not lines:
         return content[:max_chars].rstrip(), None, None
 
-    normalized_groups = []
-    for raw_group in (primary_terms, fallback_terms):
-        seen: set[str] = set()
-        group: list[str] = []
-        for raw_term in raw_group:
-            term = str(raw_term or "").strip().casefold()
-            if not term or term in seen:
-                continue
-            seen.add(term)
-            group.append(term)
-        normalized_groups.append(tuple(group))
+    normalized_groups = [
+        tuple(dict.fromkeys(term for raw in group if (term := str(raw or "").strip().casefold())))
+        for group in (primary_terms, fallback_terms)
+    ]
 
-    focus_index = 0
+    implementation_index = (
+        implementation_start_line - source_start_line
+        if isinstance(source_start_line, int) and isinstance(implementation_start_line, int)
+        else -1
+    )
+    prefer_implementation = prefer_implementation and 0 <= implementation_index < len(lines)
+    # Explicit literal filters still select matching documentation/declarations.
+    literal_match = any(term in content.casefold() for term in normalized_groups[0])
+    if prefer_implementation and not literal_match:
+        body = "".join(lines[implementation_index:]).rstrip()
+        if len(body) <= max_chars:
+            return body, implementation_start_line, source_start_line + len(lines) - 1
+
+    focus_index = implementation_index if prefer_implementation else 0
     matched_terms: tuple[str, ...] = ()
-    for terms in normalized_groups:
+    for group_index, terms in enumerate(normalized_groups):
         scored_lines = []
         for index, line in enumerate(lines):
+            if group_index == 1 and prefer_implementation and index < implementation_index:
+                continue
             lowered = line.casefold()
             matches = tuple(term for term in terms if term in lowered)
             if matches:
@@ -561,6 +571,11 @@ def _focused_candidate_excerpt(
             _count, _matched_chars, _order, focus_index, matched_terms = max(scored_lines)
             break
 
+    # Prefer implementation only when no query term identifies a source line.
+    # Preserve explicit docstring/declaration matches.
+    if not matched_terms and 0 <= implementation_index < len(lines):
+        focus_index = max(focus_index, implementation_index)
+    window_start = window_end = focus_index
     focus_line = lines[focus_index]
     if len(focus_line) > max_chars:
         lowered = focus_line.casefold()
@@ -573,11 +588,7 @@ def _focused_candidate_excerpt(
         left = max(0, match_offset - max(0, max_chars - len(matching_term)) // 2)
         left = min(left, max(0, len(focus_line) - max_chars))
         excerpt = focus_line[left : left + max_chars].rstrip()
-        window_start = focus_index
-        window_end = focus_index
     else:
-        window_start = focus_index
-        window_end = focus_index
         used = len(focus_line)
         while True:
             added = False
@@ -585,7 +596,8 @@ def _focused_candidate_excerpt(
                 window_end += 1
                 used += len(lines[window_end])
                 added = True
-            if window_start > 0 and used + len(lines[window_start - 1]) <= max_chars:
+            floor = implementation_index if prefer_implementation and not literal_match else 0
+            if window_start > floor and used + len(lines[window_start - 1]) <= max_chars:
                 window_start -= 1
                 used += len(lines[window_start])
                 added = True
@@ -593,17 +605,57 @@ def _focused_candidate_excerpt(
                 break
         excerpt = "".join(lines[window_start : window_end + 1]).rstrip()
 
-    if (
-        isinstance(source_start_line, int)
-        and not isinstance(source_start_line, bool)
-        and source_start_line > 0
-    ):
+    if valid_start:
         return (
             excerpt,
             source_start_line + window_start,
             source_start_line + window_end,
         )
     return excerpt, None, None
+
+
+def _code_excerpt(
+    content: str, metadata: Mapping[str, Any], max_chars: int,
+    primary_terms: Sequence[str] = (), fallback_terms: Sequence[str] = (),
+) -> tuple[str, int | None, int | None, dict[str, Any]]:
+    """Select source once and describe its coverage identically in both modes."""
+    start = metadata.get("start_line")
+    implementation = metadata.get("implementation_start_line")
+    terms = {str(t).casefold() for t in fallback_terms}
+    graph = metadata.get("graph")
+    symbol = str((graph.get("symbol") if isinstance(graph, Mapping) else None) or metadata.get("symbol") or "")
+    documentation = bool(terms & {"docstring", "documentation", "docs", "example", "examples", "doctest"})
+    prefer = (not terms or bool(terms & {"implementation", "logic", "body"}) or
+              (symbol.rsplit(".", 1)[-1].casefold() in terms and not documentation))
+    prefer = prefer and not any(str(t).casefold() in content.casefold() for t in primary_terms)
+    excerpt, shown_start, shown_end = _focused_candidate_excerpt(
+        content, max_chars=max_chars, source_start_line=start,
+        primary_terms=primary_terms, fallback_terms=fallback_terms,
+        implementation_start_line=implementation, prefer_implementation=prefer,
+    )
+    coverage = {"truncated": len(excerpt) < len(content.rstrip())}
+    if not isinstance(start, int) or isinstance(start, bool) or start < 1:
+        return excerpt, shown_start, shown_end, coverage
+    lines = content.splitlines()
+    source_start = metadata.get("symbol_start_line", start)
+    source_end = metadata.get("symbol_end_line", start + len(lines) - 1)
+    if not all(type(n) is int for n in (source_start, source_end)) or not 0 < source_start <= start <= start + len(lines) - 1 <= source_end:
+        return excerpt, shown_start, shown_end, coverage
+    coverage["source_lines"] = [source_start, source_end]
+    whole_lines = (not metadata.get("partial_source_line") and shown_start is not None and shown_end is not None and
+                   "\n".join(excerpt.splitlines()).rstrip() == "\n".join(lines[shown_start-start:shown_end-start+1]).rstrip())
+    coverage["truncated"] = not (whole_lines and shown_start == source_start and shown_end == source_end)
+    read_start = source_start
+    if type(implementation) is int and "symbol_end_line" in metadata and source_start <= implementation <= source_end:
+        coverage["implementation_lines"] = [implementation, source_end]
+        coverage["implementation_complete"] = bool(whole_lines and shown_start <= implementation and shown_end >= source_end)
+        if prefer:
+            read_start = implementation
+    missing = [[read_start, source_end]]
+    if whole_lines:
+        missing = [[read_start, min(source_end, shown_start-1)], [max(read_start, shown_end+1), source_end]]
+    coverage["read_lines"] = [[a, b] for a, b in missing if a <= b]
+    return excerpt, shown_start, shown_end, coverage
 
 
 def _bm25_text(*parts: object) -> str:
@@ -711,7 +763,7 @@ def weighted_rrf_fuse(
         fused_item["metadata"] = metadata
         fused.append(fused_item)
 
-    fused.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item["uri"])))
+    fused.sort(key=lambda item: (-float(item.get("score") or 0.0), code_source_key(item)))
     return fused[: max(0, limit)]
 
 
@@ -786,8 +838,58 @@ def _weighted_sum_fuse(
         fused_item["score"] = score
         fused_item["metadata"] = metadata
         fused.append(fused_item)
-    fused.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item["uri"])))
+    fused.sort(key=lambda item: (-float(item.get("score") or 0.0), code_source_key(item)))
     return fused[: max(0, limit)]
+
+
+def _retain_code_matches(
+    fused: list[dict[str, Any]], query: str, weights: Mapping[str, float], limit: int,
+) -> list[dict[str, Any]]:
+    """Reserve at most two evidence slots without changing route scores or IDs."""
+    terms = _extract_code_query_terms(query)
+    # Sentence capitalization alone is not an explicit code identifier.
+    identifiers = [term for term in terms if (
+        "_" in term.strip("_") or any(c.isupper() for c in term[1:])
+        or f"`{term}`" in query or query.strip() == term
+        or re.search(rf"\b{re.escape(term)}\.|\.{re.escape(term)}\b", query)
+    )]
+
+    identifiers = {re.sub(r"[^a-z0-9]", "", term.lower()) for term in identifiers}
+
+    def matches_symbol(item):
+        symbol = str(item.get("metadata", {}).get("symbol") or "")
+        parts = re.findall(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+|[0-9]+", symbol)
+        boundaries = {0}
+        offset = 0
+        for part in parts:
+            offset += len(part)
+            boundaries.add(offset)
+        joined = "".join(parts).lower()
+        return any(start + len(term) in boundaries and joined.startswith(term, start)
+                   for term in identifiers for start in boundaries)
+
+    def rank(item, route):
+        if weights.get(route, 0.0) <= 0:
+            return math.inf
+        return item.get("metadata", {}).get("route_ranks", {}).get(route, math.inf)
+
+    protected = []
+    explicit = [item for item in fused if rank(item, "symbolic") < math.inf and matches_symbol(item)]
+    if explicit:
+        protected.append(min(explicit, key=lambda item: (rank(item, "symbolic"), code_source_key(item))))
+    # Require lexical support for the top semantic hit.
+    semantic = [item for item in fused if rank(item, "semantic") == 1
+                and min(rank(item, "symbolic"), rank(item, "bm25")) <= 3
+                and item.get("metadata", {}).get("route_scores", {}).get("semantic", {}).get("raw", 0.0) > 0]
+    if semantic:
+        protected.append(semantic[0])
+    selected = []
+    seen = set()
+    for item in protected + fused:
+        if item["uri"] not in seen:
+            seen.add(item["uri"])
+            selected.append(item)
+    return selected[:max(0, limit)]
 
 
 def fuse_route_hits(
@@ -796,22 +898,26 @@ def fuse_route_hits(
     mode: str = "weighted_rrf",
     weights: Mapping[str, float] | None = None,
     limit: int = _DEFAULT_TOP_K,
+    query: str = "",
 ) -> list[dict[str, Any]]:
     """Apply one of the supported deterministic fusion modes."""
 
     normalized_mode = str(mode or "weighted_rrf").strip().lower()
+    effective_weights = dict(_ROUTE_WEIGHTS)
+    if weights is not None:
+        effective_weights.update({str(key): float(value) for key, value in weights.items()})
+    fusion_limit = sum(len(hits) for hits in route_hits.values()) if query else limit
     if normalized_mode == "weighted_rrf":
-        return weighted_rrf_fuse(route_hits, limit=limit, weights=weights)
-    if normalized_mode in {"weighted_sum", "sum"}:
-        effective_weights = dict(_ROUTE_WEIGHTS)
-        if weights is not None:
-            effective_weights.update({str(key): float(value) for key, value in weights.items()})
-        return _weighted_sum_fuse(
+        fused = weighted_rrf_fuse(route_hits, limit=fusion_limit, weights=effective_weights)
+    elif normalized_mode in {"weighted_sum", "sum"}:
+        fused = _weighted_sum_fuse(
             route_hits,
-            limit=limit,
+            limit=fusion_limit,
             weights=effective_weights,
         )
-    raise ValueError(f"unsupported code retrieval fusion mode: {mode}")
+    else:
+        raise ValueError(f"unsupported code retrieval fusion mode: {mode}")
+    return _retain_code_matches(fused, query, effective_weights, limit) if query else fused
 
 
 def _code_evidence_path(metadata: dict[str, Any]) -> str:
@@ -978,6 +1084,7 @@ class CodeRetrievalService:
                 overview = str(node.overview or "")
                 content = str(node.content or "")
                 metadata.update(dict(node.metadata or {}))
+                metadata.pop("file_source", None)
             item.update(
                 {
                     "abstract": abstract,
@@ -1087,9 +1194,7 @@ class CodeRetrievalService:
             )
             return ActiveCodeSearchOutcome(status="error", diagnostics=diagnostics, error=type(exc).__name__)
 
-        scoped_records = tuple(
-            record for record in snapshot.records if self._record_matches_scope(record, request.scope)
-        )
+        scoped_records = self._scope_full_records(snapshot.records, request.scope)
         scoped_uris = {
             canonical_node_uri(
                 str(record.get("uri") or ""),
@@ -1246,6 +1351,7 @@ class CodeRetrievalService:
         mode = str(getattr(self._cfg, "code_retrieval_fusion_mode", "weighted_rrf"))
         fused = fuse_route_hits(
             route_hits,
+            query=request.query,
             mode=mode,
             weights=weights,
             limit=candidate_limit,
@@ -1256,6 +1362,8 @@ class CodeRetrievalService:
             result_limit=result_limit,
             snippet_chars=snippet_chars,
             batch_chars=batch_chars,
+            primary_focus_terms=request.scope.grep_terms,
+            fallback_focus_terms=_extract_code_query_terms(request.query),
         )
         route_count = sum(len(hits) for hits in route_hits.values())
         dedup_count = max(0, route_count - len({item.get("uri") for hits in route_hits.values() for item in hits}))
@@ -1647,6 +1755,7 @@ class CodeRetrievalService:
         try:
             fused = fuse_route_hits(
                 route_hits,
+                query=request.query,
                 mode=fusion_mode,
                 weights=self._code_route_weights(),
                 limit=candidate_limit,
@@ -2076,14 +2185,17 @@ class CodeRetrievalService:
             seen.add(uri)
             selected.append(record)
 
-        for route in ("bm25", "symbolic"):
-            for item in route_hits.get(route, ()):
-                append_uri(_candidate_canonical_uri(dict(item)))
+        # Interleave routes so BM25 cannot exhaust the semantic candidate cap.
+        channels = [route_hits.get(route, ()) for route in ("symbolic", "bm25")]
+        for index in range(max((len(items) for items in channels), default=0)):
+            for items in channels:
+                if index < len(items):
+                    append_uri(_candidate_canonical_uri(dict(items[index])))
         for record in sorted(
             by_uri.values(),
             key=lambda value: (
                 corpus.file_ranks.get(_candidate_canonical_uri(value), math.inf),
-                _candidate_canonical_uri(value),
+                code_source_key(value),
             ),
         ):
             append_uri(_candidate_canonical_uri(record))
@@ -2367,7 +2479,7 @@ class CodeRetrievalService:
             )
             for record, vector in document_vectors
         ]
-        hits.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item.get("uri") or "")))
+        hits.sort(key=lambda item: (-float(item.get("score") or 0.0), code_source_key(item)))
         if not hits and state == "ok":
             state = "zero_result"
         result = {
@@ -2468,6 +2580,51 @@ class CodeRetrievalService:
         return weights
 
     @staticmethod
+    def _scope_source_text(record: Mapping[str, Any]) -> str:
+        # Apply literal filters to source only; metadata remains a ranking signal.
+        return str(record.get("content") or "").lower()
+
+    @classmethod
+    def _scope_full_records(
+        cls, records: Sequence[Mapping[str, Any]], scope: CodeSearchScope,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not scope.grep_terms:
+            return tuple(record for record in records if cls._record_matches_scope(record, scope))
+        structural_scope = CodeSearchScope(
+            root_slugs=scope.root_slugs, paths=scope.paths, glob_patterns=scope.glob_patterns,
+        )
+        terms = tuple(term.lower() for term in scope.grep_terms)
+        groups: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
+        for record in records:
+            if not cls._record_matches_scope(record, structural_scope):
+                continue
+            metadata = dict(record.get("metadata") or {})
+            root = str(metadata.get("resource_root_slug") or "")
+            path = str(metadata.get("relative_path") or "").replace("\\", "/")
+            # Group only known file identities within this account snapshot.
+            key = ("file", root, path, str(metadata.get("root_fingerprint") or ""),
+                   str(metadata.get("file_key") or "")) if root and path else (
+                       "record", str(record.get("uri") or ""), str(id(record)),
+                   )
+            groups.setdefault(key, []).append(record)
+        selected: list[Mapping[str, Any]] = []
+        for group in groups.values():
+            sources = {r["_file_source"] for r in group if isinstance(r.get("_file_source"), str)}
+            if not sources:
+                raise _validation("scope.source_snapshot", "full source snapshot missing; refresh code resources")
+            if len(sources) > 1:
+                raise _validation("scope.source_snapshot_conflict", "conflicting file snapshots; refresh code resources")
+            source = sources.pop().lower()
+            if not all(term in source for term in terms):
+                continue
+            for record in group:
+                text = cls._scope_source_text(record)
+                if any(term in text for term in terms):
+                    # Keep only source-anchored chunks; never mutate the snapshot.
+                    selected.append({**record, "_file_grep_terms": terms})
+        return tuple(selected)
+
+    @staticmethod
     def _record_matches_scope(record: Mapping[str, Any], scope: CodeSearchScope) -> bool:
         metadata = dict(record.get("metadata") or {})
         if metadata.get("resource_type") != "code":
@@ -2480,21 +2637,15 @@ class CodeRetrievalService:
             return False
         if scope.glob_patterns and not any(fnmatch.fnmatchcase(path, pattern) for pattern in scope.glob_patterns):
             return False
-        searchable = " ".join(
-            str(value or "")
-            for value in (
-                path,
-                metadata.get("symbol"),
-                metadata.get("signature"),
-                metadata.get("symbol_kind"),
-                metadata.get("source_extension"),
-                metadata.get("language"),
-                record.get("content"),
-                record.get("overview"),
-                record.get("abstract"),
-            )
-        ).lower()
-        return all(term.lower() in searchable for term in scope.grep_terms)
+        if not scope.grep_terms:
+            return True
+        searchable = CodeRetrievalService._scope_source_text(record)
+        terms = tuple(term.lower() for term in scope.grep_terms)
+        verified_file_terms = record.get("_file_grep_terms", ())
+        if all(term in verified_file_terms for term in terms):
+            # Require a chunk-level anchor to exclude unrelated sibling chunks.
+            return any(term in searchable for term in terms)
+        return all(term in searchable for term in terms)
 
     def _item_matches_scope(
         self,
@@ -2519,6 +2670,8 @@ class CodeRetrievalService:
         result_limit: int,
         snippet_chars: int,
         batch_chars: int,
+        primary_focus_terms: Sequence[str] = (),
+        fallback_focus_terms: Sequence[str] = (),
     ) -> tuple[list[CodeEvidence], int, int, int]:
         evidence: list[CodeEvidence] = []
         hydration_errors = 0
@@ -2551,17 +2704,19 @@ class CodeRetrievalService:
             safe_root_slug = str(metadata.get("resource_root_slug") or "").strip()
             if not _SAFE_ROOT_SLUG.fullmatch(safe_root_slug) or safe_root_slug in {".", ".."}:
                 safe_root_slug = ""
-            start_line = metadata.get("start_line") if isinstance(metadata.get("start_line"), int) else None
-            end_line = metadata.get("end_line") if isinstance(metadata.get("end_line"), int) else None
-            locator = locator_path
-            if start_line is not None and end_line is not None:
-                locator = f"{locator_path}:{start_line}-{end_line}"
             body = str(node.content or node.overview or node.abstract or "")
             remaining = max(0, batch_chars - body_used)
             allowed = min(snippet_chars, remaining)
-            if len(body) > allowed:
-                clipped_count += 1
-                body = body[:allowed].rstrip() if allowed else ""
+            body, start_line, end_line, coverage = _code_excerpt(
+                body, metadata, allowed, primary_focus_terms, fallback_focus_terms,
+            )
+            clipped_count += int(coverage["truncated"])
+            if not body:
+                omitted_count += 1
+                continue
+            locator = locator_path
+            if start_line is not None and end_line is not None:
+                locator = f"{locator_path}:{start_line}-{end_line}"
             body_used += len(body)
             graph_context = tuple(
                 dict(value)
@@ -2582,6 +2737,7 @@ class CodeRetrievalService:
                     symbol_kind=str(metadata.get("symbol_kind") or ""),
                     signature=str(metadata.get("signature") or ""),
                     excerpt=body,
+                    coverage=coverage,
                     graph_context=graph_context,
                     fusion_score=float(item.get("score") or 0.0),
                     route_ranks=dict(metadata.get("route_ranks") or {}),
@@ -2730,20 +2886,16 @@ class CodeRetrievalService:
             safe_root_slug = str(metadata.get("resource_root_slug") or "").strip()
             if not _SAFE_ROOT_SLUG.fullmatch(safe_root_slug) or safe_root_slug in {".", ".."}:
                 safe_root_slug = ""
-            start_line = metadata.get("start_line") if isinstance(metadata.get("start_line"), int) else None
-            end_line = metadata.get("end_line") if isinstance(metadata.get("end_line"), int) else None
             body = str(node.content or node.overview or node.abstract or "")
             remaining = max(0, batch_chars - body_used)
             allowed = min(snippet_chars, remaining)
-            if len(body) > allowed:
-                clipped_count += 1
-                body, start_line, end_line = _focused_candidate_excerpt(
-                    body,
-                    max_chars=allowed,
-                    source_start_line=start_line,
-                    primary_terms=primary_focus_terms,
-                    fallback_terms=fallback_focus_terms,
-                )
+            body, start_line, end_line, coverage = _code_excerpt(
+                body, metadata, allowed, primary_focus_terms, fallback_focus_terms,
+            )
+            clipped_count += int(coverage["truncated"])
+            if not body:
+                omitted_count += 1
+                continue
             locator = locator_path
             if start_line is not None and end_line is not None:
                 locator = f"{locator_path}:{start_line}-{end_line}"
@@ -2767,6 +2919,7 @@ class CodeRetrievalService:
                     symbol_kind=str(metadata.get("symbol_kind") or ""),
                     signature=str(metadata.get("signature") or ""),
                     excerpt=body,
+                    coverage=coverage,
                     graph_context=graph_context,
                     fusion_score=float(item.get("score") or 0.0),
                     route_ranks=dict(metadata.get("route_ranks") or {}),
@@ -2996,11 +3149,13 @@ class CodeRetrievalService:
             symbol_kind = str(metadata.get("symbol_kind") or "code")
             score = 0.0
             for term in query_terms:
-                if term == symbol_lower:
+                if term == symbol_lower or term == symbol_lower.rsplit(".", 1)[-1]:
                     score += 3.0
                 elif term in symbol_lower:
                     score += 1.5
-                if term in signature_lower:
+                if term in _route_tokens(signature_lower):
+                    score += 3.0
+                elif term in signature_lower:
                     score += 1.0
                 if term in path_lower:
                     score += 0.6
@@ -3008,7 +3163,7 @@ class CodeRetrievalService:
                 score += 0.8
             if score > 0.0:
                 scored.append((score, record))
-        scored.sort(key=lambda item: (-item[0], str(item[1]["uri"])))
+        scored.sort(key=lambda item: (-item[0], code_source_key(item[1])))
         if not scored:
             return []
 
@@ -3080,7 +3235,7 @@ class CodeRetrievalService:
             if query_tokens & relation_words:
                 score = min(1.0, score + 0.15)
             items.append(self._record_item(record, score, "graph"))
-        items.sort(key=lambda item: (-float(item["score"]), str(item["uri"])))
+        items.sort(key=lambda item: (-float(item["score"]), code_source_key(item)))
         return items[:top_k]
 
     def _search_graph_resolved(
@@ -3135,7 +3290,10 @@ class CodeRetrievalService:
             overlap = query_terms & terms
             if overlap:
                 anchors.append((float(len(overlap)), uri))
-        anchors.sort(key=lambda value: (-value[0], value[1]))
+        def node_key(uri):
+            return code_source_key(by_uri[uri])
+
+        anchors.sort(key=lambda value: (-value[0], node_key(value[1])))
         anchor_uris = [uri for _, uri in anchors[: max(1, top_k)]]
         if not anchor_uris:
             return []
@@ -3266,7 +3424,7 @@ class CodeRetrievalService:
         # snapshot without issuing unbounded reverse relation-store queries.
         anchor_set = set(anchor_uris)
         inbound_counts = {uri: 0 for uri in anchor_uris}
-        for source_uri in sorted(by_uri):
+        for source_uri in sorted(by_uri, key=node_key):
             if source_uri in anchor_set:
                 continue
             if time.monotonic() >= deadline:
@@ -3291,17 +3449,18 @@ class CodeRetrievalService:
         for anchor in anchor_uris:
             if time.monotonic() >= deadline:
                 raise TimeoutError("graph route deadline exceeded")
-            neighbors = sorted(outgoing.get(anchor, set()) | incoming.get(anchor, set()))
+            neighbors = sorted(outgoing.get(anchor, set()) | incoming.get(anchor, set()), key=node_key)
             bounded_nodes.update(neighbors[:neighbor_limit])
+        ordered_nodes = sorted(bounded_nodes, key=node_key)
         adjacency = {
-            uri: sorted((outgoing.get(uri, set()) | incoming.get(uri, set())) & bounded_nodes)
-            for uri in bounded_nodes
+            uri: sorted((outgoing.get(uri, set()) | incoming.get(uri, set())) & bounded_nodes, key=node_key)
+            for uri in ordered_nodes
         }
         # Fixed-iteration personalized PageRank over the bounded graph.
         restart = 0.15
-        scores = {uri: (1.0 / len(anchor_uris) if uri in anchor_uris else 0.0) for uri in bounded_nodes}
+        scores = {uri: (1.0 / len(anchor_uris) if uri in anchor_uris else 0.0) for uri in ordered_nodes}
         for _ in range(8):
-            next_scores = {uri: 0.0 for uri in bounded_nodes}
+            next_scores = {uri: 0.0 for uri in ordered_nodes}
             for uri, score in scores.items():
                 neighbor_targets = adjacency.get(uri, [])
                 if not neighbor_targets:
@@ -3324,14 +3483,14 @@ class CodeRetrievalService:
                 for neighbor in (outgoing.get(uri, set()) | incoming.get(uri, set()))
                 if neighbor in anchor_rank
             )
-            for uri in bounded_nodes
+            for uri in ordered_nodes
         }
         walk_rank = {
             uri: rank
             for rank, uri in enumerate(
                 sorted(
                     (uri for uri, value in walk_scores.items() if value > 0),
-                    key=lambda value: (-walk_scores[value], value),
+                    key=lambda value: (-walk_scores[value], node_key(value)),
                 ),
                 start=1,
             )
@@ -3339,7 +3498,7 @@ class CodeRetrievalService:
         ppr_rank = {
             uri: rank
             for rank, uri in enumerate(
-                sorted(bounded_nodes, key=lambda value: (-scores[value], value)),
+                sorted(bounded_nodes, key=lambda value: (-scores[value], node_key(value))),
                 start=1,
             )
         }
@@ -3354,16 +3513,16 @@ class CodeRetrievalService:
                 for ranks in inner_route_ranks.values()
                 if uri in ranks
             )
-            for uri in bounded_nodes
+            for uri in ordered_nodes
         }
-        ranked = sorted(bounded_nodes, key=lambda uri: (-inner_scores[uri], uri))[:top_k]
+        ranked = sorted(bounded_nodes, key=lambda uri: (-inner_scores[uri], node_key(uri)))[:top_k]
         items: list[dict[str, Any]] = []
         max_score = max((inner_scores[uri] for uri in ranked), default=0.0)
         for uri in ranked:
             record = by_uri[uri]
             metadata = dict(record.get("metadata") or {})
             graph_context: list[dict[str, str]] = []
-            for target in sorted(adjacency.get(uri, ())):
+            for target in adjacency.get(uri, ()):
                 edge = context_by_edge.get((uri, target))
                 if edge is None:
                     incoming_edge = context_by_edge.get((target, uri))
@@ -3436,6 +3595,7 @@ class CodeRetrievalService:
             if not _is_code_node(node):
                 continue
             metadata = dict(node.metadata or {})
+            file_source = metadata.pop("file_source", None)
             index_metadata = {
                 **metadata,
                 "uri": node.uri,
@@ -3449,6 +3609,7 @@ class CodeRetrievalService:
                 "has_content": bool(node.content),
             }
             record = {
+                "_file_source": file_source,
                 "uri": node.uri,
                 "metadata": index_metadata,
                 "abstract": node.abstract or "",

@@ -797,6 +797,7 @@ class ReadAPI:
         resource_type: str | None = None,
         memory_directories: list[str] | None = None,
         collect_graph_supplement: bool = False,
+        use_scene: bool | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -821,6 +822,7 @@ class ReadAPI:
             resource_type=resource_type,
             memory_directories=memory_directories,
             **({"collect_graph_supplement": True} if collect_graph_supplement else {}),
+            **({"use_scene": use_scene} if use_scene is not None else {}),
         )
 
         if not include_debug:
