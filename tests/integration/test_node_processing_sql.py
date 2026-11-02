@@ -21,6 +21,44 @@ from tests.unit.server.test_extraction_retry_task import ready
 from tests.unit.extraction.test_node_processing import NodeLLM, card, operation
 
 
+def test_synchronous_node_processing_waits_for_busy_user_directory(database, ctx):
+    """A different session's topic commit must not fail after one second."""
+    _, make = database
+    holder_fs, _, _ = make()
+    service, writer, manager, archive, _ = service_pair(
+        make, ctx, extract=lambda **kwargs: [replace(
+            card(), provenance_ids=[f"prov:1:archive:{kwargs['archive_id']}:msg-one"]
+        )],
+    )
+    writer._node_processing_enabled = True
+    writer._llm = NodeLLM(lambda _: [operation([0])])
+    service._cfg.node_processing_enabled = True
+    directory = writer._writer._identity_resolver.uris.get_directory_uri("entity", ctx).rstrip("/")
+    holder_ctx = replace(ctx, session_id=ctx.session_id + "-holder")
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_directory():
+        with holder_fs.memory_identity_lock(directory, holder_ctx):
+            entered.set()
+            assert release.wait(10)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        holder = executor.submit(hold_directory)
+        assert entered.wait(5)
+        write = executor.submit(service.after_turn, params(ctx))
+        try:
+            time.sleep(1.2)
+            assert not write.done()
+        finally:
+            release.set()
+        holder.result(timeout=5)
+        result = write.result(timeout=10)
+
+    assert result["ok"] is True and result["status"] == "completed"
+    assert len(category_nodes(writer, "entity", ctx)) == 1
+    assert len(archive.list_archives(ctx.session_id, ctx)) == 1
+
+
 def test_node_processing_sql_reconnect_reuses_drafts(database, ctx):
     _, make = database
     service, writer, manager, _, _ = service_pair(make, ctx, extract=lambda **kwargs: [card()])

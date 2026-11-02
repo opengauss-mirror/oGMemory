@@ -196,6 +196,13 @@ def _guard_session_mutation(function):
         ctx = params.get("_ctx") or self.build_context(params)
         try:
             with self._session_mutation_scope(ctx, refresh=function.__name__ != "delete_session") as guard:
+                if (guard is not None and function.__name__ == "after_turn"
+                        and callable(getattr(guard, "identity_lock", None))):
+                    from service.extraction_retry import background_retry_running
+                    if (not background_retry_running() and (
+                            str(params.get("clientRequestId") or params.get("client_request_id") or "").strip()
+                            or self._param_bool(params, "wait", "wait", default=False))):
+                        guard.wait_for_identity_lock = True
                 if guard is not None and function.__name__ == "commit_session_buffer":
                     params = {**params, "wait": True}
                 result = function(self, {**params, "_ctx": ctx})
