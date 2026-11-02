@@ -393,15 +393,17 @@ class ChromaVectorIndex(VectorIndex):
         """
         if not record_id:
             return None
-        result = self._collection.get(
-            ids=[record_id], include=["documents", "metadatas", "embeddings"]
-        )
+        with self._locked():
+            result = self._collection.get(
+                ids=[record_id], include=["documents", "metadatas", "embeddings"]
+            )
         ids = (result or {}).get("ids") or []
         if not ids:
             return None
         meta = ((result.get("metadatas") or [{}])[0]) or {}
         doc = ((result.get("documents") or [""])[0]) or ""
-        emb = ((result.get("embeddings") or [[]])[0]) or []
+        embeddings = result.get("embeddings")
+        emb = embeddings[0] if embeddings is not None and len(embeddings) else None
         # Mirror the OpenGauss path: surface a stable ``filters``
         # shape with account_id / owner_space so callers can re-derive
         # the scope without inspecting raw metadata.
@@ -410,7 +412,7 @@ class ChromaVectorIndex(VectorIndex):
             "owner_space": meta.get("owner_space", ""),
         }
         metadata = dict(meta)
-        if emb and "_embedding" not in metadata:
+        if emb is not None and len(emb) and "_embedding" not in metadata:
             metadata["_embedding"] = [float(x) for x in emb]
         return IndexRecord(
             id=str(ids[0]),

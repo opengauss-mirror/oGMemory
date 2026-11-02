@@ -181,3 +181,50 @@ def test_windows_lock_propagates_access_denied(monkeypatch):
 
     assert exc_info.value is access_denied
     chroma_index.time.sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("embedding_kind", ["array", "list", "none", "empty"])
+def test_get_record_handles_numpy_embeddings_without_truth_value_checks(embedding_kind):
+    numpy = pytest.importorskip("numpy")
+    index = _index()
+    embeddings = {
+        "array": numpy.array([[0.5, 0.25, 0.75]], dtype=numpy.float32),
+        "list": [[0.5, 0.25, 0.75]], "none": None, "empty": [],
+    }[embedding_kind]
+    index._collection = Mock()
+    index._collection.get.return_value = {
+        "ids": ["one"], "documents": ["full body"],
+        "metadatas": [{"uri": "ctx://tenant/memory/one", "level": 2,
+                       "account_id": "tenant", "owner_space": "user:alice"}],
+        "embeddings": embeddings,
+    }
+    saved = index.get_record("one")
+    assert saved.text == "full body" and saved.filters["account_id"] == "tenant"
+    if embedding_kind in {"array", "list"}:
+        assert saved.metadata["_embedding"] == [0.5, 0.25, 0.75]
+    else:
+        assert "_embedding" not in saved.metadata
+
+
+def test_get_record_waits_for_a_writer_holding_the_collection_lock():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    index = _index()
+    index._collection = Mock()
+    index._collection.get.return_value = {"ids": []}
+    started = Event()
+
+    def read():
+        started.set()
+        return index.get_record("one")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with index._locked():
+            future = pool.submit(read)
+            assert started.wait(timeout=2)
+            with pytest.raises(TimeoutError):
+                future.result(timeout=0.05)
+            index._collection.get.assert_not_called()
+        assert future.result(timeout=2) is None
+    index._collection.get.assert_called_once()
