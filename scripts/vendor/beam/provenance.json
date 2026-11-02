@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/mohammadtavakoli78/BEAM",
+  "commit": "b2da22eac88bb0874c64665f13457eb99835774a",
+  "prompt_extraction": "AST literal value of unified_llm_judge_base_prompt from src/prompts.py; unchanged text",
+  "upstream_prompts_sha256": "81fe51ab2bcd7e8ad218b3a9a969a340c38d31f90ac2d93fa78a3bb890ba157b",
+  "files": {
+    "compute_metrics.py": "e72bf25d36d521d166862063ec94f8e7875328193142d1edddb9b4677d47780d",
+    "report_results.py": "386257d0a9b3b6e610d286ada9f7437cf4caed89702957cf8ccf30be9e006599",
+    "LICENSE": "60c7b74ffaacaae383c3f06a48bc79d204b25bc9c1856df9711b3d290febd474",
+    "unified_llm_judge_base_prompt.txt": "593373c642a288a7b590577d8a8fc92c3f9a2b70e2f64ad6e59a040a6c56b7f5"
+  },
+  "vendor_normalization": "report_results.py has one final newline added; all upstream function bodies and prompt text unchanged"
+}
