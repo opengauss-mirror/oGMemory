@@ -31,6 +31,8 @@ _SCOPE_FIELDS = (
 )
 _JSON_FILTERS = {"node_status", "extracted_node_id", "clip_id"}
 _BATCH_SIZE = 32
+_URI_BATCH_SIZE = 128
+_QUERY_PAGE_SIZE = 256
 _TEXT_FIELDS = ("text", "text_1", "text_2", "text_3", "text_4")
 _VARCHAR_LIMITS = {"id": 512, "text": 65535, **dict.fromkeys(_SCOPE_FIELDS, 8192)}
 
@@ -346,7 +348,9 @@ class MilvusVectorIndex(VectorIndex):
     ) -> list[SeedHit]:
         return self.search_by_vector(query_vector, {**filters, "parent_uri": parent_uri}, top_k)
 
-    def _query_rows(self, filters: dict[str, Any], output_fields: list[str]):
+    def _query_rows(
+        self, filters: dict[str, Any], output_fields: list[str], *, page_size: int = _QUERY_PAGE_SIZE
+    ):
         # The server iterator flag orders by primary key. Use bounded keyset
         # pages directly: pymilvus 2.6.17 QueryIterator performs an unbounded
         # describe_collection during construction, even with a timeout.
@@ -360,7 +364,7 @@ class MilvusVectorIndex(VectorIndex):
             batch = self._rpc(
                 "query", collection_name=self._collection_name, filter=page_filter,
                 output_fields=list(dict.fromkeys(["id", *output_fields])),
-                limit=_BATCH_SIZE, iterator="True", consistency_level="Strong",
+                limit=page_size, iterator="True", consistency_level="Strong",
             )
             if not batch:
                 break
@@ -369,6 +373,8 @@ class MilvusVectorIndex(VectorIndex):
                 raise RuntimeError("Milvus returned an unordered iterator page")
             cursor = ids[-1]
             yield from batch
+            if len(batch) < page_size:
+                break
 
     def get_embeddings(
         self,
@@ -382,10 +388,16 @@ class MilvusVectorIndex(VectorIndex):
             return {}
         output = {}
         wanted = list(dict.fromkeys(uris))
-        for start in range(0, len(wanted), _BATCH_SIZE):
+        fields = ["uri", "embedding"]
+        if expected_texts is not None:
+            fields.extend(_TEXT_FIELDS)
+        # Keep long-text response pages bounded, but avoid fetching any text
+        # when callers only need vectors. URI and write batch sizes are independent.
+        page_size = _BATCH_SIZE if expected_texts is not None else _QUERY_PAGE_SIZE
+        for start in range(0, len(wanted), _URI_BATCH_SIZE):
             for row in self._query_rows(
-                {**filters, "uri": wanted[start:start + _BATCH_SIZE], "level": level},
-                ["uri", "embedding", *_TEXT_FIELDS],
+                {**filters, "uri": wanted[start:start + _URI_BATCH_SIZE], "level": level},
+                fields, page_size=page_size,
             ):
                 if expected_texts is None or self._text(row) == expected_texts.get(row["uri"]):
                     output[row["uri"]] = [float(value) for value in row["embedding"]]

@@ -284,3 +284,21 @@ def test_real_scalar_index_repair_and_legacy_text_migration(index):
         if reopened:
             reopened.close()
         client.drop_collection(collection_name=name)
+
+
+def test_real_bulk_embedding_reads_need_one_bounded_rpc(index, monkeypatch):
+    records = [make_record(f"bulk-{number}") for number in range(128)]
+    index.upsert(records)
+    query = index._client.query
+    calls = []
+
+    def tracked_query(**kwargs):
+        calls.append(kwargs)
+        return query(**kwargs)
+
+    monkeypatch.setattr(index._client, "query", tracked_query)
+    vectors = index.get_embeddings([record.uri for record in records], {"account_id": "a"})
+    assert len(vectors) == 128
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == index._timeout
+    assert calls[0]["output_fields"] == ["id", "uri", "embedding"]

@@ -103,7 +103,7 @@ def test_get_embeddings_text_guard_and_bounded_query(index):
     ) == {"y": [0.0, 1.0, 0.0]}
     calls = index._client.query.call_args_list
     assert all(call.kwargs["timeout"] == 7 for call in calls)
-    assert 'id > "b"' in calls[1].kwargs["filter"]
+    assert len(calls) == 1
     index._client.query_iterator.assert_not_called()
 
 
@@ -377,7 +377,7 @@ def test_large_text_survives_read_rewrite_and_shrinking(index, text):
 
 def test_keyset_pagination_escapes_primary_keys_and_fails_on_unordered_pages(index):
     index._client.query.side_effect = [[{"id": 'a"', "uri": "one"}], []]
-    assert list(index._query_rows({"account_id": "a"}, ["uri"])) == [{"id": 'a"', "uri": "one"}]
+    assert list(index._query_rows({"account_id": "a"}, ["uri"], page_size=1)) == [{"id": 'a"', "uri": "one"}]
     assert 'id > "a\\\""' in index._client.query.call_args.kwargs["filter"]
     index._client.query.side_effect = [[{"id": "b"}, {"id": "a"}]]
     with pytest.raises(RuntimeError, match="unordered"):
@@ -401,3 +401,34 @@ def test_scalar_indexes_preserve_existing_and_fill_missing(index):
     assert set(fields) == {"owner_space", "level", "parent_uri", "uri"}
     assert index._client.create_index.call_count == 4
     assert all(c.kwargs["timeout"] == 7 for c in index._client.create_index.call_args_list)
+
+
+def test_bulk_embeddings_use_one_rpc_and_do_not_fetch_documents(index):
+    rows = [{"id": f"id-{number:03}", "uri": f"uri-{number}",
+             "embedding": [1., 0., 0.]} for number in range(128)]
+    index._client.query.return_value = rows
+    assert len(index.get_embeddings([r["uri"] for r in rows], {"account_id": "a"})) == 128
+    index._client.query.assert_called_once()
+    call = index._client.query.call_args.kwargs
+    assert call["output_fields"] == ["id", "uri", "embedding"]
+    assert call["limit"] == 256 and call["timeout"] == 7
+    assert call["consistency_level"] == "Strong"
+
+
+def test_keyset_pagination_stops_on_short_page_and_keeps_same_uri_records(index):
+    rows = [{"id": f"id-{number:03}", "uri": "same", "embedding": [1., 0., 0.]}
+            for number in range(529)]
+    index._client.query.side_effect = [rows[:256], rows[256:512], rows[512:]]
+    assert index.get_embeddings(["same"], {}) == {"same": [1., 0., 0.]}
+    calls = index._client.query.call_args_list
+    assert len(calls) == 3
+    assert 'id > "id-255"' in calls[1].kwargs["filter"]
+    assert 'id > "id-511"' in calls[2].kwargs["filter"]
+
+
+def test_expected_texts_use_bounded_long_document_pages(index):
+    index._client.query.return_value = []
+    index.get_embeddings(["same"], {}, expected_texts={"same": "body"})
+    call = index._client.query.call_args.kwargs
+    assert call["limit"] == 32
+    assert all(name in call["output_fields"] for name in ("text", "text_1", "text_4"))
