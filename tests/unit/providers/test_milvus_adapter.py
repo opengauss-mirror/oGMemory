@@ -393,6 +393,7 @@ def test_query_timeout_propagates_without_using_sdk_iterator(index):
 
 
 def test_scalar_indexes_preserve_existing_and_fill_missing(index):
+    pytest.importorskip("pymilvus")
     index._client.list_indexes.return_value = ["custom_account"]
     index._client.describe_index.return_value = {"field_name": "account_id"}
     index._ensure_scalar_indexes()
