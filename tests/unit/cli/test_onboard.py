@@ -326,3 +326,57 @@ def test_docker_environment_rejects_chroma(tmp_path):
         generate_quickstart_env({}, {}, vector_config={"type": "chroma"},
                                 output_path=tmp_path / "unsupported.env")
     assert not (tmp_path / "unsupported.env").exists()
+
+
+@pytest.mark.parametrize("mode", ["local", "headless"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_milvus_cli_parameters_survive_save_and_reload(tmp_path, monkeypatch, mode, existing):
+    import yaml
+
+    from cli.lib.local_config import load_local_config
+
+    config_path = tmp_path / "config.yaml"
+    if existing:
+        config_path.write_text(yaml.safe_dump({"vector_db": {
+            "type": "milvus", "milvus_uri": "http://old:19530", "milvus_collection": "old",
+            "milvus_db_name": "old", "milvus_timeout": 2,
+        }}))
+    monkeypatch.setenv("OGMEM_CONFIG", str(config_path))
+    monkeypatch.setattr("cli.lib.process.find_project_root", lambda: tmp_path)
+    monkeypatch.setattr(onboard, "_step1_check", lambda args: True)
+    monkeypatch.setattr(onboard, "_step2_llm", lambda args: {"provider": "mock", "model": "mock"})
+    monkeypatch.setattr(onboard, "_step3_embedding", lambda *a: {
+        "provider": "mock", "model": "mock", "dimension": 3,
+    })
+    monkeypatch.setattr(onboard, "_step_install_deps", lambda *a: True)
+    monkeypatch.setattr(onboard, "confirm", lambda *a, **kw: False)
+    args = build_parser().parse_args([
+        "onboard", "--mode", mode, "--non-interactive", "--vector-db", "milvus",
+        "--storage-backend", "agfs", "--milvus-uri", "http://selected:19530",
+        "--milvus-collection", "selected", "--milvus-db-name", "selected_db",
+        "--milvus-timeout", "7.5",
+    ])
+    assert onboard.run(args) == 0
+    saved = yaml.safe_load(config_path.read_text())["vector_db"]
+    assert saved == {"type": "milvus", "dimension": 3, "milvus_uri": "http://selected:19530",
+                     "milvus_collection": "selected", "milvus_db_name": "selected_db",
+                     "milvus_timeout": 7.5}
+    runtime = load_local_config(tmp_path, str(config_path))
+    assert (runtime.milvus_uri, runtime.milvus_collection_name, runtime.milvus_db_name,
+            runtime.milvus_timeout) == ("http://selected:19530", "selected", "selected_db", 7.5)
+
+
+@pytest.mark.parametrize("mode", ["local", "headless"])
+def test_existing_memory_backend_can_be_changed_in_interactive_menu(monkeypatch, mode):
+    args = build_parser().parse_args(["onboard", "--mode", mode, "--storage-backend", "agfs"])
+    existing_defaults(args, {"vector_db": {"type": "memory"}})
+    seen = []
+
+    def choose(prompt, options, **kw):
+        seen.append(kw["default"])
+        return 1
+
+    monkeypatch.setattr(onboard, "select", choose)
+    vdb, _ = onboard._step4_database(args)
+    assert seen == [0]
+    assert vdb["type"] == "chroma"

@@ -141,7 +141,7 @@ def _step4_database(args) -> tuple[dict, dict]:
     # All supported providers use the same configuration path.
     vector_types = _vector_db_choices(args)
     requested = getattr(args, "vector_db", None) or "opengauss"
-    if requested not in vector_types:
+    if getattr(args, "mode", None) == "docker" and requested == "chroma":
         raise ValueError(
             "Docker supports openGauss or external Milvus; Chroma requires local/headless mode"
         )
@@ -152,7 +152,7 @@ def _step4_database(args) -> tuple[dict, dict]:
         labels = {"opengauss": "openGauss", "chroma": "Chroma", "milvus": "Milvus"}
         vdb_type = vector_types[
             select("Vector database:", [labels[name] for name in vector_types],
-                   default=vector_types.index(requested))
+                   default=vector_types.index(requested) if requested in vector_types else 0)
         ]
 
     vdb = {"type": vdb_type}
@@ -462,7 +462,14 @@ plugin:
             cfg += f"  openclaw_config: {quote(openclaw_config)}\n"
 
     import yaml
-    return yaml.safe_load(cfg)
+    value = yaml.safe_load(cfg)
+    if vdb["type"] == "milvus":
+        value["vector_db"].update({
+            key: vdb[key] for key in (
+                "milvus_uri", "milvus_collection", "milvus_db_name", "milvus_timeout"
+            ) if key in vdb
+        })
+    return value
 
 
 
