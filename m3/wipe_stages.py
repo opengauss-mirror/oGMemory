@@ -358,7 +358,8 @@ def post_ops(
                 "sql": (
                     f"DELETE FROM {vector_table} "
                     "WHERE filters->>'account_id' = %(account_id)s "
-                    "AND uri LIKE 'm3://%'"
+                    # %% below — escaped for psycopg2 (named params present)
+                    "AND uri LIKE 'm3://%%'"
                 ),
                 "when": "index_episodic in wiped range + --wipe-vector",
             })
@@ -459,6 +460,12 @@ def run(
         cur.execute(delete_stmt, del_params)
         report["deleted_nodes"] = cur.rowcount
     for op in ops:
+        # drop_vector_rows runs on vector_conn below when one is provided —
+        # executing it on conn too would self-deadlock (conn's uncommitted
+        # delete holds the transactionid lock vector_conn then waits on,
+        # while conn only commits after the vector_conn execute returns).
+        if op["name"] == "drop_vector_rows" and vector_conn is not None:
+            continue
         with conn.cursor() as cur:
             cur.execute(op["sql"], {**op.get("params", {}), "account_id": account})
             report.setdefault("post_op_rowcounts", {})[op["name"]] = cur.rowcount
@@ -472,6 +479,9 @@ def run(
                     vector_op["sql"], {"account_id": account}
                 )
                 report["post_op_rowcounts"]["drop_vector_rows"] = cur.rowcount
+            # psycopg2 is not autocommit by default — without this the
+            # vector delete silently rolled back at connection close.
+            vector_conn.commit()
     for path in qa_files:
         try:
             path.unlink()
