@@ -133,7 +133,8 @@ def test_complete_ingestion_preserves_source_payload_and_freeze_manifest(monkeyp
         "database": "beam_eval_fixture_1234", "inventory": fingerprint, "runtime": runtime}))
     monkeypatch.setattr(ingest, "source_pairs", lambda *_: (7, pairs()))
     monkeypatch.setattr(ingest, "require_eval_container", lambda *_: {"State": {"Running": False}})
-    db = Mock(spec=["assert_idle", "fingerprint"])
+    # Python 3.11.0 rejects lazy assert_* attributes, even when listed in spec.
+    db = Mock(spec=["assert_idle", "fingerprint"], assert_idle=Mock())
     db.fingerprint.return_value = fingerprint
     monkeypatch.setattr(ingest, "SnapshotDB", lambda *_: db)
     monkeypatch.setattr(ingest, "check_runtime", lambda *_: runtime)
@@ -156,6 +157,7 @@ def test_complete_ingestion_preserves_source_payload_and_freeze_manifest(monkeyp
                            memory_container="memory", postgres_container="postgres", memory_url="http://127.0.0.1:8090",
                            account="a", user="u", output_dir=tmp_path / "ingest", timeout=5)
     result = ingest.ingest(args)
+    db.assert_idle.assert_called_once_with()
     assert result["status"] == "ingested_unfrozen"
     assert result["source_pairs"] == result["completed_pairs"] == 1
     assert result["parquet_sha256"] == ingest.digest(source)
