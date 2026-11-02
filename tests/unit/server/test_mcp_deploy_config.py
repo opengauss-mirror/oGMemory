@@ -60,7 +60,9 @@ def test_standalone_dockerfile_remains_jenkins_sed_compatible():
     runtime = dockerfile.split("FROM golang:", 1)[0]
     assert "go build" not in runtime
     assert "COPY agfs/agfs-server" not in dockerfile
-    assert "COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh" in dockerfile
+    assert "COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh" in dockerfile
+    assert "chmod 755 /opt/entrypoint.sh" in runtime
+    assert "COPY --chmod" not in dockerfile
     assert "entrypoint-standalone-mcp.sh" not in dockerfile
     assert "ENV OGMEM_MCP_DEFAULT_TOOLSET=read-only" in dockerfile
 
