@@ -93,19 +93,18 @@ def test_search_filters_before_top_k_and_preserves_hit(index):
     assert hits[0].abstract == "summary" and hits[0].score == 0.9
 
 
-def test_get_embeddings_text_guard_and_iterator_close(index):
-    iterator = index._client.query_iterator.return_value
-    iterator.next.side_effect = [
-        [
-            {"uri": "x", "text": "old", "embedding": [1.0, 0.0, 0.0]},
-            {"uri": "y", "text": "same", "embedding": [0.0, 1.0, 0.0]},
-        ],
-        [],
-    ]
+def test_get_embeddings_text_guard_and_bounded_query(index):
+    index._client.query.side_effect = [[
+        {"id": "a", "uri": "x", "text": "old", "embedding": [1.0, 0.0, 0.0]},
+        {"id": "b", "uri": "y", "text": "same", "embedding": [0.0, 1.0, 0.0]},
+    ], []]
     assert index.get_embeddings(
         ["x", "y"], {"account_id": "a"}, expected_texts={"x": "new", "y": "same"}
     ) == {"y": [0.0, 1.0, 0.0]}
-    iterator.close.assert_called_once()
+    calls = index._client.query.call_args_list
+    assert all(call.kwargs["timeout"] == 7 for call in calls)
+    assert 'id > "b"' in calls[1].kwargs["filter"]
+    index._client.query_iterator.assert_not_called()
 
 
 def test_empty_operations_do_not_call_provider(index):
@@ -189,10 +188,10 @@ def _client(monkeypatch):
 def test_startup_repairs_schema_left_without_index(monkeypatch):
     client = _client(monkeypatch)
     client.has_collection.return_value = True
-    client.list_indexes.side_effect = [[], ["embedding"]]
+    client.list_indexes.side_effect = [[], ["embedding"], ["embedding"]]
     MilvusVectorIndex(dimension=3, timeout=7)
     client.create_collection.assert_not_called()
-    client.create_index.assert_called_once()
+    assert client.create_index.call_count == 6
     assert client.create_index.call_args.kwargs["timeout"] == 7
     client.load_collection.assert_called_once_with(collection_name="contextengine", timeout=7)
 
@@ -203,7 +202,7 @@ def test_startup_tolerates_only_duplicate_creation(monkeypatch):
     client = _client(monkeypatch)
     client.has_collection.return_value = False
     client.create_collection.side_effect = milvus_error(65535, "collection already exists")
-    client.list_indexes.side_effect = [[], ["embedding"]]
+    client.list_indexes.side_effect = [[], ["embedding"], ["embedding"]]
     client.create_index.side_effect = milvus_error(65535, "index already exists")
     MilvusVectorIndex(dimension=3)
     client.load_collection.assert_called_once()
@@ -237,21 +236,20 @@ def test_schema_dimension_mismatch_fails_before_index_creation(monkeypatch):
 def test_timeout_propagates_through_runtime_operations(index):
     index._client.search.return_value = [[]]
     index._client.get.return_value = []
-    index._client.query.return_value = [{"count(*)": 0}]
-    index._client.query_iterator.return_value.next.return_value = []
+    index._client.query.side_effect = [[{"count(*)": 0}], []]
     index.upsert([record()])
     index.delete(["one"])
     index.search_by_vector([1.0, 0.0, 0.0], {"account_id": "a"}, 1)
     index.get_record("one")
     index.count()
     index.get_embeddings(["uri"], {"account_id": "a"})
-    for method in ["upsert", "delete", "search", "get", "query", "query_iterator"]:
+    for method in ["upsert", "delete", "search", "get", "query"]:
         assert getattr(index._client, method).call_args.kwargs["timeout"] == 7.0
     assert "text" not in index._client.search.call_args.kwargs["output_fields"]
 
 
 @pytest.mark.parametrize(
-    "field,value", [("text", "中" * 21846), ("id", "x" * 513), ("metadata", {"blob": "x" * 65536})]
+    "field,value", [("text", "中" * 110000), ("id", "x" * 513), ("metadata", {"blob": "x" * 65536})]
 )
 def test_reject_oversized_utf8_before_any_batch(index, field, value):
     items = [record() for _ in range(129)]
@@ -355,3 +353,50 @@ def test_metadata_at_capacity_does_not_grow_after_read_and_rewrite(index, capaci
         assert rewritten["metadata"] == original["metadata"]
         assert rewritten["space_id"] == "space-1"
         assert rewritten["video_id"] == "video-1"
+
+
+@pytest.mark.parametrize("text", ["x" * 73662, "中🙂" * 37449, "x" * 262144])
+def test_large_text_survives_read_rewrite_and_shrinking(index, text):
+    item = record()
+    item.text = text
+    index.upsert([item])
+    row = dict(index._client.upsert.call_args.kwargs["data"][0])
+    assert len(row["text"].encode()) <= 65535
+    index._client.get.return_value = [row]
+    saved = index.get_record(item.id)
+    assert saved.text == text
+    index.upsert([saved])
+    assert index._client.upsert.call_args.kwargs["data"][0] == row
+    index._client.query.side_effect = [[row], []]
+    assert index.get_embeddings([item.uri], {}, expected_texts={item.uri: text})
+    item.text = "short"
+    index.upsert([item])
+    rewritten = index._client.upsert.call_args.kwargs["data"][0]
+    assert index._text(rewritten) == "short" and rewritten["text_1"] == ""
+
+
+def test_keyset_pagination_escapes_primary_keys_and_fails_on_unordered_pages(index):
+    index._client.query.side_effect = [[{"id": 'a"', "uri": "one"}], []]
+    assert list(index._query_rows({"account_id": "a"}, ["uri"])) == [{"id": 'a"', "uri": "one"}]
+    assert 'id > "a\\\""' in index._client.query.call_args.kwargs["filter"]
+    index._client.query.side_effect = [[{"id": "b"}, {"id": "a"}]]
+    with pytest.raises(RuntimeError, match="unordered"):
+        list(index._query_rows({}, ["uri"]))
+
+
+def test_query_timeout_propagates_without_using_sdk_iterator(index):
+    index._client.query.side_effect = TimeoutError("deadline exceeded")
+    with pytest.raises(TimeoutError):
+        index.get_embeddings(["uri"], {})
+    assert index._client.query.call_args.kwargs["timeout"] == 7
+    index._client.query_iterator.assert_not_called()
+
+
+def test_scalar_indexes_preserve_existing_and_fill_missing(index):
+    index._client.list_indexes.return_value = ["custom_account"]
+    index._client.describe_index.return_value = {"field_name": "account_id"}
+    index._ensure_scalar_indexes()
+    fields = [c.kwargs["field_name"] for c in index._client.prepare_index_params.return_value.add_index.call_args_list]
+    assert set(fields) == {"owner_space", "level", "parent_uri", "uri"}
+    assert index._client.create_index.call_count == 4
+    assert all(c.kwargs["timeout"] == 7 for c in index._client.create_index.call_args_list)

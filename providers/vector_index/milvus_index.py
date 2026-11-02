@@ -30,7 +30,8 @@ _SCOPE_FIELDS = (
     "extractor_type",
 )
 _JSON_FILTERS = {"node_status", "extracted_node_id", "clip_id"}
-_BATCH_SIZE = 128
+_BATCH_SIZE = 32
+_TEXT_FIELDS = ("text", "text_1", "text_2", "text_3", "text_4")
 _VARCHAR_LIMITS = {"id": 512, "text": 65535, **dict.fromkeys(_SCOPE_FIELDS, 8192)}
 
 
@@ -62,6 +63,8 @@ class MilvusVectorIndex(VectorIndex):
                 )
                 schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=dimension)
                 schema.add_field("text", DataType.VARCHAR, max_length=_VARCHAR_LIMITS["text"])
+                for name in _TEXT_FIELDS[1:]:
+                    schema.add_field(name, DataType.VARCHAR, max_length=65535, nullable=True)
                 schema.add_field("metadata", DataType.JSON)
                 schema.add_field("level", DataType.INT64)
                 for field in _SCOPE_FIELDS:
@@ -73,14 +76,16 @@ class MilvusVectorIndex(VectorIndex):
                     consistency_level="Strong",
                 )
             self._validate_schema(DataType)
+            self._ensure_text_fields(DataType)
             self._ensure_index()
+            self._ensure_scalar_indexes()
             self._rpc("load_collection", collection_name=collection_name)
         except Exception:
             self._client.close()
             raise
 
     def _rpc(self, method: str, **kwargs):
-        """Pass a deadline to every network operation, including iterator creation."""
+        """Pass a deadline to every network operation, including schema and index changes."""
         return getattr(self._client, method)(timeout=self._timeout, **kwargs)
 
     def _create_if_absent(self, method: str, **kwargs) -> None:
@@ -119,6 +124,42 @@ class MilvusVectorIndex(VectorIndex):
                 "Existing Milvus collection has an incompatible oGMemory schema/dimension"
             )
 
+    def _ensure_text_fields(self, data_type) -> None:
+        # Nullable additive fields preserve collections created before long-text
+        # support. Old rows read as empty suffixes; no data rewrite is required.
+        schema = self._rpc("describe_collection", collection_name=self._collection_name)
+        fields = {field["name"]: field for field in schema["fields"]}
+        for name in _TEXT_FIELDS[1:]:
+            if name not in fields:
+                self._create_if_absent(
+                    "add_collection_field", collection_name=self._collection_name,
+                    field_name=name, data_type=data_type.VARCHAR,
+                    max_length=65535, nullable=True,
+                )
+            elif (fields[name]["type"] != data_type.VARCHAR
+                  or int(fields[name].get("params", {}).get("max_length", 0)) < 65535):
+                raise ValueError("Existing Milvus collection has incompatible text suffix fields")
+
+    @staticmethod
+    def _text_parts(text: str) -> dict[str, str]:
+        encoded = text.encode("utf-8")
+        if len(encoded) > 65535 * len(_TEXT_FIELDS):
+            raise ValueError("Milvus text exceeds 327675 UTF-8 bytes")
+        parts = {}
+        for name in _TEXT_FIELDS:
+            # Only drop the incomplete codepoint at this boundary. Advance by
+            # the bytes actually consumed so it is retained in the next part.
+            part = encoded[:65535].decode("utf-8", errors="ignore")
+            parts[name] = part
+            encoded = encoded[len(part.encode("utf-8")):]
+        if encoded:
+            raise ValueError("Milvus text exceeds available UTF-8 chunk capacity")
+        return parts
+
+    @staticmethod
+    def _text(row: dict) -> str:
+        return "".join(row.get(name) or "" for name in _TEXT_FIELDS)
+
     def _embedding_index(self) -> dict[str, Any] | None:
         for name in self._rpc("list_indexes", collection_name=self._collection_name):
             info = self._rpc(
@@ -147,6 +188,21 @@ class MilvusVectorIndex(VectorIndex):
             info = self._embedding_index()
         if info is None or info.get("metric_type") != "COSINE":
             raise ValueError("Existing Milvus collection must have a COSINE embedding index")
+
+    def _ensure_scalar_indexes(self) -> None:
+        indexed = set()
+        for name in self._rpc("list_indexes", collection_name=self._collection_name):
+            info = self._rpc("describe_index", collection_name=self._collection_name, index_name=name)
+            indexed.add(info.get("field_name"))
+        # Limit automatic indexes to the common tenant/hierarchy access paths.
+        # Preserve existing scalar indexes regardless of their implementation.
+        for field in ("account_id", "owner_space", "level", "parent_uri", "uri"):
+            if field not in indexed:
+                params = self._client.prepare_index_params()
+                params.add_index(field_name=field, index_name=f"scope_{field}", index_type="AUTOINDEX")
+                self._create_if_absent(
+                    "create_index", collection_name=self._collection_name, index_params=params,
+                )
 
     def _vector(self, values) -> list[float]:
         if values is None or len(values) != self._dimension:
@@ -209,7 +265,7 @@ class MilvusVectorIndex(VectorIndex):
                 id=record.id,
                 uri=record.uri,
                 level=record.level,
-                text=record.text,
+                **self._text_parts(record.text),
                 memory_directory=memory_directory(record.uri),
                 metadata=metadata,
                 embedding=self._vector(record.metadata.get("_embedding")),
@@ -291,22 +347,28 @@ class MilvusVectorIndex(VectorIndex):
         return self.search_by_vector(query_vector, {**filters, "parent_uri": parent_uri}, top_k)
 
     def _query_rows(self, filters: dict[str, Any], output_fields: list[str]):
-        iterator = self._rpc(
-            "query_iterator",
-            collection_name=self._collection_name,
-            filter=self._build_filter(filters),
-            output_fields=output_fields,
-            batch_size=1000,
-            consistency_level="Strong",
-        )
-        try:
-            while True:
-                batch = iterator.next()
-                if not batch:
-                    break
-                yield from batch
-        finally:
-            iterator.close()
+        # The server iterator flag orders by primary key. Use bounded keyset
+        # pages directly: pymilvus 2.6.17 QueryIterator performs an unbounded
+        # describe_collection during construction, even with a timeout.
+        expression = self._build_filter(filters)
+        cursor = None
+        while True:
+            page_filter = expression
+            if cursor is not None:
+                bound = "id > " + json.dumps(cursor, ensure_ascii=False)
+                page_filter = f"({expression}) and ({bound})" if expression else bound
+            batch = self._rpc(
+                "query", collection_name=self._collection_name, filter=page_filter,
+                output_fields=list(dict.fromkeys(["id", *output_fields])),
+                limit=_BATCH_SIZE, iterator="True", consistency_level="Strong",
+            )
+            if not batch:
+                break
+            ids = [row["id"] for row in batch]
+            if ids != sorted(ids) or (cursor is not None and ids[0] <= cursor):
+                raise RuntimeError("Milvus returned an unordered iterator page")
+            cursor = ids[-1]
+            yield from batch
 
     def get_embeddings(
         self,
@@ -318,13 +380,16 @@ class MilvusVectorIndex(VectorIndex):
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
-        return {
-            row["uri"]: [float(value) for value in row["embedding"]]
+        output = {}
+        wanted = list(dict.fromkeys(uris))
+        for start in range(0, len(wanted), _BATCH_SIZE):
             for row in self._query_rows(
-                {**filters, "uri": uris, "level": level}, ["uri", "embedding", "text"]
-            )
-            if expected_texts is None or row["text"] == expected_texts.get(row["uri"])
-        }
+                {**filters, "uri": wanted[start:start + _BATCH_SIZE], "level": level},
+                ["uri", "embedding", *_TEXT_FIELDS],
+            ):
+                if expected_texts is None or self._text(row) == expected_texts.get(row["uri"]):
+                    output[row["uri"]] = [float(value) for value in row["embedding"]]
+        return output
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         if not record_id:
@@ -344,7 +409,7 @@ class MilvusVectorIndex(VectorIndex):
             id=row["id"],
             uri=row["uri"],
             level=row["level"],
-            text=row["text"],
+            text=self._text(row),
             filters={
                 key: value
                 for key, value in scope.items()

@@ -69,7 +69,7 @@ dev = [
 opengauss = []  # psycopg2-binary now in core dependencies
 m3-budget = ["tokenizers>=0.20,<1"]
 chroma = ["chromadb>=0.4.0"]
-milvus = ["pymilvus>=2.4.15,<2.7"]
+milvus = ["pymilvus>=2.6.17,<2.7"]
 deepagents = ["deepagents>=0.7.23,<0.8"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 

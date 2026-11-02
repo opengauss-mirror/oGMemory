@@ -173,7 +173,7 @@ def test_real_concurrent_first_startup(index):
                     clients.append(future.result())
                 except Exception as exc:
                     failures.append(exc)
-            assert not failures, failures
+            assert not failures, [str(exc) for exc in failures]
         clients[0].upsert([make_record("concurrent")])
         assert all(client.count() == 1 for client in clients)
     finally:
@@ -226,3 +226,61 @@ def test_real_metadata_at_capacity_survives_read_and_reindex(index):
         assert saved.filters["space_id"] == "space-1"
         index.upsert([saved])
     assert index.count({"account_id": "a", "space_id": "space-1", "video_id": "video-1"}) == 1
+
+
+def test_real_large_unicode_body_and_same_uri_multiple_records(index):
+    from dataclasses import replace
+
+    item = make_record("long-skill", level=2)
+    item.text = "中🙂" * 37449
+    siblings = [replace(item, id=f"unit-{n:03}", text=f"unit-{n:03}") for n in range(69)]
+    index.upsert([item, *siblings])
+    assert index.count() == 70
+    assert index.get_record(item.id).text == item.text
+    assert index.get_embeddings([item.uri], {"account_id": "a"}, level=2,
+                                expected_texts={item.uri: item.text})
+    # The last sibling is beyond the first two keyset pages for this URI.
+    assert index.get_embeddings([item.uri], {"account_id": "a"}, level=2,
+                                expected_texts={item.uri: siblings[-1].text})
+    saved = index.get_record(item.id)
+    index.upsert([saved])
+    assert index.get_record(item.id).text == item.text
+    index.delete([item.id])
+    assert index.get_record(item.id) is None and index.count() == 69
+
+
+def test_real_scalar_index_repair_and_legacy_text_migration(index):
+    item = make_record("legacy")
+    index.upsert([item])
+    # Simulate the original schema without suffix fields in a separate collection.
+    from pymilvus import DataType, MilvusClient
+
+    from providers.vector_index.milvus_index import _SCOPE_FIELDS, _VARCHAR_LIMITS
+
+    name = "ogmemory_legacy_" + uuid4().hex
+    client = index._client
+    schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+    schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=512)
+    schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=3)
+    schema.add_field("text", DataType.VARCHAR, max_length=65535)
+    schema.add_field("metadata", DataType.JSON)
+    schema.add_field("level", DataType.INT64)
+    for field in _SCOPE_FIELDS:
+        schema.add_field(field, DataType.VARCHAR, max_length=_VARCHAR_LIMITS[field])
+    client.create_collection(collection_name=name, schema=schema)
+    reopened = None
+    try:
+        row = client.get(collection_name=index._collection_name, ids=[item.id])[0]
+        row = {k: v for k, v in row.items() if not k.startswith("text_")}
+        client.insert(collection_name=name, data=[row])
+        reopened = MilvusVectorIndex(uri=os.environ["OGMEM_TEST_MILVUS_URI"],
+                                     token=os.environ.get("MILVUS_TOKEN", ""),
+                                     collection_name=name, dimension=3)
+        assert reopened.get_record(item.id).text == item.text
+        names = client.list_indexes(collection_name=name)
+        fields = {client.describe_index(collection_name=name, index_name=n)["field_name"] for n in names}
+        assert {"embedding", "account_id", "owner_space", "level", "parent_uri", "uri"} <= fields
+    finally:
+        if reopened:
+            reopened.close()
+        client.drop_collection(collection_name=name)
