@@ -36,6 +36,37 @@ logger = logging.getLogger(__name__)
 _dns_slots = threading.BoundedSemaphore(4)
 
 
+def sql_connection_identity(dsn):
+    """Conservative identity for sharing an authenticated SQL session.
+
+    Ignore only transport/diagnostic settings. Credentials, options (including
+    search_path), endpoints and all unknown settings must still match.
+    """
+    values = psycopg2.extensions.parse_dsn(dsn)
+    for key in ("connect_timeout", "application_name", "fallback_application_name"):
+        values.pop(key, None)
+    return tuple(sorted(values.items()))
+
+
+def is_connection_alive(conn):
+    """Validate an idle session without leaving a transaction open."""
+    if conn.closed != 0:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        conn.rollback()
+        return True
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
+
+
 def remaining_seconds(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -210,20 +241,7 @@ class SharedConnectionPool:
 
     def _is_connection_alive(self, conn) -> bool:
         """Check that an idle connection is still usable."""
-        if conn.closed != 0:
-            return False
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-            conn.rollback()
-            return True
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return False
+        return is_connection_alive(conn)
 
     def get_connection(
         self,
@@ -384,20 +402,32 @@ class PoolAdapterMixin:
 
         return psycopg2.connect(self._connection_string)
 
+    def _pooled_connection_alive(self, conn) -> bool:
+        """Liveness check for a pooled connection on borrow.
+
+        Default is the cheap ``closed`` flag; subclasses that must survive
+        database restarts / network drops override this with a round-trip
+        validation (e.g. ``is_connection_alive``). Fresh connections from
+        ``_create_connection`` are never validated.
+        """
+        return conn.closed == 0
+
     def _standalone_get_connection(self, timeout=None):
         """Borrow a standalone connection (blocks if the cap is reached).
 
         ``timeout=None`` blocks until a slot frees up; a numeric ``timeout``
-        raises ``RuntimeError`` when it elapses.  Objects built via
-        ``__new__`` (no ``_init_pool``) fall back to the legacy unbounded
-        pop-or-create path.
+        raises ``RuntimeError`` when it elapses.  Dead pooled connections
+        are discarded (loop) until the pool is empty, then a fresh
+        connection is opened.  Objects built via ``__new__`` (no
+        ``_init_pool``) fall back to the legacy unbounded pop-or-create
+        path.
         """
         semaphore = getattr(self, "_semaphore", None)
         if semaphore is None:
             pool = getattr(self, "_pool", None)
-            if pool:
+            while pool:
                 conn = pool.pop()
-                if conn.closed == 0:
+                if self._pooled_connection_alive(conn):
                     return conn
                 # Defensive close for symmetry with the semaphore path
                 # (the conn may already be closed; never raise here).
@@ -414,16 +444,17 @@ class PoolAdapterMixin:
                 f"slot (pool_size={self._pool_size})"
             )
         try:
-            with self._lock:
-                conn = self._pool.pop() if self._pool else None
-            if conn is not None:
-                if conn.closed == 0:
+            while True:
+                with self._lock:
+                    conn = self._pool.pop() if self._pool else None
+                if conn is None:
+                    return self._create_connection()
+                if self._pooled_connection_alive(conn):
                     return conn
                 try:
                     conn.close()
                 except Exception:
                     pass
-            return self._create_connection()
         except Exception:
             semaphore.release()
             raise

@@ -1934,3 +1934,46 @@ def test_search_coverage_preserves_indentation_and_invalidates_completeness_on_t
         assert '"read_lines":[[1,32]]' in payload
         assert "# lines 20-32" not in payload
         assert "[excerpt clipped]" in payload
+
+
+@pytest.mark.parametrize('failures', [1, 2])
+def test_query_connection_retry_is_bounded_and_never_becomes_no_hits(monkeypatch, failures):
+    import psycopg2
+    service = _FakeService()
+    original = service.read_api.search_memory
+    calls = []
+    def search(*args, **kwargs):
+        calls.append(True)
+        if len(calls) <= failures:
+            raise psycopg2.OperationalError('server closed the connection unexpectedly')
+        return original(*args, **kwargs)
+    monkeypatch.setattr(service.read_api, 'search_memory', search)
+    if failures == 1:
+        assert query_memory(service, query='testing preference')['hits']
+    else:
+        with pytest.raises(RuntimeError, match='database connection unavailable after one retry'):
+            query_memory(service, query='testing preference')
+    assert len(calls) == 2
+
+
+def test_query_does_not_retry_statement_errors(monkeypatch):
+    import psycopg2
+    from unittest.mock import Mock
+    service = _FakeService()
+    search = Mock(side_effect=psycopg2.ProgrammingError('invalid SQL'))
+    monkeypatch.setattr(service.read_api, 'search_memory', search)
+    with pytest.raises(psycopg2.ProgrammingError):
+        query_memory(service, query='testing preference')
+    assert search.call_count == 1
+
+
+def test_query_never_retries_inside_session_mutation(monkeypatch):
+    import psycopg2
+    from unittest.mock import Mock
+    service = _FakeService()
+    search = Mock(side_effect=psycopg2.OperationalError('owning connection lost'))
+    monkeypatch.setattr(service.read_api, 'search_memory', search)
+    monkeypatch.setattr('fs.sql_adapter.session_mutation.active_session_guard', lambda: object())
+    with pytest.raises(psycopg2.OperationalError):
+        query_memory(service, query='testing preference')
+    assert search.call_count == 1

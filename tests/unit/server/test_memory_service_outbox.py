@@ -84,12 +84,15 @@ def test_shared_sql_pool_receives_configured_dialect(monkeypatch):
 
 
 @pytest.mark.parametrize("dialect", ["opengauss", "postgresql"])
-def test_vector_index_shares_configured_sql_pool(monkeypatch, dialect):
+@pytest.mark.parametrize("vector_dsn", ["host=storage dbname=memory",
+    "dbname=memory host=storage connect_timeout=10",
+    "host=storage dbname=memory application_name=mcp"])
+def test_vector_index_shares_configured_sql_pool(monkeypatch, dialect, vector_dsn):
     dsn = "host=storage dbname=memory"
     service = MemoryService(config=OgMemConfig(
         provider="mock", vector_db_type="opengauss", storage_backend="sql",
         sql_dialect=dialect, sql_connection_string=dsn,
-        opengauss_connection_string=dsn,
+        opengauss_connection_string=vector_dsn,
     ))
     pool = Mock()
     index = Mock()
