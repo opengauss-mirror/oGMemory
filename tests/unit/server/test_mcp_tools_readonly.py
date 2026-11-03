@@ -780,6 +780,16 @@ def test_search_skills_uses_only_reviewed_catalog():
     assert "request_id" not in payload
 
 
+@pytest.mark.parametrize("query", ["zzz", "C", "!!!"])
+def test_search_skills_omits_zero_score_rows(query):
+    service = _SkillService()
+
+    payload = search_skills(service, query=query, top_k=3, agent_id="bot")
+
+    assert payload["skills"] == []
+    assert payload["truncated"] is False
+
+
 def test_skill_tools_use_transport_agent_header_before_config_default():
     service = _SkillService()
     service.build_context = lambda params, identity=None: RequestContext(
