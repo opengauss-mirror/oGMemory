@@ -10,13 +10,15 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 from core.models import IndexRecord
-from providers.config import ProviderConfig
+from providers.vector_index.factory import create_vector_index
 
 
-def check_milvus(config: ProviderConfig) -> None:
+def check_milvus(config: Any) -> None:
     probe = uuid4().hex
     account = f"ogmemory-preflight-{probe}"
     uri = f"ctx://{account}/users/probe/memories/entities/check"
@@ -27,7 +29,7 @@ def check_milvus(config: ProviderConfig) -> None:
         filters={"account_id": account, "owner_space": "user:probe"},
         metadata={"_embedding": vector},
     )
-    index = config.create_vector_index()
+    index = create_vector_index(config)
     try:
         index.upsert([record])
         saved = index.get_record(record.id)
@@ -53,7 +55,10 @@ def main() -> int:
     # without printing credentials from the configured URI or token.
     logging.disable(logging.CRITICAL)
     try:
-        check_milvus(ProviderConfig(
+        # ProviderConfig imports eagerly load the application's default YAML.
+        # A preflight container bypasses the entrypoint that expands that YAML;
+        # use only its explicitly supplied vector settings with the same factory.
+        check_milvus(SimpleNamespace(
             vector_db_type="milvus",
             embedding_dimension=int(os.environ["VECTOR_DB_DIMENSION"]),
             milvus_uri=os.environ["MILVUS_URI"],

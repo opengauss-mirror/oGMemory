@@ -11,20 +11,22 @@ from scripts import check_milvus
 from server.memory_service import MemoryService
 
 
-def probe_config():
+def probe_config(monkeypatch):
     index = Mock()
     records = []
     index.upsert.side_effect = lambda value: records.extend(value)
     index.get_record.side_effect = lambda _: records[0] if index.delete.call_count == 0 else None
     index.search_by_vector.side_effect = lambda *a: [SimpleNamespace(uri=records[0].uri)]
-    config = SimpleNamespace(embedding_dimension=3, create_vector_index=Mock(return_value=index))
+    config = SimpleNamespace(embedding_dimension=3)
+    monkeypatch.setattr(check_milvus, "create_vector_index", Mock(return_value=index))
     return config, index, records
 
 
-def test_preflight_checks_read_search_delete_and_removes_only_its_own_record():
-    config, index, records = probe_config()
+def test_preflight_checks_read_search_delete_and_removes_only_its_own_record(monkeypatch):
+    config, index, records = probe_config(monkeypatch)
     check_milvus.check_milvus(config)
     assert len(records) == 1
+    check_milvus.create_vector_index.assert_called_once_with(config)
     record = records[0]
     assert record.filters["account_id"].startswith("ogmemory-preflight-")
     assert record.uri.startswith(f"ctx://{record.filters['account_id']}/")
@@ -37,8 +39,8 @@ def test_preflight_checks_read_search_delete_and_removes_only_its_own_record():
 
 
 @pytest.mark.parametrize("operation", ["upsert", "read", "search", "delete", "cleanup"])
-def test_preflight_fails_closed_and_closes_client(operation):
-    config, index, records = probe_config()
+def test_preflight_fails_closed_and_closes_client(operation, monkeypatch):
+    config, index, records = probe_config(monkeypatch)
     if operation == "upsert":
         index.upsert.side_effect = PermissionError("write denied")
     elif operation == "read":
@@ -105,3 +107,20 @@ def test_health_rejects_initial_milvus_connection_failure(monkeypatch):
     result = service.health()
     assert result["status"] == "error"
     assert result["vector_db"]["available"] is False
+
+
+def test_preflight_import_does_not_read_unexpanded_application_yaml(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    config = tmp_path / "template.yaml"
+    config.write_text("service:\n  http_port: ${OGMEM_HTTP_PORT}\n")
+    completed = subprocess.run(
+        [sys.executable, "-c", "import scripts.check_milvus"],
+        cwd=Path(__file__).resolve().parents[3],
+        env={**os.environ, "OGMEM_CONFIG": str(config)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr

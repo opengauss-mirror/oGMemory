@@ -258,7 +258,8 @@ def test_selected_backend_and_milvus_parameters_reach_environment(tmp_path, back
 @pytest.mark.parametrize("backend,probe_failure", [
     ("opengauss", False), ("milvus", False), ("milvus", True),
 ])
-def test_real_quickstart_renders_selected_backend(tmp_path, backend, probe_failure):
+@pytest.mark.parametrize("grpc_override", [None, "", "custom-bypass.example"])
+def test_real_quickstart_renders_selected_backend(tmp_path, backend, probe_failure, grpc_override):
     from string import Template
 
     import yaml
@@ -303,7 +304,8 @@ exit 0
         env={"PATH": f"{shims}:/usr/bin:/bin", "HOME": str(tmp_path),
              "OGMEMORY_ENV_FILE": str(envfile), "OGMEMORY_STACK_ROOT": str(tmp_path),
              "OGMEM_IMAGE": "test-current-image", "CAPTURE": str(capture), "LANG": "C.UTF-8",
-             "PREFLIGHT_FAIL": "1" if probe_failure else "0"},
+             "PREFLIGHT_FAIL": "1" if probe_failure else "0",
+             **({"MILVUS_NO_GRPC_PROXY": grpc_override} if grpc_override is not None else {})},
         capture_output=True, text=True, timeout=10,
     )
     commands = capture.read_text()
@@ -314,6 +316,8 @@ exit 0
         assert "MILVUS_URI=http://milvus.example:19530" in probe
         assert "VECTOR_DB_DIMENSION=1024" in probe
         assert "-e MILVUS_TOKEN" in probe
+        bypass = "milvus.example" if grpc_override is None else grpc_override
+        assert f"no_grpc_proxy={bypass}" in shlex.split(probe)
     if probe_failure:
         assert completed.returncode == 1
         assert "未替换现有容器" in completed.stderr
@@ -323,6 +327,7 @@ exit 0
     assert "VALIDATION_STOP" in completed.stderr, completed.stderr
     if backend == "milvus":
         assert commands.index("scripts.check_milvus") < commands.index("rm -f")
+        assert commands.count(f"-e no_grpc_proxy={bypass} ") == 2
     text = (tmp_path / "ogmemory-ogmem/ogmemory.yaml").read_text()
     config = yaml.safe_load(Template(text).safe_substitute({
         "VECTOR_DB_TYPE": backend, "MILVUS_URI": "http://milvus.example:19530",
@@ -336,3 +341,20 @@ exit 0
     assert ("--name ogmem_opengauss" in commands) == (backend == "opengauss")
     if backend != "opengauss":
         assert "--entrypoint python test-current-image" in commands
+
+
+@pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
+@pytest.mark.parametrize("budget", ["0", "86401", "1.5"])
+def test_invalid_readiness_budget_fails_before_deployment(tmp_path, budget):
+    envfile = deploy_helpers.generate_quickstart_env(
+        model_config(), model_config(), output_path=tmp_path / "runtime.env",
+    )
+    result = subprocess.run(
+        ["bash", str(ROOT / "deploy/user-quickstart/deploy.sh")],
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+             "OGMEMORY_ENV_FILE": str(envfile), "OGMEM_DEPLOY_WAIT_SECONDS": budget},
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 1
+    assert "OGMEM_DEPLOY_WAIT_SECONDS 必须是 1-86400" in result.stderr
+    assert not (tmp_path / "ogmemory-ogmem").exists()

@@ -50,16 +50,39 @@ wait_http() {
   local name="$1"
   local url="$2"
   local container="$3"
-  local attempt
-  for attempt in $(seq 1 120); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
+  local deadline=$((SECONDS + ${OGMEM_DEPLOY_WAIT_SECONDS:-360}))
+  local remaining request_timeout connect_timeout pause
+  while ((SECONDS < deadline)); do
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || break
+    request_timeout=$((remaining < 10 ? remaining : 10))
+    connect_timeout=$((remaining < 3 ? remaining : 3))
+    if curl -fsS --connect-timeout "$connect_timeout" --max-time "$request_timeout" \
+      "$url" >/dev/null 2>&1; then
       echo "$name 已就绪"
       return 0
     fi
-    sleep 3
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || break
+    pause=$((remaining < 3 ? remaining : 3))
+    sleep "$pause"
   done
   docker logs --tail 100 "$container" >&2 || true
   fail "$name 启动超时"
+}
+
+milvus_proxy_host() {
+  local authority="${1#*://}"
+  local host
+  authority="${authority%%[/?#]*}"
+  authority="${authority##*@}"
+  if [[ "$authority" == \[* ]]; then
+    authority="${authority#\[}"
+    host="${authority%%\]*}"
+  else
+    host="${authority%%:*}"
+  fi
+  printf '%s' "${host,,}"
 }
 
 show_upstream_error() {
@@ -248,6 +271,10 @@ external_after_turn_threshold_value="${OGMEM_AFTER_TURN_THRESHOLD-}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+OGMEM_DEPLOY_WAIT_SECONDS="${OGMEM_DEPLOY_WAIT_SECONDS:-360}"
+[[ "$OGMEM_DEPLOY_WAIT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] && \
+  ((OGMEM_DEPLOY_WAIT_SECONDS <= 86400)) || fail "OGMEM_DEPLOY_WAIT_SECONDS 必须是 1-86400 的整数"
+
 VECTOR_DB_TYPE="${VECTOR_DB_TYPE:-opengauss}"
 case "$VECTOR_DB_TYPE" in
   opengauss|milvus) ;;
@@ -263,6 +290,11 @@ if [[ "$VECTOR_DB_TYPE" == milvus ]]; then
   [[ "$MILVUS_URI" == http://* || "$MILVUS_URI" == https://* ]] || fail "MILVUS_URI 必须是外部服务 HTTP(S) 地址"
   [[ "$MILVUS_URI" != *://localhost* && "$MILVUS_URI" != *://127.0.0.1* ]] || \
     fail "MILVUS_URI 必须从容器可达；宿主机服务可使用 host.docker.internal"
+  milvus_host="$(milvus_proxy_host "$MILVUS_URI")"
+  [[ -n "$milvus_host" ]] || fail "MILVUS_URI 缺少服务主机"
+  # gRPC does not treat no_proxy='*' as a universal bypass. Use the target
+  # hostname, while preserving an explicit operator override (including empty).
+  MILVUS_NO_GRPC_PROXY="${MILVUS_NO_GRPC_PROXY-${no_grpc_proxy-$milvus_host}}"
 fi
 
 if [[ -n "$external_reset_openclaw_config_set" ]]; then
@@ -485,6 +517,7 @@ if [[ "$VECTOR_DB_TYPE" == milvus ]]; then
     docker network create "$OGMEM_NETWORK" >/dev/null
   MILVUS_TOKEN="${MILVUS_TOKEN:-}" docker run --rm \
     --network "$OGMEM_NETWORK" --add-host host.docker.internal:host-gateway \
+    -e "no_grpc_proxy=$MILVUS_NO_GRPC_PROXY" \
     -e "MILVUS_URI=$MILVUS_URI" -e MILVUS_TOKEN \
     -e "MILVUS_COLLECTION=$MILVUS_COLLECTION" -e "MILVUS_DB_NAME=$MILVUS_DB_NAME" \
     -e "MILVUS_TIMEOUT=$MILVUS_TIMEOUT" -e "VECTOR_DB_DIMENSION=$EMBEDDING_DIMENSION" \
@@ -692,6 +725,7 @@ docker run -d \
   -e "OG_API_AGENT_ID=${OG_API_AGENT_ID}" \
   -e "OG_ADMIN_API_KEYS=${OG_ACCOUNT_ID}:${OG_TENANT_API_KEY}" \
   -e NO_PROXY='*' -e no_proxy='*' \
+  -e "no_grpc_proxy=${MILVUS_NO_GRPC_PROXY-${no_grpc_proxy-}}" \
   -v "$STACK_DIR/ogmemory.yaml:/etc/ogmem/config.yaml:ro" \
   -v "$STACK_DIR/agfs:/data/agfs" \
   "$OGMEM_IMAGE" >/dev/null

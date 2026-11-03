@@ -38,6 +38,10 @@ Docker quickstart 支持 openGauss 与外部 Milvus：openGauss 创建配套数�
 
 Docker quickstart 在替换已有容器前，使用正式运行网络与 Milvus 配置检查 schema/索引及写入、回读、检索和删除权限。探测记录使用 UUID 隔离账户，删除并确认不可读取后才报告成功；预检失败会保留现有容器。`/api/v1/health` 持续检查 Milvus 的有超时读取，断连或权限失效时返回 503，恢复后返回 200。
 
+预检仅使用显式传入的 Milvus 参数，不读取需要由入口展开的默认应用模板。有 Docker HTTP 代理时，预检与正式容器默认将 Milvus URI 的主机加入 `no_grpc_proxy`，避免依赖 gRPC 不支持的 `no_proxy=*` 通配规则；可通过部署环境变量 `MILVUS_NO_GRPC_PROXY` 指定其他主机列表，显式设为空字符串可继续使用代理。
+
+每项 HTTP 服务的就绪等待默认最多 360 秒，单次连接最多 3 秒、单次请求最多 10 秒，并在接近总截止时间时缩短请求预算。可通过 `OGMEM_DEPLOY_WAIT_SECONDS` 设置 1-86400 秒的等待上限。
+
 共享镜像的基础依赖和 Milvus SDK 安装均启用正常 HTTPS 证书校验；使用私有包源时应配置受信任 CA，不跳过证书验证。
 
 手动配置容器时，使用包含 Milvus 可选依赖的运行镜像并挂载上述 YAML 配置；无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
