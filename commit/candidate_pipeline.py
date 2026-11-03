@@ -6,10 +6,12 @@ Runs all CandidateExtractor implementations in parallel and aggregates results.
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 
-from core.models import RequestContext, CandidateMemory
+from core.candidate_dedup import merge_duplicate_event_sources
 from core.interfaces import CandidateExtractor
 from core.logging_config import get_logger
-from core.validation import validate_candidate, validate_attribution, ValidationError
+from core.memory_names import candidate_identity_key
+from core.models import CandidateMemory, RequestContext
+from core.validation import validate_attribution, validate_candidate
 
 logger = get_logger(__name__)
 
@@ -120,7 +122,6 @@ class CandidatePipeline:
                     candidates = future.result()
                     all_candidates.extend(candidates)
                 except Exception as e:
-                    # An empty/partial result is not a successful extraction.
                     logger.error(
                         "Extractor %s failed: %s",
                         extractor.__class__.__name__, e,
@@ -129,15 +130,7 @@ class CandidatePipeline:
                     raise
 
         # Validate all candidates
-        validated_candidates = []
-        for candidate in all_candidates:
-            try:
-                candidate = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
-                validated_candidates.append(validate_candidate(candidate))
-            except ValidationError as e:
-                logger.warning("Rejected invalid candidate: %s", e)
-
-        return validated_candidates
+        return self._validate_candidates(all_candidates, ctx)
 
     def _extract_serial(
         self,
@@ -171,7 +164,6 @@ class CandidatePipeline:
                 )
                 all_candidates.extend(candidates)
             except Exception as e:
-                # Let the service rewind the watermark and retry this input.
                 logger.error(
                     "Extractor %s failed: %s",
                     extractor.__class__.__name__, e,
@@ -180,15 +172,12 @@ class CandidatePipeline:
                 raise
 
         # Validate all candidates
-        validated_candidates = []
-        for candidate in all_candidates:
-            try:
-                candidate = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
-                validated_candidates.append(validate_candidate(candidate))
-            except ValidationError as e:
-                logger.warning("Rejected invalid candidate: %s", e)
+        return self._validate_candidates(all_candidates, ctx)
 
-        return validated_candidates
+    @staticmethod
+    def _validate_candidates(candidates, ctx):
+        return [validate_candidate(validate_attribution(candidate, user_id=ctx.user_id if ctx else None))
+                for candidate in candidates]
 
     @staticmethod
     def _call_extractor(
@@ -230,15 +219,25 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Deduplicate candidates by (category, routing_key, abstract prefix).
+        """Deduplicate matching candidate identities and abstract prefixes.
 
         Keeps the candidate with the highest confidence per group.
         This catches duplicates that slip through dual-run merge,
         e.g. same fact extracted from different spans.
+        Unbound event drafts require exact equality and retain all source IDs.
+        Unbound cases lack reliable run origin here and remain separate, including
+        exact drafts from independent spans or extractors.
         """
-        seen: dict[tuple[str, str, str], CandidateMemory] = {}
-        for c in candidates:
-            key = (c.category, c.routing_key, c.abstract[:80])
-            if key not in seen or c.confidence > seen[key].confidence:
+        seen: dict[tuple[str, ...] | int, CandidateMemory] = {}
+        for index, c in enumerate(candidates):
+            if c.category in {"event", "case"} and not c.target_uri and (
+                c.category == "case" or c.write_operation_id
+            ):
+                seen[index] = c
+                continue
+            key = (*candidate_identity_key(c), c.abstract[:80])
+            if key in seen and c.category == "event" and not c.target_uri:
+                seen[key] = merge_duplicate_event_sources(seen[key], c)
+            elif key not in seen or c.confidence > seen[key].confidence:
                 seen[key] = c
         return list(seen.values())

@@ -9,10 +9,11 @@ import json
 import logging
 import os
 import re
-from typing import Any
+import threading
+from contextlib import contextmanager
+from typing import Any, Final
 
 from core.llm_output import final_text
-import threading
 
 try:
     import json_repair
@@ -73,18 +74,29 @@ def _loads_lenient_json_text(raw: str) -> Any:
     return json.loads("".join(cleaned))
 
 try:
-    from openai import APIStatusError, BadRequestError, OpenAI
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        BadRequestError,
+        LengthFinishReasonError,
+        OpenAI,
+    )
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAILLM. "
         "Install it with: pip install openai"
     )
 
-from core.errors import ToolCallProtocolError
-from core.errors import LLMCallError  # noqa: E402
+from core.errors import (
+    LLMOutputTruncatedError,
+    LLMTransientError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+)
+from core.errors import LLMCallError
 from core.interfaces import LLM
+from core.operation_deadline import check_deadline, remaining_seconds
 from providers.token_tracker import TokenTracker, UsagePersistenceError
-
 
 # Default models
 GPT_4O = "gpt-4o"
@@ -150,11 +162,75 @@ class OpenAILLM(LLM):
         self.token_tracker = TokenTracker(model=self._model)
 
     def _create_completion(self, **kwargs):
+        remaining = remaining_seconds()
+        client = (self._client if remaining is None else
+                  self._client.with_options(timeout=min(120.0, remaining), max_retries=0))
+        if remaining is not None and "timeout" in kwargs:
+            # A per-call override takes precedence over client.with_options.
+            # Keep a tighter custom timeout while enforcing the operation limit.
+            import httpx
+            timeout = kwargs["timeout"]
+            if isinstance(timeout, httpx.Timeout):
+                kwargs["timeout"] = httpx.Timeout(**{
+                    name: min(value, remaining) if value is not None else remaining
+                    for name, value in timeout.as_dict().items()})
+            else:
+                kwargs["timeout"] = min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining
+        attempted = False
         try:
-            return self._client.chat.completions.create(**kwargs)
-        except Exception:
-            self.token_tracker.record_failure('llm')
+            if (kwargs.get("extra_body") or {}).get("stream") is True:
+                body = dict(kwargs["extra_body"])
+                body.pop("stream")
+                kwargs["stream_options"] = {
+                    **(body.pop("stream_options", None) or {}),
+                    "include_usage": True,
+                }
+                kwargs["extra_body"] = body
+                try:
+                    check_deadline()
+                    attempted = True
+                    with client.beta.chat.completions.stream(**kwargs) as stream:
+                        if remaining is not None:
+                            for _event in stream:
+                                try:
+                                    check_deadline()
+                                except OperationDeadlineExceededError:
+                                    # A final usage chunk may arrive at the deadline.
+                                    # Let the caller record it before rejecting the result.
+                                    snapshot = stream.current_completion_snapshot
+                                    if snapshot.usage is not None:
+                                        return snapshot
+                                    raise
+                        return stream.get_final_completion()
+                except LengthFinishReasonError as exc:
+                    return exc.completion
+            check_deadline()
+            attempted = True
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if attempted:
+                self.token_tracker.record_failure('llm')
+            check_deadline()
+            if (isinstance(exc, APIConnectionError)
+                    or isinstance(exc, APIStatusError) and (exc.status_code == 429 or exc.status_code >= 500)):
+                raise LLMTransientError(f"OpenAI provider temporarily unavailable: {exc}") from exc
             raise
+
+    @contextmanager
+    def _required_tool_lock(self):
+        remaining = remaining_seconds()
+        if remaining is None:
+            with self._required_tool_choice_lock:
+                yield
+            return
+        acquired = self._required_tool_choice_lock.acquire(timeout=min(remaining, threading.TIMEOUT_MAX))
+        if not acquired:
+            raise OperationDeadlineExceededError("Operation deadline exceeded waiting for tool capability")
+        try:
+            check_deadline()
+            yield
+        finally:
+            self._required_tool_choice_lock.release()
 
     def _is_reasoning_model(self) -> bool:
         if self._is_reasoning_model_override is not None:
@@ -173,28 +249,6 @@ class OpenAILLM(LLM):
         if self._extra_body:
             parameters["extra_body"] = self._extra_body
         return parameters
-
-    def _raise_if_tool_truncated(self, response) -> None:
-        """Do not repair partial tool arguments or retry an exhausted budget.
-
-        A protocol retry, second-temperature run, and JSON fallback all use
-        the same token budget. They cannot be assumed to fix truncation and
-        previously hid the useful error behind many minutes of repeated calls.
-        """
-        if getattr(response.choices[0], "finish_reason", None) != "length":
-            return
-        usage = getattr(response, "usage", None)
-        details = getattr(usage, "completion_tokens_details", None)
-        message = (
-            f"LLM tool output truncated: model={self._model} finish_reason=length "
-            f"max_tokens={self._max_tokens} "
-            f"completion_tokens={getattr(usage, 'completion_tokens', None)} "
-            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)}. "
-            "Increase llm.max_tokens and, for slow reasoning models, "
-            "llm.request_timeout_seconds; validate a full input before retrying."
-        )
-        logger.error(message)
-        raise LLMCallError(message)
 
     def _track_usage(self, response) -> dict:
         usage = getattr(response, "usage", None)
@@ -221,6 +275,27 @@ class OpenAILLM(LLM):
             "cache_read": cache_read,
             "cache_write": cache_write,
         }
+
+    def _normalize_tool_response(self, response, tools) -> None:
+        """Provider hook run only after usage accounting and truncation checks."""
+
+    def _ensure_complete_response(self, response, *, kind: str = "structured") -> None:
+        """Keep dev's typed failure/deadline contract and metadata-only diagnostics."""
+        check_deadline()
+        if getattr(response.choices[0], "finish_reason", None) != "length":
+            return
+        usage = getattr(response, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        message = (
+            f"LLM {kind} output truncated: exceeded the configured token limit; "
+            f"model={self._model} finish_reason=length max_tokens={self._max_tokens} "
+            f"completion_tokens={getattr(usage, 'completion_tokens', None)} "
+            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)}. "
+            "Review llm.max_tokens and llm.request_timeout_seconds; "
+            "validate a full input before retrying."
+        )
+        logger.error(message)
+        raise LLMOutputTruncatedError(message)
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         system_message = self._build_system_message(schema)
@@ -259,10 +334,29 @@ class OpenAILLM(LLM):
                 {"type": "input_audio", "input_audio": {"data": "<b64>", "format": "wav"}},
             ]}
 
-        Any ``system`` message in ``messages`` is dropped — the system
-        role is rebuilt from ``schema`` so JSON-mode guarantees hold.
+        Preserve caller system instructions (for example, which audiovisual
+        facts a memory must retain), then append the schema/output constraint.
+        JSON formatting must not silently erase the task's extraction policy.
         """
-        system_message = self._build_system_message(schema)
+        instructions = []
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if content is None:
+                continue
+            if isinstance(content, str):
+                instructions.append(content)
+            elif isinstance(content, list) and all(
+                isinstance(part, dict) and part.get("type") == "text"
+                and isinstance(part.get("text"), str) for part in content
+            ):
+                instructions.extend(part["text"] for part in content)
+            else:
+                raise ValueError("Multimodal system instructions must contain text only")
+        system_message = "\n\n".join([
+            *instructions, self._build_system_message(schema),
+        ])
         json_type = schema.get("type", "object")
         use_json_format = (
             self._json_mode
@@ -274,7 +368,7 @@ class OpenAILLM(LLM):
         for m in messages:
             role = m.get("role", "user")
             if role == "system":
-                # Schema-driven system_message is authoritative.
+                # Already retained in the combined system message above.
                 continue
             prepared.append({"role": role, "content": m.get("content")})
 
@@ -308,6 +402,7 @@ class OpenAILLM(LLM):
             **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
+        self._ensure_complete_response(response, kind="multimodal")
         content = response.choices[0].message.content
         result = self._extract_json_from_text(content or "")
         return self._validate_result(result, schema)
@@ -340,12 +435,14 @@ class OpenAILLM(LLM):
                 **self._completion_parameters(self._temperature),
             )
             self._track_usage(response)
+            self._ensure_complete_response(response, kind="multimodal")
             content = response.choices[0].message.content or ""
             result = self._extract_json_from_text(content)
             return self._validate_result(result, schema)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse multimodal LLM response as JSON: {e}")
-        except (ValueError, TypeError):
+        except (LLMCallError, LLMOutputTruncatedError, LLMTransientError,
+                OperationDeadlineExceededError, UsagePersistenceError, ValueError, TypeError):
             raise
         except Exception as e:
             raise RuntimeError(f"OpenAI API error on multimodal: {e}") from e
@@ -362,28 +459,13 @@ class OpenAILLM(LLM):
             **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
-        raw_content = response.choices[0].message.content or ""
-        content = raw_content.strip()
-        # Some endpoints (notably MiniMax-M3) emit a ``<think>…</think>``
-        # reasoning prefix BEFORE the JSON object even though we asked
-        # for ``response_format={"type": "json_object"}``. Direct
-        # ``json.loads`` on the raw content then fails with the
-        # "Expecting value" error since the JSON parser trips on the
-        # ``<think>`` tag. Fall back to the same JSON extraction the
-        # text-mode path uses so the reasoning prefix is stripped and
-        # the trailing balanced ``{…}`` block is recovered.
+        self._ensure_complete_response(response)
+        content = response.choices[0].message.content
         try:
-            result = _loads_lenient_json_text(content)
+            result = self._extract_json_from_text(content or "")
             return self._validate_result(result, schema)
-        except json.JSONDecodeError as e:
-            logger.warning(
-                "Model %s returned non-JSON content under json_object "
-                "format (likely a reasoning prefix like <think>…</think>); "
-                "extracting JSON from response text — %s",
-                self._model, e,
-            )
-            result = self._extract_json_from_text(content)
-            return self._validate_result(result, schema)
+        except (ValueError, TypeError) as exc:
+            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
 
     def _complete_json_text_fallback(self, system_message: str, prompt: str, schema: dict) -> dict:
         enhanced_system = (
@@ -401,7 +483,13 @@ class OpenAILLM(LLM):
                 **self._completion_parameters(self._temperature),
             )
             self._track_usage(response)
+            self._ensure_complete_response(response)
             content = response.choices[0].message.content or ""
+        except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError, UsagePersistenceError):
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"OpenAI API error: {exc}") from exc
+        try:
             values = self._extract_json_values_from_text(content)
             if not values:
                 # Preserve response-shape evidence without logging conversation
@@ -437,15 +525,20 @@ class OpenAILLM(LLM):
                         first_error = exc
             assert first_error is not None
             raise first_error
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse LLM response as JSON: {e}")
-        except (ValueError, TypeError):
-            raise
-        except Exception as e:
-            raise RuntimeError(f"OpenAI API error: {e}") from e
+        except (ValueError, TypeError) as exc:
+            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
 
     @staticmethod
     def _extract_json_from_text(text: str) -> Any:
+        """Extract JSON value from LLM free-text output.
+
+        Multi-layer parsing chain:
+        1. Direct json.loads on sanitized text
+        2. Extract from ```json``` fenced code blocks
+        3. Repair the outer JSON value (close unclosed braces/brackets)
+        4. Extract balanced objects or arrays
+        5. json_repair.loads as last resort
+        """
         values = OpenAILLM._extract_json_values_from_text(text)
         if values:
             return values[0]
@@ -498,6 +591,16 @@ class OpenAILLM(LLM):
             except json.JSONDecodeError:
                 pass
 
+        value_start = OpenAILLM._first_json_value_start(stripped)
+        if value_start >= 0 and not OpenAILLM._balanced_json_value(stripped, value_start):
+            partial = stripped[value_start:]
+            closer = "}" if partial.startswith("{") else "]"
+            for repaired in (partial + closer, OpenAILLM._repair_truncated_json(partial)):
+                try:
+                    return [_loads_lenient_json_text(repaired)]
+                except json.JSONDecodeError:
+                    pass
+
         values = []
         start = OpenAILLM._first_json_value_start(stripped)
         while start >= 0:
@@ -515,22 +618,6 @@ class OpenAILLM(LLM):
                 start = OpenAILLM._first_json_value_start(stripped, start + 1)
         if values:
             return values
-
-        brace_start = OpenAILLM._first_json_value_start(stripped)
-        if brace_start >= 0:
-            # raw_decode respects braces inside strings and escaped quotes.
-            try:
-                result, _ = json.JSONDecoder().raw_decode(
-                    _sanitize_json_text(stripped[brace_start:])
-                )
-                return [result]
-            except json.JSONDecodeError:
-                pass
-            partial = stripped[brace_start:]
-            try:
-                return [_loads_lenient_json_text(OpenAILLM._repair_truncated_json(partial))]
-            except json.JSONDecodeError:
-                pass
 
         if json_repair is not None:
             try:
@@ -611,11 +698,15 @@ class OpenAILLM(LLM):
         if isinstance(args, dict):
             return args
         try:
-            return json.loads(args)
+            result = json.loads(args)
+            if isinstance(result, dict):
+                return result
         except (json.JSONDecodeError, TypeError):
             pass
         try:
-            return json.loads(_sanitize_json_text(args))
+            result = json.loads(_sanitize_json_text(args))
+            if isinstance(result, dict):
+                return result
         except (json.JSONDecodeError, TypeError):
             pass
         if json_repair is not None:
@@ -626,8 +717,7 @@ class OpenAILLM(LLM):
                     return result
             except Exception:
                 pass
-        logger.warning("Failed to parse tool call arguments, wrapping as raw: %.200s", args)
-        return {"raw": args}
+        raise ToolCallProtocolError("Tool call arguments must contain a JSON object")
 
     def complete_with_tools(
         self,
@@ -661,7 +751,7 @@ class OpenAILLM(LLM):
             # Only the first unknown-capability request probes ``required``.
             # Concurrent dual-run extraction waits for that result so providers
             # that reject ``required`` are not probed twice.
-            with self._required_tool_choice_lock:
+            with self._required_tool_lock():
                 if self._required_tool_choice_capability == "unknown":
                     return self._complete_with_tools_impl(
                         prompt=prompt,
@@ -712,7 +802,9 @@ class OpenAILLM(LLM):
                     tool_choice=effective_tool_choice,
                     **self._completion_parameters(temperature),
                 )
-                self._raise_if_tool_truncated(response)
+                usage = self._track_usage(response)
+                self._ensure_complete_response(response)
+                self._normalize_tool_response(response, openai_tools)
 
                 message = response.choices[0].message
                 raw_tool_calls = message.tool_calls
@@ -762,7 +854,9 @@ class OpenAILLM(LLM):
                                 max_required_empty_attempts,
                                 delay,
                             )
-                            time.sleep(delay)
+                            remaining = remaining_seconds()
+                            time.sleep(delay if remaining is None else min(delay, remaining))
+                            check_deadline()
                             continue
                         raise ToolCallProtocolError(
                             "Required tool call returned no tool_calls after "
@@ -796,9 +890,18 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
-            except (LLMCallError, ToolCallProtocolError, UsagePersistenceError):
+            except (LLMCallError, LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError,
+                    ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
+                if (
+                    effective_tool_choice == "required"
+                    and self._is_required_tool_output_parse_error(e)
+                ):
+                    raise ToolCallProtocolError(
+                        "Server could not parse the generated required tool-call array",
+                        tool_choice="required",
+                    ) from e
                 if (
                     tool_choice == "required"
                     and effective_tool_choice == "required"
@@ -862,40 +965,30 @@ class OpenAILLM(LLM):
         )
 
     @staticmethod
-    def _is_required_tool_choice_unsupported(exc: BadRequestError) -> bool:
-        """Conservatively recognize explicit rejection of ``required``.
+    def _is_required_tool_output_parse_error(exc: BadRequestError) -> bool:
+        """Recognize vLLM's response-side FunctionDefinition list validation.
 
-        Empty tool calls and unrelated HTTP 400 responses must not poison the
-        capability cache.
+        vLLM 0.10.2 can report a model-generated object instead of the required
+        tool-call array as HTTP 400. This is a protocol failure, not a rejected
+        input schema. Match the specific output validator and error type only;
+        unrelated request/auth/context errors must not trigger JSON fallback.
         """
         body = getattr(exc, "body", None)
-        try:
-            body_text = json.dumps(body, ensure_ascii=False) if body else ""
-        except (TypeError, ValueError):
-            body_text = str(body or "")
-        text = f"{exc} {body_text}".lower().replace("-", "_")
-        mentions_choice = "tool_choice" in text or "tool choice" in text
-        mentions_required = "required" in text
-        explicit_rejection = any(
-            marker in text
-            for marker in (
-                "not support",
-                "unsupported",
-                "doesn't support",
-                "does not allow",
-                "not allowed",
-                "only support",
+        if not isinstance(body, dict):
+            return False
+        error = body.get("error", body)
+        if not isinstance(error, dict):
+            return False
+        message = error.get("message", "")
+        return (
+            isinstance(message, str)
+            and "validation error for list[function-wrap[__log_extra_fields__()]]" in message
+            and (
+                ("Input should be a valid array [type=list_type," in message
+                 and "input_type=dict]" in message)
+                or ("Invalid JSON:" in message and "[type=json_invalid," in message
+                    and "input_type=str]" in message)
             )
-        )
-        enumerates_allowed_values = (
-            any(
-                marker in text
-                for marker in ("must be one of", "allowed values", "valid values")
-            )
-            and "auto" in text
-        )
-        return mentions_choice and mentions_required and (
-            explicit_rejection or enumerates_allowed_values
         )
 
     def complete_with_tools_messages(
@@ -925,27 +1018,25 @@ class OpenAILLM(LLM):
                 for t in tools
             ]
 
-        api_tool_choice = tool_choice
-        if tools is None:
-            # Don't pass tool_choice when tools is None (OpenAI API requirement)
-            api_tool_choice = None
+        tool_parameters = {"tools": openai_tools, "tool_choice": tool_choice} if openai_tools else {}
 
         try:
             response = self._create_completion(
                 model=self._model,
                 messages=prepared_messages,
-                tools=openai_tools,
-                tool_choice=api_tool_choice,
+                **tool_parameters,
                 **self._completion_parameters(self._temperature),
             )
             usage = self._track_usage(response)
-            self._raise_if_tool_truncated(response)
+            self._ensure_complete_response(response)
+            self._normalize_tool_response(response, openai_tools)
 
             message = response.choices[0].message
 
             raw_tool_calls = message.tool_calls or []
             tool_calls = [
                 {
+                    "id": getattr(call, "id", None),
                     "tool": call.function.name,
                     "input": self._parse_tool_args(call.function.arguments),
                     # Usage belongs to the whole LLM response. Multiple tool
@@ -959,7 +1050,18 @@ class OpenAILLM(LLM):
 
             return tool_calls, content
 
+        except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError,
+                ToolCallProtocolError, UsagePersistenceError):
+            raise
         except BadRequestError as e:
+            if (
+                tool_parameters.get("tool_choice") == "required"
+                and self._is_required_tool_output_parse_error(e)
+            ):
+                raise ToolCallProtocolError(
+                    "Server could not parse the generated required tool-call array",
+                    tool_choice="required",
+                ) from e
             raise LLMCallError(
                 f"OpenAI BadRequestError (400): {e}",
                 status_code=400,

@@ -124,6 +124,10 @@ def rerank_with_transcript_bm25(
     if not hits or not query or not query.strip():
         return list(hits)
 
+    transcript_texts = [_hit_transcript_text(h) for h in hits]
+    if not any(text.strip() for text in transcript_texts):
+        return list(hits)
+
     # ``lex_query`` decouples the BM25 token side from the embedder
     # query. Falls back to ``query`` so existing callers (and the
     # project-wide default of "same string for both sides") keep working.
@@ -146,7 +150,6 @@ def rerank_with_transcript_bm25(
     if not query_tokens:
         return list(hits)
 
-    transcript_texts = [_hit_transcript_text(h) for h in hits]
     transcript_tokens = [_tokenize(t) for t in transcript_texts]
 
     # If no hit carries any transcript tokens, BM25 can't add signal —

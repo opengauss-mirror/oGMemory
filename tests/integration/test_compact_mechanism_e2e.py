@@ -8,14 +8,11 @@ TopicBuffer integration paths without requiring a local AGFS/SQL/HTTP stack.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import time
+from dataclasses import dataclass
 
-import pytest
-
-from core.models import ContextNode, RequestContext, RetrievedBlock, SearchMemoryResult
+from core.models import RequestContext, RetrievedBlock, SearchMemoryResult
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 from session.archive_store import SessionArchiveStore
@@ -82,6 +79,9 @@ class RecordingWriteAPI:
 @dataclass
 class StaticPrefetchReadAPI:
     hits: list[RetrievedBlock]
+
+    def read_memory(self, uri, ctx, **kwargs):
+        return next(hit for hit in self.hits if hit.uri == uri)
 
     def search_memory(self, **kwargs):
         categories = kwargs.get("categories")

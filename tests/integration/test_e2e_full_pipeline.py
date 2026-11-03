@@ -12,28 +12,28 @@ This test verifies the full data flow:
 Run with: pytest tests/integration/test_e2e_full_pipeline.py -v -s
 """
 
-import pytest
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.models import RequestContext, user_space_name, agent_space_name
+
+from core.models import RequestContext, agent_space_name, user_space_name
+from index.index_record_builder import build_index_records
+from providers.embedder import MockEmbedder
+from providers.llm import MockLLM
+from providers.vector_index import InMemoryVectorIndex
+from retrieval.context_reader import ContextReader
+from retrieval.hierarchical_searcher import HierarchicalSearcher
+from retrieval.pipeline import RetrievalConfig, RetrievalPipeline
+from retrieval.query_planner import QueryPlanner
+from retrieval.result_ranker import ResultRanker
+from retrieval.seed_retriever import SeedRetriever
 from service.api import MemoryWriteAPI, ReadAPI
 from service.memory_fs import MemoryFS
-from retrieval.pipeline import RetrievalPipeline, RetrievalConfig
-from retrieval.query_planner import QueryPlanner
-from retrieval.seed_retriever import SeedRetriever
-from retrieval.hierarchical_searcher import HierarchicalSearcher
-from retrieval.result_ranker import ResultRanker
-from retrieval.context_reader import ContextReader
-from fs.agfs_adapter import AGFSContextFS
-from providers.llm import MockLLM
-from providers.embedder import MockEmbedder
-from providers.vector_index import InMemoryVectorIndex
-from index.index_record_builder import build_index_records
-from pyagfs import AGFSClient
 
 
 @pytest.fixture(scope="function")
@@ -41,7 +41,7 @@ def e2e_context():
     """Create RequestContext for e2e testing."""
     import uuid
     return RequestContext(
-        account_id="e2e-test-account",
+        account_id=f"e2e-test-{uuid.uuid4().hex}",
         user_id="test-user",
         agent_id="test-agent",
         session_id=str(uuid.uuid4()),
@@ -73,6 +73,9 @@ def e2e_llm():
             "tool": "extract_profile",
             "input": {
                 "abstract": "李明是一名Python开发工程师，在北京工作",
+                "evidence_quote": "我叫李明",
+                "attributed_speaker": "user",
+                "attribution_basis": "self_first_person",
                 "overview": "## Profile\n\n姓名: 李明\n职业: Python开发工程师\n地点: 北京",
                 "content": "我叫李明，是一名Python开发工程师，目前在北京工作",
                 "confidence": 0.95,
@@ -84,6 +87,7 @@ def e2e_llm():
             "input": {
                 "routing_key": "coding_style",
                 "abstract": "偏好PEP8代码风格，使用类型注解",
+                "evidence_quote": "遵循PEP8规范",
                 "overview": "## 编码风格偏好\n\n- 遵循PEP8规范\n- 使用类型注解\n- 函数文档字符串",
                 "content": "详细编码偏好: 遵循PEP8，使用类型注解和docstring",
                 "confidence": 0.9,
@@ -193,60 +197,20 @@ class TestE2EFullPipeline:
         # ====================================================================
         print("\n[Step 2] Verify ContextNodes stored...")
 
-        # Expected URIs (category is singular in URI)
-        # Note: event/case use generated event_id (timestamp_uuid), not routing_key
+        expected_uris = [plan["target_uri"] for plan in result["plans"]]
+        stored_nodes = [agfs.read_node(uri, e2e_context) for uri in expected_uris]
+        nodes = {node.category: node for node in stored_nodes}
+        assert set(nodes) == {"profile", "preference", "entity", "event", "case", "pattern", "skill"}
+        assert all(agfs.exists(uri, e2e_context) for uri in expected_uris)
         profile_uri = f"ctx://{e2e_context.account_id}/users/{e2e_context.user_id}/memories/profile"
-        preference_uri = f"ctx://{e2e_context.account_id}/users/{e2e_context.user_id}/memories/preference/coding_style"
-        entity_uri = f"ctx://{e2e_context.account_id}/users/{e2e_context.user_id}/memories/entity/fastapi"
-        pattern_uri = f"ctx://{e2e_context.account_id}/agents/{e2e_context.agent_id}/memories/pattern/async_error_handling"
-        skill_uri = f"ctx://{e2e_context.account_id}/agents/{e2e_context.agent_id}/skills/skill"
-
-        # Verify fixed URIs first
-        fixed_uris = [profile_uri, preference_uri, entity_uri, pattern_uri, skill_uri]
-        for uri in fixed_uris:
-            assert agfs.exists(uri, e2e_context), f"Node should exist: {uri}"
-            print(f"  ✓ {uri}")
-
-        # For event/case, we need to discover their actual URIs since they use generated IDs
-        # Use MemoryFS list method which handles directory listing
-        from service.memory_fs import MemoryFS
-        memory_fs = MemoryFS(fs=agfs)
-
-        # List event directory
-        event_path = f"/users/{e2e_context.user_id}/memories/event"
-        try:
-            # list() returns list of dicts with 'uri' key
-            event_items = memory_fs.list(event_path, e2e_context)
-            assert len(event_items) > 0, "Should have at least one event"
-            event_uri = event_items[0]['uri']
-            print(f"  ✓ {event_uri}")
-        except Exception as e:
-            # If listing fails, skip event URI verification
-            print(f"  ! Event listing skipped: {e}")
-            event_uri = None
-
-        # List case directory
-        case_path = f"/agents/{e2e_context.agent_id}/memories/case"
-        try:
-            case_items = memory_fs.list(case_path, e2e_context)
-            assert len(case_items) > 0, "Should have at least one case"
-            case_uri = case_items[0]['uri']
-            print(f"  ✓ {case_uri}")
-        except Exception as e:
-            print(f"  ! Case listing skipped: {e}")
-            case_uri = None
-
-        # Build expected_uris list excluding None values
-        expected_uris = [
-            profile_uri, preference_uri, entity_uri, pattern_uri, skill_uri
-        ]
-        if event_uri:
-            expected_uris.append(event_uri)
-        if case_uri:
-            expected_uris.append(case_uri)
+        assert nodes["profile"].uri == profile_uri
+        assert "PEP8" in nodes["preference"].content
+        assert "FastAPI" in nodes["entity"].content
+        assert "try/except" in nodes["pattern"].content
+        assert "FastAPI" in nodes["skill"].content
 
         # Verify node structure
-        profile_node = agfs.read_node(profile_uri, e2e_context)
+        profile_node = nodes["profile"]
         assert profile_node.category == "profile"
         assert profile_node.owner_space == user_space_name(e2e_context.user_id)
         assert profile_node.abstract == "李明是一名Python开发工程师，在北京工作"
@@ -255,13 +219,9 @@ class TestE2EFullPipeline:
         assert profile_node.metadata.get("status") == "ACTIVE"
         print("  ✓ Profile node structure valid")
 
-        # Verify case is agent-owned (if we found it)
-        if case_uri:
-            case_node = agfs.read_node(case_uri, e2e_context)
-            assert case_node.category == "case"
-            assert case_node.owner_space == agent_space_name(e2e_context.agent_id)
-            assert "selectinload" in case_node.content
-            print("  ✓ Case node owned by agent")
+        case_node = nodes["case"]
+        assert case_node.owner_space == agent_space_name(e2e_context.agent_id)
+        assert "selectinload" in case_node.content
 
         # ====================================================================
         # Step 3: Build Index Records
@@ -269,8 +229,7 @@ class TestE2EFullPipeline:
         print("\n[Step 3] Build index records...")
 
         all_records = []
-        for uri in expected_uris:
-            node = agfs.read_node(uri, e2e_context)
+        for node in stored_nodes:
             records = build_index_records(node)
             all_records.extend(records)
             print(f"  {node.category}: {len(records)} records (L0/L1/L2)")
@@ -345,12 +304,8 @@ class TestE2EFullPipeline:
 
         # Try a more specific query for profile
         print("\n  Query 1b: Direct profile URI lookup")
-        try:
-            profile_content = read_api.read_memory(profile_uri, e2e_context)
-            assert "李明" in profile_content.content_excerpt or "工程师" in profile_content.content_excerpt
-            print(f"    ✓ Direct profile read works: {profile_content.abstract[:50]}...")
-        except Exception as e:
-            print(f"    ! Direct profile read failed: {e}")
+        profile_content = read_api.read_memory(profile_uri, e2e_context)
+        assert "李明" in profile_content.content_excerpt or "工程师" in profile_content.content_excerpt
 
         # Test 2: More searches to verify retrieval
         print("\n  Query 2: '编码风格是什么？'")
@@ -399,12 +354,12 @@ class TestE2EFullPipeline:
         print("  ✓ Multi-tenant isolation working")
 
         print("\n✅ Full pipeline test PASSED!")
-        print(f"\nSummary:")
-        print(f"  - Extracted: 7 memory types (profile/preference/entity/event/case/pattern/skill)")
+        print("\nSummary:")
+        print("  - Extracted: 7 memory types (profile/preference/entity/event/case/pattern/skill)")
         print(f"  - Stored: {len(expected_uris)} ContextNodes in AGFS (event/case use dynamic IDs)")
         print(f"  - Indexed: {len(all_records)} IndexRecords")
-        print(f"  - Retrieved: All queries returned relevant results")
-        print(f"  - Isolation: Multi-tenant working correctly")
+        print("  - Retrieved: All queries returned relevant results")
+        print("  - Isolation: Multi-tenant working correctly")
 
 
 @pytest.mark.e2e
@@ -448,7 +403,7 @@ class TestE2EMemoryFS:
         # Read overview
         overview = memory_fs.read_overview(profile_path, e2e_context)
         assert len(overview) > 0, "Overview should not be empty"
-        print(f"  ✓ Profile overview exists")
+        print("  ✓ Profile overview exists")
 
 
 # E2E marker

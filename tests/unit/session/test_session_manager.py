@@ -8,7 +8,7 @@ import pytest
 
 from core.models import ContextNode, RequestContext, Role
 from session.models import ArchiveEntry, SessionMessage, SessionMeta
-from session.session_manager import SessionBuffer, SessionManager
+from session.session_manager import SessionBuffer, SessionManager, SessionOperationInProgress
 from session.session_state import TaskState
 from session.topic_buffer import SlotContent
 
@@ -27,6 +27,28 @@ def ctx():
 @pytest.fixture
 def mgr():
     return SessionManager()
+
+
+@pytest.mark.parametrize("entry", ["commit", "snapshot_and_clear"])
+@pytest.mark.parametrize("batch", [{}, {"unknown_format": True}, {"lifecycle": {}}])
+def test_source_clear_preserves_unrecognized_pending_batch(ctx, entry, batch):
+    manager = SessionManager()
+    buffer = manager.get_or_create(ctx.session_id, ctx)
+    buffer.add("user", "Source awaiting recovery")
+    buffer.runtime_extensions["memory_extraction_recovery"] = {"version": 1, "batch": batch}
+    before = buffer.capture_rollback_state()
+
+    with pytest.raises(SessionOperationInProgress) as conflict:
+        if entry == "commit":
+            manager.commit(ctx.session_id, ctx, wait=True)
+        else:
+            buffer.snapshot_and_clear()
+
+    assert conflict.value.conflict_type == (
+        "lifecycle_source_reserved" if "lifecycle" in batch else "extraction_source_reserved")
+    assert buffer.capture_rollback_state() == before
+    assert buffer.runtime_extensions["memory_extraction_recovery"]["batch"] == batch
+    assert not manager._tasks and not buffer.commit_in_progress
 
 
 @pytest.fixture

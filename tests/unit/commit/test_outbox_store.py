@@ -766,6 +766,69 @@ class TestCountUnfinished:
             "total": 3,
         }
 
+    @pytest.mark.parametrize("lock_name", [
+        ".state.json.resource-mutation-lock",
+        ".state.json.resource-mutation-lock-" + "a" * 32,
+        ".profile.update-lock",
+        ".profile.update-lock-" + "b" * 32,
+    ])
+    def test_count_unfinished_during_metadata_lock_publication(self, lock_name):
+        directories = {
+            "/local/accounts/test-account/": [
+                {"name": lock_name, "is_dir": True},
+                {"name": "profile", "is_dir": True},
+            ],
+            "/local/accounts/test-account/profile/": [
+                {"name": ".outbox", "is_dir": True},
+            ],
+            "/local/accounts/test-account/profile/.outbox/": [
+                {"name": "live.json", "is_dir": False},
+            ],
+        }
+
+        def list_directory(path):
+            if path not in directories:
+                raise FileNotFoundError(f"no such directory: {path}")
+            return directories[path]
+
+        self.mock_client.ls.side_effect = list_directory
+        self.mock_client.read.return_value = self._event("live")
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 1,
+            "processing": 0,
+            "total": 1,
+        }
+
+    def test_count_unfinished_includes_owner_named_like_metadata_lock(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": "users", "is_dir": True}],
+            [{"name": ".alice.update-lock", "is_dir": True}],
+            [{"name": "memories", "is_dir": True}],
+            [{"name": "profile", "is_dir": True}],
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "live.json", "is_dir": False}],
+        ]
+        self.mock_client.read.return_value = self._event("live")
+
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 1,
+            "processing": 0,
+            "total": 1,
+        }
+
+    def test_count_unfinished_during_event_completion(self):
+        self.mock_client.ls.side_effect = [
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "completed.json", "is_dir": False}],
+        ]
+        self.mock_client.read.side_effect = FileNotFoundError("event not found")
+
+        assert self.store.count_unfinished("test-account") == {
+            "pending": 0,
+            "processing": 0,
+            "total": 0,
+        }
+
     def test_count_unfinished_skips_dlq_entries(self):
         self.mock_client.ls.side_effect = [
             [{"name": ".outbox", "is_dir": True}],

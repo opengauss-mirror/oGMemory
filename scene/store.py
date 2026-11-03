@@ -2,22 +2,54 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from core.models import ContextNode
+from core.models import ContextNode, RequestContext
 from scene.models import PersistedScene, SceneArchive, SceneCluster, SceneSnapshot
 
 SceneSourceState = tuple[int, object]
 ResolvedArchiveSource = tuple[str, float]
+SceneNodeReader = Callable[[str, RequestContext], ContextNode]
+
+
+@runtime_checkable
+class SceneSnapshotRepository(Protocol):
+    """Persistence port for one scoped scene snapshot.
+
+    Implementations own transactions, tenant isolation, locking, and the
+    serialization format. Scene retrieval and decision code only depends on
+    this port.
+    """
+
+    def load_snapshot(self, account_id: str, owner_space: str) -> SceneSnapshot: ...
+
+    def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool: ...
+
+
+class SceneEvidenceRepository(SceneSnapshotRepository, Protocol):
+    """Publication port sharing the canonical writers' transaction or mutation lock."""
+
+    def compare_and_swap_checked(
+        self, expected: SceneSnapshot, replacement: SceneSnapshot,
+        check: Callable[[SceneNodeReader | None], bool],
+    ) -> bool:
+        """Hold canonical mutation protection across check and snapshot CAS.
+
+        The backend acquires protection for the account/owner's evidence first,
+        invokes check with a transaction-bound reader (or None for a shared
+        mutation lock), and commits only when it returns True.
+        A failed check returns False. All canonical writers share this protection.
+        """
+        ...
 
 
 @dataclass(frozen=True)
 class SceneDecisionInput:
-    """Detached scenes, complete member evidence and indexed vectors at one revision.
+    """Detached scenes and a bounded evidence window at one revision.
 
-    Nodes include every existing scene member and the offered new evidence.
+    Nodes include offered evidence and complete members of selected scene candidates.
     Embeddings use node URIs as keys. Adapters return caller-owned node and vector
     copies so a decision can operate independently of subsequent backend changes.
     """
@@ -25,28 +57,44 @@ class SceneDecisionInput:
     snapshot: SceneSnapshot
     nodes: tuple[ContextNode, ...]
     embeddings: dict[str, list[float]]
+    unavailable_uris: tuple[str, ...] = ()
 
 
 @runtime_checkable
 class SceneDecisionStore(Protocol):
     """Consistent snapshot reads and atomic publication scoped by account and owner.
 
-    Scene changes and source-memory changes advance the same monotonic scope
-    revision, including manual edits and deletions. Adapters own transactions
-    and synchronization across readers and writers.
+    Scene changes advance the monotonic scope revision. Adapters validate source
+    versions during publication and own transactions across readers and writers.
     """
 
-    def load_input(self, account_id: str, owner_space: str) -> SceneDecisionInput:
-        """Read scene state, member nodes and indexed vectors from one revision."""
+    def load_input(
+        self,
+        account_id: str,
+        owner_space: str,
+        *,
+        node_uris: Sequence[str] | None = None,
+    ) -> SceneDecisionInput:
+        """Read one revision and the bounded evidence window for a job.
+
+        Adapters should include the offered URIs plus existing scene members
+        and any evidence required to compare or merge those scenes.
+        """
         ...
 
-    def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool:
+    def compare_and_swap(
+        self, expected: SceneSnapshot, replacement: SceneSnapshot,
+        *, evidence_nodes: Sequence[ContextNode] = (),
+        source_fingerprints: Sequence[tuple[str, str]] = (),
+    ) -> bool:
         """Publish the full scene replacement when the scope revision still matches.
 
         Both snapshots identify the same account and owner. The replacement
         revision equals expected.revision + 1. Return True after atomic commit;
         return False on revision conflict, preserving the current state.
         Raise ValueError for a scope mismatch or invalid replacement revision.
+        Include any nodes acquired by preflight tools in the same atomic source check.
+        Source-only memory fingerprints capture the state when tool evidence was read.
         """
         ...
 

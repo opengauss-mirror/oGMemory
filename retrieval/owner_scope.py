@@ -6,6 +6,14 @@ from core.enums import ContextType
 from core.models import RequestContext, TypedQuery
 
 
+def canonical_owner_space(space: str) -> str:
+    """Normalize legacy user and agent prefixes while preserving the identifier."""
+    for prefix in ("user_", "agent_"):
+        if space.startswith(prefix):
+            return space.replace(prefix, prefix[:-1] + ":", 1)
+    return space
+
+
 def allowed_owner_space_filter(
     typed_query: TypedQuery,
     ctx: RequestContext,

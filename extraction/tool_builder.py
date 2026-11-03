@@ -8,8 +8,21 @@ SchemaRegistry is the single source of truth for extraction tools.
 
 from logging import getLogger
 
-from core.models import CandidateMemory
-from extraction.schemas.models import FieldType
+from core.errors import ToolCallProtocolError
+from core.models import CandidateMemory, ContextNode, RequestContext
+from core.validation import (
+    MAX_ABSTRACT_LEN,
+    MAX_CONTENT_LEN,
+    MAX_OVERVIEW_LEN,
+    validate_attribution,
+    validate_candidate,
+)
+from extraction.incremental_edit import (
+    INCREMENTAL_TOOLS,
+    build_incremental_tools,
+    materialize_incremental_input,
+)
+from extraction.schemas.models import FieldType, MemoryTypeSchema
 from extraction.schemas.registry import (
     SchemaRegistry,
     is_schema_version_compatible,
@@ -32,6 +45,66 @@ _EXCLUDED_TOOL_FIELDS = {"provenance_ids"}
 
 # Schemas used by storage/internal flows, not by LLM extraction.
 _INTERNAL_MEMORY_TYPES = {"session_archive", "session_summary"}
+_UPDATE_MEMORY_TYPES = {"profile", "entity", "preference", "pattern"}
+_TEXT_LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
+                "content": MAX_CONTENT_LEN}
+_UPDATE_INSTRUCTION = (
+    "Bound upserts: copy read target_uri, expected_version, routing_key, exact scope_ref "
+    "(even empty) and preference holder. Return complete content preserving unchanged "
+    "facts; abstract/overview summarize it all. Never replace scope with a conversation "
+    "date. Different scopes need separate unbound facts, without old-scope facts."
+)
+_PROFILE_SNAPSHOT_INSTRUCTION = (
+    "Runtime storage contract: profile has ONE fixed file. Emit exactly ONE "
+    "extract_profile operation containing ALL supported profile attributes in this input, "
+    "both at creation and update. This single-file contract takes precedence over the "
+    "attribute-per-call and separate-node examples; preserve their fact eligibility "
+    "and attribution rules. For updates, read the existing profile and retain its "
+    "unchanged facts. Use its routing_key; for creation use 'identity'."
+)
+
+
+def _supports_read_target(schema: MemoryTypeSchema) -> bool:
+    return (schema.operation_mode == "upsert" and schema.memory_type in _UPDATE_MEMORY_TYPES
+            and (schema.is_single_file if schema.memory_type == "profile" else schema.is_multi_file))
+
+
+def _source_identity_properties(schema: MemoryTypeSchema) -> dict:
+    """Expose identity metadata only for the memory categories that use it."""
+    if not schema.is_multi_file or schema.memory_type not in {"entity", "preference", "pattern", "event", "case"}:
+        return {}
+    properties = {
+        "scope_ref": {"type": "string", "description":
+            "Identity namespace, NOT evidence provenance. Use ONE explicitly established "
+            "business/project/world boundary only when it distinguishes different same-named "
+            "subjects or preference contexts. Otherwise use an empty string, including ordinary "
+            "conversations about the same people across sessions. A source document title, "
+            "chat label, message ID or observation date does not establish an identity namespace. "
+            "Keep source references in provenance_ids and dates with the facts. A document title "
+            "may be a scope only if the document itself defines a distinct world or namespace. "
+            "Reuse the read identity scope for updates; never join independent scopes."},
+    }
+    if schema.memory_type == "entity":
+        properties["object_name"] = {"type": "string", "description":
+            "Stable source name of the one person, organization, project or object "
+            "described. Copy its exact original name across updates: for Atlas in "
+            "Project A, use object_name='Atlas' and scope_ref='Project A'. Never "
+            "append project labels, descriptions or qualifiers to the name. "
+            "Always include this field; use an empty string only for an unnamed subject."}
+    if schema.memory_type in {"event", "case"}:
+        properties["title"] = {"type": "string", "description":
+            "Concise source-grounded title of this occurrence or case."}
+    return properties
+
+
+def build_update_instruction(registry: SchemaRegistry) -> str:
+    """Describe runtime write units independently of persisted schema fields."""
+    schemas = [schema for schema in registry.list_enabled()
+               if is_schema_version_compatible(schema) and _supports_read_target(schema)]
+    parts = [_UPDATE_INSTRUCTION] if schemas else []
+    if any(schema.memory_type == "profile" and schema.is_single_file for schema in schemas):
+        parts.append(_PROFILE_SNAPSHOT_INSTRUCTION)
+    return "\n\n".join(parts)
 
 
 def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
@@ -77,6 +150,14 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
             if field.description:
                 prop_def["description"] = field.description
 
+            if field.name in _TEXT_LIMITS:
+                prop_def["maxLength"] = _TEXT_LIMITS[field.name]
+                prop_def["description"] = (
+                    prop_def.get("description", "")
+                    + f" Maximum {_TEXT_LIMITS[field.name]} characters. "
+                    "Keep category-relevant facts in content, not source narration; summarize in abstract/overview."
+                )
+
             if field.enum:
                 prop_def["enum"] = field.enum
 
@@ -85,9 +166,42 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
             if field.required:
                 required.append(field.name)
 
+        for name, definition in _source_identity_properties(schema).items():
+            if name not in properties:
+                properties[name] = definition
+                required.append(name)
+        if schema.memory_type == "preference" and "who" in properties:
+            properties["who"]["description"] = (
+                properties["who"].get("description", "") + " "
+                "The person, group or organization holding this preference, identified "
+                "by the source. Use its name, preserving the existing holder on updates. "
+                "Keep reporting-speaker evidence separate from the preference statement."
+            )
+        description = schema.description
+        if schema.memory_type == "entity" and schema.is_multi_file:
+            description += (
+                "\nRuntime identity contract: each call describes exactly ONE subject in ONE identity namespace. "
+                "The same subject mentioned in another conversation remains the same entity. "
+                "Same-named objects belonging to different projects are distinct nodes: emit separate "
+                "calls, each with its exact object_name and its own scope_ref and facts. "
+                "For Atlas in Project A and another Atlas in Project B, emit two calls; never "
+                "create a third aggregate Atlas node or a combined 'Project A / Project B' scope. "
+                "This applies to both creation and updates. When only one scoped object changes, "
+                "update that object without combining it with the unchanged object."
+            )
+        if _supports_read_target(schema):
+            properties.update({
+                "target_uri": {"type": "string", "description": "Existing memory URI read for this update."},
+                "expected_version": {"type": "integer", "minimum": 1,
+                                     "description": "Version from the memory read result."},
+            })
+            description += "\n" + _UPDATE_INSTRUCTION
+            if schema.memory_type == "profile" and schema.is_single_file:
+                description = _PROFILE_SNAPSHOT_INSTRUCTION + "\n\n" + description
+
         tools.append({
             "name": schema.tool_name,
-            "description": schema.description,
+            "description": description,
             "schema_version": schema.version,
             "metadata": {
                 "memory_type": schema.memory_type,
@@ -102,6 +216,9 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
 
         logger.debug(f"Built tool definition: {schema.tool_name}")
 
+    if any(is_schema_version_compatible(schema) and _supports_read_target(schema)
+           for schema in registry.list_enabled()):
+        tools.extend(build_incremental_tools())
     return tools
 
 
@@ -125,6 +242,10 @@ def parse_tool_call(
     tool_name: str,
     tool_input: dict,
     registry: SchemaRegistry,
+    *,
+    read_nodes: dict[str, ContextNode] | None = None,
+    ctx: RequestContext | None = None,
+    current_content: str | None = None,
 ) -> tuple[str, str, CandidateMemory] | None:
     """Validate and parse a tool call using schema definitions.
 
@@ -137,6 +258,23 @@ def parse_tool_call(
         Tuple of (memory_type, owner_scope, CandidateMemory) if valid,
         None if tool_name is unknown or validation fails
     """
+    if tool_name in INCREMENTAL_TOOLS:
+        name, full_input = materialize_incremental_input(
+            tool_name, tool_input, registry, read_nodes, ctx, current_content,
+        )
+        parsed = parse_tool_call(name, full_input, registry)
+        if parsed is None:
+            raise ToolCallProtocolError("incremental update did not produce a schema-valid complete snapshot")
+        category, owner, candidate = parsed
+        try:
+            candidate = validate_candidate(candidate)
+        except Exception as exc:
+            raise ToolCallProtocolError("incremental update failed complete snapshot validation") from exc
+        attributed = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
+        if attributed.category != category or attributed.owner_scope != owner:
+            raise ToolCallProtocolError("incremental update cannot change the read target's attribution")
+        return category, owner, candidate
+
     # Find a compatible schema by tool_name
     schema = None
     for s in registry.list_compatible_enabled():
@@ -238,9 +376,30 @@ def parse_tool_call(
         elif field.default is not None:
             validated_fields[field.name] = field.default
 
+    identity_fields = {}
+    for name in _source_identity_properties(schema):
+        value = tool_input.get(name, validated_fields.get(name))
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            errors.append(f"{name}: expected source identity text")
+        else:
+            identity_fields[name] = value
+
     if errors:
         logger.warning(f"Validation failed for tool {tool_name}: {errors}")
         return None
+
+    target_uri = tool_input.get("target_uri", "")
+    expected_version = tool_input.get("expected_version")
+    if target_uri or expected_version is not None:
+        if (not _supports_read_target(schema)
+                or not isinstance(target_uri, str) or not target_uri.strip()
+                or type(expected_version) is not int or expected_version < 1
+                or not all(isinstance(tool_input.get(name), str) and tool_input[name].strip()
+                           for name in ("abstract", "overview", "content"))):
+            logger.warning("Invalid read target for tool %s", tool_name)
+            return None
 
     # Extract common fields for CandidateMemory
     abstract = validated_fields.get("abstract", "")
@@ -297,5 +456,24 @@ def parse_tool_call(
             attributed_speaker=attributed_speaker,
             attribution_basis=attribution_basis,
             provenance_ids=validated_fields.get("provenance_ids", []),
+            target_uri=target_uri,
+            expected_version=expected_version,
+            **identity_fields,
         ),
     )
+
+
+def validate_read_target(candidate: CandidateMemory, read_versions: dict[str, int],
+                         *, read_nodes=None, ctx=None) -> None:
+    """Bind a complete update to the snapshot actually supplied to extraction."""
+    if candidate.target_uri and (candidate.target_uri not in read_versions
+                                 or read_versions[candidate.target_uri] != candidate.expected_version):
+        raise ToolCallProtocolError("memory update requires the URI and version of a successful read")
+
+    if candidate.target_uri and read_nodes is not None and candidate.category in {"entity", "preference", "pattern"}:
+        from commit.identity_resolver import MemoryIdentityResolver
+        node = read_nodes.get(candidate.target_uri)
+        if node is None or ctx is None or not MemoryIdentityResolver._in_scope(node, candidate, ctx):
+            raise ToolCallProtocolError(
+                "memory update must preserve the read target category, owner, source scope_ref "
+                "(including an empty value) and preference holder")

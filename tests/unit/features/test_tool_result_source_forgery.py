@@ -34,7 +34,9 @@ def _service(tmp_path, *, mode: str = "user_message") -> MemoryService:
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     )
     service._get_archive_store = lambda: None
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     return service

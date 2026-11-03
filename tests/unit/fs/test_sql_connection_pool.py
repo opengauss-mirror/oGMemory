@@ -118,3 +118,54 @@ def test_bounded_retrying_caller_can_skip_idle_preflight(monkeypatch):
     pool.return_connection(stale)
 
     assert pool.get_connection(validate=False) is stale
+
+
+def test_auto_probe_completes_with_delayed_wire_responses():
+    import struct
+    import threading
+    import time
+
+    def message(kind, body):
+        return kind + struct.pack("!I", len(body) + 4) + body
+
+    def read_exact(conn, size):
+        data = b""
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            assert chunk
+            data += chunk
+        return data
+
+    def serve(listener):
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(3)
+            size = struct.unpack("!I", read_exact(conn, 4))[0]
+            read_exact(conn, size - 4)
+            time.sleep(.02)
+            conn.sendall(message(b"R", struct.pack("!I", 0))
+                         + message(b"S", b"server_version\x0016.0\x00")
+                         + message(b"S", b"client_encoding\x00UTF8\x00")
+                         + message(b"S", b"DateStyle\x00ISO, MDY\x00") + message(b"Z", b"I"))
+            assert read_exact(conn, 1) == b"Q"
+            size = struct.unpack("!I", read_exact(conn, 4))[0]
+            assert read_exact(conn, size - 4) == b"SELECT version()\x00"
+            time.sleep(.02)
+            row = b"PostgreSQL 16.0"
+            description = struct.pack("!H", 1) + b"version\x00" + struct.pack("!IhIhih", 0, 0, 25, -1, -1, 0)
+            conn.sendall(message(b"T", description)
+                         + message(b"D", struct.pack("!Hi", 1, len(row)) + row)
+                         + message(b"C", b"SELECT 1\x00") + message(b"Z", b"I"))
+
+    with module.socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(3)
+        worker = threading.Thread(target=serve, args=(listener,), daemon=True)
+        worker.start()
+        dsn = f"host=127.0.0.1 port={listener.getsockname()[1]} dbname=test user=test sslmode=disable"
+        started = time.monotonic()
+        dialect = module.resolve_connection_dialect("auto", dsn, 2)
+        worker.join(3)
+    assert dialect.name == "postgresql"
+    assert .04 <= time.monotonic() - started < 2

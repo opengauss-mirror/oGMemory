@@ -21,6 +21,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from providers.decision.config import DecisionConfig
+
 # Auto-load .env from config/ directory so API keys are available
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _dotenv_path = os.path.join(_project_root, "config", ".env")
@@ -182,6 +184,24 @@ def _resolve_bool(yaml_val: Any, env_name: str, default: bool) -> bool:
     if env is not None:
         return env.lower() in ("1", "true", "yes")
     return default
+
+
+def _resolve_expand_hierarchy(yaml_val: Any) -> bool:
+    """Resolve the expansion flag without silently accepting invalid values."""
+    env_name = "OGMEM_RETRIEVAL_EXPAND_HIERARCHY"
+    value = yaml_val if yaml_val is not None else os.environ.get(env_name)
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (str, int)):
+        normalized = str(value).strip().lower()
+        if normalized in ("1", "true", "yes"):
+            return True
+        if normalized in ("0", "false", "no"):
+            return False
+    source = "retrieval.expand_hierarchy" if yaml_val is not None else env_name
+    raise ValueError(f"{source} must be a boolean (true/false, yes/no, 1/0)")
 
 
 def _resolve_optional_bool(yaml_val: Any, env_name: str) -> bool | None:
@@ -473,10 +493,12 @@ class OgMemConfig:
     openai_embedding_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
     embedding_multimodal: bool = False
     embedding_max_input_chars: int = 30_000
+    embedding_batch_size: int = 2048
     st_model: str = "BAAI/bge-m3"
 
     # -- Vector DB -------------------------------------------------------------
     vector_db_type: str = "chroma"
+    vector_db_dialect: str | None = None
     opengauss_connection_string: str | None = None
     opengauss_dimension: int = 1024
     opengauss_table_name: str = "vector_index"
@@ -577,10 +599,17 @@ class OgMemConfig:
 
     # -- Storage backend -------------------------------------------------------
     storage_backend: str = "agfs"  # "agfs" | "sql"
-    sql_dialect: str = "postgresql"  # "postgresql" | "opengauss"
+    sql_dialect: str | None = None  # Shared vector databases are identified at startup when omitted.
     sql_connection_string: str | None = None
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
+    agent_memory_enabled: bool = False
+
+    # -- Scene memory ---------------------------------------------------------
+    scene_enabled: bool = False
+    scene_generation_enabled: bool = True
+    scene_retrieval_enabled: bool = True
+    scene_options: dict[str, Any] = field(default_factory=dict)
 
     # -- Agent skill sedimentation --------------------------------------------
     skill_sedimentation_enabled: bool = False
@@ -628,7 +657,7 @@ class OgMemConfig:
 
     # -- Memory extraction -----------------------------------------------------
     extraction_mode: str = "eager"  # "eager" (prefetch + single-shot) or "lazy" (ReAct loop)
-    after_turn_threshold: int = 200
+    after_turn_threshold: int = 400
     rolling_compress_enabled: bool = True
     rolling_compress_fallback_enabled: bool = False
     compact_prepare_token_ttl: int = 300
@@ -702,14 +731,50 @@ class OgMemConfig:
     perf_run_id: str | None = None
     perf_rate_card: str | None = None
 
+    # Appended to preserve positional construction of existing settings.
+    retrieval_expand_hierarchy: bool = True
+    # Appended to preserve positional configuration arguments; eager opt-in only.
+    source_occurrence_reconciliation_enabled: bool = False
+    card_format_enabled: bool = False
+    dual_pass_enabled: bool = True
+    node_processing_enabled: bool = False
+
+    # Explicit opt-in, independent of the generative LLM and eager/lazy mode.
+    decision: DecisionConfig | None = None
+
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if isinstance(self.decision, dict):
+            self.decision = DecisionConfig.from_mapping(self.decision)
+        elif self.decision is not None and not isinstance(self.decision, DecisionConfig):
+            raise ValueError("decision must be DecisionConfig, a mapping, or null")
+        if type(self.source_occurrence_reconciliation_enabled) is not bool:
+            raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
+        if type(self.card_format_enabled) is not bool:
+            raise ValueError("card_format_enabled must be a boolean")
+        if type(self.dual_pass_enabled) is not bool:
+            raise ValueError("dual_pass_enabled must be a boolean")
+        if type(self.node_processing_enabled) is not bool:
+            raise ValueError("node_processing_enabled must be a boolean")
         from fs.sql_adapter.dialect import normalize_sql_dialect
 
+        if self.sql_dialect is None:
+            shared_opengauss = (
+                str(self.vector_db_type).strip().casefold() == "opengauss"
+                and self.opengauss_connection_string
+                and (not self.sql_connection_string
+                     or self.sql_connection_string == self.opengauss_connection_string)
+            )
+            self.sql_dialect = "auto" if shared_opengauss else "postgresql"
         self.sql_dialect = normalize_sql_dialect(self.sql_dialect)
+        if self.vector_db_dialect is None:
+            shared = (not self.sql_connection_string
+                      or self.sql_connection_string == self.opengauss_connection_string)
+            self.vector_db_dialect = self.sql_dialect if shared else "opengauss"
+        self.vector_db_dialect = normalize_sql_dialect(self.vector_db_dialect)
         if not 2 <= self.trace_max_turn_events <= 1024:
             raise ValueError("trace_max_turn_events must be between 2 and 1024")
         filter_integer_settings = (
@@ -758,7 +823,15 @@ class OgMemConfig:
             raise ValueError(
                 "tool_output_filter_output_max_chars must be at least the read and bash min chars"
             )
+        from scene.config import SceneConfig
+        SceneConfig().merged(self.scene_options)
         embedding_max_input_chars = self.embedding_max_input_chars
+        if (
+            isinstance(self.embedding_batch_size, bool)
+            or not isinstance(self.embedding_batch_size, int)
+            or not 1 <= self.embedding_batch_size <= 2048
+        ):
+            raise ValueError("embedding_batch_size must be an integer between 1 and 2048")
         if isinstance(embedding_max_input_chars, bool) or not isinstance(
             embedding_max_input_chars, int
         ):
@@ -986,6 +1059,8 @@ class OgMemConfig:
             raise ValueError(
                 "AGFS skill sedimentation requires service.workers=1"
             )
+        if not isinstance(self.retrieval_expand_hierarchy, bool):
+            raise ValueError("retrieval_expand_hierarchy must be a boolean")
         if self.retrieval_hybrid_enabled and self.storage_backend != "sql":
             raise ValueError(
                 "hybrid retrieval requires storage.backend=sql for canonical backfill"
@@ -1129,7 +1204,13 @@ class OgMemConfig:
             )
         )
 
+        decision_raw = raw.get("decision")
+        if isinstance(decision_raw, dict) and decision_raw:
+            decision_raw = {**decision_raw, "api_key": _resolve(decision_raw.get("api_key"), "OGMEM_DECISION_API_KEY", "")}
+        decision_config = DecisionConfig.from_mapping(decision_raw)
+
         cfg = cls(
+            decision=decision_config,
             # LLM
             provider=_resolve(llm.get("provider"), "CONTEXTENGINE_PROVIDER", "mock"),
             openai_api_key=llm_api_key,
@@ -1173,10 +1254,14 @@ class OgMemConfig:
                 int,
             ),
             st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-m3"),
+            embedding_batch_size=_resolve(
+                emb.get("batch_size"), "OGMEM_EMBEDDING_BATCH_SIZE", 2048, int,
+            ),
             # Vector DB. Env vars are named VECTOR_DB_* because the backend
             # may be openGauss OR PostgreSQL+pgvector (see OpenGaussVectorIndex);
             # the historical OPENGAUSS_* spellings still work as legacy aliases.
             vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "chroma"),
+            vector_db_dialect=_resolve(vdb.get("dialect"), "VECTOR_DB_DIALECT", None),
             opengauss_connection_string=_resolve_with_alias(
                 vdb.get("connection_string"),
                 "VECTOR_DB_CONNECTION_STRING", "OPENGAUSS_CONNECTION_STRING",
@@ -1847,7 +1932,7 @@ class OgMemConfig:
             sql_dialect=_resolve(
                 storage.get("dialect"),
                 "SQL_DIALECT",
-                "postgresql",
+                None,
             ),
             sql_connection_string=_resolve_with_alias(
                 storage.get("connection_string"),
@@ -1864,6 +1949,19 @@ class OgMemConfig:
                 int,
             ),
             # Agent skill sedimentation
+            agent_memory_enabled=_resolve_bool(
+                (raw.get("agent_memory") or {}).get("enabled"), "OGMEM_AGENT_MEMORY_ENABLED", False,
+            ),
+            scene_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("enabled"), "OGMEM_SCENE_ENABLED", False,
+            ),
+            scene_generation_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("generation_enabled"), "OGMEM_SCENE_GENERATION_ENABLED", True,
+            ),
+            scene_retrieval_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("retrieval_enabled"), "OGMEM_SCENE_RETRIEVAL_ENABLED", True,
+            ),
+            scene_options=dict((raw.get("scene") or {}).get("options") or {}),
             skill_sedimentation_enabled=_resolve_bool(
                 sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,
             ),
@@ -1981,15 +2079,32 @@ class OgMemConfig:
                 [],
             ),
             # Memory extraction
+            card_format_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("card_format_enabled"),
+                "OGMEM_CARD_FORMAT_ENABLED", False,
+            ),
             extraction_mode=_resolve(
                 memory.get("extraction", {}).get("mode"),
                 "OGMEM_EXTRACTION_MODE",
                 "eager",
             ),
+            dual_pass_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("dual_pass_enabled"),
+                "OGMEM_DUAL_PASS_ENABLED", True,
+            ),
+            node_processing_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("node_processing_enabled"),
+                "OGMEM_NODE_PROCESSING_ENABLED", False,
+            ),
+            source_occurrence_reconciliation_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("source_occurrence_reconciliation_enabled"),
+                "OGMEM_SOURCE_OCCURRENCE_RECONCILIATION_ENABLED",
+                False,
+            ),
             after_turn_threshold=_resolve(
                 memory.get("after_turn_threshold"),
                 "OGMEM_AFTER_TURN_THRESHOLD",
-                200,
+                400,
                 int,
             ),
             rolling_compress_enabled=_resolve_bool(
@@ -2152,6 +2267,9 @@ class OgMemConfig:
                 float,
             ),
             # Retrieval
+            retrieval_expand_hierarchy=_resolve_expand_hierarchy(
+                retrieval.get("expand_hierarchy"),
+            ),
             retrieval_max_top_k=_resolve(
                 retrieval.get("max_top_k"),
                 "OGMEM_RETRIEVAL_MAX_TOP_K",

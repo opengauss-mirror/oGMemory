@@ -30,9 +30,9 @@ Unix：
 
 ```bash
 mkdir -p ~/.config/opencode/plugins/ogmemory
-cp opencode-plugin/wrappers/ogmemory.js ~/.config/opencode/plugins/ogmemory.js
-cp opencode-plugin/index.mjs opencode-plugin/package.json ~/.config/opencode/plugins/ogmemory/
-cp -r opencode-plugin/lib ~/.config/opencode/plugins/ogmemory/
+cp plugins/opencode/wrappers/ogmemory.js ~/.config/opencode/plugins/ogmemory.js
+cp plugins/opencode/index.mjs plugins/opencode/package.json ~/.config/opencode/plugins/ogmemory/
+cp -r plugins/opencode/lib ~/.config/opencode/plugins/ogmemory/
 ```
 
 目录：
@@ -46,7 +46,7 @@ cp -r opencode-plugin/lib ~/.config/opencode/plugins/ogmemory/
     └── lib/
 ```
 
-Windows 安装见 [`../../opencode-plugin/INSTALL-ZH.md`](../../opencode-plugin/INSTALL-ZH.md)。
+Windows 安装见 [`../../plugins/opencode/INSTALL-ZH.md`](../../plugins/opencode/INSTALL-ZH.md)。
 
 ## 4. 配置文件
 
@@ -55,6 +55,8 @@ Windows 安装见 [`../../opencode-plugin/INSTALL-ZH.md`](../../opencode-plugin/
 ```json
 {
   "enabled": true,
+  "autoCapture": true,
+  "autoRecall": true,
   "endpoint": "http://127.0.0.1:8090",
   "apiKey": "<tenant-key>",
   "accountId": "acct-1",
@@ -70,6 +72,8 @@ Windows 安装见 [`../../opencode-plugin/INSTALL-ZH.md`](../../opencode-plugin/
 | 字段 | 类型 | 默认值 | 约束/说明 |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | false 时禁用所有 Hook 和网络请求 |
+| `autoCapture` | boolean | `true` | false 时不缓存新消息，不自动写入或重试 `after_turn`；不影响读取 |
+| `autoRecall` | boolean | `true` | false 时不调用 `compose`，也不注入记忆；不影响自动写入 |
 | `endpoint` | string | `http://127.0.0.1:8090` | 不允许 URL 用户名、密码、query、fragment；非 loopback 必须 HTTPS |
 | `apiKey` | string | `""` | oGMemory 租户 Key |
 | `accountId` | string | `""` | 租户 ID |
@@ -82,7 +86,7 @@ Windows 安装见 [`../../opencode-plugin/INSTALL-ZH.md`](../../opencode-plugin/
 
 未知字段会导致配置失败。
 
-环境变量覆盖文件：
+以下环境变量覆盖文件中的身份、地址和 Trace 内容配置：
 
 ```bash
 export OG_MEMORY_URL='https://ogmemory.example.com'
@@ -92,6 +96,24 @@ export OG_AUTH_USER_ID='user-1'
 export OG_AUTH_AGENT_ID='opencode'
 export OGMEM_TRACE_CAPTURE_CONTENT='1'
 ```
+
+### 只读记忆模式
+
+通过独立的自动写入和读取开关，在配置文件中加入：
+
+```json
+{
+  "enabled": true,
+  "autoCapture": false,
+  "autoRecall": true
+}
+```
+
+此时继续通过 `/api/v1/compose` 读取并注入已有记忆，但不缓存新对话，也不会在轮次完成、空闲、压缩、错误、会话删除或退出时调用 `/api/v1/after_turn`。
+
+JSON 未配置对应字段时，可通过 `OGMEM_AUTO_CAPTURE`、`OGMEM_AUTO_RECALL` 设置默认值；显式 JSON `true` 或 `false` 优先于环境变量。环境变量值 `0`、`false`、`off`、`no`（不区分大小写）表示关闭。修改后重启 OpenCode。
+
+开关只控制原生插件的自动记忆流程。会话、工具、压缩和错误 Trace 仍会上传；关闭 capture 后，依赖消息缓存的 `user_message`、`assistant_message` 和 `turn_end` Trace 不再生成。显式 MCP 工具的读写行为不受影响。
 
 ## 5. HTTP 请求
 
@@ -251,7 +273,7 @@ Trace：
 插件测试：
 
 ```bash
-cd opencode-plugin
+cd plugins/opencode
 npm run check
 npm test
 npm pack --dry-run

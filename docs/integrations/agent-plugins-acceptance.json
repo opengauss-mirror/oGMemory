@@ -1,0 +1,71 @@
+{
+  "date": "2026-10-06",
+  "model": "doubao-seed-2.1-lite",
+  "backend": "WSL PostgreSQL 14 + BGE-M3 + oGMemory production MCP",
+  "clients": {
+    "Codex": {
+      "version": "0.160.1",
+      "write_session": "01a111e3-9cdc-7fe1-a86b-9a0d7544c4ab",
+      "recall_session": "01a111e4-7060-7b51-a2e3-fc90c3316e25",
+      "successful_memory_tools": [
+        "ogm_query_memory",
+        "ogm_read_memory",
+        "ogm_write_memory"
+      ],
+      "new_session_recall": true,
+      "expected_fact": "每周二北京时间19:00发布，依赖管理使用uv",
+      "evidence_sha256": {
+        "codex-autonomous-write.jsonl": "bdef7841468dafef35495a0423498a9b7cfb8ccf862f0610435c90948dc5327b",
+        "codex-autonomous-read.jsonl": "e8ea919b4ba398d11e98a98d8061ad0d7e3bc117b6ec90f5c3a5ce74c7dbc5b2"
+      }
+    },
+    "Claude Code": {
+      "version": "2.1.152",
+      "write_session": "3690feac-e703-4620-9893-e850da1988d5",
+      "recall_session": "387d49ef-d417-401d-8035-1171b77de2a4",
+      "successful_memory_tools": [
+        "mcp__ogmemory__ogm_query_memory",
+        "mcp__ogmemory__ogm_read_memory",
+        "mcp__ogmemory__ogm_write_memory"
+      ],
+      "new_session_recall": true,
+      "expected_fact": "每周二北京时间19:00发布，依赖管理使用uv",
+      "evidence_sha256": {
+        "claude-autonomous-write.jsonl": "6f8aa633f19ea31813026bbc76c7d1bcc68a287e1c4e37e15ad626edd47769f8",
+        "claude-autonomous-read.jsonl": "cdcc8f872b4226afb2140c27e55f2a2d2a45973abb7399cdbcd8615a6c4e3d3f"
+      }
+    },
+    "DSH": {
+      "version": "0.1.5-rc.2",
+      "write_session": "session-683edb0a-d73a-4233-ab07-f6e33c45ea7a",
+      "recall_session": "session-2c620b7f-d55c-4764-8be8-a2db23d02b59",
+      "successful_memory_tools": [
+        "mcp__ogmemory__ogm_query_memory",
+        "mcp__ogmemory__ogm_read_memory",
+        "mcp__ogmemory__ogm_write_memory"
+      ],
+      "new_session_recall": true,
+      "expected_fact": "每周二北京时间19:00发布，依赖管理使用uv",
+      "evidence_sha256": {
+        "dsh-home\\sessions\\--D-ogmemory-agent-validation-dsh-workspace--\\session-683edb0a-d73a-4233-ab07-f6e33c45ea7a\\session.v3.jsonl.zstd": "8867359829347e44db45a8786321e5e917084e8ba56b1970d22372aff94b5f3a",
+        "dsh-home\\sessions\\--D-ogmemory-agent-validation-dsh-workspace--\\session-2c620b7f-d55c-4764-8be8-a2db23d02b59\\session.v3.jsonl.zstd": "42979d65c5ca5778aac85b33e297e6169e0189d185307fd548b1a6b6f67e3163"
+      }
+    },
+    "OpenClaw (WSL)": {
+      "version": "2026.9.8",
+      "write_session": "854507b1-272e-4216-8f84-d23cac8b8403",
+      "recall_session": "c8320199-78c3-4762-bd8d-9f37a4048393",
+      "successful_memory_tools": [
+        "ogmemory__ogm_query_memory",
+        "ogmemory__ogm_read_memory",
+        "ogmemory__ogm_write_memory"
+      ],
+      "new_session_recall": true,
+      "expected_fact": "每周二北京时间19:00发布，依赖管理使用uv",
+      "evidence_sha256": {
+        "openclaw-wsl-autonomous-write.jsonl": "e53cd5428763244cd39c9dd6b9b7423fb4dcedd1a2cd1725b9131691de73501b",
+        "openclaw-wsl-autonomous-read.jsonl": "b0c0d1e3033ddaeccaadd967a67a21524a3002af948490563ac45fda696b51fd"
+      }
+    }
+  }
+}

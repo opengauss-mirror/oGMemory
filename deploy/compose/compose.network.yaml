@@ -1,0 +1,6 @@
+# Optional subnet override; enable through COMPOSE_FILE in .env.
+networks:
+  memory:
+    ipam:
+      config:
+        - subnet: ${OGMEM_NETWORK_SUBNET:?Set a non-overlapping OGMEM_NETWORK_SUBNET in .env}

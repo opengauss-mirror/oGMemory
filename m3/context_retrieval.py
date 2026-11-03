@@ -1,4 +1,6 @@
 """Shared deterministic neighborhood planning, separate from query ranking."""
+from heapq import merge
+
 from core.clip_lookup import clip_ordinal
 
 
@@ -10,24 +12,42 @@ def validate_context_options(radius: int, context_k: int) -> None:
         raise ValueError("context_k > 0 requires include_neighbors > 0")
 
 
-def neighbor_plan(seeds, *, radius, before_clip=None):
+def neighbor_plan(seeds, *, radius, before_clip=None, max_clips=None):
     """Map (video, clip) to (distance, seed rank, supporting seed identity).
 
     Nearest clips first, then stronger main evidence; no invented clip IDs for
     malformed provenance. Existing main clips are left out of context requests.
+    Merge directional streams so sparse/invalid ranges do not require walking
+    the entire radius before reaching the first eligible clip.
     """
+    if max_clips is not None and max_clips <= 0:
+        return {}
     normalized = [(video, clip_ordinal(clip), identity) for video, clip, identity in seeds]
     occupied = {(video, clip) for video, clip, _ in normalized if clip is not None}
+
+    def direction(video, clip, identity, rank, step):
+        if step == -1:
+            start = max(1, clip - before_clip) if before_clip is not None else 1
+            end = min(radius, clip)
+        else:
+            start = 1
+            end = min(radius, before_clip - clip) if before_clip is not None else radius
+        for distance in range(start, end + 1):
+            target = clip + step * distance
+            if (video, target) not in occupied:
+                yield (distance, rank, video, target), identity
+
+    streams = [
+        direction(video, clip, identity, rank, step)
+        for rank, (video, clip, identity) in enumerate(normalized)
+        if video and clip is not None
+        for step in (-1, 1)
+    ]
     planned = {}
-    for rank, (video, clip, identity) in enumerate(normalized):
-        if not video or clip is None:
-            continue
-        for distance in range(1, radius + 1):
-            for target in (clip - distance, clip + distance):
-                key = (video, target)
-                if target < 0 or key in occupied or (before_clip is not None and target > before_clip):
-                    continue
-                priority = (distance, rank, identity)
-                if key not in planned or priority[:2] < planned[key][:2]:
-                    planned[key] = priority
-    return dict(sorted(planned.items(), key=lambda item: (*item[1][:2], item[0])))
+    for (distance, rank, video, target), identity in merge(*streams):
+        key = (video, target)
+        if key not in planned:
+            planned[key] = (distance, rank, identity)
+            if max_clips is not None and len(planned) >= max_clips:
+                break
+    return planned

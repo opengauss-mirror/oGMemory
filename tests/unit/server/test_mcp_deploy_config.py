@@ -225,7 +225,7 @@ def test_candidate_local_deploy_env_values_reach_unified_config(tmp_path, monkey
 def test_standalone_dockerfile_declares_runtime_dependencies():
     dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
 
-    assert '"mcp[cli]>=2.0.0,<3"' in dockerfile
+    assert '"mcp[cli]==2.0.0"' in dockerfile
     assert "libsqlite3-0" not in dockerfile
     for dependency in ("pydantic", "python-dotenv", "json-repair", "rank-bm25", "nltk"):
         assert dependency in dockerfile

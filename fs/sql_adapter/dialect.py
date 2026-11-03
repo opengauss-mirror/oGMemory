@@ -15,7 +15,7 @@ class SQLDialect(ABC):
 
     name: str
     supports_batch_claim: bool = True
-    lock_timeout_parameter: str = "lock_timeout"
+    lock_timeout_parameter: str | None = "lock_timeout"
 
     def prepare_schema(self, schema_sql: str) -> str:
         return schema_sql
@@ -25,6 +25,9 @@ class SQLDialect(ABC):
 
     @abstractmethod
     def ensure_workspace_root(self, cursor: Any, account_id: str, root_id: str) -> None: ...
+
+    @abstractmethod
+    def ensure_extraction_work_account(self, cursor: Any, account_id: str) -> None: ...
 
     @abstractmethod
     def write_context_node(
@@ -88,8 +91,8 @@ def normalize_sql_dialect(value: str | SQLDialect | None) -> str:
     dialect = str(value or POSTGRESQL).strip().casefold()
     if dialect == "postgres":
         dialect = POSTGRESQL
-    if dialect not in {POSTGRESQL, OPENGAUSS}:
-        raise ValueError("sql dialect must be postgresql or opengauss")
+    if dialect not in {POSTGRESQL, OPENGAUSS, "auto"}:
+        raise ValueError("sql dialect must be postgresql or opengauss, or auto")
     return dialect
 
 
@@ -97,6 +100,8 @@ def resolve_sql_dialect(value: str | SQLDialect | None) -> SQLDialect:
     if isinstance(value, SQLDialect):
         return value
     dialect = normalize_sql_dialect(value)
+    if dialect == "auto":
+        raise ValueError("auto SQL dialect requires a database connection")
     if dialect == OPENGAUSS:
         from fs.sql_adapter.opengauss_dialect import OpenGaussDialect
 

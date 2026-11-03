@@ -32,6 +32,17 @@ llm:
   # extra_body:                  # [all] arbitrary OpenAI-compatible provider options
   #   thinking: {type: enabled}
 
+# ---- Decision model [all, optional] ----
+# Omit or use null to preserve native behavior. Credentials alone do not enable it.
+# The Jev protocol supports official Jev, Vercel and self-hosted Laya.
+# decision:
+#   provider: jev
+#   base_url: "https://ai-gateway.vercel.sh/typesafe"
+#   model: "typesafe-ai/jev"       # self-hosted Laya: multilingual
+#   # Omit api_key to read OGMEM_DECISION_API_KEY; no YAML placeholder expansion.
+#   # api_key: ""                  # explicit empty string for services without auth
+#   timeout_seconds: 30
+
 # ---- Embedding Configuration [all] ----
 embedding:
   # provider: null               # [all] defaults to llm.provider
@@ -197,8 +208,11 @@ sharing:
 # ---- Memory Extraction [all] ----
 memory:
   extraction:
-    mode: lazy                    # [all] eager / lazy (lazy = ReAct loop with read tools)
-  # after_turn_threshold: 200    # [all] tokens before auto-extraction
+    card_format_enabled: false  # Validate entity/preference cards and recover malformed output in background.
+    mode: eager                   # [all] eager / lazy (lazy = ReAct loop with read tools)
+    node_processing_enabled: false # [all] eager or lazy extraction followed by topic node processing
+    dual_pass_enabled: true       # [all] Run two native extraction passes per span
+  # after_turn_threshold: 400    # [all] tokens before auto-extraction
   # rolling_compress_enabled: true
   # compact_prepare_token_ttl: 300
   # directory_summary_enabled: false
@@ -281,15 +295,22 @@ skills:
     # reviewer_model: gpt-4o-mini
     # sync_target: ~/.agents/skills
 
-# ---- Hybrid retrieval [openGauss + SQL canonical storage, opt-in] ----
-# Requires the openGauss BM25 access method and <&> operator. The configured
-# database role must be able to create/alter the versioned lexical tables,
-# indexes, and generation sequence. Rolling mixed-version workers are
-# unsupported: upgrade and stop every old vector-only outbox worker before
-# enabling this flag, and do not start one
-# while hybrid is enabled. Historical rebuilds stream bounded pages in one
-# background worker; the first read per owner scope fails closed until ready.
+# ---- Retrieval [all] ----
 retrieval:
+  # Service-instance setting; restart every worker after changing it.
+  # false searches only L2 without roots, hierarchical expansion, or child
+  # searches, including empty-result fallbacks. Existing ranking and public
+  # URI/read behavior apply; results discovered through L0/L1 may be lost.
+  # Priority: this YAML value > OGMEM_RETRIEVAL_EXPAND_HIERARCHY > true.
+  expand_hierarchy: true
+  # Hybrid retrieval [openGauss + SQL canonical storage, opt-in]: requires
+  # the openGauss BM25 access method and <&> operator. The configured database
+  # role must be able to create/alter the versioned lexical tables, indexes,
+  # and generation sequence. Rolling mixed-version workers are unsupported:
+  # upgrade and stop every old vector-only outbox worker before enabling this
+  # flag, and do not start one while hybrid is enabled. Historical rebuilds
+  # stream bounded pages in one background worker; the first read per owner
+  # scope fails closed until ready.
   hybrid_enabled: false
   vector_top_k: 100
   lexical_top_k: 50
@@ -307,6 +328,9 @@ retrieval:
       max_query_chars: 32768
 
 # ---- Cache [all] ----
+agent_memory:
+  enabled: false                # OGMEM_AGENT_MEMORY_ENABLED; Tools / Experiences from finalized traces
+
 cache:
   enabled: true                  # [all]
   max_size: 1000                 # [all]

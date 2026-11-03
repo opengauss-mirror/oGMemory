@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from core.models import RequestContext
-from extraction.tools import Extractor
+from extraction.tools import Extractor, _PreparedSpan, _Span
 from providers.token_tracker import TokenTracker, request_usage_scope
 from server.memory_service import _run_with_usage_scope
 from skills.sedimentation import _attribute_skill_usage
@@ -19,9 +19,9 @@ def test_extraction_pool_preserves_each_callers_scope():
             account_id=account, user_id="alice", agent_id="", session_id="s", trace_id="t"
         )
         extractor = Extractor(Mock())
-        spans = [SimpleNamespace(start=i, end=i) for i in range(2)]
+        spans = [_Span(start=i, end=i) for i in range(2)]
         extractor._prepare_unique_spans = Mock(
-            return_value=[SimpleNamespace(span=s) for s in spans]
+            return_value=[_PreparedSpan(span=s, prompt="", prompt_sha="") for s in spans]
         )
 
         def structure(*args, **kwargs):

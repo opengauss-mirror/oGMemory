@@ -19,9 +19,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# Make claude-plugin/scripts importable
+# Make plugins/claude-code/scripts importable
 # ---------------------------------------------------------------------------
-_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "claude-plugin" / "scripts"
+_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "plugins/claude-code" / "scripts"
 _REDACTION_FIXTURES = (
     Path(__file__).resolve().parents[2] / "fixtures" / "trace" / "redaction_cases.json"
 )
@@ -34,6 +34,77 @@ def _reimport(name: str):
     if name in sys.modules:
         del sys.modules[name]
     return importlib.import_module(name)
+
+
+def test_trace_keeps_exposed_model_reasoning(monkeypatch):
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    event = _reimport("call_add_session_message").claude_hook_to_event({
+        "hook_event_name": "Stop", "last_assistant_message": "Use batches of 100.",
+        "reasoning": "The contract sets the limit.",
+    })
+    assert event["assistant_message"] == "Use batches of 100."
+    assert event["reasoning"] == "The contract sets the limit."
+
+def test_stop_captures_current_transcript_thinking_and_text(monkeypatch, tmp_path):
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    transcript = tmp_path / "trace.jsonl"
+    rows = [
+        {"message": {"role": "user", "content": "Check the API."}},
+        {"message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "Inspect the API contract."},
+            {"type": "text", "text": "Use batches of 100."},
+        ]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    event = _reimport("call_add_session_message").claude_hook_to_event({
+        "hook_event_name": "Stop", "transcript_path": str(transcript),
+    })
+    assert event["assistant_message"] == "Use batches of 100."
+    assert event["reasoning"] == "Inspect the API contract."
+
+
+@pytest.mark.parametrize("hook_answer", [None, "Hook final answer."])
+def test_stop_preserves_final_answer_after_long_intermediate_text(monkeypatch, tmp_path, hook_answer):
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    transcript = tmp_path / "trace.jsonl"
+    rows = [
+        {"message": {"role": "user", "content": "Check the API."}},
+        {"message": {"role": "assistant", "content": [{"type": "text", "text": "Planning. " * 2000}]}},
+        {"message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Use batches of 100."},
+            {"type": "text", "text": "Verify each response."},
+        ]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    event = _reimport("call_add_session_message").claude_hook_to_event({
+        "hook_event_name": "Stop", "transcript_path": str(transcript),
+        "last_assistant_message": hook_answer,
+    })
+    assert event["assistant_message"] == (hook_answer or "Use batches of 100.\nVerify each response.")
+    assert event["assistant_messages"].startswith("Planning. ")
+    assert len(event["assistant_messages"]) < 10100
+
+
+@pytest.mark.parametrize("character", ["字", "😀", "\x01"])
+def test_stop_spool_bounds_complete_json_and_preserves_answer(monkeypatch, tmp_path, character):
+    mod = _reimport("call_add_session_message")
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+    answer = "答" * 10000
+    event = mod.claude_hook_to_event({
+        "hook_event_name": "Stop", "last_assistant_message": answer,
+        "reasoning": character * 10000, "assistant_messages": character * 10000,
+    })
+    with patch.object(mod.subprocess, "Popen"):
+        assert mod.post_trace_event("sess-1", event)
+    spool_files = list(tmp_path.rglob("*.json"))
+    assert len(spool_files) == 1
+    saved = json.loads(spool_files[0].read_text(encoding="utf-8"))
+    envelope = mod._trace_envelope("sess-1", saved["event"], saved["event_id"], saved["event_time"])
+    assert len(json.dumps(envelope, ensure_ascii=False).encode("utf-8")) <= mod._MAX_TRACE_EVENT_BODY_BYTES
+    assert saved["event"]["assistant_message"] == answer
+    assert saved["event"]["event_type"] == "turn_end"
+    assert saved["event"]["truncated"] is True
 
 
 # ===========================================================================
@@ -119,6 +190,39 @@ class TestBaseApiUrl:
         mod = _reimport("ogm_plugin_request")
         monkeypatch.setattr(mod, "_try_ogmem_config", lambda: None)
         assert mod.base_api_url() == "http://localhost:8090"
+
+    def test_loads_monorepo_config_from_external_working_directory(self, monkeypatch, tmp_path):
+        config_path = tmp_path / "ogmem.yaml"
+        config_path.write_text(
+            "service:\n"
+            "  http_port: 19123\n"
+            "identity:\n"
+            "  account_id: configured-acct\n"
+            "  user_id: configured-user\n"
+            "  agent_id: configured-agent\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OGMEM_CONFIG", str(config_path))
+        for name in (
+            "OG_MEMORY_URL",
+            "OG_MEMORY_ACCOUNT_ID",
+            "OG_ACCOUNT_ID",
+            "OG_MEMORY_USER_ID",
+            "OG_USER_ID",
+            "OG_MEMORY_AGENT_ID",
+            "OG_AGENT_ID",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        mod = _reimport("ogm_plugin_request")
+
+        assert mod._identity_and_url() == (
+            "configured-acct",
+            "configured-user",
+            "configured-agent",
+            "http://127.0.0.1:19123",
+        )
 
 
 class TestMcpRecovery:

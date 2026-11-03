@@ -101,6 +101,14 @@ dsh --profile web
 
 ## 5. 体验跨会话记忆
 
+体验前确认自动采集与召回均开启。如果 DSH 已运行，先按 `Ctrl+C` 退出，设置环境变量后重新启动：
+
+```bash
+export OGMEM_AUTO_CAPTURE=true
+export OGMEM_AUTO_RECALL=true
+dsh --profile web
+```
+
 在 DSH 页面新建会话，发送：
 
 ```text
@@ -132,3 +140,41 @@ dsh --profile web
 | 会话结束 | 完成待写入对话的提交并清理会话状态 |
 
 安装并配置插件后，用户正常对话即可使用自动记忆与跨会话召回。
+
+## 7. Trace 采集
+
+插件默认在 `turn/end` 后读取本轮持久化事件，按顺序上报到
+`/api/v1/trace/events`：用户消息、助手消息、工具开始、工具成功或失败，以及
+`turn_end`。会话开始和结束分别上报 `session_start`、`session_end`。
+工具调用通过 `tool_use_id` 关联；服务端在 `turn_end` 汇总本轮 Trace。
+
+Trace 采用独立持久化队列，保存在会话身份目录下的 `traces` 子目录，按会话
+顺序发送并重试；恢复后复用事件 ID。消息和工具内容上传前脱敏，每个内容字段
+最多保留 10,000 字符。
+
+| 配置 | 默认值 | 用途 |
+| --- | --- | --- |
+| `traceEnabled` / `OGMEM_DSH_TRACE` | `true` | Trace 采集开关 |
+| `traceCaptureContent` / `OGMEM_DSH_TRACE_CAPTURE_CONTENT` | `true` | 关闭后采集事件结构和内容长度 |
+| `traceTimeoutMs` | `3000` | 单次上报超时，单位毫秒 |
+
+`captureToolResults` 控制工具文本进入记忆写回；Trace 工具事件由上述 Trace 配置控制。
+
+## 8. 自动记忆控制（可选）
+
+若只需召回已有记忆，退出当前 DSH 后设置以下变量并重新启动：
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+dsh --profile web
+```
+
+两个开关默认均开启。`OGMEM_AUTO_CAPTURE` 控制自动写回和会话 dispose；关闭时不启动记忆队列，
+已有待写入文件保留，不会在后台重放，重新开启后恢复处理。`OGMEM_AUTO_RECALL` 独立控制自动召回。
+配置字段分别为 `autoCapture`、`autoRecall`，环境变量优先；`1`、`true`、`yes`（忽略大小写和首尾空格）表示开启，其余显式值关闭。
+原有 `writebackEnabled`、`composeEnabled`、`disposeEnabled` 仍生效，需要对应开关同时开启才执行。
+修改环境后重启 DSH。Trace 以及显式工具保持独立，写入工具仍由 `writeToolsEnabled` 控制。
+
+关闭采集后，新对话不会自动写入，延长等待也不会生成新记忆。再次执行第 5 节跨会话体验时，
+须将两个变量重新设为 `true` 并重启 DSH，然后发送新的记忆内容。

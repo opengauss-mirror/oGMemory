@@ -325,7 +325,7 @@ class TestParseArgs:
     def test_defaults(self):
         args = parse_args(["--frames-manifest", "x.jsonl"])
         assert args.backend == "http"
-        assert args.cv_timeout == 30.0
+        assert args.cv_timeout is None  # Resolved from YAML, with a 30-second fallback.
         assert args.min_confidence == 0.5
         assert args.max_faces == 20
         assert args.graph_store == "memory"

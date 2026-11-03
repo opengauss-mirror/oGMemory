@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import ipaddress
 import json
 import re
 import shlex
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -18,15 +20,31 @@ class UnsafeTraceError(ValueError):
 _REDACTED = "[REDACTED_SECRET]"
 _URI_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s]+)@")
 _SECRET_KEY = re.compile(
-    r"(?:api[_-]?key|authorization|cookie|credential(?:s)?|password|passwd|private[_-]?key|"
+    r"(?:api[_-]?key|authorization|cookie|credential(?:s)?|password|passwd|pwd|private[_-]?key|"
     r"secret(?:[_-]access[_-]key)?|token)",
+    re.IGNORECASE,
+)
+_QUOTED_JSON_FIELD = re.compile(r'("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*")')
+_SECRET_VALUE = (
+    r'''(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'''
+    r"'(?:''|\\[\s\S]|[^'\\])*(?:'|\\?$)|"
+    r'''\\[\s\S]?|[^\s,;'"\\])+'''
+)
+_YAML_MULTILINE_KEY = re.compile(
+    r'''^[ \t]*(?:-[ \t]+)?(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([A-Za-z_][A-Za-z0-9_.-]*))'''
+    r"[ \t]*:[ \t]*(?:[|>][1-9+-]{0,2})?[ \t]*(?:#[^\r\n]*)?\r?$",
+    re.MULTILINE,
+)
+_TRACE_ASSIGNMENT = re.compile(
+    r"(?:--([A-Za-z_][A-Za-z0-9_.-]*)\s+|\b([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*)"
+    r"(?:(?:Bearer|Basic)\s+)?" + _SECRET_VALUE,
     re.IGNORECASE,
 )
 _SECRET_PATTERNS = (
     # PEM payloads must be removed as a unit, not merely have their header hidden.
     re.compile(
         r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?"
-        r"-----END(?: [A-Z0-9]+)* PRIVATE KEY-----",
+        r"(?:-----END(?: [A-Z0-9]+)* PRIVATE KEY-----|\Z)",
         re.DOTALL,
     ),
     # Provider credentials are often pasted without a label.
@@ -35,16 +53,25 @@ _SECRET_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     # JWTs are credentials even when no surrounding field identifies them as such.
     re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b"),
+    re.compile(r"(?i)\b(?:set-cookie|cookie)[ \t]*[:=][ \t]*[^\r\n]+"),
     re.compile(r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+[^\s,'\";]+"),
     re.compile(
-        r"(?i)\b(?:[a-z0-9]+[_-])*(?:api[_-]?key|credential(?:s)?|password|passwd|private[_-]?key|"
+        r"(?i)\b(?:[a-z0-9]+[_-])*(?:api[_-]?key|credential(?:s)?|password|passwd|pwd|private[_-]?key|"
         r"secret(?:[_-]access[_-]key)?|token|authorization|cookie)"
-        r"\s*[:=]\s*(?:(?:bearer|basic)\s+)?(?:['\"][^'\"]+['\"]|[^\s,;]+)"
+        r"\s*[:=]\s*(?:(?:bearer|basic)\s+)?" + _SECRET_VALUE
     ),
     re.compile(
-        r"(?i)--(?:api[-_]?key|credential(?:s)?|password|secret|token)"
-        r"(?:=|\s+)(?:['\"][^'\"]+['\"]|[^\s,;]+)"
+        rf"(?i)--{_SECRET_KEY.pattern}"
+        r"(?:=|\s+)" + _SECRET_VALUE
     ),
+)
+_TRACE_RULES = tuple(
+    (
+        re.compile(rule["pattern"], re.ASCII | (re.I if "i" in rule["flags"] else 0)),
+        rule["replacement"].replace("$1", r"\g<1>"),
+        rule.get("validator"),
+    )
+    for rule in json.loads(Path(__file__).with_name("trace_redaction_rules.json").read_text(encoding="utf-8"))
 )
 _ABSOLUTE_PATHS = (
     re.compile(r"(?<![\w])(?:[A-Za-z]:\\|[A-Za-z]:/)(?:[^\s<>:'\"|?*]+[\\/])*[^\s<>:'\"|?*]*"),
@@ -263,6 +290,140 @@ def sanitize_text(value: str, *, reject_instructions: bool = False) -> str:
     return result
 
 
+def sanitize_trace_text(value: str) -> str:
+    """Redact structured JSON and quoted credentials embedded in trace text."""
+    if len(value) > 65_536:
+        return _REDACTED
+    scan_budget = 262_144
+
+    def redact_ipv6(match):
+        try:
+            ipaddress.IPv6Address(match[0])
+        except ValueError:
+            return match[0]
+        return "[REDACTED_IP]"
+
+    def redact_text(text):
+        if any(_SECRET_KEY.search(next(group for group in match.groups() if group is not None))
+               for match in _YAML_MULTILINE_KEY.finditer(text)):
+            return _REDACTED
+        result = sanitize_text(text)
+        parts = []
+        cursor = position = 0
+        while match := _TRACE_ASSIGNMENT.search(result, position):
+            key = match[1] or match[2]
+            if _SECRET_KEY.search(key):
+                parts.extend((result[cursor:match.start()], _REDACTED))
+                cursor = position = match.end()
+            else:
+                position = match.start() + len(key) + (2 if match[1] else 0)
+        parts.append(result[cursor:])
+        result = "".join(parts)
+        for pattern, replacement, validator in _TRACE_RULES:
+            result = pattern.sub(redact_ipv6 if validator == "ipv6" else replacement, result)
+        return result
+
+    def has_sensitive_json_key(text):
+        for match in re.finditer(r'("(?:\\.|[^"\\])*")\s*:', text):
+            try:
+                key = json.loads(match[1])
+            except ValueError:
+                key = match[1]
+            if _SECRET_KEY.search(key):
+                return True
+        return False
+
+    def redact_embedded(text, depth=0):
+        nonlocal scan_budget
+        for match in re.finditer(r"'([^'\\\r\n]*)'\s*:", text):
+            if _SECRET_KEY.search(match[1]):
+                return _REDACTED
+        decoder = json.JSONDecoder()
+        parts = []
+        cursor = 0
+        for match in re.finditer(r'[\[{"]', text):
+            if match.start() < cursor:
+                continue
+            scan_budget -= len(text)
+            if scan_budget < 0:
+                return _REDACTED
+            try:
+                parsed, end = decoder.raw_decode(text, match.start())
+            except ValueError:
+                if has_sensitive_json_key(text):
+                    return _REDACTED
+                continue
+            except RecursionError:
+                return _REDACTED
+            if isinstance(parsed, str) and _SECRET_KEY.search(parsed) and text[end:].lstrip().startswith(":"):
+                return _REDACTED
+            parts.extend((text[cursor:match.start()], json.dumps(redact(parsed, depth + 1), ensure_ascii=False)))
+            cursor = end
+        parts.append(text[cursor:])
+        return "".join(parts)
+
+    def redact(value, depth=0):
+        if depth >= 32:
+            return _REDACTED
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                base_key = redact_text(key)
+                safe_key = base_key
+                suffix = 2
+                while safe_key in result:
+                    safe_key = f"{base_key}_{suffix}"
+                    suffix += 1
+                result[safe_key] = _REDACTED if _SECRET_KEY.search(key) else redact(item, depth + 1)
+            return result
+        if isinstance(value, list):
+            return [redact(item, depth + 1) for item in value]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            text = str(value)
+            cleaned = redact_text(text)
+            return value if cleaned == text else cleaned
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except RecursionError:
+                return _REDACTED
+            except ValueError:
+                return redact_text(_QUOTED_JSON_FIELD.sub(
+                    lambda match: redact_field(match, depth + 1), redact_embedded(value, depth + 1),
+                ))
+            if not isinstance(parsed, (dict, list, str)):
+                return redact_text(value)
+            return json.dumps(redact(parsed, depth + 1), ensure_ascii=False)
+        return value
+
+    def redact_field(match, depth=0):
+        key = match[1]
+        try:
+            name = json.loads(key)
+        except ValueError:
+            name = key
+        if re.fullmatch(r"\[REDACTED(?:_[A-Z]+)?\](?:_\d+)?", name):
+            return match[0]
+        if _SECRET_KEY.search(name):
+            return f'{key}: "{_REDACTED}"'
+        try:
+            original = json.loads(match[2])
+        except ValueError:
+            return match[0]
+        cleaned = redact(original, depth + 1)
+        return match[0] if cleaned == original else f'{key}: {json.dumps(cleaned, ensure_ascii=False)}'
+
+    try:
+        parsed = json.loads(value)
+    except RecursionError:
+        return _REDACTED
+    except ValueError:
+        value = redact_embedded(value)
+    else:
+        value = json.dumps(redact(parsed), ensure_ascii=False)
+    return redact_text(_QUOTED_JSON_FIELD.sub(redact_field, value))
+
+
 def sanitize_trace(events: list[dict[str, Any]], *, allow_failed: bool = False) -> SanitizedTrace:
     """Sanitize a JSON trace and verify messages and tool outcomes are complete."""
     if not isinstance(events, list) or not events:
@@ -356,11 +517,12 @@ class StreamingTraceSanitizer:
         event_type = event_type.strip()
         if event_type in _MESSAGE_FIELDS:
             message = _message_text(raw, _MESSAGE_FIELDS[event_type])
-            if not message:
+            reasoning = _message_text(raw, ("reasoning",)) if event_type == "assistant_message" else ""
+            if not message and not reasoning:
                 raise UnsafeTraceError(f"{event_type} has no meaningful content")
             if event_type == "user_message":
                 self.has_user = True
-            else:
+            elif message:
                 if _FAILED_OUTCOME.search(message) and not self.allow_failed:
                     raise UnsafeTraceError("trace contains an explicit failed or incomplete outcome")
                 self.failed_outcome = self.failed_outcome or bool(_FAILED_OUTCOME.search(message))

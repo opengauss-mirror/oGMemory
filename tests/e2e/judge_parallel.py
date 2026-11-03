@@ -1,4 +1,4 @@
-"""Parallel LoCoMo judge using the same prompt as eval.py judge."""
+"""Memory evaluation judge with explicit rubrics and resumable results."""
 
 from __future__ import annotations
 
@@ -13,7 +13,28 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from locomo_mcp_prompts import LOCOMO_ACCURACY_PROMPT
+PROTOCOL_VERSION = "memory-eval-v1"
+
+LOCOMO_PROTOCOL_VERSION = "locomo-standard-v3"
+
+JUDGE_SYSTEM = "You are an expert grader."
+
+JUDGE_PROMPT = """Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given:
+(1) a question (posed by one user to another user),
+(2) a 'gold' (ground truth) answer,
+(3) a generated answer
+
+The point of the question is to ask about something one user should know about the other based on prior conversations.
+Be generous with grading - as long as it touches on the same topic as the gold answer, count as CORRECT.
+For time questions, accept same date/time even if format differs.
+
+Question: {question}
+Gold answer: {gold_answer}
+Generated answer: {generated_answer}
+
+Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}"""
+
+JUDGE_PROFILES = {"locomo": JUDGE_PROMPT}
 
 thread_local = threading.local()
 RESUME_FIELDS = ("sample_id", "qi", "question", "expected", "response")
@@ -36,21 +57,31 @@ def get_client(api_key: str, base_url: str):
     return client
 
 
-def build_prompt(row: dict[str, str]) -> str:
-    return LOCOMO_ACCURACY_PROMPT.format(
+def build_prompt(row: dict[str, str], profile: str = "locomo") -> str:
+    return JUDGE_PROFILES[profile].format(
         question=row["question"],
         gold_answer=row["expected"],
         generated_answer=row["response"],
     )
 
 
-def build_judge_signature(base_url: str, model: str, api_mode: str) -> str:
+def build_judge_signature(
+    base_url: str, model: str, api_mode: str, disable_thinking: bool = False,
+    profile: str = "locomo",
+) -> str:
     payload = json.dumps(
         {
             "base_url": base_url.rstrip("/"),
             "model": model,
             "api_mode": api_mode,
-            "prompt": LOCOMO_ACCURACY_PROMPT,
+            "prompt": JUDGE_PROFILES[profile],
+            "protocol": (
+                LOCOMO_PROTOCOL_VERSION
+                if profile == "locomo" else PROTOCOL_VERSION
+            ),
+            "disable_thinking": disable_thinking,
+            "system": JUDGE_SYSTEM,
+            "temperature": 0,
         },
         sort_keys=True,
     )
@@ -67,6 +98,8 @@ def judge_row(
     max_attempts: int = 3,
     retry_delay: float = 2.0,
     stop_event: threading.Event | None = None,
+    disable_thinking: bool = False,
+    profile: str = "locomo",
 ) -> tuple[int, str, str, bool, bool]:
     if row.get("is_correct") in ("CORRECT", "WRONG"):
         return index, row["is_correct"], row.get("reasoning", ""), False, False
@@ -79,14 +112,16 @@ def judge_row(
         try:
             client = get_client(api_key, base_url)
             if api_mode == "responses":
-                resp = client.responses.create(model=model, input=build_prompt(row), timeout=60)
+                resp = client.responses.create(model=model, instructions=JUDGE_SYSTEM, input=build_prompt(row, profile), temperature=0, timeout=60)
                 content = resp.output_text.strip()
             else:
                 resp = client.chat.completions.create(
                     model=model,
-                    messages=[{"role": "user", "content": build_prompt(row)}],
+                    messages=[{"role": "system", "content": JUDGE_SYSTEM},
+                              {"role": "user", "content": build_prompt(row, profile)}],
                     temperature=0,
                     timeout=60,
+                    **({"extra_body": {"thinking": {"type": "disabled"}}} if disable_thinking else {}),
                 )
                 content = resp.choices[0].message.content.strip()
             start = content.find("{")
@@ -149,12 +184,14 @@ def write_rows(path: str, rows: list[dict[str, str]], fieldnames: list[str]) -> 
     os.replace(tmp_path, path)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("--output", required=True)
     parser.add_argument("--api-base", required=True)
     parser.add_argument("--judge-model", required=True)
+    parser.add_argument("--judge-profile", choices=tuple(JUDGE_PROFILES), default="locomo")
+    parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument("--api-mode", choices=("chat", "responses"), default="chat")
     parser.add_argument("--api-key", default=os.environ.get("OGMEM_API_KEY", ""))
     parser.add_argument("-p", "--parallel", type=int, default=8)
@@ -162,14 +199,18 @@ def main() -> int:
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=2.0)
     parser.add_argument("--fail-fast-rate-limit", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
+    if args.disable_thinking and args.api_mode != "chat":
+        parser.error("--disable-thinking requires chat completions")
     if not args.api_key:
         print("Error: missing API key", file=sys.stderr)
         return 1
 
     rows = load_rows(args.input)
-    signature = build_judge_signature(args.api_base, args.judge_model, args.api_mode)
+    signature = build_judge_signature(
+        args.api_base, args.judge_model, args.api_mode, args.disable_thinking, args.judge_profile
+    )
     for row in rows:
         if row.get("judge_signature") != signature:
             row["is_correct"] = ""
@@ -218,6 +259,8 @@ def main() -> int:
                 args.max_attempts,
                 args.retry_delay,
                 stop_event,
+                args.disable_thinking,
+                args.judge_profile,
             )
             for index, row in pending
         ]

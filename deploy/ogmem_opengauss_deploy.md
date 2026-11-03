@@ -23,8 +23,8 @@ docker info
 | 组件 | 使用场景 | 镜像 |
 | --- | --- | --- |
 | openGauss | 所有部署方式 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328` |
-| oGMemory | 所有部署方式 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807` |
-| OpenClaw | Context Engine / MCP 部署 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0807` |
+| oGMemory | 所有部署方式 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013` |
+| OpenClaw | Context Engine / MCP 部署 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0903` |
 
 按以下顺序完成部署：
 
@@ -35,8 +35,6 @@ docker info
 ## 一键快速安装部署
 
 如需一键完成 openGauss、oGMemory、Context Engine 和 MCP 容器的安装与验证，请参考 [oGMemory 一键部署与体验指南](https://gitcode.com/opengauss/oGMemory/tree/dev/deploy/user-quickstart)。
-
-以下章节介绍各容器的手工部署方法。
 
 ## 第一部分：openGauss
 
@@ -172,7 +170,7 @@ docker run -d --name ogmem --network host \
   -e OGMEM_CONFIG=/etc/ogmem/config.yaml \
   -v /your_directory/ogmemory.yaml:/etc/ogmem/config.yaml:ro \
   -v /your_directory/ogmem:/data/agfs \
-  swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807
+  swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013
 ```
 
 参数说明：
@@ -209,9 +207,15 @@ curl http://127.0.0.1:8090/api/v1/health
 docker restart ogmem
 ```
 
+### 5. 打开管理界面
+
+在浏览器中访问 `http://<服务器IP>:8090/memory-viewer/`，将服务器 IP 和端口替换为实际部署值。在 **连接设置** 中填写部署时配置的 oGMemory API Key，点击 **连接**，即可通过左侧 **记忆** 查看目录和内容。
+
+页面操作和常见问题见 [管理界面使用指南](../docs/memory_viewer_guide.md)。
+
 ## 第三部分：OpenClaw
 
-本部分介绍 OpenClaw 的 Context Engine 和 MCP 两种接入方式。开始操作前，请确保 openGauss 和 oGMemory 已按前述步骤完成部署。
+启动 OpenClaw 前，确保 openGauss 和 oGMemory 已完成部署。
 
 > OpenClaw 部署请使用“镜像汇总”中列出的镜像。
 
@@ -232,7 +236,7 @@ export OG_ACCOUNT_ID='acct-demo'
 export OG_USER_ID='ce-user'
 export OG_CE_AGENT_ID='ce-agent'
 export OG_MCP_AGENT_ID='mcp-agent'
-export OPENCLAW_IMAGE='swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0807'
+export OPENCLAW_IMAGE='swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0903'
 export OPENCLAW_CONTAINER_NAME='openclaw_ce'
 export OPENCLAW_HOME_DIR="$OGMEM_STACK/openclaw-ce"
 export GATEWAY_PORT='18790'
@@ -260,7 +264,9 @@ from pathlib import Path
 
 cfg = {
     "agents": {"defaults": {"skipBootstrap": True, "timeoutSeconds": 600,
-                             "model": {"primary": f"custom-openai/{os.environ['LLM_MODEL']}"}}},
+                             "model": {"primary": f"custom-openai/{os.environ['LLM_MODEL']}"}},
+               "list": [{"id": os.environ["OG_CE_AGENT_ID"], "default": True,
+                         "workspace": "/home/node/.openclaw/workspace"}]},
     "models": {"mode": "merge", "providers": {"custom-openai": {
         "baseUrl": os.environ["LLM_BASE_URL"], "apiKey": os.environ["LLM_API_KEY"],
         "api": "openai-completions", "timeoutSeconds": 300,
@@ -369,6 +375,11 @@ cfg = {
             "timeoutSeconds": 600,
             "model": {"primary": f"custom-openai/{os.environ['LLM_MODEL']}"},
         },
+        "list": [{
+            "id": os.environ["OG_MCP_AGENT_ID"],
+            "default": True,
+            "workspace": "/home/node/.openclaw/workspace",
+        }],
     },
     "models": {
         "mode": "merge",
@@ -482,13 +493,46 @@ docker run -d \
 
 ### 5. 验证两种接入
 
-执行以下命令验证 MCP 接入：
+在服务器终端设置要验证的容器；这些变量也用于[操作指南](user-quickstart/TEST_GUIDE_zh.md#1-操作准备)：
+
+```bash
+export OGMEM_CONTAINER='ogmem'
+export CE_CONTAINER="$OPENCLAW_CONTAINER_NAME"
+export MCP_CONTAINER='openclaw_mcp'
+```
+
+先从两个 OpenClaw 容器分别调用配置的模型服务：
+
+```bash
+for container in "$CE_CONTAINER" "$MCP_CONTAINER"; do
+  agent_id="$(docker exec -u node -e HOME=/home/node "$container" node -e '
+    const cfg = require("/home/node/.openclaw/openclaw.json");
+    const agents = cfg.agents?.list ?? [];
+    process.stdout.write(agents.find(agent => agent.default)?.id ?? agents[0]?.id ?? "main");
+  ')"
+  docker exec -u node -e HOME=/home/node "$container" openclaw agent \
+    --agent "$agent_id" \
+    --session-id "model-check-$(date +%s)" \
+    --message '只回复：模型连接正常' --json
+done
+```
+
+两个容器都应返回“模型连接正常”。出现 `EADDRNOTAVAIL` 等连接错误时，检查报错容器的模型域名解析、IPv4/IPv6 出站网络和模型服务访问权限，修复后重跑模型请求。查看 Gateway 错误和容器重启次数：
+
+```bash
+for container in "$CE_CONTAINER" "$MCP_CONTAINER"; do
+  docker inspect "$container" --format '{{.Name}} status={{.State.Status}} restarts={{.RestartCount}}'
+  docker logs "$container" --since 10m 2>&1 | tail -n 100
+done
+```
+
+随后检查 MCP 工具连接：
 
 ```bash
 curl -fsS http://127.0.0.1:18789/health
 
 docker exec -u node -e HOME=/home/node \
-  openclaw_mcp openclaw mcp probe ogmemory --json
+  "$MCP_CONTAINER" openclaw mcp probe ogmemory --json
 ```
 
 验证结果应满足以下条件：`diagnostics` 为空，且工具列表包含：
@@ -499,31 +543,20 @@ ogmemory__ogm_read_memory
 ogmemory__ogm_write_memory
 ```
 
-执行以下命令验证 Context Engine 接入：
+检查 Context Engine Gateway：
 
 ```bash
-export CE_SMOKE_SESSION="ce-smoke-$(date +%s)"
-
-curl -fsS http://127.0.0.1:18790/health
-
-curl -fsS -X POST http://127.0.0.1:18790/v1/responses \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $OPENCLAW_GATEWAY_TOKEN" \
-  -H 'X-OpenClaw-Agent-ID: main' \
-  -H "X-OpenClaw-Session-Key: $CE_SMOKE_SESSION" \
-  -d '{
-    "model": "openclaw",
-    "input": "只回复：Context Engine 对接正常",
-    "stream": false
-  }'
-
-docker logs openclaw_ce --since 5m 2>&1 | grep -E \
-  '\[og-memory\].*(assemble|compose|afterTurn)' | tail -n 100
-
-unset CE_SMOKE_SESSION
+curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health"
 ```
 
-验证结果应满足以下条件：Responses API 返回包含“Context Engine 对接正常”的回答，且日志中包含 `assemble`、`compose` 和 `afterTurn called`。
+按操作指南完成[Context Engine 测试](user-quickstart/TEST_GUIDE_zh.md#2-context-engine-测试)和[MCP 测试](user-quickstart/TEST_GUIDE_zh.md#3-mcp-测试)，并核对以下结果：
+
+| 接入方式 | 通过条件 |
+| --- | --- |
+| Context Engine | 短、长内容触发提取或 `/compact` 完成后，在 oGMemory 中核对写入的记忆；切换新会话后，正确召回短内容偏好和长内容中的各项事实。 |
+| MCP | 模型实际调用 oGMemory 工具完成写入，按检索返回的 URI 读取并核对内容；新会话正确召回，更新后再次读取和查询，得到更新后的要求。 |
+
+在[管理界面](../docs/memory_viewer_guide.md)中选择部署时的 Account、User 和 Agent，核对记忆内容；MCP 还可使用 `ogm_read_memory` 读取检索返回的 URI。保存工具返回和存储核对结果，作为部署验收记录。
 
 ### 6. 配置目录判断
 

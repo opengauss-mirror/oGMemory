@@ -18,16 +18,57 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.errors import ToolCallProtocolError
+from core.errors import LLMCallError, LLMOutputTruncatedError, ToolCallProtocolError
 from core.models import RequestContext, CandidateMemory
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import build_extraction_tools, build_tool_to_category
-from extraction.tools import Extractor, _PreparedSpan, _Span
+from extraction.tools import Extractor, _PreparedSpan, _SPAN_SCHEMA, _Span
 from providers.llm.mock_llm import MockLLM
 
 
 class TestExtractorEmptyResults:
     """Tests for Extractor with no tool calls."""
+
+    @pytest.mark.parametrize("original_error", [None, LLMCallError("output truncated")])
+    def test_lazy_llm_failure_is_not_successful_empty_extraction(self, monkeypatch, original_error):
+        from types import SimpleNamespace
+        loop = Mock()
+        loop.run.return_value = SimpleNamespace(
+            finish_reason="llm_error", llm_error=original_error, candidates=[],
+        )
+        monkeypatch.setattr(
+            "extraction.extraction_react_loop.ExtractionReActLoop",
+            Mock(return_value=loop),
+        )
+        extractor = Extractor(MockLLM(), mode="lazy")
+        extractor._structure_span_eager = Mock()
+        ctx = RequestContext(account_id="a", user_id="u", agent_id="g",
+                             session_id="s", trace_id="t")
+        with pytest.raises(LLMCallError) as error:
+            extractor._structure_span_lazy(_Span(start=0, end=0), "prompt", ctx)
+        if original_error is not None:
+            assert error.value is original_error
+        extractor._structure_span_eager.assert_not_called()
+
+    @pytest.mark.parametrize("message_count", [1, 3])
+    def test_span_prompt_and_schema_bound_outer_message_indices(self, message_count):
+        llm = MockLLM()
+        llm.complete_json = Mock(return_value={"spans": []})
+        extractor = Extractor(llm)
+        messages = [{"role": "user", "content": "Alice: Hello\nBob: Hi\nAlice: I paint."}
+                    for _ in range(message_count)]
+        assert extractor._identify_spans(messages, None, "") == []
+        prompt = llm.complete_json.call_args.args[0]
+        schema = llm.complete_json.call_args.kwargs["schema"]
+        assert f"exactly {message_count} indexed messages" in prompt
+        assert "INSIDE one message are not additional messages" in prompt
+        spans = schema["properties"]["spans"]
+        assert spans["maxItems"] == message_count
+        for key in ("start", "end"):
+            assert spans["items"]["properties"][key]["minimum"] == 0
+            assert spans["items"]["properties"][key]["maximum"] == message_count - 1
+        assert "maxItems" not in _SPAN_SCHEMA["properties"]["spans"]
+        assert "maximum" not in _SPAN_SCHEMA["properties"]["spans"]["items"]["properties"]["start"]
 
     def test_default_lazy_react_timeout_is_long_enough_for_slow_tool_extraction(self):
         """Default ReAct timeout gives slow tool-calling extraction room to finish."""
@@ -158,7 +199,7 @@ class TestExtractorPhase2PromptDedupe:
 
         assert result == []
         assert llm.complete_with_tools.call_count == 2  # dual-run: 2 calls per unique span
-        assert "Phase 2 duplicate prompt skipped" in caplog.text
+        assert "Phase 2 profile spans coalesced" in caplog.text
 
     def test_duplicate_prompt_merges_categories_for_lazy_prefetch(self):
         """Deduped lazy spans keep categories from skipped duplicate prompts."""
@@ -433,12 +474,13 @@ class TestExtractorToolCallFallback:
             )
         llm.complete_json.assert_called_once()
 
-    def test_multiple_spans_keep_native_concurrency_and_fallback_once_per_failed_span(self):
+    @pytest.mark.parametrize("error_type", [ToolCallProtocolError, LLMOutputTruncatedError])
+    def test_multiple_spans_keep_native_concurrency_and_fallback_once_per_failed_span(self, error_type):
         llm = Mock()
 
         def complete_with_tools(*, prompt, **_kwargs):
             if prompt == "failed span":
-                raise ToolCallProtocolError("empty native result")
+                raise error_type("incomplete native result")
             return [self._preference("tea")]
 
         llm.complete_with_tools.side_effect = complete_with_tools
@@ -639,6 +681,7 @@ class TestExtractorToolCallFallback:
                     {"start": 0, "end": 0, "reason": "preference", "categories": ["preference"]}
                 ]
             },
+            {"categories": ["preference"]},
             {"operations": [self._preference("coffee", confidence=0.3)]},
         ]
         llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")
@@ -651,7 +694,7 @@ class TestExtractorToolCallFallback:
         )
 
         assert result == []
-        assert llm.complete_json.call_count == 2
+        assert llm.complete_json.call_count == 3
 
 
 class TestExtractorSinglePreference:
@@ -893,11 +936,11 @@ class TestExtractorToolMapping:
     """Tests for tool name to category mapping."""
 
     def test_all_tool_names_mapped(self):
-        """Tool names match tool_to_category keys exactly."""
+        """Schema extraction tools have fixed category mappings; edits use their read target."""
         registry = SchemaRegistry()
         tools = build_extraction_tools(registry)
         tool_to_category = build_tool_to_category(registry)
-        tool_names = {t["name"] for t in tools}
+        tool_names = {t["name"] for t in tools if t["name"].startswith("extract_")}
         mapped_names = set(tool_to_category.keys())
 
         assert tool_names == mapped_names, (

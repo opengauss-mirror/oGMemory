@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,11 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from core.models import ContextNode, RequestContext
+from fs.sql_adapter.pool import SharedConnectionPool
+from fs.sql_adapter.sql_context_fs import SQLContextFS
 from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+from server.mcp_resources import external_to_internal_uri
 
 ROOT = Path(__file__).resolve().parents[2]
 _ENV_PASSTHROUGH = {
@@ -244,6 +249,11 @@ async def _run_streamable_http_all_tools_call_check() -> None:
             "description: Exercise MCP Skill management\n---\n\n"
             "# Protocol managed Skill\n\nUse the protocol workflow.\n",
         )
+    update_archive = io.BytesIO()
+    with zipfile.ZipFile(update_archive, "w", zipfile.ZIP_DEFLATED) as package:
+        for file in skill_dir.rglob("*"):
+            if file.is_file():
+                package.write(file, file.relative_to(skill_dir.parent))
     proc = _start_http_server(
         port,
         default_toolset="all",
@@ -253,7 +263,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
         _wait_for_port(port, proc)
         headers = {
             "X-API-Key": "root-key",
-            "X-Account-ID": "acct-protocol-http-call",
+            "X-Account-ID": f"acct-protocol-http-call-{uuid.uuid4().hex}",
             "X-User-ID": "root",
         }
         async with httpx.AsyncClient(headers=headers, timeout=30) as http_client:
@@ -307,7 +317,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                             ).decode("ascii"),
                         },
                     )
-                    assert not install_result.is_error
+                    assert not install_result.is_error, _log_tail(proc, 8000)
                     assert _tool_json(install_result)["action"] == "create"
 
                     update_result = await session.call_tool(
@@ -315,10 +325,10 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                         {
                             "name": "protocol-managed-skill",
                             "agent_id": "main",
-                            "path": str(skill_dir),
+                            "archive_base64": base64.b64encode(update_archive.getvalue()).decode("ascii"),
                         },
                     )
-                    assert not update_result.is_error
+                    assert not update_result.is_error, _log_tail(proc, 8000)
                     assert _tool_json(update_result)["action"] == "update"
 
                     delete_skill_result = await session.call_tool(
@@ -332,16 +342,39 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     assert not delete_skill_result.is_error
                     assert _tool_json(delete_skill_result)["action"] == "delete"
 
+                    account_id = headers["X-Account-ID"]
+                    pool = SharedConnectionPool(connection_string=sql_dsn, pool_size=1)
+                    try:
+                        fs = SQLContextFS(pool=pool)
+                        ctx = RequestContext(account_id=account_id, user_id="root", agent_id="main",
+                                             session_id="protocol-delete", trace_id="protocol-delete")
+                        fs.write_node(ContextNode(
+                            uri=external_to_internal_uri("ogmemory://memories/preference/protocol", ctx),
+                            context_type="MEMORY", category="preference", level=0,
+                            owner_space="user:root", abstract="Protocol user", overview="Protocol preference",
+                            content="Protocol user preference",
+                        ), ctx)
+                    finally:
+                        pool.close_all()
+                    preference_result = await session.call_tool(
+                        "ogm_read_memory", {"uri": "ogmemory://memories/preference/protocol"}
+                    )
+                    assert not preference_result.is_error
+                    assert "Protocol user preference" in _tool_json(preference_result)["content"]
+
                     delete_result = await session.call_tool(
                         "ogm_delete_memory",
                         {
-                            "uri": "ogmemory://memories/preference",
-                            "reason": "verify delete tool validation through Streamable HTTP",
+                            "uri": "ogmemory://memories/preference/protocol",
+                            "reason": "Exercise preference deletion through Streamable HTTP",
                             "client_request_id": "mcp-e2e-delete-1",
                         },
                     )
-                    assert delete_result.is_error is True
-                    assert "single ogmemory" in delete_result.content[0].text
+                    assert not delete_result.is_error, _log_tail(proc, 8000)
+                    deleted = _tool_json(delete_result)
+                    assert deleted["ok"] is True
+                    assert deleted["deleted"] is True
+                    assert deleted["client_request_id"] == "mcp-e2e-delete-1"
 
                     legacy_calls = (
                         ("ogm.query_memory", {"query": "legacy alias must be rejected", "top_k": 1}),
@@ -549,6 +582,7 @@ def _assert_no_trace_provenance(*payloads: dict[str, Any]) -> None:
 
 def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
     SQLTraceEventStore(connection_string=dsn, pool_size=1)
+    candidate_id = f"protocol-candidate-{account_id}"
     uri = f"ctx://{account_id}/agents/{agent_id}/skills/protocol-review"
     content = "---\nname: protocol-review\ndescription: Review protocol behavior.\n---\n# Protocol review\n"
     conn = psycopg2.connect(dsn)
@@ -561,7 +595,7 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
             )
             cur.execute(
                 "DELETE FROM skill_candidates WHERE account_id = %s AND candidate_id = %s",
-                (account_id, "protocol-candidate"),
+                (account_id, candidate_id),
             )
             cur.execute("DELETE FROM context_nodes WHERE uri = %s", (uri,))
             cur.execute(
@@ -601,10 +635,11 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
                 INSERT INTO skill_candidates
                     (candidate_id, account_id, agent_id, capability_key,
                      state, assessment)
-                VALUES ('protocol-candidate', %s, %s, 'protocol-review-candidate',
+                VALUES (%s, %s, %s, 'protocol-review-candidate',
                         'assessed', %s::jsonb)
                 """,
                 (
+                    candidate_id,
                     account_id,
                     agent_id,
                     json.dumps(
@@ -619,10 +654,11 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
                 """
                 INSERT INTO skill_candidate_evidence
                     (account_id, candidate_id, evidence_uri, evidence_type, session_id)
-                VALUES (%s, 'protocol-candidate', %s, 'trace', 'secret-protocol-session')
+                VALUES (%s, %s, %s, 'trace', 'secret-protocol-session')
                 """,
                 (
                     account_id,
+                    candidate_id,
                     f"ctx://{account_id}/agents/{agent_id}/traces/protocol-candidate-turn",
                 ),
             )

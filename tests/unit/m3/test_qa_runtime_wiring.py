@@ -56,6 +56,31 @@ def test_react_qa_uses_requested_account(tmp_path, monkeypatch):
     assert adapter.run.call_args.args[0].account_id == "custom-account"
 
 
+def test_partial_qa_failure_returns_nonzero_and_keeps_both_records(tmp_path, monkeypatch):
+    annotations = tmp_path / "annotations.json"
+    annotations.write_text(json.dumps({"v": {"qa_list": [
+        {"question_id": "q1", "question": "Where?", "answer": "Here"},
+        {"question_id": "q2", "question": "When?", "answer": "Now"},
+    ]}}))
+    output = tmp_path / "qa.jsonl"
+    args = parse_react_qa_args([
+        "--annotations", str(annotations), "--output-jsonl", str(output),
+    ])
+    adapter = Mock()
+    adapter.run.side_effect = [
+        SimpleNamespace(output=["Here"], completed=True, iterations=1, finish_reason="done"),
+        SimpleNamespace(output=[], completed=False, iterations=3,
+                        finish_reason="llm_error", llm_error=RuntimeError("GPU out of memory")),
+    ]
+    monkeypatch.setattr("m3.control_adapter.OGMemoryControlAdapter", Mock(return_value=adapter))
+    assert run_react_qa(args, graph=Mock(), embedder=Mock(), llm=Mock()) == 2
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["predicted_answer"] == "Here" and not rows[0]["error"]
+    assert rows[1]["predicted_answer"] == ""
+    assert "out of memory" in rows[1]["error"]
+
+
 def test_qa_only_resume_preserves_account(tmp_path, monkeypatch):
     from m3 import resume
 

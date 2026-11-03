@@ -53,7 +53,9 @@ class SQLModelUsageStore:
                 wait_for_postgres(cur.connection, deadline)
 
         execute("SET LOCAL statement_timeout = '5s'")
-        execute(f"SET LOCAL {self.pool.sql_dialect.lock_timeout_parameter} = '5s'")
+        lock_timeout = self.pool.sql_dialect.lock_timeout_parameter
+        if lock_timeout:
+            execute(f"SET LOCAL {lock_timeout} = '5s'")
         rows = []
         for event in events:
             for scope, counters in sorted(event["allocations"].items()):

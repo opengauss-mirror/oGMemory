@@ -48,6 +48,7 @@ def _service(tmp_path, **overrides) -> MemoryService:
         OgMemConfig(**values),
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     )
+    service._get_context_fs = lambda: None
     service._get_archive_store = lambda: None
     manager = service.get_session_manager()
     manager.load_session_state = lambda session_id, ctx: True
@@ -153,6 +154,7 @@ def test_first_view_store_failure_returns_original_model_content():
         ),
         tool_result_store=_FailingStore(),
     )
+    service._get_context_fs = lambda: None
     payload = "secret payload"
 
     result = service.govern_first_view_tool_result(_params(payload))

@@ -169,6 +169,7 @@ OGMEM_PORT=${OGMEM_HTTP_PORT:-8090}
 OGMEM_THREADS=${OGMEM_THREADS:-${OGMEM_WORKERS:-2}}
 echo "[entrypoint] Starting oGMemory HTTP server on :${OGMEM_PORT} with 1 process and ${OGMEM_THREADS} threads..."
 exec python3 -m gunicorn \
+  --config python:server.gunicorn_config \
   --bind "0.0.0.0:${OGMEM_PORT}" \
   --workers 1 \
   --worker-class gthread \

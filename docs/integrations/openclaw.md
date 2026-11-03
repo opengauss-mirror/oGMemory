@@ -10,7 +10,7 @@
 ## 2. 安装插件
 
 ```bash
-cd openclaw_context_engine_plugin
+cd plugins/openclaw
 openclaw plugins install --link .
 openclaw gateway restart
 ```
@@ -344,7 +344,7 @@ Trace：
 
 ```bash
 openclaw doctor
-npm test --prefix openclaw_context_engine_plugin
+npm test --prefix plugins/openclaw
 curl http://127.0.0.1:8090/api/v1/health
 ```
 

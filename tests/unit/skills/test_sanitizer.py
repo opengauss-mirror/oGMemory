@@ -133,6 +133,23 @@ def test_canonical_turn_end_counts_as_assistant_completion():
     assert sanitized.events[-1]["event_type"] == "turn_end"
 
 
+def test_reasoning_only_message_preserves_model_evidence_in_completed_trace():
+    events = _events()
+    events.insert(1, {
+        "event_type": "assistant_message",
+        "assistant_message": "",
+        "reasoning": "Inspect the current artifact before updating it. api_key=abcdefghijklmnop",
+    })
+
+    sanitized = sanitize_trace(events)
+
+    assert sanitized.events[1]["reasoning"] == (
+        "Inspect the current artifact before updating it. [REDACTED_SECRET]"
+    )
+    assert sanitized.events[-1]["assistant_message"] == "done"
+    assert sanitized.tools == {"read_file"}
+
+
 @pytest.mark.parametrize(
     "path",
     [

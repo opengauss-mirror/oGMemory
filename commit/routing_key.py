@@ -5,6 +5,11 @@ This module normalizes them using a synonym table and simple heuristics
 to prevent memory fragmentation (e.g., "coffee" vs "beverage" → same node).
 """
 
+from core.memory_names import (
+    canonical_memory_key as canonical_memory_key,
+    is_meaningful_memory_key as is_meaningful_memory_key,
+)
+
 # Synonym groups: all keys in a group map to the first (canonical) entry.
 _SYNONYM_GROUPS: list[list[str]] = [
     # Beverage

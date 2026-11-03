@@ -6,22 +6,35 @@ to vector indexing. They require a running AGFS server or MockAGFS.
 Run with: pytest tests/integration/ -v -m integration
 """
 
-import pytest
-import os
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.models import RequestContext, user_space_name, agent_space_name, TypedQuery
-from service.api import MemoryWriteAPI
-from fs.agfs_adapter import AGFSContextFS
-from providers.llm import MockLLM
-from providers.embedder import MockEmbedder
-from providers.vector_index import InMemoryVectorIndex
-from commit import OutboxStore
+from core.models import TypedQuery, user_space_name
 from index.index_record_builder import build_index_records
+from providers.vector_index import InMemoryVectorIndex
+from service.api import MemoryWriteAPI
+
+
+@pytest.fixture
+def mock_llm(mock_llm):
+    mock_llm._mock_tool_calls = [{
+        "tool": "extract_profile",
+        "input": {
+            "abstract": "Alice likes TypeScript",
+            "overview": "## Profile\nName: Alice\nPreference: TypeScript",
+            "content": "我是Alice，喜欢TypeScript",
+            "confidence": 0.9,
+            "evidence_quote": "我是Alice",
+            "attributed_speaker": "user",
+            "attribution_basis": "self_first_person",
+        },
+    }]
+    return mock_llm
 
 
 # ============================================================================
@@ -49,6 +62,9 @@ class TestFullPipeline:
                     "abstract": "软件工程师张三",
                     "overview": "## Profile\n\nName: 张三\nRole: 软件工程师",
                     "content": "我叫张三，是一名软件工程师",
+                    "evidence_quote": "我叫张三，是一名软件工程师",
+                    "attributed_speaker": "user",
+                    "attribution_basis": "self_first_person",
                     "confidence": 0.9,
                 },
             }
@@ -109,7 +125,7 @@ class TestFullPipeline:
         results = vector_index.search(query)
 
         assert len(results) >= 1
-        assert results[0].uri == profile_uri
+        assert results[0].uri.removesuffix("/content.md") == profile_uri
 
 
 @pytest.mark.integration
@@ -124,15 +140,18 @@ class TestMultiTenantIsolation:
 
         # Write memory for user A
         api.commit_session(
-            [{"role": "user", "content": "我是用户A的私密信息"}],
+            [{"role": "user", "content": "我是Alice，喜欢TypeScript。这是用户A的私密信息"}],
             sample_context_a
         )
 
         # Write memory for user B
         api.commit_session(
-            [{"role": "user", "content": "我是用户B的私密信息"}],
+            [{"role": "user", "content": "我是Alice，喜欢TypeScript。这是用户B的私密信息"}],
             sample_context_b
         )
+
+        assert agfs.exists(f"ctx://{sample_context_a.account_id}/users/{sample_context_a.user_id}/memories/profile", sample_context_a)
+        assert agfs.exists(f"ctx://{sample_context_b.account_id}/users/{sample_context_b.user_id}/memories/profile", sample_context_b)
 
         # Verify A cannot read B's data
         profile_uri_b = f"ctx://{sample_context_b.account_id}/users/{sample_context_b.user_id}/memories/profile"
@@ -153,10 +172,11 @@ class TestOwnerSpaceFormat:
         api = MemoryWriteAPI(fs=agfs, llm=mock_llm)
 
         messages = [
-            {"role": "user", "content": "测试 owner_space 格式"}
+            {"role": "user", "content": "我是Alice，喜欢TypeScript。测试 owner_space 格式"}
         ]
 
         result = api.commit_session(messages, sample_context)
+        assert result["writes_completed"] == 1
 
         # Read back the node
         profile_uri = f"ctx://{sample_context.account_id}/users/{sample_context.user_id}/memories/profile"
@@ -174,7 +194,7 @@ class TestOwnerSpaceFormat:
         api = MemoryWriteAPI(fs=agfs, llm=mock_llm)
 
         messages = [
-            {"role": "user", "content": "测试索引格式"}
+            {"role": "user", "content": "我是Alice，喜欢TypeScript。测试索引格式"}
         ]
 
         api.commit_session(messages, sample_context)

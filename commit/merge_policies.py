@@ -8,9 +8,11 @@ import uuid as uuid_lib
 from datetime import UTC, datetime
 
 from commit.routing_key import normalize_routing_key
+from core.errors import ConcurrentModificationError
 from core.interfaces import ContextFS, MergePolicy
 from core.models import CandidateMemory, RequestContext, WritePlan
 from core.uri_resolver import URIResolver
+from core.validation import validate_candidate
 
 
 def _merge_provenance_ids(
@@ -32,9 +34,8 @@ class ProfilePolicy(MergePolicy):
 
     Behavior (CLAUDE.md §5):
     - Target URI: ctx://{account}/users/{user}/memories/profile
-    - Always merge (never create new, never skip)
-    - New information replaces old (user state changes)
-    - Conflict resolution: new information wins
+    - Create the profile once, then reconcile incoming facts with its current content
+    - Keep the current version for optimistic concurrency control
 
     Profile is a fixed URI that gets continuously updated.
     """
@@ -57,36 +58,51 @@ class ProfilePolicy(MergePolicy):
             ctx: RequestContext for this operation
 
         Returns:
-            WritePlan with action="merge" and target URI for profile
+            WritePlan with the fixed target URI and the current profile snapshot
         """
         target_uri = self._uri_resolver.resolve("profile", {"routing_key": candidate.routing_key}, ctx)
 
-        # Check if profile exists
+        if candidate.target_uri and candidate.target_uri != target_uri:
+            raise ValueError("profile update target must match its fixed URI")
+        if candidate.target_uri and (type(candidate.expected_version) is not int or candidate.expected_version < 1):
+            raise ValueError("profile update requires a positive read version")
+        if candidate.target_uri:
+            validate_candidate(candidate)
+            if not all(isinstance(getattr(candidate, name), str) and getattr(candidate, name).strip()
+                       for name in ("abstract", "overview", "content")):
+                raise ValueError("profile update requires complete content, overview and abstract")
         exists = self._fs.exists(target_uri, ctx)
-
+        merged_fields = {"expected_version": 0}
         if exists:
-            action = "merge"
             existing_node = self._fs.read_node(target_uri, ctx)
-            current_version = existing_node.metadata.get("version", 0)
-
-            # Merge strategy: new info replaces old (user state changes)
+            if candidate.target_uri:
+                if candidate.expected_version != existing_node.metadata.get("version", 0):
+                    raise ConcurrentModificationError(
+                        target_uri, candidate.expected_version, existing_node.metadata.get("version", 0),
+                    )
+                if (all(getattr(candidate, name) == getattr(existing_node, name)
+                        for name in ("abstract", "overview", "content"))
+                        and set(candidate.provenance_ids) <= set(existing_node.metadata.get("provenance_ids", []))
+                        and all(not getattr(candidate, name)
+                                or getattr(candidate, name) == existing_node.metadata.get(name)
+                                for name in ("when", "who", "where"))):
+                    return WritePlan(action="skip", target_uri=target_uri)
             merged_fields = {
-                "abstract": candidate.abstract,
-                "overview": candidate.overview,
-                "content": candidate.content,
+                "existing_metadata": dict(existing_node.metadata),
                 "updated_at": datetime.now(UTC).isoformat(),
-                "expected_version": current_version,
+                "expected_version": existing_node.metadata.get("version", 0),
                 "provenance_ids": _merge_provenance_ids(
-                    existing_node.metadata.get("provenance_ids"),
-                    candidate.provenance_ids,
+                    existing_node.metadata.get("provenance_ids"), candidate.provenance_ids,
                 ),
             }
-        else:
-            action = "create"
-            merged_fields = {}
+            if not candidate.target_uri:
+                merged_fields.update({f"existing_{name}": getattr(existing_node, name)
+                                      for name in ("abstract", "overview", "content")})
+        elif candidate.target_uri:
+            raise ValueError("profile update target must exist")
 
         return WritePlan(
-            action=action,
+            action="merge" if exists else "create",
             target_uri=target_uri,
             merged_fields=merged_fields,
             relation_edges=[],
@@ -137,7 +153,14 @@ class AggregateTopicPolicy(MergePolicy):
         target_uri = self._uri_resolver.resolve(candidate.category, routing_fields, ctx)
 
         # Check if exact URI exists
-        if self._fs.exists(target_uri, ctx):
+        exists = self._fs.exists(target_uri, ctx)
+        if not exists and candidate.legacy_routing_key:
+            legacy_key = normalize_routing_key(candidate.legacy_routing_key, candidate.category)
+            legacy_fields = _schema_routing_fields(candidate.category, legacy_key)
+            legacy_uri = self._uri_resolver.resolve(candidate.category, legacy_fields, ctx)
+            if legacy_uri != target_uri and self._fs.exists(legacy_uri, ctx):
+                target_uri, exists = legacy_uri, True
+        if exists:
             # Read existing node to get version for optimistic locking
             existing_node = self._fs.read_node(target_uri, ctx)
             current_version = existing_node.metadata.get("version", 0)
@@ -204,19 +227,9 @@ class AppendOnlyPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" and unique event ID
         """
-        # Build fields based on category
-        if candidate.category == "event":
-            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-            unique_id = uuid_lib.uuid4().hex[:8]
-            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
-        elif candidate.category == "case":
-            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-            unique_id = uuid_lib.uuid4().hex[:8]
-            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
-        else:
-            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-            unique_id = uuid_lib.uuid4().hex[:8]
-            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
+        timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        unique_id = uuid_lib.uuid4().hex[:8]
+        fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
 
         target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 

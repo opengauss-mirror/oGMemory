@@ -41,6 +41,7 @@ class EventType(str, Enum):
     ARCHIVE_CONTEXT = "ARCHIVE_CONTEXT"    # Soft-delete a ContextNode (mark as ARCHIVED)
     MOVE_CONTEXT = "MOVE_CONTEXT"          # Rename/relocate a ContextNode
     UPSERT_RELATION = "UPSERT_RELATION"    # Add or update relation edges
+    EXTRACT_AGENT_MEMORY = "EXTRACT_AGENT_MEMORY"
 
 
 class RetrievalIntent(str, Enum):

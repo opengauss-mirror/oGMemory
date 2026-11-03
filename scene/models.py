@@ -10,6 +10,8 @@ class SceneMember:
     context_uri: str
     weight: float
     role: str = "member"
+    node_version: int = 0
+    source_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,9 @@ class SceneCluster:
     source_fingerprint: str
     basis: str = "semantic"
     source_archive_ids: tuple[str, ...] = ()
+    boundary: tuple[tuple[str, str], ...] = ()
+    time_start: str | None = None
+    time_end: str | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,10 @@ class SceneRecord:
 
     scene_id: str
     cluster: SceneCluster
+    version: int = 1
+    status: str = "ACTIVE"
+    origin: str = "automatic"
+    description_edited: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,13 @@ class PersistedScene:
     member_count: int
     members: frozenset[str] = field(default_factory=frozenset)
     basis: str = "semantic"
+    label: str = ""
+    summary: str = ""
+    source_fingerprint: str = ""
+    source_archive_ids: tuple[str, ...] = ()
+    boundary: tuple[tuple[str, str], ...] = ()
+    time_start: str | None = None
+    time_end: str | None = None
 
 
 @dataclass(frozen=True)

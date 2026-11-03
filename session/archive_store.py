@@ -17,8 +17,8 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Optional
 
-from core.interfaces import ContextFS
-from core.models import RequestContext, ContextNode, Role
+from core.interfaces import ArchiveLocator, ContextFS
+from core.models import ContextNode, RequestContext, Role
 from session.models import ArchiveEntry, ArchiveWriteResult
 
 
@@ -279,6 +279,18 @@ class SessionArchiveStore:
 
         except Exception:
             return None
+
+    def read_archive_by_id(self, archive_id: str, ctx: RequestContext) -> ArchiveEntry | None:
+        """Read the unique archive selected by the scoped ContextFS lookup."""
+        if not isinstance(self.fs, ArchiveLocator):
+            return None
+        uri = self.fs.find_archive_uri(archive_id, ctx)
+        entry = self.read_archive(uri.split("/")[-3], archive_id, ctx) if uri else None
+        if (entry is not None and (ctx.user_id or ctx.agent_id)
+                and entry.metadata.get("owner_user_id", "") == ctx.user_id
+                and (not ctx.agent_id or entry.metadata.get("owner_agent_id", "") == ctx.agent_id)):
+            return entry
+        return None
 
     def read_archive_abstract(
         self, session_id: str, archive_id: str, ctx: RequestContext

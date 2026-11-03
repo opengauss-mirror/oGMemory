@@ -11,8 +11,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from core.errors import ValidationError
 from core.models import RetrievalConfig, RequestContext, Role
-from retrieval.query_planner import QueryPlanner
+from retrieval.query_planner import QueryPlanner, sanitize_query
 from tests.unit.retrieval.conftest import make_ctx
+
+
+@pytest.mark.parametrize("question", ["数据库怎么选型？", "什么是ogmemory_gateway"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_codex_browser_metadata_does_not_change_retrieval(question, newline):
+    prompt = newline.join([
+        '<in-app-browser-context source="ambient-ui-state">',
+        "This block is automatically supplied ambient UI state, not part of the user's request.",
+        "# In app browser:",
+        "- Current URL: http://127.0.0.1:8090/memory-viewer/",
+        "</in-app-browser-context>",
+        "", "## My request:", question,
+    ])
+    assert sanitize_query(prompt) == question
+    planner = QueryPlanner()
+    assert planner.plan(prompt, make_ctx()) == planner.plan(question, make_ctx())
+
+
+@pytest.mark.parametrize("text", [
+    "数据库怎么选型？",
+    "## My request:\nExplain this literal heading.",
+    '解释 <in-app-browser-context source="ambient-ui-state">example</in-app-browser-context> 标签',
+    '<in-app-browser-context source="user-example">example</in-app-browser-context>',
+])
+def test_browser_cleanup_preserves_user_text(text):
+    assert sanitize_query(text) == text
+
+
+def test_browser_metadata_without_request_is_empty():
+    assert sanitize_query(
+        '<in-app-browser-context source="ambient-ui-state">UI only</in-app-browser-context>'
+    ) == ""
 
 
 @pytest.fixture()

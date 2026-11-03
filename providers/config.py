@@ -57,6 +57,7 @@ class ProviderConfig:
 
     # Vector database configuration
     vector_db_type: VectorDbType = "chroma"
+    vector_db_dialect: str | None = None
     opengauss_connection_string: str | None = None
     opengauss_dimension: int = 1024
     opengauss_table_name: str = "vector_index"
@@ -81,6 +82,7 @@ class ProviderConfig:
 
     # Maximum characters sent for each OpenAI-compatible embedding input.
     embedding_max_input_chars: int = 30_000
+    embedding_batch_size: int = 2048
 
     # Lazy secrets cache
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
@@ -128,6 +130,7 @@ class ProviderConfig:
             embedding_provider=cfg.embedding_provider,
             st_model=cfg.st_model,
             vector_db_type=cfg.vector_db_type,
+            vector_db_dialect=cfg.vector_db_dialect,
             opengauss_connection_string=cfg.opengauss_connection_string,
             opengauss_dimension=cfg.opengauss_dimension,
             opengauss_table_name=cfg.opengauss_table_name,
@@ -139,6 +142,7 @@ class ProviderConfig:
             openai_embedding_api_key_command=cfg.openai_embedding_api_key_command,
             embedding_multimodal=cfg.embedding_multimodal,
             embedding_max_input_chars=cfg.embedding_max_input_chars,
+            embedding_batch_size=cfg.embedding_batch_size,
             embedding_dimension=cfg.opengauss_dimension,
         )
 
@@ -209,6 +213,7 @@ class ProviderConfig:
                     cache_max_size=self.cache_max_size,
                     multimodal=self.embedding_multimodal,
                     max_input_chars=self.embedding_max_input_chars,
+                    batch_size=self.embedding_batch_size,
                 )
             return OpenAIEmbedder(
                 api_key=emb_key,
@@ -217,6 +222,7 @@ class ProviderConfig:
                 dimension=self.opengauss_dimension,
                 multimodal=self.embedding_multimodal,
                 max_input_chars=self.embedding_max_input_chars,
+                batch_size=self.embedding_batch_size,
             )
 
         raise ValueError(f"Unknown embedding provider: {ep}")
@@ -242,6 +248,7 @@ class ProviderConfig:
             table_name=self.opengauss_table_name,
             pool_size=self.opengauss_pool_size,
             pool=pool,
+            dialect=self.vector_db_dialect or pool.sql_dialect,
         )
 
     def create_llm(self) -> LLM:
@@ -303,7 +310,9 @@ class ProviderConfig:
             openai_embedding_api_key_command=self.openai_embedding_api_key_command,
             embedding_multimodal=self.embedding_multimodal,
             embedding_max_input_chars=self.embedding_max_input_chars,
+            embedding_batch_size=self.embedding_batch_size,
             vector_db_type=self.vector_db_type,
+            vector_db_dialect=self.vector_db_dialect,
             opengauss_connection_string=self.opengauss_connection_string,
             opengauss_dimension=self.opengauss_dimension,
             opengauss_table_name=self.opengauss_table_name,

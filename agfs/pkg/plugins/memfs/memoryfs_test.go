@@ -320,6 +320,40 @@ func TestMemoryFSRename(t *testing.T) {
 	}
 }
 
+func TestMemoryFSRenameReplacesFile(t *testing.T) {
+	for _, target := range []string{"/target.txt", "/source.txt"} {
+		t.Run(target, func(t *testing.T) {
+			fs := NewMemoryFS()
+			content := []byte("replacement")
+			if _, err := fs.Write("/source.txt", content, -1, filesystem.WriteFlagCreate); err != nil {
+				t.Fatalf("Write source failed: %v", err)
+			}
+			if target != "/source.txt" {
+				if _, err := fs.Write(target, []byte("previous"), -1, filesystem.WriteFlagCreate); err != nil {
+					t.Fatalf("Write target failed: %v", err)
+				}
+			}
+			if err := fs.Rename("/source.txt", target); err != nil {
+				t.Fatalf("Rename failed: %v", err)
+			}
+			actual, err := readIgnoreEOF(fs, target)
+			if err != nil {
+				t.Fatalf("Read target failed: %v", err)
+			}
+			if !bytes.Equal(actual, content) {
+				t.Fatalf("Target content = %q, want %q", actual, content)
+			}
+			entries, err := fs.ReadDir("/")
+			if err != nil {
+				t.Fatalf("Read directory failed: %v", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("Directory entries = %d, want 1", len(entries))
+			}
+		})
+	}
+}
+
 func TestMemoryFSReadDir(t *testing.T) {
 	fs := NewMemoryFS()
 

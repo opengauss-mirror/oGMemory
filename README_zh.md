@@ -6,7 +6,9 @@
 七类上下文。三级缓存层次。一个虚拟文件系统。
 降低 token 消耗。保持信号密度。跨越会话边界。
 
-[English](readme.md) | 中文
+[English](README.md) | 中文
+
+文档总览：[docs/README.md](docs/README.md)
 </div>
 
 ---
@@ -366,6 +368,15 @@ L0 → L1 → L2：每个层级产生信号浓度不同的 embedding。短文本
 
 ---
 
+## oGMemory 评测效果
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
+  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
+</picture>
+
+---
+
 ## 快速开始
 
 ### 前置条件
@@ -510,7 +521,8 @@ curl -X POST http://localhost:8090/api/v1/compose \
 <summary><strong>Docker</strong></summary>
 
 ```bash
-docker compose up  # 服务端口 8090，PostgreSQL 端口 5432
+# 先填写 .env，按 deploy/compose/README_zh.md 部署。
+bash deploy/compose/deploy.sh start
 ```
 
 </details>
@@ -584,7 +596,7 @@ result = write_api.commit_session(messages, ctx)
 | `SQL_CONNECTION_STRING` | — | SQL 数据库 DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
 | `OGMEM_CONFIG` | `ogmem.yaml` | YAML 配置文件路径 |
-| `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 触发 after_turn 自动抽取的待处理 token 阈值 |
+| `OGMEM_AFTER_TURN_THRESHOLD` | `400` | 触发 after_turn 自动抽取的待处理 token 阈值 |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 启用 Layer 2 滚动会话压缩 |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | LLM 压缩不可用时启用规则 fallback |
 | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | `prepareToken` 有效期，单位秒 |
@@ -597,39 +609,16 @@ result = write_api.commit_session(messages, ctx)
 
 ### 仓库结构
 
-```
-ContextEngine/
-├── core/                   # 领域模型、Protocol 接口、枚举、错误类型
-├── fs/sql_adapter/         # ContextFS → PostgreSQL 适配器（原子 upsert、RLS 租户隔离）
-├── extraction/             # CandidateExtractor（ReAct 循环 + YAML SchemaRegistry）
-│   ├── prompts/            #   LLM 提示模板
-│   └── schemas/            #   各上下文类型的 YAML 抽取 Schema
-├── commit/                 # 写入链路：PolicyRouter → MergePolicy → ContextWriter
-├── index/                  # 异步索引：OutboxWorker → IndexRecordBuilder → VectorDB
-├── retrieval/              # 读取链路：IntentClassifier → SeedRetriever → ResultRanker
-├── providers/              # 外部适配：LLM、Embedder、VectorIndex、RelationStore
-│   ├── llm/                #   OpenAI 兼容 LLM 提供商
-│   ├── embedder/           #   4 种嵌入后端（OpenAI、火山引擎等）
-│   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   PostgreSQL 关系存储
-├── service/                # API 层：MemoryWriteAPI、MemoryReadAPI、多租户
-├── server/                 # HTTP REST 服务（Flask）、认证/RBAC、会话管理
-├── session/                # SessionManager、TopicBuffer、RollingCompressor
-├── tests/
-│   ├── contract/           # 跨团队契约测试（不变量检查）
-│   ├── unit/               # 各包单元测试
-│   ├── integration/        # 端到端集成测试
-│   ├── e2e/                # LoCoMo 基准评测框架
-│   └── fixtures/           # 共享测试数据
-├── docs/                   # 架构、部署、快速上手指南
-├── examples/               # 使用示例（SDK、Claude Code 集成）
-├── cli/                    # 统一管理 CLI（ogmem 命令）
-├── plugins/ogmemory/       # Codex 插件（全生命周期 HTTP Hooks）
-├── openclaw_context_engine_plugin/  # OpenClaw 插件（TypeScript 桥接）
-└── scripts/                # 辅助脚本
-```
+[源码目录](docs/architecture/repository-layout.md) · [文档总览](docs/README.md) · [客户端接入](docs/integrations/README.md)
 
 ---
+
+## 通用 Agent Plugin
+
+[`plugins/agent-plugins/`](plugins/agent-plugins/) 提供记忆检索、详情读取和写入三个 MCP 工具，
+配套 `ogmemory-memory` Skill，适用于标准插件客户端及普通 MCP Agent。
+OpenClaw、DSH、Claude Code、Codex 的操作步骤见
+[通用 Agent Plugin 教程](docs/integrations/agent-plugins.md)。此接入由模型主动调用，不自动捕获对话。
 
 ## Codex 集成
 
@@ -639,24 +628,33 @@ ContextEngine/
 
 ## OpenCode 集成
 
-仓库中的 [`opencode-plugin`](opencode-plugin/) 是可发布到 npm 的 OpenCode 插件包，提供自动记忆检索、会话增量写入和标准 Trace 记录。插件面向 OpenCode 1.15.11 或更高版本，工作在 MCP 之上；MCP 仍可用于显式记忆工具调用。
+仓库中的 [`plugins/opencode`](plugins/opencode/) 是可发布到 npm 的 OpenCode 插件包，提供自动记忆检索、会话增量写入和标准 Trace 记录。插件面向 OpenCode 1.15.11 或更高版本，工作在 MCP 之上；MCP 仍可用于显式记忆工具调用。
 
-源码安装、配置、隐私控制和验证步骤请参考[中文安装说明](opencode-plugin/INSTALL-ZH.md)。
+源码安装、配置、隐私控制和验证步骤请参考[中文安装说明](plugins/opencode/INSTALL-ZH.md)。
 
 ---
 
 ## DeepSeek Harness 集成
 
-仓库中的可安装 [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle 支持
+仓库中的可安装 [`plugins/deepseek-harness`](plugins/deepseek-harness/) bundle 支持
 DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召回。
 
 接入、配置与跨会话体验步骤见 [DeepSeek Harness 对接指南](docs/integrations/deepseek-harness.md)。
 
 ---
 
+## LangChain Deep Agents 集成
+
+安装 `python -m pip install '.[deepagents]'`，将
+`integrations.deepagents.OGMemoryMiddleware` 传入
+`create_deep_agent(middleware=[...])`，即可自动召回记忆和写回完成轮次。
+支持同步与异步调用，通过 `configurable.thread_id` 隔离会话。
+详见 [Deep Agents 对接指南](docs/integrations/deepagents.md) 和
+[交互示例](examples/deepagents_memory.py)。
+
 ## Hermes Agent 集成
 
-仓库中的 [`hermes_memory_plugin`](hermes_memory_plugin/) 提供原生 Hermes
+仓库中的 [`plugins/hermes`](plugins/hermes/) 提供原生 Hermes
 `MemoryProvider`，支持自动召回、轮次写回、会话提交，以及
 `ogmemory_search`、`ogmemory_remember` 工具。
 
@@ -672,13 +670,13 @@ DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召
 ogmem onboard --mode plugin
 
 # 或在插件源码目录中手工安装
-cd openclaw_context_engine_plugin
+cd plugins/openclaw
 openclaw plugins install -l .
 ```
 
 `ogmem onboard --mode plugin` 为**已有 Agent 和独立部署的 oGMemory 服务**生成接入配置。
 它不会安装 Agent/插件、修改 Agent 的生效配置、安装后端依赖或启动服务。
-通过 `--agent` 选择 OpenClaw、Claude Code、Codex、OpenCode、DeepSeek Harness 或 Hermes；
+通过 `--agent` 选择 OpenClaw、Claude Code、Codex、OpenCode、DeepSeek Harness、Hermes 或 Deep Agents；
 其它 Agent 名称自动生成 HTTP MCP 配置。
 
 ```bash
@@ -740,7 +738,7 @@ ContextFS / SQL 存储 + 向量索引
 
 | 文档 | 说明 |
 | ---- | ---- |
-| [CLAUDE.md](CLAUDE.md) | 完整技术规范 |
+| [docs/README.md](docs/README.md) | 文档总览与主题导航 |
 | [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) | 环境配置 |
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
 | [客户端 Agent 对接指南](docs/integrations/README.md) | REST、Python、MCP 与 Agent 插件接入汇总 |
@@ -750,7 +748,7 @@ ContextFS / SQL 存储 + 向量索引
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
 | [OpenClaw + oGMemory Context Engine 单机部署](docs/deployment/openclaw_context_engine_quickstart_zh.md) | 拉取 `dev` 分支后的可验收部署教程 |
 | [OpenClaw + oGMemory 双接入镜像部署](deploy/ogmem_opengauss_deploy.md) | 一键复用 Context Engine、独立配置 MCP 的验证教程 |
-| [OpenClaw 插件](openclaw_context_engine_plugin/README.md) | 集成搭建 |
+| [OpenClaw 插件](plugins/openclaw/README.md) | 集成搭建 |
 | [基准测试](tests/e2e/) | LoCoMo 评测框架 |
 
 ---
@@ -788,6 +786,10 @@ ContextFS / SQL 存储 + 向量索引
 ### 基础设施
 - oGMemory 使用基于 AGFS 的分层存储，为 Session 范围内的记忆资源提供持久化能力
 - [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
+
+## SWE-bench 测试参考
+
+参见 [SWE-bench Lite 测试指导与脚本](benchmarks/swebench/README.md)，对比 baseline 与使用 openGauss SQL 后端的 oGMemory，包含单题验证、连续执行、官方评分和用量统计。
 
 ## 许可证
 

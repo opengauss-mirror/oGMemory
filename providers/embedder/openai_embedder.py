@@ -186,6 +186,7 @@ class OpenAIEmbedder(Embedder):
         dimension: int | None = None,
         multimodal: bool = False,
         max_input_chars: int = DEFAULT_MAX_INPUT_CHARS,
+        batch_size: int = 2048,
     ):
         """Initialize OpenAI embedder.
 
@@ -196,6 +197,7 @@ class OpenAIEmbedder(Embedder):
             dimension: Expected dimension (for validation). If None, inferred from model.
             multimodal: Use the ``/embeddings/multimodal`` endpoint.
             max_input_chars: Maximum characters sent for each embedding input.
+            batch_size: Maximum texts per request to the compatible endpoint.
         """
         if not api_key:
             if base_url:
@@ -221,6 +223,8 @@ class OpenAIEmbedder(Embedder):
                 )
         if max_input_chars < 1:
             raise ValueError("max_input_chars must be positive")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 2048:
+            raise ValueError("batch_size must be an integer between 1 and 2048")
 
         self._api_key = api_key
         self._base_url = base_url
@@ -228,6 +232,7 @@ class OpenAIEmbedder(Embedder):
         self._dimension = dimension or self._get_model_dimension(model)
         self._multimodal = multimodal
         self._max_input_chars = max_input_chars
+        self._batch_size = batch_size
 
         client_kwargs = {"api_key": api_key}
         if base_url:
@@ -282,23 +287,17 @@ class OpenAIEmbedder(Embedder):
         """Embed a batch of texts using OpenAI API.
 
         Args:
-            texts: List of input texts (max 2048 texts per request).
+            texts: Input texts, split into requests of at most batch_size texts.
 
         Returns:
             List of embedding vectors, one per input text.
 
         Raises:
             OpenAIError: If the API request fails.
-            ValueError: If texts list is empty or too large.
+            ValueError: If the returned vectors have an unexpected shape.
         """
         if not texts:
             return []
-
-        if len(texts) > 2048:
-            raise ValueError(
-                f"Batch size too large: {len(texts)}. "
-                "OpenAI API supports max 2048 texts per request."
-            )
 
         deadline = (None if timeout_seconds is None else
                     time.monotonic() + self._bounded_timeout_seconds(timeout_seconds))
@@ -323,24 +322,33 @@ class OpenAIEmbedder(Embedder):
                     timeout_seconds=None if deadline is None else deadline - time.monotonic(),
                 )
             else:
-                client = self._embedding_client(
-                    timeout_seconds=None if deadline is None else deadline - time.monotonic())
-                try:
-                    with _EMBED_SEMAPHORE:
-                        response = _run_with_retry(
-                            lambda: client.embeddings.create(
-                                input=truncated, model=self._model
-                            ),
-                            "embeddings.create",
-                        )
-                except Exception:
-                    self.token_tracker.record_failure('embedding', deadline=deadline)
-                    raise
-                usage = getattr(response, "usage", None)
-                total_tokens = embedding_usage_tokens(usage)
-                self.token_tracker.record_embed(total_tokens or 0,
-                    usage_known=total_tokens is not None, deadline=deadline)
-                embeddings = [item.embedding for item in response.data]
+                embeddings = []
+                for start in range(0, len(truncated), self._batch_size):
+                    batch = truncated[start:start + self._batch_size]
+                    with embedding_input_scope(range(start, start + len(batch))):
+                        client = self._embedding_client(
+                            timeout_seconds=None if deadline is None else deadline - time.monotonic())
+                        try:
+                            with _EMBED_SEMAPHORE:
+                                response = _run_with_retry(
+                                    lambda: client.embeddings.create(
+                                        input=batch, model=self._model
+                                    ),
+                                    "embeddings.create",
+                                )
+                        except Exception:
+                            self.token_tracker.record_failure('embedding', deadline=deadline)
+                            raise
+                        usage = getattr(response, "usage", None)
+                        total_tokens = embedding_usage_tokens(usage)
+                        self.token_tracker.record_embed(total_tokens or 0,
+                            usage_known=total_tokens is not None, deadline=deadline)
+                        vectors = [item.embedding for item in response.data]
+                        if len(vectors) != len(batch):
+                            raise ValueError(
+                                f"Embedding count mismatch: expected {len(batch)}, got {len(vectors)}"
+                            )
+                        embeddings.extend(vectors)
         except UsagePersistenceError:
             raise
         except Exception as e:

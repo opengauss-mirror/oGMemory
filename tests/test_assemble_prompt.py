@@ -165,7 +165,7 @@ def test_compose_with_mock_layers():
         archive_included=True,
     )
 
-    output = svc._assemble_result_to_dict(mock_result)
+    output = svc._to_response(mock_result)
 
     print("\n>>> ogmem compose() 返回给 OpenClaw 插件的字段 <<<\n")
     for key in ["identityContext", "episodicContext", "sessionContext", "retrievedEvidence"]:

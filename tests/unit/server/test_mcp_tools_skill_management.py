@@ -10,14 +10,18 @@ import pytest
 from core.errors import ConcurrentModificationError
 from core.models import RequestContext, Role
 from providers.unified_config import OgMemConfig
+from server.auth import ResolvedIdentity
 from server.mcp_server import create_mcp_server
 from server.mcp_tools import delete_skill, install_skill, update_skill
 from server.memory_service import MemoryService
 
 
 class _FakeAuth:
+    def __init__(self, *, active=False):
+        self.active = active
+
     def role_control_active(self):
-        return False
+        return self.active
 
     def require_role(self, ctx, *roles):
         assert ctx.role in roles
@@ -127,24 +131,59 @@ class _MemoryFS:
         del self.nodes[uri]
 
 
-def _real_service(fs):
+def _real_service(fs, *, auth_active=False):
     cfg = OgMemConfig(mcp_default_toolset="all", agent_id="bot")
     service = MemoryService.__new__(MemoryService)
     service._cfg = cfg
     service._get_context_fs = MethodType(lambda self: fs, service)
-    service.get_auth_service = MethodType(lambda self: _FakeAuth(), service)
+    service.get_auth_service = MethodType(lambda self: _FakeAuth(active=auth_active), service)
     service.build_context = MethodType(
         lambda self, params, identity=None: RequestContext(
-            account_id="acct-1",
-            user_id="root",
+            account_id=identity.account_id if identity else "acct-1",
+            user_id=identity.user_id if identity else "root",
             agent_id=params.get("agentId") or "bot",
             session_id="mcp-skill-management",
             trace_id="mcp-skill-management",
-            role=Role.ROOT,
+            role=identity.role if identity else Role.ROOT,
         ),
         service,
     )
     return service, cfg
+
+
+@pytest.mark.parametrize("input_form", ["data", "archive_base64"])
+def test_http_admin_installs_and_updates_uploaded_package(input_form):
+    fs = _MemoryFS()
+    service, _ = _real_service(fs, auth_active=True)
+    identity = ResolvedIdentity(role=Role.ADMIN, account_id="tenant-a", user_id="admin-a")
+    auth_kwargs = {
+        "agent_id": "bot",
+        "allow_stdio_env_auth": False,
+        "resolved_identity": identity,
+    }
+
+    def package_input(body):
+        files = {"SKILL.md": SKILL_MD, "references/checklist.txt": body}
+        if input_form == "data":
+            return {"data": {"files": files}}
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as package:
+            for path, content in files.items():
+                package.writestr(path, content)
+        return {"archive_base64": base64.b64encode(archive.getvalue()).decode("ascii")}
+
+    created = install_skill(service, **package_input("Before"), **auth_kwargs)
+    updated = update_skill(
+        service, name="review-code", **package_input("After"), **auth_kwargs
+    )
+    ctx = service.build_context({"agentId": "bot"}, identity=identity)
+    attachment = service.read_managed_skill_file(ctx, "review-code", "references/checklist.txt")
+
+    assert created["action"] == "create"
+    assert updated["action"] == "update"
+    assert updated["version"] == 2
+    assert attachment["content"] == "After"
+    assert all(node.uri.startswith("ctx://tenant-a/") for node in fs.nodes.values())
 
 
 @pytest.mark.asyncio

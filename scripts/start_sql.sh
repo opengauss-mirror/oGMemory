@@ -156,8 +156,8 @@ check_prereqs() {
     if [ ! -f "$CONFIG_PATH" ] && [ -z "$RAW_SQL_CONNECTION_STRING" ]; then
         warn "Config file not found: $CONFIG_PATH"
         echo "  Recommended:"
-        echo "    cp \"$EXAMPLE_CONFIG_PATH\" \"$PROJECT_ROOT/ogmem.yaml\""
-        echo "    # edit storage.connection_string in $PROJECT_ROOT/ogmem.yaml"
+        echo "    cp \"$EXAMPLE_CONFIG_PATH\" \"$CONFIG_PATH\""
+        echo "    # edit storage.connection_string in $CONFIG_PATH"
     fi
 
     if [ -z "$SQL_CONNECTION_STRING" ]; then

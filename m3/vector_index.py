@@ -70,15 +70,7 @@ def build_m3_vector_index(runtime: "M3RuntimeConfig") -> "VectorIndex":
     backend = (runtime.vector_index_backend or "opengauss").lower()
 
     if backend in ("opengauss", "pgvector"):
-        # Both ``opengauss`` (the recommended production target) and
-        # ``pgvector`` (the single-DB convenience alias) route to the
-        # same :class:`OpenGaussVectorIndex` because the underlying
-        # SQL — CREATE EXTENSION vector, vector(N), hnsw, MERGE INTO
-        # — is portable across the two servers via the standard PG
-        # wire protocol. ``psycopg2`` talks to either without code
-        # changes. See the class docstring in
-        # ``providers/vector_index/opengauss_index.py`` for the
-        # CREATE EXTENSION no-op-on-openGauss handling.
+        # Backend selection controls extension bootstrap through the SQL dialect.
         if not runtime.vector_index_connection_string:
             raise ValueError(
                 "vector_db.connection_string is required for the "
@@ -98,6 +90,7 @@ def build_m3_vector_index(runtime: "M3RuntimeConfig") -> "VectorIndex":
             table_name=runtime.vector_index_table_name,
             pool_size=runtime.vector_index_pool_size,
             dimension=runtime.embedding_dimension,
+            dialect="postgresql" if backend == "pgvector" else "opengauss",
         )
 
     if backend == "chroma":

@@ -1,5 +1,7 @@
 # oGMemory Docker 镜像构建与部署指南
 
+> 文档入口：[文档总览](../README.md)。本页保留镜像构建、参数、容器架构和故障排查；Compose 部署见 [Compose 指南](../../deploy/compose/README_zh.md)。
+
 ## 1. 前置条件
 
 | 依赖项 | 要求 |
@@ -34,7 +36,7 @@ oGMemory/
 ├── service/                    # IndexService
 ├── fs/                         # AGFS 文件系统适配
 ├── scripts/                    # 启动脚本（run_index_service.py）
-└── openclaw_context_engine_plugin/  # OpenClaw 插件
+└── plugins/openclaw/  # OpenClaw 插件
 ```
 
 ## 3. 构建镜像

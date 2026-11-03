@@ -62,7 +62,7 @@ class TestAttributionBasis:
         result = validate_attribution(candidate, user_id="eval-1")
         assert result.category == "entity"
         assert result.owner_scope == "user"
-        assert "andrew" in result.routing_key
+        assert result.routing_key == "andrew_occupation"
 
     def test_self_first_person_passes(self):
         """self_first_person basis → stays as profile."""

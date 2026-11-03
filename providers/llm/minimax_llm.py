@@ -26,12 +26,58 @@ Configuration is via env or kwargs::
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from itertools import permutations
+
+from core.errors import ToolCallProtocolError
 
 from .openai_llm import OpenAILLM
 
 DEFAULT_BASE_URL = "https://api.minimaxi.com/v1"
 DEFAULT_MODEL = "MiniMax-M3"
+logger = logging.getLogger(__name__)
+
+
+def _named_scalar_arguments(values: list, schema: dict) -> dict:
+    """Losslessly name positional values only when the schema gives one answer.
+
+    Do not rely on JSON property order or invent optional defaults. Deliberately
+    limited to small, simple scalar schemas (including M3 Search/Answer);
+    ambiguous, constrained, or nested schemas require native named arguments.
+    """
+    allowed = {"type", "properties", "required", "additionalProperties", "description", "title"}
+    properties = schema.get("properties", {})
+    if (schema.get("type") != "object" or set(schema) - allowed
+            or not isinstance(properties, dict) or len(properties) > 6
+            or len(values) > len(properties)):
+        raise ToolCallProtocolError("Unsupported MiniMax positional argument schema")
+    required = set(schema.get("required", []))
+
+    def matches(value, spec):
+        if not isinstance(spec, dict) or set(spec) - {"type", "description", "title", "default"}:
+            return False
+        kind = spec.get("type")
+        return (
+            (kind == "string" and isinstance(value, str))
+            or (kind == "integer" and isinstance(value, int) and not isinstance(value, bool))
+            or (kind == "boolean" and isinstance(value, bool))
+            or (kind == "null" and value is None)
+        )
+
+    candidates = {}
+    for names in permutations(properties, len(values)):
+        if not required.issubset(names):
+            continue
+        if all(matches(value, properties[name]) for name, value in zip(names, values)):
+            candidate = dict(zip(names, values))
+            candidates[json.dumps(candidate, sort_keys=True)] = candidate
+            if len(candidates) > 1:
+                raise ToolCallProtocolError("Ambiguous MiniMax positional tool arguments")
+    if len(candidates) != 1:
+        raise ToolCallProtocolError("MiniMax positional arguments do not match required scalar parameters")
+    return next(iter(candidates.values()))
 
 
 def _normalise_base_url(base_url: str | None) -> str:
@@ -54,9 +100,10 @@ class MiniMaxLLM(OpenAILLM):
     """OpenAI-compatible MiniMax-M3 client.
 
     Inherits ``complete_json``, ``complete_multimodal``, ``complete_with_tools``,
-    and ``complete_with_tools_messages`` from :class:`OpenAILLM`. The only
-    differences are the defaults for ``base_url`` and ``model``, which
-    route requests to MiniMax's managed API.
+    and ``complete_with_tools_messages`` from :class:`OpenAILLM`. The
+    defaults for ``base_url`` and ``model`` route requests to MiniMax's
+    managed API. A provider-specific compatibility step also converts
+    positional scalar tool arguments only when their schema mapping is unique.
     """
 
     def __init__(
@@ -67,6 +114,7 @@ class MiniMaxLLM(OpenAILLM):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         json_mode: bool = True,
+        request_timeout_seconds: float = 120.0,
     ) -> None:
         # Read MiniMax-specific env first, then fall back to the
         # generic OpenAI env so a single OGMEM_API_KEY can power
@@ -92,7 +140,31 @@ class MiniMaxLLM(OpenAILLM):
             temperature=temperature,
             max_tokens=max_tokens,
             json_mode=json_mode,
+            request_timeout_seconds=request_timeout_seconds,
         )
+
+    def _normalize_tool_response(self, response, tools) -> None:
+        """Canonicalize wire arguments after the caller has recorded usage."""
+        if not tools:
+            return
+        schemas = {t["function"]["name"]: t["function"].get("parameters", {})
+                   for t in tools if t.get("type") == "function"}
+        for choice in getattr(response, "choices", None) or []:
+            if choice.finish_reason == "length":
+                continue  # the shared truncation guard rejects this response
+            for call in choice.message.tool_calls or []:
+                try:
+                    arguments = json.loads(call.function.arguments)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(arguments, list):
+                    continue
+                schema = schemas.get(call.function.name)
+                if schema is None:
+                    raise ToolCallProtocolError("MiniMax positional call names an undeclared function")
+                named = _named_scalar_arguments(arguments, schema)
+                call.function.arguments = json.dumps(named, ensure_ascii=False)
+                logger.info("Normalized unambiguous MiniMax positional arguments for %s", call.function.name)
 
 
 __all__ = ["MiniMaxLLM", "DEFAULT_BASE_URL", "DEFAULT_MODEL"]

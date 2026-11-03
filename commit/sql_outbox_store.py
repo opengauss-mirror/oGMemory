@@ -9,7 +9,7 @@ import hashlib
 import json
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 
 from core.enums import EventType
@@ -111,6 +111,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         return parts[0] + "/"
 
     def _collect_sibling_abstracts(self, node_uri: str, ctx: RequestContext) -> list[str]:
+        self.bind_context(ctx)
         dir_uri = self._node_uri_to_directory_uri(node_uri)
         try:
             siblings = self._fs.list_children(dir_uri, ctx)
@@ -127,6 +128,12 @@ class SQLOutboxStore(PoolAdapterMixin):
         return abstracts
 
     def _insert_event(self, event: OutboxEvent, account_id: str) -> None:
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            if account_id != guard.ctx.account_id:
+                guard.poison("outbox account does not match its mutation session")
+            guard.check_active()
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -198,6 +205,27 @@ class SQLOutboxStore(PoolAdapterMixin):
     # OutboxStore Protocol
     # ------------------------------------------------------------------
 
+    def register_once(self, event: OutboxEvent, ctx: RequestContext) -> None:
+        self.bind_context(ctx)
+        if self.is_event_current(event.event_id, event.uri):
+            return
+        with self.processing_lock(event.uri):
+            if not self.is_event_current(event.event_id, event.uri):
+                self._insert_event(event, ctx.account_id)
+
+    def save_payload(self, event: OutboxEvent) -> None:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE outbox_events SET payload = %s WHERE event_id = %s",
+                            (Json(event.payload), event.event_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
     def build_write_event(self, node: ContextNode) -> OutboxEvent:
         """Build an OutboxEvent for a node write without persisting it.
 
@@ -209,12 +237,14 @@ class SQLOutboxStore(PoolAdapterMixin):
         return build_code_resource_write_event(node)
 
     def register_write(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         event = self.build_write_event(node)
         account_id = self._extract_account_id(node.uri)
         self._insert_event(event, account_id)
         return event
 
     def register_delete(self, uri: str, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         event = self.build_delete_event(uri)
         account_id = self._extract_account_id(uri)
         self._insert_event(event, account_id)
@@ -227,7 +257,7 @@ class SQLOutboxStore(PoolAdapterMixin):
 
         return build_code_resource_delete_event(uri)
 
-    def register_archive(self, uri: str, ctx: RequestContext) -> OutboxEvent:
+    def register_archive(self, uri: str, ctx: RequestContext, *, record_ids: list[str] | None = None) -> OutboxEvent:
         """Register a node archive for index synchronization.
 
         Pre-computes ids_to_delete so the worker can remove vector records
@@ -240,6 +270,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         Returns:
             OutboxEvent that was registered
         """
+        self.bind_context(ctx)
         from core.models import IndexRecord
 
         l2_uri = uri.rstrip("/") + "/content.md"
@@ -252,7 +283,7 @@ class SQLOutboxStore(PoolAdapterMixin):
             event_id=str(uuid.uuid4()),
             event_type=EventType.ARCHIVE_CONTEXT.value,
             uri=uri,
-            payload={"ids_to_delete": ids_to_delete},
+            payload={"ids_to_delete": record_ids if record_ids is not None else ids_to_delete},
             status="PENDING",
         )
         account_id = self._extract_account_id(uri)
@@ -260,6 +291,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         return event
 
     def register_directory(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         dir_uri = self._node_uri_to_directory_uri(node.uri)
         abstracts = self._collect_sibling_abstracts(node.uri, ctx)
 
@@ -391,8 +423,10 @@ class SQLOutboxStore(PoolAdapterMixin):
         worker_id: str,
         limit: int = 100,
         timeout_seconds: int = 300,
+        *,
+        exclude_event_types: list[str] | None = None,
     ) -> list[tuple[str, OutboxEvent]]:
-        """Atomically claim ready events while preserving per-URI order."""
+        """Claim supported ready events before the batch limit, preserving per-URI order."""
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -415,6 +449,7 @@ class SQLOutboxStore(PoolAdapterMixin):
                                         < NOW() - %s * interval '1 second'
                                 )
                               )
+                          AND candidate.event_type <> ALL(%s)
                           AND NOT EXISTS (
                                 SELECT 1
                                 FROM outbox_events AS earlier
@@ -441,7 +476,7 @@ class SQLOutboxStore(PoolAdapterMixin):
                     )
                     SELECT * FROM claimed ORDER BY seq ASC NULLS LAST
                     """,
-                    (timeout_seconds, limit, worker_id),
+                    (timeout_seconds, exclude_event_types or [], limit, worker_id),
                 )
                 rows = cur.fetchall()
             conn.commit()
@@ -497,7 +532,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         return conn
 
     @contextmanager
-    def processing_lock(self, node_uri: str):
+    def processing_lock(self, node_uri: str, *, timeout_seconds: float = _PROCESSING_LOCK_TIMEOUT_SECONDS):
         """Serialize all side effects for one URI across worker processes."""
         lock_key = _uri_processing_lock_key(node_uri)
         conn = psycopg2.connect(
@@ -507,7 +542,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         acquired = False
         try:
             conn.set_session(autocommit=True)
-            deadline = time.monotonic() + _PROCESSING_LOCK_TIMEOUT_SECONDS
+            deadline = time.monotonic() + timeout_seconds
             with conn.cursor() as cur:
                 while True:
                     cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
@@ -528,6 +563,30 @@ class SQLOutboxStore(PoolAdapterMixin):
                     conn.close()
             if conn.closed == 0:
                 conn.close()
+
+    @contextmanager
+    def claim_agent_event(self, event: OutboxEvent, worker_id: str):
+        """Reload checkpoints under the URI lock and hold it through acknowledgement."""
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(self.processing_lock(event.uri, timeout_seconds=0))
+            except TimeoutError:
+                yield False
+                return
+            ctx = RequestContext(**event.payload["context"])
+            fresh = self.get_event(ctx.account_id, event.event_id)
+            if fresh is None or fresh.status not in {"PENDING", "PROCESSING"}:
+                yield False
+                return
+            event.payload, event.retry_count = fresh.payload, fresh.retry_count
+            event.status, event.next_retry_at = fresh.status, fresh.next_retry_at
+            if event.next_retry_at and datetime.fromisoformat(event.next_retry_at) > datetime.now(UTC):
+                yield False
+                return
+            if event.status == "PENDING" and not self.try_acquire(event, event.uri, worker_id):
+                yield False
+                return
+            yield True
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
         conn = self._get_connection()
@@ -582,10 +641,15 @@ class SQLOutboxStore(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM outbox_events WHERE event_id = %s",
-                    (event.event_id,),
-                )
+                if event.event_type == EventType.EXTRACT_AGENT_MEMORY.value:
+                    audit = {key: event.payload[key] for key in ("trace_uri", "value_reviews") if key in event.payload}
+                    cur.execute("UPDATE outbox_events SET status = 'DONE', payload = %s WHERE event_id = %s",
+                                (Json(audit), event.event_id))
+                else:
+                    cur.execute(
+                        "DELETE FROM outbox_events WHERE event_id = %s",
+                        (event.event_id,),
+                    )
             conn.commit()
         except Exception:
             conn.rollback()

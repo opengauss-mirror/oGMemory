@@ -9,7 +9,7 @@ Flow:
 
 Notes:
 - This script exercises the real OpenClaw plugin bridge implementation in
-  `openclaw_context_engine_plugin/bridge/memory_api.py`.
+  `plugins/openclaw/bridge/memory_api.py`.
 - It does NOT require running the OpenClaw daemon; it invokes bridge lifecycle
   functions directly in-process.
 """
@@ -27,7 +27,7 @@ from uuid import uuid4
 
 def _load_bridge_module(repo_root: Path):
     """Import bridge module from local plugin path."""
-    plugin_dir = repo_root / "openclaw_context_engine_plugin"
+    plugin_dir = repo_root / "plugins/openclaw"
     bridge_file = plugin_dir / "bridge" / "memory_api.py"
 
     import importlib.util

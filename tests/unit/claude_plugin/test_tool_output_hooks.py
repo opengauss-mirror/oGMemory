@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "claude-plugin" / "scripts"
+_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "plugins/claude-code" / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -192,7 +192,7 @@ def test_read_hook_omits_recovery_instruction_without_mcp_capability(
 
 
 def test_filter_hooks_are_registered_only_for_post_tool_use(monkeypatch):
-    hooks_path = Path(__file__).resolve().parents[3] / "claude-plugin" / "hooks" / "hooks.json"
+    hooks_path = Path(__file__).resolve().parents[3] / "plugins/claude-code" / "hooks" / "hooks.json"
     data = json.loads(hooks_path.read_text(encoding="utf-8"))
     post_groups = {group.get("matcher"): group for group in data["hooks"]["PostToolUse"]}
     assert "call_filter_read.py" in post_groups["Read"]["hooks"][0]["command"]

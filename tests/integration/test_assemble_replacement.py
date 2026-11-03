@@ -4,8 +4,8 @@ Tests that assemble returns messages[] without systemPromptAddition,
 uses token budget management, and supports archive inclusion.
 """
 
-import pytest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, patch
+
 from core.models import RequestContext
 from server.memory_service import MemoryService
 
@@ -94,8 +94,8 @@ class TestAssembleReplacementMode:
             # Result should be within reasonable bounds
             assert result["estimatedTokens"] < 100_000  # Should respect budget
 
-    def test_assemble_includes_memory_hits_as_system_message(self):
-        """Test that memory hits are injected as system message after original messages."""
+    def test_assemble_includes_memory_hits_as_user_message(self):
+        """Test that memory hits are injected as user message after original messages."""
         service = MemoryService()
 
         params = {
@@ -110,14 +110,15 @@ class TestAssembleReplacementMode:
             mock_result = Mock()
 
             # Create mock hit
-            mock_hit = Mock()
-            mock_hit.category = "preference"
-            mock_hit.abstract = "Prefers Python for data science"
-            mock_hit.content_excerpt = ""
-            mock_hit.score = 0.85
-            mock_hit.relations = []
-
+            from core.models import RetrievedBlock
+            mock_hit = RetrievedBlock(
+                uri="ctx://test-account/users/test-user/memories/preference/coding",
+                score=0.85, category="preference",
+                abstract="Prefers Python for data science",
+                content_excerpt="Prefers Python for data science",
+            )
             mock_result.hits = [mock_hit]
+            mock_api.read_memory.return_value = mock_hit
             mock_api.search_memory.return_value = mock_result
             mock_get_read_api.return_value = mock_api
 
@@ -127,13 +128,13 @@ class TestAssembleReplacementMode:
             assert result["systemPromptAddition"] == ""
             assert result["memoryUserMessage"] == ""
 
-            # Memory hits injected as system message after original messages
+            # Memory hits injected as user message after original messages
             msgs = result["messages"]
-            system_msgs = [m for m in msgs if m["role"] == "system"]
-            assert len(system_msgs) >= 1
+            user_msgs = [m for m in msgs if m["role"] == "user"]
+            assert len(user_msgs) >= 1
 
-            # Last system message should contain working set
-            ws_msg = [m for m in msgs if m["role"] == "system" and "Working Set" in m.get("content", "")]
+            # Retrieved memories follow the original messages
+            ws_msg = [m for m in msgs if m["role"] == "user" and "Retrieved Memories" in m.get("content", "")]
             assert len(ws_msg) >= 1
             assert "preference" in ws_msg[0]["content"]
             assert "Prefers Python" in ws_msg[0]["content"]
@@ -206,7 +207,7 @@ class TestAssembleReplacementMode:
         }]
 
         msg = service._format_working_set(working_set, TokenBudget().allocate())
-        assert "Working Set" in msg
+        assert "Retrieved Memories" in msg
         assert "preference" in msg
         assert "dark mode" in msg
 

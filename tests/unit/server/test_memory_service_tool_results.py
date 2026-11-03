@@ -30,7 +30,9 @@ def _ctx(role=Role.MEMBER) -> RequestContext:
 
 def _isolate_service(service: MemoryService) -> MemoryService:
     service._get_archive_store = lambda: None
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     return service
@@ -175,7 +177,9 @@ def test_lifecycle_entrypoints_do_not_ack_pending_governance_failure(entrypoint)
         ),
         tool_result_store=_FailingStore(),
     )
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.add_message("session", "toolResult", "secret payload", _ctx())
     params = {"sessionId": "session", "_ctx": _ctx()}
 
@@ -226,7 +230,9 @@ def test_failed_user_turn_falls_back_to_original_without_disabling_later_externa
         ),
         tool_result_store=_FailingStore(),
     )
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda _session_id, _ctx: True
     manager.save_session_state = lambda _session_id, _ctx: True
     first_output = "failed user-turn original payload"

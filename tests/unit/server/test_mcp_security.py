@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from core.models import RequestContext, Role
-from server.auth import AuthenticationError, ResolvedIdentity
+from providers.unified_config import OgMemConfig
+from server.api_keys import APIKeyManager
+from server.auth import AuthenticationError, AuthService, ResolvedIdentity
+from server.control_plane_store import ControlPlaneStore
 from server.mcp_security import (
     build_mcp_context,
     has_mcp_http_request,
@@ -98,6 +101,40 @@ def test_build_mcp_context_resolves_stdio_api_key_from_env(monkeypatch):
     assert ctx.user_id == "user-auth"
     assert ctx.agent_id == ""
     assert service.params == {"sessionId": "s1"}
+
+
+@pytest.mark.parametrize("role", ["user", "admin"])
+@pytest.mark.parametrize("bearer", [False, True])
+def test_mcp_registered_identity_is_bound_to_its_account_and_user(tmp_path, monkeypatch, role, bearer):
+    manager = APIKeyManager(ControlPlaneStore(mount_prefix="", local_root=str(tmp_path)))
+    manager.create_account("account-a", "admin")
+    manager.create_account("account-b", "admin")
+    key = manager.register_user("account-a", "same-user", role)
+    manager.register_user("account-b", "same-user", role)
+    auth = AuthService(OgMemConfig(role_control_enabled=True, root_api_key="root-key"), manager)
+    service = _FakeService(auth)
+    monkeypatch.setenv("OGMEM_MCP_API_KEY", "root-key")
+    monkeypatch.setenv("OGMEM_MCP_ACCOUNT_ID", "account-b")
+    credential = {"Authorization": "Bearer " + key} if bearer else {"X-API-Key": key}
+    headers = {**credential, "X-Account-ID": "account-a", "X-User-ID": "admin", "X-Role": "root"}
+
+    ctx = build_mcp_context(service, {"session_id": "same-session"}, transport_headers=headers,
+                            allow_stdio_env_auth=False)
+
+    assert (ctx.account_id, ctx.user_id) == ("account-a", "same-user")
+    assert ctx.role == (Role.ADMIN if role == "admin" else Role.MEMBER)
+    with pytest.raises(AuthenticationError):
+        build_mcp_context(service, {}, transport_headers={**headers, "X-Account-ID": "account-b"},
+                          allow_stdio_env_auth=False)
+
+
+def test_stdio_explicit_invalid_credential_does_not_use_environment_root(tmp_path, monkeypatch):
+    auth = AuthService(OgMemConfig(role_control_enabled=True, root_api_key="root-key"),
+                       APIKeyManager(ControlPlaneStore(mount_prefix="", local_root=str(tmp_path))))
+    monkeypatch.setenv("OGMEM_MCP_API_KEY", "root-key")
+
+    with pytest.raises(AuthenticationError):
+        build_mcp_context(_FakeService(auth), {}, transport_headers={"Authorization": "Bearer unknown"})
 
 
 def test_build_mcp_context_prefers_transport_headers_over_env(monkeypatch):

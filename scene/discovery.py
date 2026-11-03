@@ -7,6 +7,7 @@ import math
 import re
 from array import array
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import dataclass
 from heapq import nlargest
 
@@ -100,7 +101,7 @@ def cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
-def _centroid(indices: set[int], vectors: list[tuple[float, ...]]) -> tuple[float, ...]:
+def _centroid(indices: Collection[int], vectors: list[tuple[float, ...]]) -> tuple[float, ...]:
     dimension = len(vectors[0])
     values = [0.0] * dimension
     for index in indices:
@@ -109,7 +110,7 @@ def _centroid(indices: set[int], vectors: list[tuple[float, ...]]) -> tuple[floa
     return _normalize([value / len(indices) for value in values])
 
 
-def _quality(indices: set[int], vectors: list[tuple[float, ...]]) -> float:
+def _quality(indices: Collection[int], vectors: list[tuple[float, ...]]) -> float:
     if len(indices) < 2:
         return 0.0
     center = _centroid(indices, vectors)
@@ -125,7 +126,7 @@ def _minimum_similarity(indices: set[int], vectors: list[tuple[float, ...]]) -> 
     )
 
 
-def _label_hint(nodes: list[ContextNode], indices: set[int]) -> str:
+def _label_hint(nodes: list[ContextNode], indices: Collection[int]) -> str:
     terms: Counter[str] = Counter()
     for index in indices:
         text = f"{nodes[index].abstract} {nodes[index].content[:300]}".lower()
@@ -136,7 +137,7 @@ def _label_hint(nodes: list[ContextNode], indices: set[int]) -> str:
 
 def _summary_hint(
     nodes: list[ContextNode],
-    indices: set[int],
+    indices: Collection[int],
     vectors: list[tuple[float, ...]],
 ) -> str:
     center = _centroid(indices, vectors)
@@ -255,7 +256,7 @@ def _account_id(uri: str) -> str:
 
 def _candidate(
     nodes: list[ContextNode],
-    indices: set[int],
+    indices: Collection[int],
     vectors: list[tuple[float, ...]],
     *,
     basis: str,

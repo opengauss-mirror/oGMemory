@@ -8,6 +8,11 @@ from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 
 
+@pytest.fixture(autouse=True)
+def local_session_backend(monkeypatch):
+    monkeypatch.setattr(MemoryService, "_get_context_fs", lambda self: None)
+
+
 def _ctx(role=Role.ADMIN, **overrides):
     values = {
         "account_id": "acct",

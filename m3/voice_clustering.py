@@ -357,7 +357,7 @@ def run_voice_clustering(
         logger.info("Graph store: %s", store_kind)
 
     ctx = RequestContext(
-        account_id=M3BENCH_ACCOUNT_ID,
+        account_id=getattr(args, "account_id", M3BENCH_ACCOUNT_ID),
         user_id=M3BENCH_USER_ID,
         agent_id=M3BENCH_AGENT_ID,
         session_id="m3bench-voice-clustering",
@@ -437,6 +437,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         description="Cluster voice segments across clips and emit same_identity edges.",
     )
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
+    p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID,
+                   help="Account whose voice identities may be read and updated.")
     p.add_argument("--connection-string", default=None,
                    help="PostgreSQL DSN for --graph-store sql")
     p.add_argument("--threshold", type=float, default=0.3,

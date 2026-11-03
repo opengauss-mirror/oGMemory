@@ -4,12 +4,13 @@ Tests the full flow: add messages → threshold → commit → get context.
 Uses mocked AGFS/LLM to avoid external dependencies.
 """
 
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, MagicMock
 
 from core.models import RequestContext
-from session.session_manager import SessionManager, SessionBuffer
 from server.memory_service import MemoryService, extract_content_text
+from session.session_manager import SessionManager
 
 
 @pytest.fixture
@@ -136,8 +137,11 @@ class TestFullLifecycle:
 class TestMemoryServiceSessionIntegration:
     @pytest.fixture
     def service(self):
+        import uuid
+
         from providers.unified_config import OgMemConfig
         cfg = OgMemConfig(
+            account_id=f"session-test-{uuid.uuid4().hex}",
             agfs_base_url="http://localhost:1833",
             agfs_mount_prefix="/local/plugin",
         )
@@ -194,17 +198,18 @@ class TestMemoryServiceSessionIntegration:
 
     def test_compact_returns_summary(self, service):
         """compact() commits and returns summary with tokensBefore/After."""
+        service._cfg.after_turn_threshold = 100_000
         # Add messages first via after_turn with high threshold
         for i in range(3):
-            service.after_turn({
+            accumulated = service.after_turn({
                 "sessionId": "sess-compact",
                 "messages": [
                     {"role": "user", "content": f"Question {i}: " + "a" * 200},
                     {"role": "assistant", "content": f"Answer {i}: " + "b" * 200},
                 ],
                 "prePromptMessageCount": 0,
-                "commitTokenThreshold": 100_000,  # Don't auto-commit
             })
+            assert accumulated["status"] == "accumulating"
 
         # Now compact
         result = service.compact({

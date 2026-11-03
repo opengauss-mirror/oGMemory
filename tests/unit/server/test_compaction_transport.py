@@ -14,7 +14,7 @@ from session.session_manager import SessionOperationInProgress
 
 
 def _make_service() -> MemoryService:
-    return MemoryService(
+    service = MemoryService(
         config=OgMemConfig(
             role_control_enabled=False,
             account_id="acct-test",
@@ -22,6 +22,8 @@ def _make_service() -> MemoryService:
             agent_id="agent-test",
         )
     )
+    service._get_context_fs = Mock(return_value=None)
+    return service
 
 
 class _FailingArtifactStore(ToolResultArtifactStore):
@@ -51,6 +53,7 @@ def _make_real_compaction_failure_service(session_id: str) -> MemoryService:
         ),
         tool_result_store=_FailingArtifactStore(),
     )
+    service._get_context_fs = Mock(return_value=None)
     ctx = service.build_context({"sessionId": session_id})
     service.get_session_manager().add_message(
         session_id,
@@ -74,6 +77,7 @@ def _make_cleaning_service(session_id: str) -> MemoryService:
         ),
         tool_result_store=_FailingArtifactStore(),
     )
+    service._get_context_fs = Mock(return_value=None)
     ctx = service.build_context({"sessionId": session_id})
     service.get_session_manager().get_or_create(session_id, ctx=ctx).cleaning = True
     return service

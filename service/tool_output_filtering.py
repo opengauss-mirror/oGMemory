@@ -23,6 +23,9 @@ _CODE_SUFFIXES = {
     ".m",
     ".php",
     ".py",
+    ".pyi",
+    ".pyx",
+    ".pxd",
     ".rb",
     ".rs",
     ".scala",
@@ -169,6 +172,9 @@ def shorten_head_tail(text: str, *, max_lines: int, label: str) -> str:
 def detect_content(text: str, *, relative_path: str = "") -> str:
     """Classify only high-confidence content shapes in a deterministic order."""
 
+    # A source Read may contain diagnostic text without being a log.
+    if Path(relative_path).suffix.lower() in _CODE_SUFFIXES:
+        return "code"
     if _TRACEBACK_RE.search(text):
         return "python_error"
     if _DIFF_RE.search(text):
@@ -196,6 +202,10 @@ def detect_content(text: str, *, relative_path: str = "") -> str:
 def reduce_read_output(text: str, *, relative_path: str, config: Any) -> ReductionOutcome:
     """Reduce a Read payload while preserving a legacy fallback for uncertain inputs."""
 
+    # Preserve authorized source Reads verbatim for editing.
+    # Range-limited Reads already bypass filtering; Bash/log output does not.
+    if Path(relative_path).suffix.lower() in _CODE_SUFFIXES:
+        return passthrough_reduction(text, detected="code", strategy="read_source_passthrough")
     max_lines = _positive_config(config, "tool_output_filter_read_max_lines", 60)
     adaptive_enabled = bool(getattr(config, "tool_output_filter_adaptive_enabled", False))
     if not adaptive_enabled:

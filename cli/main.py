@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     plugin = p_onboard.add_argument_group("Existing Agent connection (plugin mode)")
     plugin.add_argument(
         "--agent",
-        help="openclaw, claude-code, codex, opencode, deepseek-harness, hermes; other names use MCP",
+        help="openclaw, claude-code, codex, opencode, deepseek-harness, hermes, deepagents, agent-plugins; other names use MCP",
     )
     plugin.add_argument("--ogmem-url", help="oGMemory HTTP API base URL as seen by the Agent")
     plugin.add_argument("--mcp-url", help="Full Streamable HTTP MCP URL, including its port and path")

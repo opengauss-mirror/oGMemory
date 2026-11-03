@@ -121,7 +121,7 @@ oGMemory/
 ├── fs/                              # AGFS 适配
 ├── scripts/                         # 运维脚本
 ├── agfs/                            # AGFS 二进制
-└── openclaw_context_engine_plugin/  # OpenClaw 插件（内置到 ogmem-openclaw 镜像）
+└── plugins/openclaw/  # OpenClaw 插件（内置到 ogmem-openclaw 镜像）
     ├── index.js                     # 插件入口（HTTP 模式）
     ├── openclaw.plugin.json
     └── package.json
@@ -327,7 +327,7 @@ docker logs openclaw 2>&1 | grep "og-memory"
 FROM alpine/openclaw:latest
 
 # 将 oGMemory 插件内置到镜像中（无需运行时挂载）
-COPY openclaw_context_engine_plugin/ /app/extensions/og-memory-context-engine/
+COPY plugins/openclaw/ /app/extensions/og-memory-context-engine/
 
 # 内置默认 openclaw.json 模板（含占位符，entrypoint 运行时注入真实值）
 COPY config/openclaw/ogmem.template.json /opt/defaults/openclaw.json

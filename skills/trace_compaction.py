@@ -10,7 +10,7 @@ from skills.artifact import validate_skill_name
 from skills.sanitizer import StreamingTraceSanitizer, without_correlation_ids
 
 _CORRELATION_KEY_ORDER = ("tool_use_id", "tool_call_id", "call_id")
-_POLICY_VERSION = 3
+_POLICY_VERSION = 4
 _FIELD_CHARS = 4000
 _LIST_ITEMS = 20
 _DICT_ITEMS = 32

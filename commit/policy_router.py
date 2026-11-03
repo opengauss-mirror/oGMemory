@@ -200,3 +200,6 @@ class PolicyRouter:
         """
         self._custom_policies[category] = policy
         logger.debug(f"Registered custom policy for category: {category}")
+
+    def has_custom_policy(self, category: str) -> bool:
+        return category in self._custom_policies

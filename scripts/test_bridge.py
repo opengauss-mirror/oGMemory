@@ -16,7 +16,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 # Add plugin directory and its parent to path
-plugin_dir = project_root / "openclaw_context_engine_plugin"
+plugin_dir = project_root / "plugins/openclaw"
 sys.path.insert(0, str(plugin_dir))
 sys.path.insert(0, str(plugin_dir / "bridge"))
 
@@ -216,7 +216,7 @@ def main():
         print("\n🎉 所有测试通过！ContextEngine 集成正常工作。")
         print("\n下一步:")
         print("  1. 安装 OpenClaw: npm install -g @openclaw/cli")
-        print("  2. 配置插件: openclaw plugins install -l ./openclaw_context_engine_plugin")
+        print("  2. 配置插件: openclaw plugins install -l ./plugins/openclaw")
         print("  3. 设置 contextEngine 插件为 og-memory-context-engine")
     else:
         print("\n⚠️ 部分测试失败，请检查 AGFS 服务是否运行。")

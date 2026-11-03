@@ -1,44 +1,34 @@
 # ContextEngine 脚本与测试指南
 
-本目录包含 ContextEngine 的启动脚本和压力测试套件。
+本目录包含 oGMemory 的本地辅助脚本和压力测试套件。服务启动入口见
+[本地快速开始](../docs/QUICKSTART.md)，部署入口见[部署入口](../docs/deployment.md)。
 
 ## 📋 目录
 
-- [快速启动](#快速启动)
+- [本地辅助脚本](#本地辅助脚本)
 - [SQL 直连模式](#-sql-直连模式)
-- [压力测试](#压力测试)
-- [性能基准测试](#性能基准测试)
-- [一致性测试](#一致性测试)
-- [测试指标说明](#测试指标说明)
+- [压力测试](#-压力测试)
+- [性能基准测试](#-性能基准测试)
+- [一致性测试](#-一致性测试)
+- [测试指标说明](#-测试指标说明)
 
 ---
 
-## 🚀 快速启动
-
-### 一键启动脚本
+## 本地辅助脚本
 
 ```bash
-./scripts/start_all.sh              # 启动 AGFS + ContextEngine
-./scripts/start_all.sh --daemon     # 后台启动
-./scripts/start_all.sh --stop       # 停止所有
-./scripts/start_all.sh --status     # 查看状态
-./scripts/start_all.sh --eval       # 启动服务 + 跑全量 LoCoMo eval
-```
-
-### 手动启动
-
-```bash
-# 1. 启动 AGFS
-export AGFS_DATA_DIR="/tmp/agfs-data"
-mkdir -p "$AGFS_DATA_DIR"
-agfs-server -c ~/.agfs-config.yaml &
-
-# 2. 激活 Python 环境
-conda activate og-memory  # 或您的环境名称
-
-# 3. 运行测试
+# 运行合约测试
 pytest tests/contract/ -v
+
+# 启动 SQL 直连模式
+./scripts/start_sql.sh --daemon
+
+# 查看或停止 SQL 直连服务
+./scripts/start_sql.sh --status
+./scripts/start_sql.sh --stop
 ```
+
+AGFS 源码构建和启动方式见 [AGFS README](../agfs/README.md)。
 
 ---
 
@@ -49,35 +39,18 @@ pytest tests/contract/ -v
 ```bash
 pip install -e .[dev,sql]
 cp config/ogmem.reference.yaml config/ogmem.yaml
-# 编辑 ./ogmem.yaml 中的 storage.connection_string
+# 编辑 config/ogmem.yaml 中的 storage.connection_string
 ./scripts/start_sql.sh
 ```
 
 说明：
 - 该脚本不会启动 AGFS，只启动 ContextEngine HTTP 服务。
-- PostgreSQL 参数放在仓库根目录 `./ogmem.yaml` 的 `storage.connection_string`。
+- PostgreSQL 参数放在 `config/ogmem.yaml` 的 `storage.connection_string`。
 - 如需自定义配置文件路径，可设置 `OGMEM_CONFIG=/path/to/config.yaml`；YAML 未填写的字段才会回退到环境变量。
 - 默认 `vector_db.type=memory`，避免额外依赖 Chroma 或 openGauss vector 扩展。
 - 默认 `llm.provider=mock`，避免依赖外部 LLM API。
-- 如需数据库向量索引，可在 `ogmem.yaml` 里把 `vector_db.type` 改成 `opengauss`，并设置 `vector_db.connection_string`。
+- 如需数据库向量索引，可在 `config/ogmem.yaml` 里把 `vector_db.type` 改成 `opengauss`，并设置 `vector_db.connection_string`。
 
-
-## 🧪 非 Mock 全链路（AGFS + OpenClaw Bridge）
-
-当你希望验证真实 AGFS + 真实 LLM（非 mock）时，可运行：
-
-```bash
-# 需要先启动 AGFS，并设置 OGMEM_API_KEY
-export AGFS_BASE_URL=http://localhost:1833
-export OGMEM_API_KEY=sk-...
-
-.venv/bin/python scripts/run_e2e_long_context_real.py
-```
-
-说明：
-- 该脚本会直接调用 `openclaw_context_engine_plugin/bridge/memory_api.py` 的 `bootstrap -> after_turn -> assemble` 生命周期。
-- 默认要求 `OGMEM_API_KEY`（非 mock）。如果仅用于连通性排查，可加 `--allow-mock-llm`。
-- 会额外尝试检测本机 `openclaw` CLI（若已安装则输出 `--version` 与 `doctor` 结果）。
 
 ## 🔥 压力测试
 
@@ -197,7 +170,7 @@ pytest tests/unit/index/test_outbox_worker.py -v
 
 ```bash
 cp config/ogmem.reference.yaml config/ogmem.yaml
-# 编辑 ./ogmem.yaml 中的 storage.connection_string
+# 编辑 config/ogmem.yaml 中的 storage.connection_string
 
 pytest tests/integration/test_sql_storage_backend.py -v
 ```
@@ -207,7 +180,7 @@ pytest tests/integration/test_sql_storage_backend.py -v
 - `SQLSessionArchiveStore` 真实会话归档
 - `SQLRelationStore` 真实关系边 round-trip
 
-该测试会优先读取 `TEST_SQL_CONNECTION_STRING`，其次读取 `SQL_CONNECTION_STRING`，最后读取 `./ogmem.yaml` 里的 `storage.connection_string`。三者都没有时会自动跳过。
+该测试会优先读取 `TEST_SQL_CONNECTION_STRING`，其次读取 `SQL_CONNECTION_STRING`，最后读取 `config/ogmem.yaml` 里的 `storage.connection_string`。三者都没有时会自动跳过。
 
 ---
 
@@ -242,9 +215,15 @@ curl http://localhost:1833/
 # 检查端口占用
 lsof -i :1833
 
-# 重启 AGFS
-killall agfs-server
-agfs-server -c ~/.agfs-config.yaml &
+# 构建并重启 AGFS
+make -C agfs build
+pkill -x agfs-server 2>/dev/null || true
+while lsof -ti :1833 >/dev/null 2>&1; do sleep 1; done
+mkdir -p .ogmem_data/agfs
+(
+  cd agfs
+  ./build/agfs-server -c config.yaml
+) &
 ```
 
 ### 测试超时

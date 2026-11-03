@@ -150,7 +150,7 @@ class CandidateMemory:
     """
     category: str  # Same as ContextNode.category
     owner_scope: str  # "user" | "agent"
-    routing_key: str  # slug or event_id candidate value
+    routing_key: str  # Stable logical key; occurrence nodes receive an allocated event ID
     abstract: str
     overview: str
     content: str
@@ -164,6 +164,19 @@ class CandidateMemory:
     attributed_speaker: str | None = None  # Who said this ('user' or speaker name)
     attribution_basis: str | None = None  # self_first_person | self_named | other_named
     provenance_ids: list[str] = field(default_factory=list)
+    object_name: str = ""  # Source name of the entity being matched
+    scope_ref: str = ""  # Identity namespace distinguishing subjects, not evidence provenance
+    target_uri: str = ""  # URI of the existing node selected for an update
+    expected_version: int | None = None  # Version read from target_uri for the update
+    legacy_routing_key: str = ""  # Previous validator's key for existing-node lookup
+    title: str = ""  # Source-grounded label for an event or case
+    complete_occurrence_context: bool = False  # Internal full snapshot: null context clears old metadata.
+    write_operation_id: str = ""  # Internal durable batch receipt; never an extraction-tool argument.
+    source_occurrence_id: str = ""  # Internal accepted source partition; never a tool argument.
+    verified_routing_aliases: list[str] = field(default_factory=list)
+    verified_object_aliases: list[str] = field(default_factory=list)
+    source_contexts: list[str] = field(default_factory=list)  # Internal complete extraction-span evidence.
+    node_draft_indices: list[int] = field(default_factory=list)  # Contributors in the durable draft checkpoint.
 
 
 class WriteAction:
@@ -257,6 +270,7 @@ class TypedQuery:
     owner_space: str | list[str] | None = None  # Further limit to user or agent scope
     intent: str | None = None  # RetrievalIntent value, for Layer 3 intent-aware retrieval
     resource_type: str | None = None  # RESOURCE subtype pre-filter (for example, "code")
+    memory_directories: list[str] | None = None  # URI type directories applied before candidate limits
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +315,7 @@ class SeedResult:
 
 @dataclass
 class LeafHit:
-    """L2 node produced by HierarchicalSearcher after recursive expansion."""
+    """L2 node produced by hierarchy expansion or direct L2 retrieval."""
     uri: str
     score: float
     level: int = 2
@@ -371,6 +385,8 @@ class RetrievalConfig:
     rrf_k: int = 60
     semantic_weight: float = 1.0
     lexical_weight: float = 1.0
+    expand_hierarchy: bool = True
+    include_agent_memories: bool = False
 
 
 # ---------------------------------------------------------------------------

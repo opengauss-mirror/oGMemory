@@ -1,276 +1,67 @@
-# ContextEngine 快速启动指南
+# 快速开始
 
-## 一键启动
+按部署方式选择入口。配置字段和环境变量见[配置参考](OGMEMORY_ENV.md)。
 
-```bash
-# 运行一键启动脚本
-./scripts/start_all.sh
-```
+## 本地开发
 
-该脚本会：
-1. 检查环境 (Python, Node.js, OpenClaw)
-2. 配置环境变量
-3. 安装 Python 依赖
-4. 启动 AGFS 服务
-5. 运行健康检查
-6. 验证记忆写入
-
-## 手动启动
-
-### 1. 启动 AGFS
+本地默认使用 SQL 存储。先准备可连接的 PostgreSQL 或 openGauss 数据库；数据库不会由本地向导创建。配置示例见 [SQL 直连最小本地启动](OGMEMORY_ENV.md#sql-直连最小本地启动)。
 
 ```bash
-# 方式一：使用一键启动脚本
-./scripts/start_all.sh
-
-# 方式二：手动启动
-cd agfs/agfs-server
-go build -o build/agfs-server
-./build/agfs-server -c config.yaml
+python -m pip install -e ".[dev]"
+ogmem onboard --mode local
+ogmem start local -d
+ogmem status
 ```
 
-### 2. 配置环境变量
+停止本地服务：
 
 ```bash
-# 复制环境变量模板
-cp config/env.example config/.env
-
-# 编辑 config/.env 文件，设置 OGMEM_API_KEY
-export OGMEM_API_KEY="sk-..."
-export AGFS_BASE_URL="http://localhost:1833"
+ogmem stop local
 ```
 
-### 3. 运行测试
+默认 SQL 模式只启动 ContextEngine，不管理 AGFS 或 IndexService。需要 AGFS 时按
+[AGFS README](../agfs/README.md) 启动；需要索引服务时单独执行 `ogmem start index -d`。
+配置文件生成在 `config/ogmem.yaml`，运行数据和日志默认位于 `.ogmem_data/`。
+
+## Docker Compose
+
+适合启动 openGauss、oGMemory HTTP/MCP 和 AGFS：
+
+- [Compose 部署指南](../deploy/compose/README_zh.md)
+- [配置目录说明](../config/README.md)
+
+## ARM64 一键部署
+
+适合在 ARM64 Linux 服务器创建独立实例：
+
+- [用户一键部署与体验指南](../deploy/user-quickstart/README_zh.md)
+- [记忆评测教程](testing/memory-evaluation-guide-zh.md#10-一键部署实例)
+
+## OpenClaw 源码部署
+
+需要直接运行 OpenClaw 和 oGMemory 时，按[源码部署教程](deployment/openclaw_context_engine_quickstart_zh.md)执行。
+
+## Docker 镜像部署
+
+需要构建或运行镜像时，按[Docker 部署说明](deployment/docker_deployment_guide.md)执行。
+
+## 客户端接入
+
+服务启动后，按客户端类型选择[集成总览](integrations/README.md)：
+
+- HTTP REST
+- Python API
+- MCP
+- Claude Code、Codex、OpenCode、OpenClaw、DeepSeek Harness、Hermes
+- LangChain Deep Agents
+
+## 验证
+
+基础单元测试：
 
 ```bash
-# 端到端测试
-pytest tests/integration/test_e2e_full_pipeline.py -v -s
-
-# 所有测试
-pytest tests/ -v
+pytest tests/unit -q
 ```
 
-## OpenClaw 集成
-
-### 安装插件
-
-```bash
-cd openclaw_context_engine_plugin
-npm install
-```
-
-### 配置 OpenClaw
-
-编辑 `~/.openclaw/openclaw.json`:
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "og-memory-context-engine"
-    },
-    "entries": {
-      "og-memory-context-engine": {
-        "enabled": true,
-        "config": {
-          "mode": "remote",
-          "memoryApiBaseUrl": "http://127.0.0.1:8090",
-          "prefetchEnabled": true,
-          "toolResultExternalizationEnabled": false,
-          "toolResultFirstViewExternalizationEnabled": true,
-          "toolResultFirstViewMinChars": 20000,
-          "semanticTurnMode": "user_message",
-          "compactTakeoverEnabled": true
-        }
-      }
-    }
-  }
-}
-```
-
-### 安装并启动
-
-```bash
-# 安装插件到 OpenClaw
-openclaw plugins install -l ./openclaw_context_engine_plugin
-
-# 重启 OpenClaw
-openclaw restart
-```
-
-### 验证
-
-```bash
-openclaw doctor
-```
-
-应该看到 `og-memory-context-engine` 作为活跃的 context engine。
-
-## 架构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      OpenClaw Gateway                       │
-│                                                               │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │         og-memory-context-engine Plugin              │   │
-│  │  ┌────────────┐        ┌────────────┐               │   │
-│  │  │ after_turn │        │  compose   │               │   │
-│  │  │  (写入)     │        │  (组装)     │               │   │
-│  │  └─────┬──────┘        └─────┬──────┘               │   │
-│  └────────┼──────────────────────┼──────────────────────┘   │
-│           │                      │                          │
-│           ▼                      ▼                          │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │            index.js HTTP bridge                       │   │
-│  │  (/prefetch, /compose, /after_turn, /compact)         │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    ContextEngine                           │
-│                                                               │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐      │
-│  │ MemoryWrite │   │ MemoryRead  │   │  AGFS       │      │
-│  │    API      │   │    API      │   │  Storage    │      │
-│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘      │
-│         │                 │                 │              │
-│         ▼                 ▼                 ▼              │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐      │
-│  │   LLM       │   │  Vector     │   │   LocalFS   │      │
-│  │ (Extraction)│   │  Index      │   │   / S3FS    │      │
-│  └─────────────┘   └─────────────┘   └─────────────┘      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 数据流
-
-### 写入路径 (after_turn)
-
-```
-OpenClaw messages
-    │
-    ▼
-afterTurn() → index.js → POST /api/v1/after_turn
-    │
-    ▼
-MemoryService.after_turn()
-    │
-    ├─→ Extraction (LLM) → CandidateMemory[]
-    │       │
-    │       ├─ extract_profile
-    │       ├─ extract_preference
-    │       ├─ extract_entity
-    │       ├─ extract_event
-    │       ├─ extract_case
-    │       ├─ extract_pattern
-    │       └─ extract_skill
-    │
-    ├─→ PolicyRouter → WritePlan
-    │
-    ├─→ ArchiveBuilder → ContextNode
-    │
-    ├─→ AGFSContextFS.write_node() → AGFS
-    │       │
-    │       ▼
-    │   /accounts/{account}/users/{user}/memories/{category}/{slug}
-    │       │
-    │       ├── content.md
-    │       ├── .abstract.md
-    │       ├── .overview.md
-    │       ├── .relations.json
-    │       └── .meta.json
-    │
-    └─→ OutboxEvent (异步索引)
-```
-
-### 检索路径 (compose)
-
-```
-OpenClaw assemble call
-    │
-    ▼
-index.js assemble()
-    │
-    ├─→ POST /api/v1/prefetch (可选)
-    │
-    ▼
-POST /api/v1/compose
-    │
-    ├─→ QueryPlanner → TypedQuery
-    │
-    ├─→ RetrievalPipeline + SessionTopicBuffer
-    │       │
-    │       ├─→ SeedRetriever (向量检索)
-    │       ├─→ HierarchicalSearcher (L0→L1→L2)
-    │       └─→ AssemblyService (排序/截断)
-    │
-    └─→ layered system messages
-```
-
-### 压缩路径 (compact)
-
-```
-OpenClaw compact call
-    │
-    ▼
-index.js compact()
-    │
-    ├─→ POST /api/v1/prepare_compaction
-    │       └─ 增量抽取并返回一次性 prepareToken
-    │
-    └─→ POST /api/v1/compact
-            └─ 同步提交/归档并返回压缩摘要
-```
-
-## 环境变量
-
-| 变量 | 必需 | 默认值 | 说明 |
-|------|------|--------|------|
-| `AGFS_BASE_URL` | ❌ | `http://localhost:1833` | AGFS 服务地址 |
-| `OGMEM_API_KEY` | ✅* | - | OpenAI API 密钥 |
-| `OGMEM_BASE_URL` | ❌ | `https://api.openai.com/v1` | API 地址 |
-| `CONTEXTENGINE_PROVIDER` | ❌ | `openai` | LLM 提供商 |
-| `VECTOR_DB_TYPE` | ❌ | `memory` | 向量数据库类型 |
-
-\* 如不设置，将使用 mock 模式 (无 LLM 调用)
-
-## 停止服务
-
-```bash
-# 停止 AGFS
-pkill -f agfs-server
-
-# 或使用保存的 PID
-kill $(cat .agfs_pid)
-```
-
-## 故障排查
-
-### AGFS 连接失败
-
-```bash
-curl http://localhost:1833/
-```
-
-### OpenAI API 调用失败
-
-检查 `.env` 文件中的 `OGMEM_API_KEY` 和 `OGMEM_BASE_URL`。
-
-### 记忆未写入
-
-查看 OpenClaw 日志：
-```bash
-openclaw logs --follow
-```
-
-### 测试验证
-
-```bash
-# 端到端测试
-pytest tests/integration/test_e2e_full_pipeline.py -v -s
-
-# Contract tests
-pytest tests/contract/ -v
-```
+Agent 插件、MCP、LoCoMO 和自备数据评测见[记忆评测教程](testing/memory-evaluation-guide-zh.md)。测试分层和流水线设计见
+[Jenkins 测试方案](testing/jenkins-test-strategy.md)。

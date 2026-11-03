@@ -3,6 +3,10 @@ version: "1.0"
 description: |
   Extract specific entities: people, places, organizations, objects.
   Call once per distinct entity mentioned.
+  Maintain a canonical factual description of that entity across conversations.
+  Keep identity, attributes and relationships; put individual occurrences in events.
+  Do not create a person dossier per session or copy dialogue, reactions and photo captions.
+  Retain concrete names and details relevant to the entity without duplicating quotations.
 directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/entities"
 filename_template: "{{ routing_key }}.md"
 operation_mode: upsert
@@ -20,11 +24,17 @@ fields:
   - name: overview
     type: string
     required: true
-    description: "Must include: entity type (person/place/org/object), key attributes, distinguishing features, relationships"
+    description: "Markdown '- ' bullets, one core fact per bullet: entity type, key attributes, distinguishing features and relationships. Summarize the whole entity, not just the latest session."
   - name: content
     type: string
     required: true
-    description: "Full detailed content"
+    description: >-
+      Markdown fact card: exactly one '# Display name' heading; optionally one brief introductory sentence;
+      then named '## ' sections containing '- ' fact bullets. Every section must contain facts.
+      Group identity, attributes and relationships under natural headings. Each bullet states one atomic fact.
+      Merge new facts into their existing sections and deduplicate. Preserve exact names, counts, dates,
+      titles, uncertainty and supported changes. Individual occurrences belong in events.
+      Source evidence remains in provenance. Paragraph bodies and chronological session recaps violate this format.
   - name: confidence
     type: number
     required: true

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import server.app as app_module
 import server.memory_viewer as memory_viewer_module
 from commit.code_resource_events import build_code_resource_write_event
@@ -409,16 +411,19 @@ def test_memory_viewer_public_listing_reads_one_bounded_page(monkeypatch):
         calls.append((limit, cursor))
         return (
             [
-                {
-                    "uri": "ogmemory://memories/event/first",
-                    "type": "event",
-                    "id": "first",
-                }
+                (
+                    "ogmemory://memories/event/first",
+                    {
+                        "uri": "ogmemory://memories/event/first",
+                        "type": "event",
+                        "id": "first",
+                    },
+                )
             ],
             False,
         )
 
-    monkeypatch.setattr(memory_viewer_module, "_list_memory_nodes_page", list_page)
+    monkeypatch.setattr(memory_viewer_module, "_list_memory_node_entries_page", list_page)
 
     response = app_module.app.test_client().get(
         "/api/v1/memories",
@@ -942,6 +947,71 @@ def test_memory_viewer_admin_hierarchy_and_targets(monkeypatch):
     )
 
 
+def test_memory_viewer_inventory_matches_directories_and_account_scope(monkeypatch):
+    class InventoryService(_RootService):
+        def get_tenant_admin_service(self):
+            return SimpleNamespace(
+                list_accounts=lambda ctx: {"accounts": [
+                    {"account_id": "acct"}, {"account_id": "other"},
+                ]},
+                list_users=lambda ctx, account_id: {"users": [
+                    {"user_id": "alice", "role": "user"},
+                ]},
+                list_agents=lambda ctx, account_id: {"agents": [
+                    {"agent_id": "helper", "owner_user_id": "alice"},
+                ]},
+            )
+
+        def list_published_skills(self, ctx, *, limit=100, cursor=None, source=None):
+            return {"skills": [{"name": "check", "source": "generated"}], "truncated": False}
+
+    service = InventoryService()
+    service.context_fs = SimpleNamespace(count_memory_children=lambda ctx: {
+        f"ctx://{ctx.account_id}/users/alice/memories/profile": 1,
+        f"ctx://{ctx.account_id}/users/alice/memories/events": 130,
+        f"ctx://{ctx.account_id}/agents/helper/memories/tools": 2,
+        f"ctx://{ctx.account_id}/users/hidden/memories/events": 99,
+    })
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    result = client.get(
+        "/api/v1/memory-viewer/inventory", query_string={"accountId": "other"},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert result.status_code == 200
+    data = result.get_json()
+    assert data["account_id"] == "other"
+    assert data["memories"] == 133
+    assert data["skills"] == 1
+    assert data["directories"]["ctx://other/users/alice/memories/events"] == 130
+    assert "ctx://other/users/hidden/memories/events" not in data["directories"]
+
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+    denied = client.get(
+        "/api/v1/memory-viewer/inventory", query_string={"accountId": "other"},
+        headers={"X-API-Key": "admin-key"},
+    )
+    assert denied.status_code in {403, 404}
+
+
+def test_memory_viewer_inventory_scopes_public_user(monkeypatch):
+    service = _Service()
+    service.context_fs = SimpleNamespace(count_memory_children=lambda ctx: {
+        "ctx://acct/users/alice/memories/profile": 1,
+        "ctx://acct/agents/agent/memories/tools": 3,
+        "ctx://acct/users/bob/memories/events": 80,
+    })
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get("/api/v1/memory-viewer/inventory")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["memories"] == 4
+    assert body["skills"] == 1
+    assert "ctx://acct/users/bob/memories/events" not in body["directories"]
+
+
 def test_memory_viewer_filters_skill_source(monkeypatch):
     service = _AdminService()
 
@@ -1040,3 +1110,53 @@ def test_memory_viewer_admin_memories_uses_bounded_cursor_page(monkeypatch):
             "ctx://acct/users/alice/memories/events/memory-09",
         )
     ]
+
+
+@pytest.mark.parametrize("admin,typed", [(False, False), (False, True), (True, True)])
+def test_memory_viewer_pages_legacy_and_unicode_names(monkeypatch, admin, typed):
+    service = _AdminService() if admin else _Service()
+    names = ["%E6%9D%8E%E9%9B%B7", "atlas", "李雷"]
+    nodes = [
+        SimpleNamespace(
+            uri=f"ctx://acct/users/alice/memories/entities/{name}",
+            category="entity", abstract=name, content="", metadata={},
+        )
+        for name in names
+    ]
+
+    class PagedContextFS(_ContextFS):
+        def exists(self, uri, ctx):
+            return any(node.uri == uri for node in nodes)
+
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            if not uri.endswith("/memories/entities"):
+                return []
+            return [node for node in nodes if after_uri is None or node.uri > after_uri][:limit]
+
+    service.context_fs = PagedContextFS(service.node)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    path = "/api/v1/memory-viewer/admin/memories" if admin else "/api/v1/memories"
+    query = {"limit": 1}
+    if typed:
+        query["type"] = "entity"
+    if admin:
+        query.update(accountId="acct", userId="alice")
+    headers = {"X-API-Key": "admin-key"} if admin else {}
+
+    seen = []
+    cursors = []
+    for page_index in range(len(names)):
+        response = client.get(path, query_string=query, headers=headers)
+        assert response.status_code == 200, response.get_json()
+        body = response.get_json()
+        seen.extend(item["id"] for item in body["memories"])
+        if typed and page_index == 0:
+            assert body["memories"][0]["context_uri"].endswith("/%E6%9D%8E%E9%9B%B7")
+        if not body["truncated"]:
+            break
+        cursors.append(body["next_cursor"])
+        query["cursor"] = body["next_cursor"]
+
+    assert seen == ["李雷", "atlas", "李雷"]
+    assert len(cursors) == len(set(cursors))

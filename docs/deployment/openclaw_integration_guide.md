@@ -108,7 +108,7 @@ docker run -d \
   -v /data2/miniconda:/data2/miniconda:ro \
   -v /home/sundechao/.local:/home/sundechao/.local:ro \
   -v /data1/sundechao/ogmem/openclaw-home:/home/node/.openclaw \
-  -v /data1/sundechao/ogmem/oG-Memory/openclaw_context_engine_plugin:/app/extensions/og-memory-context-engine \
+  -v /data1/sundechao/ogmem/oG-Memory/plugins/openclaw:/app/extensions/og-memory-context-engine \
   -v /data1/sundechao/ogmem/oG-Memory:/data1/sundechao/ogmem/oG-Memory \
   -e OPENCLAW_GATEWAY_TOKEN=test-token-123 \
   -e OGMEM_MODE=local \

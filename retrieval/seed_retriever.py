@@ -1,8 +1,8 @@
 """Stage 2 — Seed retriever.
 
-Performs a global vector search across all levels (L0/L2), optionally
+Performs a global L0/L1/L2 vector search, or L2-only without expansion, optionally
 augmented with BM25 keyword search via Vector-Anchored Fusion.
-Splits results into starting_points (L0) and initial_candidates (L2).
+Splits results into starting_points (L0/L1) and initial_candidates (L2).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from core.models import (
     TypedQuery,
 )
 from retrieval.candidate_pool import candidate_top_k
+from retrieval.identity import memory_identity
 from retrieval.owner_scope import allowed_owner_space_filter, visible_agent_ids
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class RetrievalConfigError(RuntimeError):
 
 
 class SeedRetriever:
-    """Global L0+L2 search with optional BM25 hybrid fusion."""
+    """Global search with optional BM25 hybrid fusion and direct L2 mode."""
 
     def __init__(
         self,
@@ -66,9 +67,13 @@ class SeedRetriever:
         if semantic_enabled:
             # Root URIs are the hierarchical seeds _merge_starting_points
             # walks; they do not depend on the embedder, so compute them
-            # unconditionally — an embedder failure degrades the vector
-            # search, not the root starting points.
-            root_uris = self._get_root_uris(typed_query.context_type, ctx)
+            # unconditionally (when hierarchy expansion is enabled) — an
+            # embedder failure degrades the vector search, not the root
+            # starting points.
+            root_uris = (
+                self._get_root_uris(typed_query.context_type, ctx)
+                if self.config.expand_hierarchy else []
+            )
             try:
                 query_vector = self.embedder.embed_texts([typed_query.text])[0]
             except Exception as exc:
@@ -148,6 +153,12 @@ class SeedRetriever:
                         global_results, bm25_results
                     )
 
+        if not self.config.expand_hierarchy:
+            return SeedResult(
+                initial_candidates=[hit for hit in global_results if hit.level == 2],
+                query_vector=query_vector,
+            )
+
         starting_points, initial_candidates = self._merge_starting_points(
             root_uris, global_results,
         )
@@ -195,7 +206,7 @@ class SeedRetriever:
         ctx: RequestContext,
     ) -> list[SeedHit]:
         filters = {
-            "level": [0, 1, 2],
+            "level": [0, 1, 2] if self.config.expand_hierarchy else 2,
             **self._search_filters(typed_query, ctx),
         }
 
@@ -236,6 +247,8 @@ class SeedRetriever:
             filters["owner_space"] = owner_space
         if typed_query.categories:
             filters["category"] = typed_query.categories
+        if typed_query.memory_directories is not None:
+            filters["memory_directory"] = typed_query.memory_directories
         return filters
 
     def _bm25_search(
@@ -248,12 +261,17 @@ class SeedRetriever:
         lexical_only = (
             self.config.hybrid_enabled and self.config.semantic_weight <= 0
         )
-        if lexical_only:
+        l2_only = lexical_only or not self.config.expand_hierarchy
+        if l2_only:
             filters["level"] = 2
 
         supported_filters = frozenset(
             getattr(self.bm25_index, "supported_filters", filters)
         )
+        if "memory_directory" in filters and "memory_directory" not in supported_filters:
+            raise RuntimeError("typed memory retrieval requires a lexical provider with a memory_directory filter")
+        if not self.config.expand_hierarchy and "level" not in supported_filters:
+            raise RuntimeError("direct L2 retrieval requires a lexical provider with a level filter")
         if self.config.hybrid_enabled and not {
             "account_id", "owner_space"
         }.issubset(supported_filters):
@@ -280,9 +298,9 @@ class SeedRetriever:
         for h in bm25_hits:
             meta = h.metadata
             metadata = dict(meta or {})
+            if l2_only and int(metadata.get("level", 2)) != 2:
+                continue
             if self.config.hybrid_enabled:
-                if lexical_only and int(metadata.get("level", 2)) != 2:
-                    continue
                 if metadata.get("account_id") != ctx.account_id:
                     logger.warning("Discarded lexical result outside account scope")
                     continue
@@ -344,19 +362,21 @@ class SeedRetriever:
             alpha: Weight for vector score (default 0.7 = 70% vector)
             saturation_k: BM25 saturation constant (default 5.0)
         """
-        # Index vector hits by URI
-        fused: dict[str, SeedHit] = {}
-        vec_scores: dict[str, float] = {}
-        bm25_scores: dict[str, float] = {}
+        # Fuse matching nodes or units within the same layer.
+        fused: dict[tuple[str, str, int], SeedHit] = {}
+        vec_scores: dict[tuple[str, str, int], float] = {}
+        bm25_scores: dict[tuple[str, str, int], float] = {}
 
         for hit in vector_hits:
-            fused[hit.uri] = hit
-            vec_scores[hit.uri] = hit.score
+            key = (*memory_identity(hit.uri, hit.metadata), hit.level)
+            fused[key] = hit
+            vec_scores[key] = hit.score
 
         for hit in bm25_hits:
-            bm25_scores[hit.uri] = hit.metadata.get("_bm25_raw_score", 0.0)
-            if hit.uri not in fused:
-                fused[hit.uri] = hit
+            key = (*memory_identity(hit.uri, hit.metadata), hit.level)
+            bm25_scores[key] = hit.metadata.get("_bm25_raw_score", 0.0)
+            if key not in fused:
+                fused[key] = hit
 
         if not fused:
             return []
@@ -406,18 +426,18 @@ class SeedRetriever:
         """Fuse heterogeneous result rankings with weighted reciprocal rank."""
         if rrf_k <= 0:
             raise ValueError("rrf_k must be positive")
-        hits: dict[tuple[str, int], SeedHit] = {}
-        scores: dict[tuple[str, int], float] = {}
-        ranks: dict[tuple[str, int], dict[str, int]] = {}
+        hits: dict[tuple[str, str, int], SeedHit] = {}
+        scores: dict[tuple[str, str, int], float] = {}
+        ranks: dict[tuple[str, str, int], dict[str, int]] = {}
         for path, path_hits, weight in (
             ("semantic", vector_hits, semantic_weight),
             ("lexical", lexical_hits, lexical_weight),
         ):
             if weight <= 0:
                 continue
-            seen: set[tuple[str, int]] = set()
+            seen: set[tuple[str, str, int]] = set()
             for rank, hit in enumerate(path_hits, start=1):
-                key = (hit.uri, hit.level)
+                key = (*memory_identity(hit.uri, hit.metadata), hit.level)
                 if not hit.uri or key in seen:
                     continue
                 seen.add(key)

@@ -74,6 +74,48 @@ def _store():
     return AGFSTraceEventStore(client=_MemoryAGFS(), mount_prefix="/local")
 
 
+def test_compaction_rebuilds_legacy_sample_checkpoint_from_full_trace():
+    from skills.sanitizer import StreamingTraceSanitizer
+    from skills.sedimentation import SkillSedimentationService
+    from skills.trace_compaction import TraceEvidenceCompactor
+    from tests.unit.skills.test_sedimentation import FakeFS, FakeLLM, _settings
+
+    store = AGFSTraceEventStore(client=_MemoryAGFS(), max_turn_events=4)
+    common = {"account_id": "acct", "owner_space": "user:alice", "agent_id": "bot", "session_id": "upgrade"}
+    events = [
+        {"event_type": "user_message", "prompt": "Read and verify."},
+        {"event_type": "tool_start", "tool_name": "read_file", "tool_use_id": "a"},
+        {"event_type": "tool_success", "tool_name": "read_file", "tool_use_id": "a", "tool_response": "Read."},
+        {"event_type": "tool_start", "tool_name": "verify_file", "tool_use_id": "b"},
+        {"event_type": "tool_success", "tool_name": "verify_file", "tool_use_id": "b", "tool_response": "Verified."},
+        {"event_type": "turn_end", "assistant_message": "File verified."},
+    ]
+    for index, event in enumerate(events):
+        saved = store.insert(**common, event_id=str(index), hook_type=event["event_type"], content=event)
+    finalized = store.finalize_session(**common, stop_event_index=saved["event_index"])
+    store.enqueue_skill_candidate_from_trace(account_id="acct", agent_id="bot", session_id="upgrade",
+                                            turn_id=finalized["turn_id"], trace_uri=finalized["uri"])
+    turn = store.claim_skill_candidates(account_id="acct", worker_id="worker", limit=1, lease_seconds=60)[0]
+    retained = store._read_state("acct", collections=("turns",), session_id="upgrade")["turns"][turn["uri"]]
+    sanitizer = StreamingTraceSanitizer(allow_failed=True)
+    compactor = TraceEvidenceCompactor(max_chars=_settings().max_trace_chars)
+    for ordinal, event in enumerate(retained["content"][:2], start=1):
+        compactor.feed(ordinal=ordinal, raw_event=event, sanitized_event=sanitizer.feed(event))
+    checkpoint = compactor.checkpoint(sanitizer=sanitizer.checkpoint(), done=False)
+    checkpoint["policy_version"] = 3
+    assert store.save_skill_compaction_checkpoint(account_id="acct", uri=turn["uri"], worker_id="worker",
+                                                  checkpoint=checkpoint, lease_seconds=60)
+    turn["assessment"] = {"compaction": checkpoint}
+    service = SkillSedimentationService(trace_store=store, context_fs=FakeFS(), assessor_llm=FakeLLM([]),
+                                       reviewer_llm=FakeLLM([]), settings=_settings())
+
+    trace, metrics = service._load_trace_evidence(turn, "worker", lambda: False)
+
+    assert trace.tools == {"read_file", "verify_file"}
+    assert metrics["compaction_resume_count"] == 0
+    assert trace.events[-1]["assistant_message"] == "File verified."
+
+
 def test_finalize_session_treats_missing_agfs_directory_as_empty():
     store = AGFSTraceEventStore(client=_StrictMemoryAGFS(), mount_prefix="/local")
     common = {

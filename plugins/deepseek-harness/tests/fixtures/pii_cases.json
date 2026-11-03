@@ -1,0 +1,242 @@
+[
+  {
+    "name": "numeric card",
+    "input": {
+      "card_number": 4111111111111111
+    },
+    "expected": {
+      "card_number": "[REDACTED_PHONE]"
+    }
+  },
+  {
+    "name": "numeric phone",
+    "input": {
+      "phone": 13800138000
+    },
+    "expected": {
+      "phone": "[REDACTED_PHONE]"
+    }
+  },
+  {
+    "name": "email",
+    "input": {
+      "email": "alice@example.com"
+    },
+    "expected": {
+      "email": "[REDACTED_EMAIL]"
+    }
+  },
+  {
+    "name": "string card",
+    "input": {
+      "card_number": "4111111111111111"
+    },
+    "expected": {
+      "card_number": "[REDACTED_PHONE]"
+    }
+  },
+  {
+    "name": "string phone",
+    "input": {
+      "phone": "13800138000"
+    },
+    "expected": {
+      "phone": "[REDACTED_PHONE]"
+    }
+  },
+  {
+    "name": "nested values",
+    "input": {
+      "values": [
+        4111111111111111,
+        "alice@example.com",
+        {
+          "phone": 13800138000
+        }
+      ],
+      "counts": [
+        3,
+        2.5,
+        true,
+        null
+      ]
+    },
+    "expected": {
+      "values": [
+        "[REDACTED_PHONE]",
+        "[REDACTED_EMAIL]",
+        {
+          "phone": "[REDACTED_PHONE]"
+        }
+      ],
+      "counts": [
+        3,
+        2.5,
+        true,
+        null
+      ]
+    }
+  },
+  {
+    "name": "standalone Bearer",
+    "input": "Bearer abcdefghijklmnop",
+    "expected": "Bearer [REDACTED]"
+  },
+  {
+    "name": "GitLab token",
+    "input": "glpat-abcdefghijklmnop",
+    "expected": "[REDACTED_TOKEN]"
+  },
+  {
+    "name": "Slack token",
+    "input": "xoxb-abcdefghijklmnop",
+    "expected": "[REDACTED_TOKEN]"
+  },
+  {
+    "name": "GitHub OAuth token",
+    "input": "gho_abcdefghijklmnop",
+    "expected": "[REDACTED_TOKEN]"
+  },
+  {
+    "name": "IPv4",
+    "input": "203.0.113.42",
+    "expected": "[REDACTED_IP]"
+  },
+  {
+    "name": "IPv6",
+    "input": "2001:db8::1",
+    "expected": "[REDACTED_IP]"
+  },
+  {
+    "name": "IPv4 mapped IPv6",
+    "input": "::ffff:192.0.2.128",
+    "expected": "[REDACTED_IP]"
+  },
+  {
+    "name": "nested credentials and IP",
+    "input": {
+      "values": [
+        "Bearer abcdefghijklmnop",
+        "glpat-abcdefghijklmnop",
+        "xoxb-abcdefghijklmnop",
+        "gho_abcdefghijklmnop",
+        "203.0.113.42",
+        "2001:db8::1",
+        "::ffff:192.0.2.128"
+      ]
+    },
+    "expected": {
+      "values": [
+        "Bearer [REDACTED]",
+        "[REDACTED_TOKEN]",
+        "[REDACTED_TOKEN]",
+        "[REDACTED_TOKEN]",
+        "[REDACTED_IP]",
+        "[REDACTED_IP]",
+        "[REDACTED_IP]"
+      ]
+    }
+  },
+  {
+    "name": "private mapping keys",
+    "input": {
+      "alice@example.com": "admin",
+      "203.0.113.42": "host",
+      "glpat-abcdefghijklmnop": "token"
+    },
+    "expected": {
+      "[REDACTED_EMAIL]": "admin",
+      "[REDACTED_IP]": "host",
+      "[REDACTED_TOKEN]": "token"
+    }
+  },
+  {
+    "name": "nested private mapping keys",
+    "input": {
+      "users": [
+        {
+          "alice@example.com": {
+            "2001:db8::1": "host"
+          }
+        }
+      ]
+    },
+    "expected": {
+      "users": [
+        {
+          "[REDACTED_EMAIL]": {
+            "[REDACTED_IP]": "host"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "token-only URL",
+    "input": "http://opaque-example@127.0.0.1/api",
+    "expected": "[REDACTED_CONNECTION_STRING]"
+  },
+  {
+    "name": "token-only URL JSON",
+    "input": {
+      "url": "http://opaque-example@127.0.0.1/api",
+      "label": "service"
+    },
+    "expected": {
+      "url": "[REDACTED_CONNECTION_STRING]",
+      "label": "service"
+    }
+  },
+  {
+    "name": "password URL JSON",
+    "input": {
+      "url": "postgresql://alice:hunter2@db.internal/app"
+    },
+    "expected": {
+      "url": "[REDACTED_CONNECTION_STRING]"
+    }
+  },
+  {
+    "name": "email key collision",
+    "input": {
+      "alice@example.com": "admin",
+      "bob@example.com": "reader"
+    },
+    "expected": {
+      "[REDACTED_EMAIL]": "admin",
+      "[REDACTED_EMAIL]_2": "reader"
+    }
+  },
+  {
+    "name": "nested key collision",
+    "input": {
+      "users": [
+        {
+          "203.0.113.1": "first",
+          "203.0.113.2": "second"
+        }
+      ]
+    },
+    "expected": {
+      "users": [
+        {
+          "[REDACTED_IP]": "first",
+          "[REDACTED_IP]_2": "second"
+        }
+      ]
+    }
+  },
+  {
+    "name": "existing suffix collision",
+    "input": {
+      "[REDACTED_EMAIL]_2": "existing",
+      "alice@example.com": "admin",
+      "bob@example.com": "reader"
+    },
+    "expected": {
+      "[REDACTED_EMAIL]_2": "existing",
+      "[REDACTED_EMAIL]": "admin",
+      "[REDACTED_EMAIL]_3": "reader"
+    }
+  }
+]

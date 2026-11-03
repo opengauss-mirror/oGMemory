@@ -1,0 +1,30 @@
+# Paths are relative to this file. Credentials are read from the environment.
+work_dir: ./work
+dataset: princeton-nlp/SWE-bench_Lite
+dataset_revision: main
+instances: [pylint-dev__pylint-5859] # Use all for the complete test split.
+arms: [baseline, sql]
+concurrency: 1
+model:
+  name: YOUR_MODEL_NAME # Required: choose a model supported by your Messages API endpoint.
+  base_url_env: ANTHROPIC_BASE_URL
+  api_key_env: ANTHROPIC_AUTH_TOKEN
+  claude: claude
+  max_turns: 60
+  timeout_seconds: 3600
+evaluation:
+  namespace: swebench
+  image_tag: latest
+  setup_timeout_seconds: 1800 # Reinstall the project after mounting its sources.
+  timeout_seconds: 1800
+ogmemory:
+  # SQL storage uses a fresh openGauss container per attempt. candidate_local
+  # builds request-local code vectors; it does not benchmark a persistent index.
+  opengauss_image: swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-lite:7.0.0lts
+  startup_timeout_seconds: 300
+  embedding:
+    provider: openai
+    model: ${SWE_EMBEDDING_MODEL}
+    base_url: ${SWE_EMBEDDING_BASE_URL}
+    api_key: ${SWE_EMBEDDING_API_KEY}
+  tool_output_filter: true

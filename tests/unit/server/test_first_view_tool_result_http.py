@@ -4,14 +4,14 @@ import importlib.util
 
 import pytest
 
-_HAS_FLASK = importlib.util.find_spec("flask") is not None
-pytestmark = pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
-
 from features.tool_result_externalization.store_local import (
     LocalToolResultArtifactStore,
 )
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
+
+_HAS_FLASK = importlib.util.find_spec("flask") is not None
+pytestmark = pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
 
 if _HAS_FLASK:
     import server.app as app_module
@@ -35,6 +35,7 @@ def test_first_view_http_rewrites_before_model_and_validates_identity(
         ),
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     )
+    monkeypatch.setattr(service, "_get_context_fs", lambda: None)
     monkeypatch.setattr(app_module, "_service", service)
     client = app_module.app.test_client()
     body = {

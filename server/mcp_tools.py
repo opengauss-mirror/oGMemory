@@ -8,16 +8,20 @@ import re
 import time
 from collections.abc import Mapping
 from typing import Any, Protocol
+from urllib.parse import quote, unquote
 
 from core.models import RetrievedBlock
 from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 from providers.token_tracker import request_usage_scope
+from retrieval.context_reader import project_memory_unit
+from retrieval.identity import memory_unit_key
 from retrieval.result_ranker import is_temporal_query
 from server.mcp_resources import (
     MEMORY_TYPES,
     external_id_from_uri,
     external_to_internal_uri_candidates,
     internal_to_external_uri,
+    iter_internal_uri_candidates,
     parse_ogmemory_uri,
     public_type_from_internal,
     render_resource,
@@ -30,6 +34,7 @@ from server.mcp_security import (
     raise_not_found_or_not_visible,
     with_untrusted_data_notice,
 )
+from server.mcp_trace import capture_write_trace
 from skills.artifact import canonical_skill_uri
 
 logger = logging.getLogger(__name__)
@@ -38,9 +43,41 @@ _FORBIDDEN_WRITE_FIELDS = {
     "type",
     "memory_type",
     "memory_id",
+    "category",
+    "context_type",
+    "owner_space",
+    "level",
+    "metadata",
     "uri",
     "abstract",
     "overview",
+    "owner_scope",
+    "routing_key",
+    "confidence",
+    "when",
+    "who",
+    "where",
+    "tool_stats",
+    "evidence_quote",
+    "attributed_speaker",
+    "attribution_basis",
+    "provenance_ids",
+    "object_name",
+    "scope_ref",
+    "target_uri",
+    "expected_version",
+    "legacy_routing_key",
+    "title",
+    "complete_occurrence_context",
+    "write_operation_id",
+    "source_occurrence_id",
+    "verified_routing_aliases",
+    "verified_object_aliases",
+    "source_contexts",
+    "node_draft_indices",
+}
+_WRITE_ARGUMENT_FIELDS = {
+    "session_id", "text", "messages", "agent_id", "client_request_id", "force_extract", "wait",
 }
 _REVIEWED_SKILL_NOTICE = (
     "This is a published Agent Skill from the oGMemory skill catalog. "
@@ -120,7 +157,7 @@ def list_memories(
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
     if cursor:
-        parsed_cursor = parse_ogmemory_uri(cursor)
+        parsed_cursor = parse_ogmemory_uri(cursor.partition("#")[0])
         if parsed_cursor.kind != "item" or parsed_cursor.memory_type == "skill":
             raise ValueError("cursor must reference an ogmemory:// memory item")
 
@@ -142,7 +179,7 @@ def list_memories(
         use_stdio_agent_default=True,
     )
     try:
-        memories, has_more = _list_memory_nodes_page(
+        entries, has_more = _list_memory_node_entries_page(
             service,
             ctx,
             limit=limit,
@@ -151,6 +188,7 @@ def list_memories(
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
+    memories = [summary for _, summary in entries]
     payload = {
         "memories": memories,
         "count": len(memories),
@@ -158,29 +196,31 @@ def list_memories(
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
     if has_more and memories:
-        payload["next_cursor"] = memories[-1]["uri"]
+        payload["next_cursor"] = _memory_list_cursor(entries[-1])
     return _truncate_memory_list_payload(
-        payload, _configured_max_response_chars(service)
+        payload, _configured_max_response_chars(service), entries
     )
 
 
-def _list_memory_nodes_page(
+def _list_memory_node_entries_page(
     service: Any,
     ctx: Any,
     *,
     limit: int,
     cursor: str | None,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[tuple[str, dict[str, Any]]], bool]:
     context_fs = service._get_context_fs()
-    candidates: list[dict[str, Any]] = []
+    order_key = getattr(context_fs, "list_node_order_key", lambda uri: uri)
+    candidates: list[tuple[str, dict[str, Any]]] = []
     fetch_limit = limit + 1
+    cursor_key = _memory_list_cursor_key(context_fs, cursor, ctx)
 
     def append_nodes(base_uri: str, external_prefix: str) -> None:
         after_uri = None
-        if cursor:
-            if cursor.startswith(external_prefix):
-                after_uri = f"{base_uri.rstrip('/')}/{cursor.removeprefix(external_prefix)}"
-            elif cursor > external_prefix:
+        if cursor_key:
+            if cursor_key.startswith(external_prefix):
+                after_uri = f"{base_uri.rstrip('/')}/{cursor_key.removeprefix(external_prefix)}"
+            elif cursor_key > external_prefix:
                 return
         if hasattr(context_fs, "list_node_summaries_page"):
             nodes = context_fs.list_node_summaries_page(
@@ -197,10 +237,10 @@ def _list_memory_nodes_page(
                 context_fs.read_node(child_uri, ctx)
                 for child_uri in child_uris[:fetch_limit]
             ]
-        summaries = (_memory_node_summary(node) for node in nodes)
-        candidates.extend(
-            summary for summary in summaries if cursor is None or summary["uri"] > cursor
-        )
+        for node in nodes:
+            sort_key = external_prefix + order_key(node.uri).rsplit("/", 1)[-1]
+            if cursor_key is None or sort_key > cursor_key:
+                candidates.append((sort_key, _memory_node_summary(node)))
 
     for memory_type, spec in MEMORY_TYPES.items():
         if memory_type == "skill":
@@ -208,12 +248,11 @@ def _list_memory_nodes_page(
         if memory_type == "profile":
             internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
             external_uri = "ogmemory://memories/profile/self"
-            if (cursor is None or external_uri > cursor) and context_fs.exists(
+            if (cursor_key is None or external_uri > cursor_key) and context_fs.exists(
                 internal_uri, ctx
             ):
-                candidates.append(
-                    _memory_node_summary(context_fs.read_node(internal_uri, ctx))
-                )
+                node = context_fs.read_node(internal_uri, ctx)
+                candidates.append((external_uri, _memory_node_summary(node)))
             continue
         if memory_type == "pattern":
             append_nodes(
@@ -236,8 +275,43 @@ def _list_memory_nodes_page(
             f"ogmemory://memories/{spec.public_type}/",
         )
 
-    candidates.sort(key=lambda memory: memory["uri"])
+    candidates.sort(key=lambda item: item[0])
     return candidates[:limit], len(candidates) > limit
+
+
+def _memory_list_cursor_key(context_fs: Any, cursor: str | None, ctx: Any) -> str | None:
+    if not cursor:
+        return None
+    public_cursor, separator, storage_hint = cursor.partition("#")
+    cursor_uris = external_to_internal_uri_candidates(public_cursor, ctx)
+    stored_cursor = cursor_uris[0]
+    if separator:
+        if not storage_hint.startswith("stored="):
+            raise ValueError("Invalid memory list cursor")
+        stored_name = unquote(storage_hint.removeprefix("stored="))
+        if unquote(stored_name) != parse_ogmemory_uri(public_cursor).memory_id:
+            raise ValueError("Invalid memory list cursor")
+        stored_cursor = f"{stored_cursor.rsplit('/', 1)[0]}/{stored_name}"
+    elif "%" in public_cursor.rsplit("/", 1)[-1]:
+        stored_cursor = next(
+            (uri for uri in iter_internal_uri_candidates(public_cursor, ctx, context_fs)
+             if context_fs.exists(uri, ctx)),
+            stored_cursor,
+        )
+    order_key = getattr(context_fs, "list_node_order_key", lambda uri: uri)
+    cursor_key = public_cursor.rsplit("/", 1)[0] + "/" + order_key(stored_cursor).rsplit("/", 1)[-1]
+    if public_cursor == "ogmemory://memories/profile/self":
+        return public_cursor
+    return cursor_key
+
+
+def _memory_list_cursor(entry: tuple[str, dict[str, Any]]) -> str:
+    sort_key, summary = entry
+    public_uri = summary["uri"]
+    stored_name = sort_key.rsplit("/", 1)[-1]
+    if stored_name == unquote(public_uri.rsplit("/", 1)[-1]):
+        return public_uri
+    return f"{public_uri}#stored={quote(stored_name, safe='')}"
 
 
 def _memory_node_summary(node: Any) -> dict[str, Any]:
@@ -440,6 +514,8 @@ def install_skill(
         resolved_identity=resolved_identity,
         use_stdio_agent_default=True,
     )
+    if path is not None and not allow_stdio_env_auth:
+        raise PermissionError("Skill path imports require trusted stdio; use data or archive_base64")
     return service.add_managed_skill(
         ctx,
         data,
@@ -480,6 +556,8 @@ def update_skill(
         resolved_identity=resolved_identity,
         use_stdio_agent_default=True,
     )
+    if path is not None and not allow_stdio_env_auth:
+        raise PermissionError("Skill path imports require trusted stdio; use data or archive_base64")
     return service.update_managed_skill(
         ctx,
         name,
@@ -982,6 +1060,7 @@ def query_memory(
     types: list[str] | None = None,
     top_k: int = 5,
     score_threshold: float | None = None,
+    use_scene: bool | None = None,
     session_id: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
@@ -995,6 +1074,8 @@ def query_memory(
     if top_k < 1 or top_k > 20:
         raise ValueError("top_k must be between 1 and 20")
 
+    if use_scene is not None and not isinstance(use_scene, bool):
+        raise ValueError("use_scene must be boolean")
     requested_types = types or []
     unknown = sorted(t for t in requested_types if t not in MEMORY_TYPES)
     if unknown:
@@ -1021,6 +1102,12 @@ def query_memory(
     )
     categories = [MEMORY_TYPES[t].internal_category for t in requested_types] or None
     search_top_k = _internal_search_top_k(service, query, top_k)
+    type_filters = {}
+    if categories and any(
+        spec.internal_category in categories and name not in requested_types
+        for name, spec in MEMORY_TYPES.items()
+    ):
+        type_filters["memory_directories"] = sorted({MEMORY_TYPES[t].directory for t in requested_types})
 
     try:
         with request_usage_scope(ctx):
@@ -1032,6 +1119,8 @@ def query_memory(
                 score_threshold=score_threshold,
                 include_debug=False,
                 fill_content_for_top_k=min(top_k, 3),
+                **type_filters,
+                **({"use_scene": use_scene} if use_scene is not None else {}),
             )
     except Exception as exc:
         recorder = getattr(service, "record_retrieval_metric", None)
@@ -1052,11 +1141,16 @@ def query_memory(
         raise
 
     hits = []
-    for hit in result.hits[:top_k]:
+    for hit in result.hits:
         try:
-            hits.append(_hit_to_public(hit))
+            row = _hit_to_public(hit)
         except ValueError:
             continue
+        if requested_types and row["type"] not in requested_types:
+            continue
+        hits.append(row)
+        if len(hits) == top_k:
+            break
 
     payload = {
         "request_id": result.request_id,
@@ -1137,6 +1231,7 @@ def read_memory(
     service: Any,
     *,
     uri: str,
+    unit_key: str | None = None,
     level: str = "all",
     max_chars: int = 12000,
     recover_original: bool = False,
@@ -1153,8 +1248,12 @@ def read_memory(
         raise ValueError("max_chars must be between 1 and 50000")
     if not isinstance(recover_original, bool):
         raise ValueError("recover_original must be a boolean")
+    if unit_key is not None and (not isinstance(unit_key, str) or not unit_key.strip()):
+        raise ValueError("unit_key must be a non-empty string")
 
     if recover_original:
+        if unit_key is not None:
+            raise ValueError("unit_key is not supported with recover_original")
         if level != "all":
             raise ValueError("level is not supported with recover_original")
         if not isinstance(uri, str) or not uri.strip():
@@ -1210,6 +1309,7 @@ def read_memory(
         {
             "uri": uri,
             "level": level,
+            "unit_key": unit_key,
             "max_chars": max_chars,
             "session_id": session_id,
             "agent_id": agent_id,
@@ -1226,6 +1326,11 @@ def read_memory(
         resolved_identity=resolved_identity,
     )
     parsed = parse_ogmemory_uri(uri)
+
+    if unit_key is not None and (parsed.kind != "item" or parsed.memory_type not in {
+        "tool_memory", "tool_evidence", "experience"
+    }):
+        raise ValueError("unit_key requires a Tool or Experience memory URI")
 
     if parsed.kind != "item":
         payload = render_resource(service, uri, ctx)
@@ -1253,9 +1358,11 @@ def read_memory(
         context_fs = service._get_context_fs()
         last_exc: Exception | None = None
         node = None
-        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+        for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
             try:
-                if hasattr(context_fs, "read_node_fields"):
+                needs_full_node = unit_key is not None or (
+                    level == "overview" and parsed.memory_type in {"tool_memory", "tool_evidence", "experience"})
+                if hasattr(context_fs, "read_node_fields") and not needs_full_node:
                     node = context_fs.read_node_fields(internal_uri, ctx, level)
                 else:
                     node = context_fs.read_node(internal_uri, ctx)
@@ -1268,6 +1375,11 @@ def read_memory(
             if last_exc is not None:
                 raise last_exc
             raise ValueError(f"URI does not reference a single memory: {uri}")
+        if unit_key is not None:
+            node = project_memory_unit(node, unit_key)
+        else:
+            from retrieval.context_reader import canonical_agent_node
+            node = canonical_agent_node(node)
         canonical_uri = internal_to_external_uri(node.uri, category=node.category)
         canonical_parsed = parse_ogmemory_uri(canonical_uri)
         payload = {
@@ -1276,12 +1388,19 @@ def read_memory(
             "id": canonical_parsed.memory_id,
             "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
         }
+        if unit_key is not None:
+            payload.update(unit_key=unit_key, unit_revision=node.metadata["unit_revision"])
         if level in {"abstract", "all"}:
             payload["abstract"] = node.abstract
         if level in {"overview", "all"}:
             payload["overview"] = node.overview
+        if level == "overview" and not node.overview and node.metadata.get("agent_memory_version") == 1:
+            payload["content"] = node.content
+            payload["level"] = "content"
         if level in {"content", "all"}:
             payload["content"] = node.content
+        if unit_key is not None or node.metadata.get("grounding"):
+            payload["grounding"] = node.metadata["grounding"]
         return _truncate_payload(payload, max_chars)
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
@@ -1329,7 +1448,8 @@ def delete_memory(
     try:
         last_exc: Exception | None = None
         result = None
-        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+        context_fs = getattr(service, "_get_context_fs", lambda: None)()
+        for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
             try:
                 result = service.forget_memory(
                     internal_uri,
@@ -1377,6 +1497,11 @@ def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
         row["overview"] = hit.overview
     if hit.content_excerpt:
         row["content_excerpt"] = hit.content_excerpt
+    if unit_key := memory_unit_key(hit.metadata):
+        row["unit_key"] = unit_key
+        for field in ("unit_revision", "grounding"):
+            if field in hit.metadata:
+                row[field] = hit.metadata[field]
     for field in ("when", "who", "where"):
         value = (hit.metadata or {}).get(field)
         if value:
@@ -1389,6 +1514,17 @@ def _internal_search_top_k(service: Any, query: str, requested_top_k: int) -> in
         return requested_top_k
     max_top_k = getattr(getattr(service.get_read_api(), "_cfg", None), "max_top_k", 50)
     return min(max_top_k, 50, max(requested_top_k * 3, 15))
+
+
+def _bounded_grounding(sources: list, max_chars: int) -> tuple[list, int]:
+    selected, used = [], 0
+    for source in sources:
+        cost = len(json.dumps(source, ensure_ascii=False))
+        if used + cost > max_chars:
+            break
+        selected.append(source)
+        used += cost
+    return selected, used
 
 
 def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -1404,6 +1540,10 @@ def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]
             else:
                 result[key] = value
                 remaining -= len(value)
+        elif key == "grounding" and isinstance(value, list):
+            result[key], used = _bounded_grounding(value, remaining)
+            remaining -= used
+            truncated = truncated or len(result[key]) < len(value)
         else:
             result[key] = value
     result["truncated"] = truncated
@@ -1428,8 +1568,13 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
                 row[field] = value[: max(0, remaining)]
                 truncated = True
                 remaining = 0
-                break
-            remaining -= len(value)
+            else:
+                remaining -= len(value)
+        if isinstance(row.get("grounding"), list):
+            sources = row["grounding"]
+            row["grounding"], used = _bounded_grounding(sources, remaining)
+            remaining -= used
+            truncated = truncated or len(row["grounding"]) < len(sources)
         truncated_hits.append(row)
     result["hits"] = truncated_hits
     result["truncated"] = truncated
@@ -1437,7 +1582,7 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
 
 
 def _truncate_memory_list_payload(
-    payload: dict[str, Any], max_chars: int
+    payload: dict[str, Any], max_chars: int, entries: list[tuple[str, dict[str, Any]]]
 ) -> dict[str, Any]:
     result = dict(payload)
     result.setdefault("truncated", False)
@@ -1453,11 +1598,11 @@ def _truncate_memory_list_payload(
         raise ValueError(
             "mcp_max_response_chars is too small for ogm_list_memories metadata"
         )
-    for memory in memories:
+    for memory, entry in zip(memories, entries):
         candidate = dict(result)
         candidate["memories"] = [*result["memories"], memory]
         candidate["count"] = len(candidate["memories"])
-        candidate["next_cursor"] = memory["uri"]
+        candidate["next_cursor"] = _memory_list_cursor(entry)
         if len(json.dumps(candidate, ensure_ascii=False, default=str)) > max_chars:
             break
         result = candidate
@@ -1584,23 +1729,24 @@ def _safe_inline_code_metadata(value: object, *, max_chars: int) -> str:
     return rendered[:max_chars]
 
 
-def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str]]:
+def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str, dict]]:
     raw_hits = result.get("evidence")
     if not isinstance(raw_hits, list):
         raw_hits = result.get("results")
     if not isinstance(raw_hits, list):
         return []
 
-    blocks: list[tuple[str, str]] = []
+    blocks: list[tuple[str, str, dict]] = []
     seen: set[tuple[str, int | None, int | None, str, str, str]] = set()
+    related_seen: set[str] = set()
     for raw_hit in raw_hits:
         if not isinstance(raw_hit, Mapping):
             continue
         path, start_line, end_line = _safe_code_hit_locator(raw_hit)
         if not path:
             continue
-        excerpt = str(raw_hit.get("excerpt") or raw_hit.get("content") or "").strip()
-        if not excerpt:
+        excerpt = str(raw_hit.get("excerpt") or raw_hit.get("content") or "").rstrip()
+        if not excerpt.strip():
             continue
         symbol = _safe_inline_code_metadata(raw_hit.get("symbol"), max_chars=200)
         signature = _safe_inline_code_metadata(raw_hit.get("signature"), max_chars=500)
@@ -1609,17 +1755,51 @@ def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str]]:
             continue
         seen.add(dedupe_key)
 
-        locator = path
-        if start_line is not None and end_line is not None:
-            locator = f"{path} (lines {start_line}-{end_line})"
+        # Keep the copyable edit locator separate from display metadata.
+        locator = "edit_target: " + json.dumps({"locator": path}, ensure_ascii=False)
         qualifiers = []
+        if start_line is not None and end_line is not None:
+            qualifiers.append(f"lines {start_line}-{end_line}")
         if symbol:
             qualifiers.append(f"symbol={symbol}")
         if signature and signature != symbol:
             qualifiers.append(f"signature={signature}")
         if qualifiers:
-            locator = f"{locator} {' '.join(qualifiers)}"
-        blocks.append((locator, excerpt))
+            locator = f"{locator}\n# {' '.join(qualifiers)}"
+        related = []
+        edges = raw_hit.get("graph_context")
+        for edge in edges if isinstance(edges, (list, tuple)) else ():
+            if len(related_seen) >= 3:
+                break
+            if not isinstance(edge, Mapping) or not isinstance(edge.get("target_locator"), str):
+                continue
+            if any(ord(c) < 32 or ord(c) == 127 for c in edge["target_locator"]):
+                continue
+            try:
+                root, file_path = _parse_code_edit_locator(edge["target_locator"])
+            except ValueError:
+                continue
+            target = f"{root}/{file_path}"
+            if target != path and target not in related_seen and len(target) <= 200:
+                related_seen.add(target)
+                related.append(target)
+        if related:
+            locator += "\n# related_files: " + json.dumps(related, ensure_ascii=False)
+        coverage = raw_hit.get("coverage")
+        safe_coverage = {}
+        if isinstance(coverage, Mapping):
+            for key in ("truncated", "implementation_complete"):
+                if type(coverage.get(key)) is bool:
+                    safe_coverage[key] = coverage[key]
+            def valid_range(value):
+                return (isinstance(value, (list, tuple)) and len(value) == 2
+                        and all(type(n) is int for n in value) and 0 < value[0] <= value[1])
+            if valid_range(coverage.get("source_lines")):
+                safe_coverage["source_lines"] = coverage["source_lines"]
+            ranges = coverage.get("read_lines")
+            if isinstance(ranges, (list, tuple)) and len(ranges) <= 2 and all(valid_range(v) for v in ranges):
+                safe_coverage["read_lines"] = ranges
+        blocks.append((locator, excerpt, safe_coverage))
     return blocks
 
 
@@ -1636,6 +1816,38 @@ def _clip_code_excerpt(excerpt: str, max_chars: int) -> str:
     )
 
 
+def _code_search_retry_hint(result: Mapping[str, Any]) -> str:
+    """Explain bounded empty searches using counts, never private source paths."""
+    diagnostics = result.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return ""
+    corpus = diagnostics.get("corpus") or {}
+    discovery = diagnostics.get("discovery") or {}
+    if not isinstance(corpus, Mapping) or not isinstance(discovery, Mapping):
+        return ""
+    hint = ""
+    if discovery.get("scope_path_count", 0) and corpus.get("files_scope_checked") == 0:
+        hint += (
+            "# no_files_in_scope: No source files were inspected under the requested scope. "
+            "scope.paths uses workspace-relative paths without the root slug shown in edit locators: "
+            "for locator ROOT/src/module.py use paths=['src/module.py']. "
+            "Check the path, or omit paths to search the registered workspace.\n"
+        )
+    if corpus.get("grep_term_count", 0) and corpus.get("files_scope_checked", 0) and not corpus.get("files_grep_matched"):
+        hint = (
+            "# no_same_file_grep_match: Within the files inspected, no file's source content contains all scope.grep_terms. "
+            "These are case-insensitive literal AND filters within one file, not alternative terms, regexes or semantic concepts. "
+            "Paths, metadata and generated summaries do not satisfy these filters. "
+            "Retry with one known literal, omit grep_terms, or search independent targets separately.\n"
+        )
+    if any(discovery.get(k) for k in ("pool_limit_reached", "file_limit_reached", "entry_limit_reached", "deadline_reached", "read_limit_reached")):
+        hint += (
+            "# bounded_search: Only a bounded candidate subset was inspected; zero hits do not prove "
+            "absence from the workspace. Retry with a more specific workspace-relative file or directory in scope.paths.\n"
+        )
+    return hint
+
+
 def _render_code_search_result(
     result: Mapping[str, Any],
     *,
@@ -1649,23 +1861,43 @@ def _render_code_search_result(
         status = "error"
     safe_query = " ".join(str(query or "").split())
     blocks = _code_search_hit_blocks(result)
+    retry_hint = _code_search_retry_hint(result) if not blocks else ""
 
-    # Reserve the fixed header with the largest possible shown-count width so
-    # adding blocks can never force a previously complete block over the cap.
-    reserved_header = (
-        f"# code_search status: {status}\n"
-        f"# query: {safe_query}\n"
-        f"# hit_count: {len(blocks)}\n"
-        f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
-    )
+    def header_for(count):
+        return (
+            f"# code_search status: {status}\n"
+            f"# query: {safe_query}\n"
+            f"# hit_count: {count}\n"
+            f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
+            f"{retry_hint}"
+        )
+
+    # Reserve the largest hit-count width before fitting blocks.
+    reserved_header = header_for(len(blocks))
     if len(reserved_header) >= max_chars:
         return reserved_header[:max_chars]
 
     selected: list[str] = []
     used = len(reserved_header)
-    for index, (locator, excerpt) in enumerate(blocks, start=1):
-        prefix = f"\n# hit {index}\n{locator}\n"
+    for index, (locator, excerpt, coverage) in enumerate(blocks, start=1):
+        def prefix_for(locator, coverage):
+            note = "# coverage: " + json.dumps(coverage, separators=(",", ":")) + "\n" if coverage else ""
+            return f"\n# hit {index}\n{locator}\n{note}"
+        prefix = prefix_for(locator, coverage)
         remaining = max_chars - used
+        if "\n# related_files:" in locator and len(prefix) + len(excerpt) > remaining:
+            locator = locator.split("\n# related_files:", 1)[0]
+            prefix = prefix_for(locator, coverage)
+        clipped = len(prefix) + len(excerpt) > remaining
+        if clipped:
+            # Transport truncation invalidates completeness and displayed line spans.
+            span = re.search(r"(?m)^# lines (\d+)-(\d+)", locator)
+            source_lines = coverage.get("source_lines") or ([int(n) for n in span.groups()] if span else None)
+            coverage = {"truncated": True}
+            if source_lines:
+                coverage["read_lines"] = [source_lines]
+            locator = re.sub(r"(?m)^# lines \d+-\d+ ?", "# ", locator)
+            prefix = prefix_for(locator, coverage)
         if remaining <= len(prefix):
             break
         clipped_excerpt = _clip_code_excerpt(excerpt, remaining - len(prefix))
@@ -1674,16 +1906,10 @@ def _render_code_search_result(
         block = prefix + clipped_excerpt
         selected.append(block)
         used += len(block)
-        if len(clipped_excerpt) < len(excerpt):
+        if clipped:
             break
 
-    header = (
-        f"# code_search status: {status}\n"
-        f"# query: {safe_query}\n"
-        f"# hit_count: {len(selected)}\n"
-        f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
-    )
-    rendered = header + "".join(selected)
+    rendered = header_for(len(selected)) + "".join(selected)
     return rendered[:max_chars]
 
 
@@ -1758,6 +1984,7 @@ def write_memory(
     if session_id is None or not session_id.strip():
         raise ValueError("session_id is required for write_memory")
     normalized_messages = _normalize_write_messages(text=text, messages=messages)
+    _validate_request_size(service, {"messages": messages or normalized_messages})
     _validate_request_size(
         service,
         {
@@ -1830,6 +2057,11 @@ def write_memory(
     )
 
     accepted_messages = len(normalized_messages) if accepted else 0
+    if accepted:
+        capture_write_trace(
+            service, ctx, messages or normalized_messages,
+            session_id=session_id, client_request_id=client_request_id,
+        )
     return {
         "ok": accepted,
         "status": result.get("status", "accepted"),
@@ -1843,12 +2075,18 @@ def write_memory(
     }
 
 
+def validate_write_arguments(arguments: Mapping[str, Any]) -> None:
+    unknown = sorted(set(arguments) - _WRITE_ARGUMENT_FIELDS)
+    if unknown:
+        raise ValueError(f"write_memory cannot set unsupported fields: {', '.join(unknown)}")
+
+
 def _normalize_write_messages(
     *,
     text: str | None,
     messages: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    if text and messages:
+    if text is not None and messages is not None:
         raise ValueError("Provide either text or messages, not both")
     if text is not None:
         if not text.strip():
@@ -1870,6 +2108,12 @@ def _normalize_write_messages(
         content = message.get("content")
         if role not in {"system", "user", "assistant", "tool"}:
             raise ValueError(f"messages[{index}].role must be system, user, assistant, or tool")
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False)
+        if not content and role == "assistant":
+            content = message.get("reasoning_content") or message.get("reasoning")
+            if not content and message.get("tool_calls"):
+                content = json.dumps(message["tool_calls"], ensure_ascii=False)
         if not isinstance(content, str) or not content.strip():
             raise ValueError(f"messages[{index}].content must be a non-empty string")
         normalized_message: dict[str, Any] = {"role": role, "content": content}

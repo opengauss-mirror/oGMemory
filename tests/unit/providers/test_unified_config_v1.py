@@ -194,6 +194,22 @@ def test_embedding_max_input_chars_defaults_to_legacy_limit():
     assert OgMemConfig().embedding_max_input_chars == 30_000
 
 
+def test_embedding_batch_size_loads_yaml_then_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("OGMEM_EMBEDDING_BATCH_SIZE", "4")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _: {"embedding": {"batch_size": 8}})
+    assert OgMemConfig.load("ignored.yaml").embedding_batch_size == 8
+    monkeypatch.setattr(uc, "_load_yaml", lambda _: {})
+    assert OgMemConfig.load("ignored.yaml").embedding_batch_size == 4
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, 2049])
+def test_embedding_batch_size_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="embedding_batch_size"):
+        OgMemConfig(embedding_batch_size=value)
+
+
 def test_embedding_max_input_chars_rejects_non_positive_values():
     with pytest.raises(ValueError, match="embedding_max_input_chars must be positive"):
         OgMemConfig(embedding_max_input_chars=0)

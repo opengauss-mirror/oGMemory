@@ -1,0 +1,54 @@
+llm:
+  provider: "${LLM_PROVIDER}"
+  api_key: "${LLM_API_KEY}"
+  base_url: "${LLM_BASE_URL}"
+  model: "${LLM_MODEL}"
+embedding:
+  provider: "${EMBEDDING_PROVIDER}"
+  api_key: "${EMBEDDING_API_KEY}"
+  base_url: "${EMBEDDING_BASE_URL}"
+  model: "${EMBEDDING_MODEL}"
+vector_db:
+  type: opengauss
+  # The runtime builds this DSN from OPENGAUSS_* with proper escaping.
+  connection_string: "host=opengauss port=5432 dbname=postgres user=gaussdb"
+  dimension: "${EMBEDDING_DIMENSION}"
+  table_name: vector_index
+  pool_size: 5
+storage:
+  backend: agfs
+agfs:
+  base_url: http://127.0.0.1:1833
+  mount_prefix: /local/plugin
+service:
+  http_port: 8090
+  workers: 1
+  threads: 2
+mcp:
+  enabled: "${OGMEM_MCP_ENABLED}"
+  host: 0.0.0.0
+  port: 8091
+  path: /mcp
+  default_toolset: read-write
+  enable_write_tools: true
+  enable_delete_tools: false
+  allowed_hosts: "${OGMEM_MCP_ALLOWED_HOSTS}"
+index:
+  interval: 15
+  workers: 1
+identity:
+  account_id: "${OG_ACCOUNT_ID}"
+  user_id: "${OG_USER_ID}"
+  agent_id: "${OG_AGENT_ID}"
+auth:
+  role_control_enabled: true
+  root_api_key: "${OG_ROOT_API_KEY}"
+  admin_api_keys:
+    - "${OG_ACCOUNT_ID}:${OG_TENANT_API_KEY}"
+memory:
+  after_turn_threshold: "${OGMEM_AFTER_TURN_THRESHOLD}"
+  rolling_compress_enabled: true
+
+# Agent 工具与经验记忆；开启步骤见 deploy/agent-memory.md。
+agent_memory:
+  enabled: false

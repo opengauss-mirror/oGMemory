@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from core.models import ContextNode, RequestContext, SeedHit
 from extraction.prefetch import MemoryPrefetcher
 from extraction.schemas.models import FieldType, MemoryTypeSchema, SchemaField
@@ -296,3 +298,70 @@ def test_prefetch_add_only_handles_empty_read_failure_and_list_failure():
     assert empty.messages == []
     assert read_failed.messages == []
     assert list_failed.messages == []
+
+@pytest.mark.parametrize('category,owner,directory', [
+    ('event', 'user:user', 'ctx://acct/users/user/memories/events'),
+    ('case', 'agent:agent', 'ctx://acct/agents/agent/memories/cases'),
+])
+@pytest.mark.parametrize('lazy', [False, True])
+def test_occurrence_prefetch_recalls_old_semantic_hit_before_recent_entries(category, owner, directory, lazy):
+    fs, vector, embedder = FakeFS(), FakeVectorIndex(), FakeEmbedder()
+    old = directory + '/a_old_inspection'
+    recent = [directory + f'/z_recent_{index:02}' for index in range(12)]
+    fs.children[directory] = [old, *recent]
+    for uri in fs.children[directory]:
+        node = _node(uri, category)
+        node.owner_space = owner
+        node.metadata = {'version': 3, 'scope_ref': 'Project A', 'when': '2026-09-01', 'who': 'Technician'}
+        fs.nodes[uri] = node
+    vector.hits = [SeedHit(uri=old + '/content.md', score=.9, category=category, abstract='old inspection', level=2)]
+    result = _prefetcher(fs, vector, embedder).prefetch_for_span([category], _ctx(), conversation_text='the earlier inspection', lazy=lazy)
+    assert old in result.listed_uris
+    assert len(result.listed_uris) == 10
+    assert vector.filters == {'category': category, 'account_id': 'acct', 'owner_space': owner}
+    assert embedder.queries == ['the earlier inspection']
+    if lazy:
+        assert result.uri_hints[0]['uri'] == old
+        assert result.read_uris == set()
+        assert result.read_versions == {}
+    else:
+        assert old in result.read_uris
+        assert result.read_versions[old] == 3
+        assert 'Content: ' + fs.nodes[old].content in result.messages[0]
+        assert 'Project A' in result.messages[0]
+
+
+def test_occurrence_prefetch_falls_back_when_search_fails_and_rejects_foreign_hits():
+    fs, vector, embedder = FakeFS(), FakeVectorIndex(), FakeEmbedder()
+    directory = 'ctx://acct/users/user/memories/events'
+    uri = directory + '/inspection'
+    fs.children[directory] = [uri]
+    fs.nodes[uri] = _node(uri, 'event')
+    vector.hits = [SeedHit(uri='ctx://other/users/user/memories/events/foreign', score=1, category='event', abstract='foreign', level=2)]
+    for index in (vector, FailingVectorIndex()):
+        result = _prefetcher(fs, index, embedder).prefetch_for_span(['event'], _ctx(), conversation_text='inspection')
+        assert result.read_uris == {uri}
+        assert result.listed_uris == {uri}
+
+
+def test_occurrence_prefetch_uses_valid_semantic_hits_when_listing_fails():
+    fs, vector = FailingFS(fail_list=True), FakeVectorIndex()
+    uri = 'ctx://acct/users/user/memories/events/inspection'
+    fs.nodes[uri] = _node(uri, 'event')
+    vector.hits = [SeedHit(uri=uri, score=.9, category='event', abstract='inspection', level=2)]
+    result = _prefetcher(fs, vector, FakeEmbedder()).prefetch_for_span(['event'], _ctx(), conversation_text='inspection')
+    assert result.read_uris == {uri}
+
+
+def test_occurrence_prefetch_stale_hits_do_not_consume_eager_slots():
+    fs, vector, embedder = FakeFS(), FakeVectorIndex(), FakeEmbedder()
+    directory = 'ctx://acct/users/user/memories/events'
+    uris = [directory + f'/inspection_{i:02}' for i in range(12)]
+    fs.children[directory] = uris
+    for uri in uris:
+        fs.nodes[uri] = _node(uri, 'event')
+    vector.hits = [SeedHit(uri=directory+'/removed', score=1, category='event', abstract='old', level=2)]
+    result = _prefetcher(fs, vector, embedder).prefetch_for_span(['event', 'case'], _ctx(), conversation_text='inspection')
+    assert len(result.read_uris) == 10
+    assert directory+'/removed' not in result.listed_uris
+    assert embedder.queries == ['inspection']

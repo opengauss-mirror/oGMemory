@@ -64,6 +64,21 @@ def test_insert_event_sends_notify(mock_sql_outbox_store):
     conn.commit.assert_called_once()
 
 
+def test_agent_memory_checkpoint_and_completion_receipt(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent("job-1", "EXTRACT_AGENT_MEMORY", "ctx://acme/agents/a/memories/agent_extraction/job-1",
+                        {"cursor": 32, "value_reviews": [{"memory_type": "tool", "decisions": []}]}, "PROCESSING")
+    store.save_payload(event)
+    sql, values = cursor.execute.call_args.args
+    assert "SET payload" in sql
+    assert values == (event.payload, event.event_id)
+    store.mark_done(event, event.uri)
+    sql, values = cursor.execute.call_args.args
+    assert "status = 'DONE'" in sql
+    assert values == ({"value_reviews": event.payload["value_reviews"]}, event.event_id)
+    assert conn.commit.call_count == 2
+
+
 def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
     created_at = datetime(2026, 4, 17, 10, 0, tzinfo=UTC)
@@ -94,7 +109,7 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     assert "earlier.status IN ('PENDING', 'PROCESSING')" in sql
     assert "FOR UPDATE OF candidate SKIP LOCKED" in sql
     assert "LIMIT %s" in sql
-    assert params == (42, 50, "worker-1")
+    assert params == (42, [], 50, "worker-1")
     conn.commit.assert_called_once()
 
 

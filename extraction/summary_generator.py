@@ -14,6 +14,7 @@ import json
 import logging
 from datetime import datetime
 
+from core.errors import LLMTransientError
 from core.models import CandidateMemory, RequestContext
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,9 @@ class SessionSummaryGenerator:
 
         Returns:
             Dict with structured summary fields, or None on failure.
+
+        Raises:
+            LLMTransientError: Temporary provider failure requiring recovery.
         """
         if not messages_text or not messages_text.strip():
             return None
@@ -116,6 +120,8 @@ class SessionSummaryGenerator:
             result = self._llm.complete_json(prompt, schema=SUMMARY_SCHEMA)
             if result and isinstance(result, dict):
                 return result
+        except LLMTransientError:
+            raise
         except Exception as exc:
             logger.warning("SessionSummaryGenerator failed: %s", exc)
 

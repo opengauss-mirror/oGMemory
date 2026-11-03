@@ -86,6 +86,7 @@ def test_directory_summary_write_path(monkeypatch, enabled, backend, atomic, act
     monkeypatch.setattr(service, "_get_shared_embedder", lambda: None)
     monkeypatch.setattr(service, "_start_outbox_worker", lambda: None)
     api = service.get_write_api()
+    api._writer._identity_resolver = None
     plan = WritePlan(action=action, target_uri=node.uri)
     api._writer._policy_router.plan = Mock(return_value=plan)
     api._writer._archive_builder.build = Mock(return_value=node)

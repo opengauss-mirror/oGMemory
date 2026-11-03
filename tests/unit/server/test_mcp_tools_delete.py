@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from urllib.parse import quote
+
 import pytest
 
 from core.models import RequestContext, Role
@@ -145,3 +148,32 @@ def test_delete_memory_maps_permission_errors_to_not_found_or_not_visible():
 
     with pytest.raises(MCPVisibilityError, match="not_found_or_not_visible"):
         delete_memory(service, uri="ogmemory://memories/preference/coding_style")
+
+
+@pytest.mark.parametrize("suffix", ["?view=content", "#content", "%00", "%2Fchild"])
+def test_delete_rejects_uri_suffixes_before_storage_mutation(suffix):
+    service = _FakeService()
+    with pytest.raises(ValueError):
+        delete_memory(service, uri="ogmemory://memories/preference/target" + suffix)
+    assert service.forget_calls == []
+
+
+@pytest.mark.parametrize("stored_name", [
+    "Mixed" + quote("历史", safe="").lower(),
+    "Mixed%E5%8e%86%e5%8F%B2",
+])
+def test_delete_resolves_historical_percent_escape_case(stored_name):
+    service = _FakeService()
+    base = "ctx://acct-1/users/alice/memories/preferences/"
+    stored_uri = base + stored_name
+    service.raise_by_uri = {
+        base + name: FileNotFoundError("missing")
+        for name in ("Mixed历史", quote("Mixed历史", safe=""), "Mixed" + quote("历史", safe="").lower())
+        if name != stored_name
+    }
+    service._get_context_fs = lambda: SimpleNamespace(list_children=lambda uri, ctx: [stored_uri])
+
+    payload = delete_memory(service, uri="ogmemory://memories/preference/" + quote("Mixed历史", safe=""))
+
+    assert payload["deleted"] is True
+    assert service.forget_calls[-1]["uri"] == stored_uri

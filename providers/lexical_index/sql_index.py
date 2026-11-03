@@ -42,7 +42,7 @@ _RESERVED = frozenset({
     "FROM",
     "WHERE",
 })
-_FILTER_COLUMNS = frozenset({"account_id", "owner_space", "context_type", "category", "level"})
+_FILTER_COLUMNS = frozenset({"account_id", "owner_space", "context_type", "category", "level", "memory_directory"})
 
 
 def _schema_lock_key(table_name: str) -> int:
@@ -1265,11 +1265,15 @@ class SQLNativeProjectionStore:
             if not values:
                 clauses.append("1=0")
                 continue
+            column = f"d.{key}"
+            if key == "memory_directory":
+                column = """CASE WHEN split_part(d.uri, '/', 6) = 'memories'
+                    THEN split_part(d.uri, '/', 7) ELSE split_part(d.uri, '/', 6) END"""
             if len(values) == 1:
-                clauses.append(f"d.{key}=%s")
+                clauses.append(f"{column}=%s")
                 params.append(values[0])
             else:
-                clauses.append(f"d.{key} IN ({','.join(['%s'] * len(values))})")
+                clauses.append(f"{column} IN ({','.join(['%s'] * len(values))})")
                 params.extend(values)
         if not clauses:
             clauses.append("1=1")

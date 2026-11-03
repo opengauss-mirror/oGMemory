@@ -1,0 +1,134 @@
+memory_type: tool
+version: '2.0'
+enabled: true
+owner_scope: agent
+directory: ctx://{{ account_id }}/agents/{{ agent_id }}/memories/tool_units
+filename_template: '{{ routing_key }}.md'
+operation_mode: upsert
+validation:
+  strict_routing_key: true
+description: Tool evidence units.
+extraction:
+  evidence_priority: current_outputs_then_inputs
+  maintenance: agent_units_v2
+  max_nodes_per_task: 8
+  prompt: Consider all supplied calls, arguments, results and errors from this tool.
+    Extract useful tool behavior, input requirements, result semantics, fetched document
+    or web facts, constraints and execution observations. Group independent knowledge
+    units under the supplied exact tool_name. Preserve each fact's source, project
+    and version applicability in its content. Ordinary successful calls can support
+    useful memory. Cite only this tool's captured evidence. Preserve exact project
+    facts, file paths, symbols, numbers, versions and applicable conditions when they
+    carry the knowledge. Distill the relevant information into title and content;
+    include reasons or boundaries only when supported. Reuse existing keys for equivalent
+    knowledge. Changed same-key content requires a correction reason. Explicit withdrawals
+    require current evidence. Ground every unit in one to four supplied source_id
+    references, optionally with wire line ranges. Return changes=[] when the evidence
+    adds no durable information.
+fields:
+- name: routing_key
+  type: string
+  required: true
+  json_schema:
+    type: string
+    minLength: 1
+    maxLength: 96
+    pattern: ^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$
+- name: tool_name
+  type: string
+  required: true
+  json_schema:
+    type: string
+    minLength: 1
+    maxLength: 240
+- name: units
+  type: array
+  required: true
+  json_schema:
+    type: array
+    maxItems: 6
+    items:
+      type: object
+      additionalProperties: false
+      required:
+      - key
+      - title
+      - content
+      - grounding
+      properties:
+        key: &id001
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[a-z][a-z0-9_-]*$
+        title:
+          type: string
+          minLength: 1
+          maxLength: 160
+        content:
+          type: string
+          minLength: 1
+          maxLength: 8000
+        grounding: &id002
+          type: array
+          minItems: 1
+          maxItems: 4
+          items:
+            type: object
+            additionalProperties: false
+            required:
+            - source_id
+            properties:
+              source_id:
+                type: string
+                minLength: 1
+                maxLength: 64
+              start_line:
+                type: integer
+                minimum: 1
+              end_line:
+                type: integer
+                minimum: 1
+            dependentRequired:
+              start_line:
+              - end_line
+              end_line:
+              - start_line
+- name: corrections
+  type: array
+  required: false
+  json_schema:
+    type: array
+    maxItems: 8
+    items:
+      type: object
+      additionalProperties: false
+      required:
+      - key
+      - reason
+      properties:
+        key: *id001
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 300
+- name: removals
+  type: array
+  required: false
+  json_schema:
+    type: array
+    maxItems: 8
+    items:
+      type: object
+      additionalProperties: false
+      required:
+      - key
+      - reason
+      - grounding
+      properties:
+        key: *id001
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 300
+        grounding: *id002

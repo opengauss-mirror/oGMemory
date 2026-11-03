@@ -1,0 +1,11 @@
+{
+  "id": "ogmemory",
+  "name": "oGMemory",
+  "version": "2.1.0",
+  "type": "general",
+  "description": "Automatic oGMemory recall, conversation persistence and canonical Agent Trace capture.",
+  "author": "oGMemory contributors",
+  "entry": {"backend": "plugin.py"},
+  "dependencies": ["httpx>=0.27.0"],
+  "qwenpaw_version": {"min": "2.1.0"}
+}

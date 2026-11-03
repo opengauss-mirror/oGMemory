@@ -28,7 +28,11 @@ def ctx() -> RequestContext:
 
 @pytest.fixture
 def service() -> MemoryService:
-    return MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    # These lifecycle tests intentionally exercise legacy in-memory writers.
+    # Durable first-turn reads are covered with real storage in recovery tests.
+    service._get_context_fs = Mock(return_value=None)
+    return service
 
 
 def _seed_buffer(service: MemoryService, ctx: RequestContext, session_id: str = "sess-compact"):
@@ -355,6 +359,7 @@ def test_after_turn_uses_configured_threshold_before_env(
 ):
     monkeypatch.setenv("OGMEM_AFTER_TURN_THRESHOLD", "1")
     service = MemoryService(config=OgMemConfig(after_turn_threshold=999999))
+    service._get_context_fs = Mock(return_value=None)
     service.get_write_api = Mock(
         side_effect=AssertionError("after_turn should still be accumulating")
     )
@@ -1250,7 +1255,7 @@ class TestAfterTurnDedup:
 
 def test_openclaw_plugin_manifest_exposes_compaction_config_schema():
     repo_root = Path(__file__).resolve().parents[3]
-    manifest_path = repo_root / "openclaw_context_engine_plugin" / "openclaw.plugin.json"
+    manifest_path = repo_root / "plugins/openclaw" / "openclaw.plugin.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     props = manifest["configSchema"]["properties"]
 

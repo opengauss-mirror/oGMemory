@@ -8,9 +8,23 @@ import server.app as app_module
 class _Service:
     def __init__(self):
         self.shutdown_calls = 0
+        self.recovery_starts = 0
+
+    def start_extraction_recovery(self):
+        self.recovery_starts += 1
 
     def shutdown(self):
         self.shutdown_calls += 1
+
+
+def test_gunicorn_worker_starts_recovery_once(monkeypatch):
+    from server.gunicorn_config import post_worker_init
+    service = _Service()
+    monkeypatch.setattr(app_module, "_service", None)
+    monkeypatch.setattr(app_module, "MemoryService", lambda config: service)
+    post_worker_init(None)
+    assert app_module._get_service() is service
+    assert service.recovery_starts == 1
 
 
 def test_shutdown_service_closes_initialized_service_once(monkeypatch):

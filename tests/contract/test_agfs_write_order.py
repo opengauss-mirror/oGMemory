@@ -3,7 +3,7 @@
 Phase 0 frozen — verifies the 4-step atomic write order convention matches
 the Repair Job's branch logic for detecting and repairing incomplete writes.
 
-See docs/agfs_directory_spec.md for full specification.
+See docs/architecture/agfs-directory-spec.md for full specification.
 """
 
 import pytest

@@ -101,7 +101,7 @@ def test_run_once_uses_batch_claim_when_supported(monkeypatch):
 
     stats = worker.run_once(store, ["acct-1"], worker_id="worker-2")
 
-    store.claim_batch.assert_called_once_with(worker_id="worker-2")
+    store.claim_batch.assert_called_once_with(worker_id="worker-2", exclude_event_types=["EXTRACT_AGENT_MEMORY"])
     process_event.assert_called_once()
     store.mark_done.assert_called_once_with(event, event.uri)
     assert stats["processed"] == 1

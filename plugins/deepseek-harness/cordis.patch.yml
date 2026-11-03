@@ -1,0 +1,23 @@
+- insert:
+    - id: ogmemory-lifecycle
+      name: '@opengauss/ogmemory-dsh-plugin'
+      config:
+        baseUrl: !!js process.env.OGMEM_URL?.trim() || 'http://127.0.0.1:8090'
+        apiKeyEnv: OGMEM_DSH_API_KEY
+        accountId: !!js process.env.OGMEM_ACCOUNT_ID?.trim() || 'acct-demo'
+        userId: !!js process.env.OGMEM_USER_ID?.trim() || 'user-dsh'
+        agentId: !!js process.env.OGMEM_AGENT_ID?.trim() || 'deepseek-harness'
+        allowInsecureHttp: !!js process.env.OGMEM_ALLOW_INSECURE_HTTP === 'true'
+        autoCapture: true
+        autoRecall: true
+        composeEnabled: true
+        writebackEnabled: true
+        disposeEnabled: true
+        toolsEnabled: !!js process.env.OGMEM_DSH_TOOLS !== 'false'
+        writeToolsEnabled: !!js process.env.OGMEM_DSH_WRITE_TOOLS === 'true'
+        deleteToolsEnabled: !!js process.env.OGMEM_DSH_DELETE_TOOLS === 'true'
+        captureToolResults: false
+        traceEnabled: !!js process.env.OGMEM_DSH_TRACE !== 'false'
+        traceCaptureContent: !!js process.env.OGMEM_DSH_TRACE_CAPTURE_CONTENT !== 'false'
+        forceExtract: !!js process.env.OGMEM_DSH_FORCE_EXTRACT !== 'false'
+        pendingDir: !!js process.env.OGMEM_DSH_PENDING_DIR?.trim() || ''

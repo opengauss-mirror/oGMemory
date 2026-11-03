@@ -12,7 +12,7 @@
       "source": {
         "source": "git-subdir",
         "url": "https://gitcode.com/opengauss/oG-Memory",
-        "path": "claude-plugin",
+        "path": "plugins/claude-code",
         "ref": "dev"
       },
       "description": "Sync Claude Code conversations to oG-Memory for persistent context",

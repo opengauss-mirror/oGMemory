@@ -248,11 +248,13 @@ def test_bm25_index_creation_uses_native_access_method():
     assert connection.commits == 1
 
 
-def test_bm25_search_applies_scope_ranking_limits_and_session_settings():
+@pytest.mark.parametrize("table_name", ["lex", "scene_lexical_v1"])
+def test_bm25_search_applies_scope_ranking_limits_and_session_settings(table_name):
     cursor = FakeCursor(
         rows=[("m1", '{"uri":"ctx://acct/m1","level":0}', 1.25)]
     )
     index, connection = _index(cursor)
+    index._table = table_name
     index._bm25_topk = 25
     index._bm25_k1 = 1.4
     index._bm25_b = 0.7
@@ -273,9 +275,13 @@ def test_bm25_search_applies_scope_ranking_limits_and_session_settings():
     assert ("enable_bm25_taat", "on") in settings
     assert ("statement_timeout", "5000") in settings
     sql, params = cursor.executed[-1]
-    assert "<&>" in sql and "indexscan" in sql
+    assert f"indexscan (d idx_{table_name}_native_bm25)" in sql
+    assert f"FROM {table_name}_docs d" in sql
+    assert "ORDER BY d.content <&> %s DESC" in sql
     assert params == ("database", "acct", "user:u1", "database", 10)
     assert hits[0].score == 1.25
+    assert hits[0].id == "m1"
+    assert hits[0].metadata == {"uri": "ctx://acct/m1", "level": 0}
     assert connection.rollbacks == 1
 
 

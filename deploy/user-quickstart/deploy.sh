@@ -5,8 +5,8 @@ readonly ENV_FILE="${OGMEMORY_ENV_FILE:-$HOME/ogmemory.env}"
 readonly STACK_ROOT="${OGMEMORY_STACK_ROOT:-$HOME}"
 readonly PUBLISH_IP="127.0.0.1"
 readonly OPENGAUSS_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328"
-readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807"
-readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0807"
+readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013"
+readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0903"
 
 fail() {
   echo "错误: $*" >&2
@@ -591,6 +591,9 @@ auth:
 memory:
   after_turn_threshold: "${OGMEM_AFTER_TURN_THRESHOLD}"
   rolling_compress_enabled: true
+
+agent_memory:
+  enabled: false
 YAML
 chmod 644 "$STACK_DIR/ogmemory.yaml"
 

@@ -6,7 +6,7 @@ multiple OpenClaw instances can share a single oG-Memory backend.
 
 Usage:
     python server/app.py                       # dev (Flask built-in)
-    gunicorn -w 2 -b 0.0.0.0:8090 server.app:app  # production
+    gunicorn -c python:server.gunicorn_config -w 2 -b 0.0.0.0:8090 server.app:app
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ from server.mcp_tools import (
 )
 from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
+from server.scene_api import create_scene_blueprint
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
@@ -63,6 +64,7 @@ app.config["MAX_CONTENT_LENGTH"] = _MAX_HTTP_BODY_BYTES
 _service: MemoryService | None = None
 _service_lock = threading.Lock()
 _operator_service = None
+_operator_service_lock = threading.Lock()
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 _MAX_TRACE_EVENT_DEPTH = 64
@@ -122,6 +124,7 @@ def _get_service() -> MemoryService:
             if _service is None:
                 cfg = get_config()
                 _service = MemoryService(config=cfg)
+                _service.start_extraction_recovery()
                 logger.info("MemoryService initialized (config loaded)")
                 # Attach to perf recorder so token snapshots work
                 try:
@@ -156,54 +159,48 @@ def _get_operator_service():
     global _operator_service
     if _operator_service is not None:
         return _operator_service
-    from service.operator_service import OperatorService
-    from service.graph_service import GraphService
-    from extraction.operators import default_registry
+    with _operator_service_lock:
+        if _operator_service is not None:
+            return _operator_service
+        from service.operator_service import OperatorService
+        from service.graph_service import GraphService
+        from extraction.operators import default_registry
 
-    cfg = get_config()
-    # Resolve the graph store the same way the rest of the system does.
-    # For AGFS mode we use the in-memory store (no SQL graph tables
-    # wired yet); for SQL mode we use the SQL store. Production users
-    # wiring operator output into a real graph should set the store
-    # via this hook.
-    storage_backend = getattr(cfg, "storage_backend", "agfs")
-    if storage_backend == "sql":
-        try:
+        cfg = get_config()
+        if cfg.storage_backend == "sql":
             from providers.graph_store import SQLGraphStore
-            store = SQLGraphStore.from_config(cfg)
-        except Exception as exc:
-            logger.warning("SQLGraphStore unavailable (%s); falling back to in-memory", exc)
+            store = SQLGraphStore(
+                connection_string=cfg.sql_connection_string,
+                pool_size=cfg.sql_pool_size,
+            )
+        else:
             from providers.graph_store import MemoryGraphStore
             store = MemoryGraphStore()
-    else:
-        from providers.graph_store import MemoryGraphStore
-        store = MemoryGraphStore()
-    graph_service = GraphService(store)
+        graph_service = GraphService(store)
 
-    # Register built-in operators (uses MockBackend by default; deployments
-    # can override by populating ``operators:`` in config/operators.yaml).
-    registry = default_registry()
-    try:
-        from extraction.operators.builtin import register_all_defaults
-        register_all_defaults(registry)
-    except Exception as exc:
-        logger.warning("Failed to register default operators: %s", exc)
-
-    # Optionally load operators from YAML if configured.
-    yaml_path = getattr(cfg, "operators_config_path", None) or "config/operators.yaml"
-    import os
-    if os.path.exists(yaml_path):
+        # Register built-in operators (uses MockBackend by default; deployments
+        # can override by populating ``operators:`` in config/operators.yaml).
+        registry = default_registry()
         try:
-            registry.load_from_config(yaml_path, override=True)
+            from extraction.operators.builtin import register_all_defaults
+            register_all_defaults(registry)
         except Exception as exc:
-            logger.warning("Failed to load operators from %s: %s", yaml_path, exc)
+            logger.warning("Failed to register default operators: %s", exc)
 
-    _operator_service = OperatorService(
-        graph_service=graph_service,
-        registry=registry,
-    )
-    logger.info("OperatorService initialized (graph_store=%s)", type(store).__name__)
-    return _operator_service
+        # Optionally load operators from YAML if configured.
+        yaml_path = getattr(cfg, "operators_config_path", None) or "config/operators.yaml"
+        if os.path.exists(yaml_path):
+            try:
+                registry.load_from_config(yaml_path, override=True)
+            except Exception as exc:
+                logger.warning("Failed to load operators from %s: %s", yaml_path, exc)
+
+        _operator_service = OperatorService(
+            graph_service=graph_service,
+            registry=registry,
+        )
+        logger.info("OperatorService initialized (graph_store=%s)", type(store).__name__)
+        return _operator_service
 
 
 def _build_authenticated_context(params: dict):
@@ -226,6 +223,7 @@ def _json_object_body() -> dict:
 
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
+    from scene.config import ConfigRevisionError
     from service.operator_service import OperatorServiceBusyError
 
     if isinstance(exc, OperatorServiceBusyError):
@@ -252,7 +250,7 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 404
     if isinstance(exc, FileExistsError):
         return jsonify({"error": str(exc)}), 409
-    if isinstance(exc, ConcurrentModificationError):
+    if isinstance(exc, (ConcurrentModificationError, ConfigRevisionError)):
         return jsonify({"error": str(exc)}), 409
     if isinstance(exc, SessionOperationInProgress):
         return jsonify({
@@ -271,6 +269,9 @@ def _error_response(exc: Exception):
 
 app.register_blueprint(
     create_memory_viewer_blueprint(_get_service, _build_authenticated_context, _error_response)
+)
+app.register_blueprint(
+    create_scene_blueprint(_get_service, _build_authenticated_context, _error_response)
 )
 
 
@@ -498,8 +499,8 @@ def handle_compose():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, _lifecycle_result_ok(result), None, tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("compose failed: %s", exc, exc_info=True)
         if rec.enabled:
@@ -556,7 +557,19 @@ def handle_after_turn():
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
+        from server.mcp_trace import capture_write_trace, validate_trace_messages
+        trace_messages = params.get("traceMessages")
+        if trace_messages is not None:
+            validate_trace_messages(trace_messages)
         result = _get_service().after_turn(params)
+        if trace_messages and _lifecycle_result_ok(result):
+            captured = capture_write_trace(
+                _get_service(), ctx, trace_messages, session_id=ctx.session_id,
+                client_request_id=str(params.get("clientRequestId") or params.get("client_request_id") or "").strip(),
+            )
+            result["trace_captured"] = captured
+            if not captured:
+                result.update(ok=False, retryable=True, status="trace_capture_pending")
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
@@ -601,6 +614,7 @@ def handle_query_memory():
                 types=params.get("types"),
                 top_k=_memory_tool_integer(params, "top_k", 5),
                 score_threshold=params.get("score_threshold"),
+                use_scene=params.get("use_scene", params.get("useScene")),
                 session_id=params.get("sessionId") or params.get("session_id"),
                 agent_id=ctx.agent_id,
                 request_context=ctx,
@@ -622,6 +636,7 @@ def handle_read_memory():
             read_memory(
                 _get_service(),
                 uri=params.get("uri", ""),
+                unit_key=params.get("unit_key"),
                 level=params.get("level", "all"),
                 max_chars=_memory_tool_integer(params, "max_chars", 12000),
                 session_id=params.get("sessionId") or params.get("session_id"),
@@ -1336,7 +1351,7 @@ def handle_perf_event():
     # P1 fix: enforce auth via _build_authenticated_context, catching exceptions.
     # P2 fix: POST returns explicit error when perf is disabled (not silent no-op).
     try:
-        ctx = _build_authenticated_context({})
+        _build_authenticated_context({})
     except (AuthenticationError, AuthorizationError) as exc:
         return _error_response(exc)
 
@@ -1823,6 +1838,7 @@ def handle_operators_task_status(task_id):
 
 def _run_http_server() -> None:
     cfg = get_config()
+    _get_service()
     logger.info("Starting oG-Memory HTTP server on :%d", cfg.http_port)
     try:
         app.run(host="0.0.0.0", port=cfg.http_port, threaded=True)

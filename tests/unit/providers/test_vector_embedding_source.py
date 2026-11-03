@@ -54,21 +54,28 @@ def test_in_memory_get_embeddings_applies_scope_and_level() -> None:
     assert result == {"ctx://tenant/memory/wanted": [0.25, 0.75]}
 
 
-def test_chroma_get_embeddings_applies_scope_and_requested_uris() -> None:
+@pytest.mark.parametrize("expected_texts", [None, {
+    "ctx://tenant/memory/wanted": "current", "ctx://tenant/memory/lagging": "fresh",
+}])
+def test_chroma_get_embeddings_applies_scope_and_requested_uris(expected_texts) -> None:
     index = ChromaVectorIndex.__new__(ChromaVectorIndex)
     index._collection = Mock()
     index._locked = Mock(return_value=nullcontext())
     index._collection.get.return_value = {
-        "embeddings": [[0.1, 0.9], [0.8, 0.2]],
+        "embeddings": [[0.1, 0.9], [0.8, 0.2], [0.5, 0.5]],
         "metadatas": [
             {"uri": "ctx://tenant/memory/wanted"},
             {"uri": "ctx://tenant/memory/not-requested"},
+            {"uri": "ctx://tenant/memory/lagging"},
         ],
+        "documents": ["current", "other", "outdated"],
     }
 
+    uris = list(expected_texts) if expected_texts else ["ctx://tenant/memory/wanted"]
     result = index.get_embeddings(
-        ["ctx://tenant/memory/wanted"],
+        uris,
         {"account_id": "tenant"},
+        expected_texts=expected_texts,
     )
 
     assert result == {"ctx://tenant/memory/wanted": [0.1, 0.9]}
@@ -77,10 +84,10 @@ def test_chroma_get_embeddings_applies_scope_and_requested_uris() -> None:
             "$and": [
                 {"account_id": "tenant"},
                 {"level": 0},
-                {"uri": {"$in": ["ctx://tenant/memory/wanted"]}},
+                {"uri": {"$in": uris}},
             ]
         },
-        include=["embeddings", "metadatas"],
+        include=["embeddings", "metadatas"] + (["documents"] if expected_texts else []),
     )
     index._locked.assert_called_once_with()
 
@@ -121,13 +128,21 @@ def test_real_chroma_get_embeddings_filters_by_uri_when_provider_is_installed(tm
     assert result == {"ctx://tenant/memory/wanted": [0.25, 0.75]}
 
 
-def test_opengauss_get_embeddings_applies_scope_and_parses_vectors() -> None:
+@pytest.mark.parametrize("expected_texts", [None, {
+    "ctx://tenant/memory/one": "current", "ctx://tenant/memory/lagging": "fresh",
+}])
+def test_opengauss_get_embeddings_applies_scope_and_parses_vectors(expected_texts) -> None:
     cursor = Mock()
     cursor.__enter__ = Mock(return_value=cursor)
     cursor.__exit__ = Mock(return_value=None)
     cursor.fetchall.return_value = [
         ("ctx://tenant/memory/one", "[0.125,0.875]"),
     ]
+    if expected_texts is not None:
+        cursor.fetchall.return_value = [
+            ("ctx://tenant/memory/one", "[0.125,0.875]", "current"),
+            ("ctx://tenant/memory/lagging", "[1,0]", "outdated"),
+        ]
     connection = Mock()
     connection.cursor.return_value = cursor
     index = OpenGaussVectorIndex.__new__(OpenGaussVectorIndex)
@@ -135,9 +150,11 @@ def test_opengauss_get_embeddings_applies_scope_and_parses_vectors() -> None:
     index._get_connection = Mock(return_value=connection)
     index._return_connection = Mock()
 
+    uris = list(expected_texts) if expected_texts else ["ctx://tenant/memory/one"]
     result = index.get_embeddings(
-        ["ctx://tenant/memory/one"],
+        uris,
         {"account_id": "tenant", "owner_space": "user:one"},
+        expected_texts=expected_texts,
     )
 
     assert result == {"ctx://tenant/memory/one": [0.125, 0.875]}
@@ -147,6 +164,6 @@ def test_opengauss_get_embeddings_applies_scope_and_parses_vectors() -> None:
         "f_account_id": "tenant",
         "f_owner_space": "user:one",
         "f_level": 0,
-        "uris": ["ctx://tenant/memory/one"],
+        "uris": uris,
     }
     index._return_connection.assert_called_once_with(connection)

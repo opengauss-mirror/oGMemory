@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from core.errors import AccessDeniedError
+from core.errors import AccessDeniedError, NodeNotFoundError
 from core.models import (
     ContextNode,
     RequestContext,
@@ -470,6 +470,83 @@ def test_list_memories_paginates_without_skipping_response_truncated_nodes():
     assert "next_cursor" not in exhausted
 
 
+@pytest.mark.parametrize(
+    "names,expected",
+    [
+        (["atlas", "张三", "李雷", "王五"], ["atlas", "张三", "李雷", "王五"]),
+        (["%E6%9D%8E%E9%9B%B7", "atlas", "bravo"], ["李雷", "atlas", "bravo"]),
+        (["%E6%9D%8E%E9%9B%B7", "atlas", "李雷"], ["李雷", "atlas", "李雷"]),
+        (["%e6%9d%8e%e9%9b%b7", "atlas", "李雷"], ["李雷", "atlas", "李雷"]),
+    ],
+)
+def test_list_memories_paginates_mixed_unicode_names(names, expected):
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/users/alice/memories/entities/{name}",
+            context_type="MEMORY", category="entity", level=0,
+            owner_space="user:alice", abstract=name, overview="", content="",
+        )
+        for name in names
+    ]
+
+    class _PagedFS(_CollectionFS):
+        def exists(self, uri, ctx):
+            return any(node.uri == uri for node in nodes)
+
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            if not uri.endswith("/memories/entities"):
+                return []
+            return [
+                node for node in nodes
+                if after_uri is None or node.uri > after_uri
+            ][:limit]
+
+    service = _CollectionService()
+    service.fs = _PagedFS()
+    seen = []
+    cursor = None
+    for _ in names:
+        page = list_memories(service, limit=1, cursor=cursor)
+        seen.extend(row["id"] for row in page["memories"])
+        if not page["truncated"]:
+            break
+        cursor = page["next_cursor"]
+    else:
+        pytest.fail("memory pagination did not finish")
+
+    assert seen == expected
+
+
+def test_list_memories_response_limit_preserves_stored_cursor():
+    names = ["%E6%9D%8E%E9%9B%B7", "atlas", "李雷"]
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/users/alice/memories/entities/{name}",
+            context_type="MEMORY", category="entity", level=0,
+            owner_space="user:alice", abstract="x" * 120, overview="", content="",
+        )
+        for name in names
+    ]
+
+    class _PagedFS(_CollectionFS):
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            if not uri.endswith("/memories/entities"):
+                return []
+            return [node for node in nodes if after_uri is None or node.uri > after_uri][:limit]
+
+    service = _CollectionService()
+    service.fs = _PagedFS()
+    first_page = list_memories(service, limit=1)
+    response_limit = len(json.dumps(first_page, ensure_ascii=False)) + 1
+    service._cfg = OgMemConfig(mcp_max_response_chars=response_limit)
+
+    capped = list_memories(service, limit=3)
+    assert capped["count"] == 1
+    assert capped["next_cursor"] == first_page["next_cursor"]
+    second = list_memories(service, limit=3, cursor=capped["next_cursor"])
+    assert second["memories"][0]["id"] == "atlas"
+
+
 def test_list_memories_validates_pagination_arguments():
     service = _CollectionService()
 
@@ -664,7 +741,7 @@ def test_search_code_renders_safe_deduplicated_edit_evidence():
 
     assert payload.count("# hit ") == 1
     assert "# code_search status: partial_failure" in payload
-    assert "\nrepo/src/service.py (lines 10-18)" in payload
+    assert 'edit_target: {"locator": "repo/src/service.py"}\n# lines 10-18' in payload
     assert "symbol=run_service" in payload
     assert "signature=def run_service(value: str) -> str:" in payload
     assert payload.count("def run_service(value: str) -> str:") == 2
@@ -697,7 +774,7 @@ def test_search_code_marks_malicious_source_as_untrusted_before_content():
     assert payload.index(CODE_EVIDENCE_UNTRUSTED_NOTICE) < payload.index(malicious_comment)
     rendered_lines = payload.splitlines()
     assert rendered_lines[rendered_lines.index("# hit 1") + 1] == (
-        "repo/src/auth.py (lines 1-2)"
+        'edit_target: {"locator": "repo/src/auth.py"}'
     )
 
 
@@ -731,9 +808,11 @@ def test_search_code_enforces_response_cap_with_complete_hit_header():
     assert len(payload) <= 260
     assert CODE_EVIDENCE_UNTRUSTED_NOTICE in payload
     assert "# hit_count: 1" in payload
-    assert "\nrepo/src/service.py (lines 1-99)" in payload
+    assert 'edit_target: {"locator": "repo/src/service.py"}' in payload
+    assert '# lines 1-99' not in payload
+    assert '"read_lines":[[1,99]]' in payload
     assert "# hit 2" not in payload
-    assert "... [excerpt clipped] ..." in payload
+    assert '"truncated":true' in payload
 
 
 def test_search_code_clamps_an_implicit_snippet_to_batch_budget():
@@ -881,11 +960,9 @@ def test_edit_file_round_trips_exact_rendered_locator_through_registered_workspa
     )
     search_payload = search_code(service, query="run_service")
     rendered_lines = search_payload.splitlines()
-    locator = rendered_lines[rendered_lines.index("# hit 1") + 1]
-    assert locator == (
-        "repo/src/service.py (lines 10-18) symbol=run_service "
-        "signature=def run_service(value: str) -> str:"
-    )
+    target_line = rendered_lines[rendered_lines.index("# hit 1") + 1]
+    locator = json.loads(target_line.removeprefix("edit_target: "))["locator"]
+    assert locator == "repo/src/service.py"
     assert not locator.startswith("#")
 
     payload = edit_file(
@@ -1457,6 +1534,25 @@ def test_query_memory_stops_adding_hits_after_response_budget_is_exhausted():
     assert payload["truncated"] is True
 
 
+@pytest.mark.parametrize("budget", [1, 4, 8, 12, 512])
+def test_query_memory_bounds_all_summary_fields_after_one_field_is_clipped(budget):
+    service = _FakeService(
+        OgMemConfig(mcp_max_response_chars=budget),
+        hits=[RetrievedBlock(
+            uri="ctx://acct-1/users/alice/memories/entities/project",
+            score=0.9, category="entity", abstract="项目摘要",
+            overview="概览" * 300, content_excerpt="正文🙂" * 300, has_content=True,
+        )],
+    )
+
+    payload = query_memory(service, query="项目", top_k=1)
+
+    row = payload["hits"][0]
+    assert sum(len(row.get(field, "")) for field in ("abstract", "overview", "content_excerpt")) <= budget
+    assert row["uri"] == "ogmemory://memories/entity/project"
+    assert payload["truncated"] is True
+
+
 def test_query_memory_rejects_target_uri_style_direct_reads():
     service = _FakeService()
 
@@ -1479,6 +1575,37 @@ def test_read_memory_reads_external_uri():
     assert payload["abstract"] == "Prefers vitest."
     assert "content" not in payload
     assert payload["truncated"] is False
+
+
+def test_read_and_delete_memory_find_encoded_legacy_uri():
+    stored_uri = "ctx://acct-1/users/alice/memories/preferences/coffee%20shop"
+    public_uri = "ogmemory://memories/preference/coffee%20shop"
+
+    class _StoredFS:
+        def read_node(self, uri, ctx):
+            if uri != stored_uri:
+                raise NodeNotFoundError(uri)
+            return ContextNode(
+                uri=uri, context_type="MEMORY", category="preference", level=0,
+                owner_space="user:alice", abstract="Coffee shop", overview="",
+                content="Coffee shop", metadata={},
+            )
+
+    service = _FakeService()
+    service.fs = _StoredFS()
+    ctx = RequestContext("acct-1", "alice", "bot", "s1", "t1")
+    assert read_memory(service, uri=public_uri, request_context=ctx)["content"] == "Coffee shop"
+
+    deleted = []
+    def forget_memory(uri, context, **kwargs):
+        if uri != stored_uri:
+            raise NodeNotFoundError(uri)
+        deleted.append(uri)
+        return {"ok": True, "deleted": True}
+
+    service.forget_memory = forget_memory
+    assert delete_memory(service, uri=public_uri, request_context=ctx)["deleted"] is True
+    assert deleted == [stored_uri]
 
 
 def test_read_memory_uses_field_level_reader_when_available():
@@ -1788,3 +1915,22 @@ def test_read_memory_recovery_rejects_limit_smaller_than_fixed_envelope():
             max_chars=500,
             agent_id="bot",
         )
+
+
+@pytest.mark.parametrize("cap", [1000, 320])
+def test_search_coverage_preserves_indentation_and_invalidates_completeness_on_transport_cut(cap):
+    excerpt = "    result = value + 1\n" * 12 + "    return result"
+    service = _CodeAdapterService(cfg=OgMemConfig(mcp_max_response_chars=cap), result={
+        "status": "ok", "evidence": [dict(relative_path="api.py", root_slug="repo",
+            start_line=20, end_line=32, excerpt=excerpt, coverage=dict(
+                source_lines=[1, 32], truncated=True, implementation_complete=True, read_lines=[]))]})
+    payload = search_code(service, query="compute")
+    assert len(payload) <= cap
+    if cap == 1000:
+        assert excerpt in payload and '"implementation_complete":true' in payload
+        assert '"read_lines":[]' in payload
+    else:
+        assert '"implementation_complete":true' not in payload
+        assert '"read_lines":[[1,32]]' in payload
+        assert "# lines 20-32" not in payload
+        assert "[excerpt clipped]" in payload

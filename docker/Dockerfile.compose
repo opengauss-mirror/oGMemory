@@ -1,0 +1,111 @@
+# Build sources are supplied by Compose from .env.
+ARG GO_BASE_IMAGE=golang:1.25-bookworm
+ARG PYTHON_BASE_IMAGE=python:3.11-slim-bookworm
+FROM ${GO_BASE_IMAGE} AS agfs-deps
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.org
+ENV GOPROXY=${GOPROXY} GOSUMDB=${GOSUMDB}
+WORKDIR /build/agfs
+COPY agfs/ ./
+RUN go mod download && go mod verify
+
+FROM ${PYTHON_BASE_IMAGE} AS python-deps
+ARG DEBIAN_MIRROR=https://mirrors.ustc.edu.cn/debian
+ARG DEBIAN_SECURITY_MIRROR=https://mirrors.ustc.edu.cn/debian-security
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+RUN sed -i \
+    -e "s|https\\?://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+    -e "s|https\\?://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+    /etc/apt/sources.list.d/debian.sources
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libpq-dev curl ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --timeout 120 \
+    flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
+    pydantic python-dotenv json-repair "jsonschema>=4.20.0" rank-bm25 nltk \
+    "mcp[cli]==2.0.0" "volcengine-python-sdk[ark]"
+
+FROM agfs-deps AS agfs-builder
+RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /out/agfs-server ./cmd/server
+
+FROM python-deps AS runtime
+
+# Copy oGMemory source
+COPY core/       /opt/ogmem/core/
+COPY retrieval/  /opt/ogmem/retrieval/
+COPY extraction/ /opt/ogmem/extraction/
+COPY commit/     /opt/ogmem/commit/
+COPY index/      /opt/ogmem/index/
+COPY providers/  /opt/ogmem/providers/
+COPY service/    /opt/ogmem/service/
+COPY fs/         /opt/ogmem/fs/
+COPY server/     /opt/ogmem/server/
+COPY session/    /opt/ogmem/session/
+COPY cli/        /opt/ogmem/cli/
+COPY scripts/    /opt/ogmem/scripts/
+COPY skills/     /opt/ogmem/skills/
+COPY perf/       /opt/ogmem/perf/
+COPY features/   /opt/ogmem/features/
+COPY scene/      /opt/ogmem/scene/
+
+# Copy AGFS binary and config
+COPY --from=agfs-builder /out/agfs-server /opt/agfs/agfs-server
+COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
+
+# Copy entrypoint
+COPY docker/entrypoint-compose.sh /opt/entrypoint.sh
+RUN sed -i 's/\r$//' /opt/entrypoint.sh && chmod 755 /opt/entrypoint.sh /opt/agfs/agfs-server
+
+# Copy default config (user can override via volume mount)
+COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
+
+# Create data directory
+RUN mkdir -p /data/agfs && useradd -m ogmem && chown -R ogmem:ogmem /data/agfs /opt/agfs /opt/ogmem /etc/ogmem
+RUN chmod -R 755 /opt/agfs /opt/ogmem
+
+# Environment defaults (kept for backward compat; YAML config takes priority)
+ENV PYTHONPATH=/opt/ogmem
+ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
+ENV AGFS_BASE_URL=http://127.0.0.1:1833
+ENV AGFS_MOUNT_PREFIX=/local/plugin
+ENV CONTEXTENGINE_PROVIDER=openai
+ENV VECTOR_DB_TYPE=opengauss
+ENV INDEX_INTERVAL=15
+ENV OG_ACCOUNT_ID=acct-demo
+ENV OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+ENV OGMEM_EMBEDDING_MODEL=text-embedding-v2
+ENV OGMEM_HTTP_PORT=8090
+ENV OGMEM_MCP_ENABLED=true
+ENV OGMEM_MCP_HOST=0.0.0.0
+ENV OGMEM_MCP_PORT=8091
+ENV OGMEM_MCP_PATH=/mcp
+ENV OGMEM_MCP_DEFAULT_TOOLSET=read-only
+ENV OGMEM_MCP_MAX_SSE_CONNECTIONS=64
+ENV OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS=false
+ENV OGMEM_MCP_ALLOWED_HOSTS=127.0.0.1,localhost,host.docker.internal
+ENV OGMEM_CODE_RESOURCES_ENABLED=false
+ENV OGMEM_CODE_WORKSPACE_ALLOWED_ROOTS=
+ENV OGMEM_CODE_RETRIEVAL_ENABLED=false
+ENV OGMEM_CODE_RETRIEVAL_SEMANTIC_ENABLED=true
+ENV OGMEM_CODE_RETRIEVAL_BM25_ENABLED=true
+ENV OGMEM_CODE_RETRIEVAL_SYMBOLIC_ENABLED=true
+ENV OGMEM_CODE_RETRIEVAL_GRAPH_ENABLED=true
+ENV OGMEM_TOOL_OUTPUT_FILTER_ENABLED=false
+ENV OGMEM_TOOL_OUTPUT_FILTER_READ_ENABLED=true
+ENV OGMEM_TOOL_OUTPUT_FILTER_BASH_ENABLED=true
+ENV OGMEM_TOOL_OUTPUT_FILTER_ADAPTIVE_ENABLED=true
+ENV OGMEM_TOOL_OUTPUT_FILTER_READ_MIN_CHARS=8000
+ENV OGMEM_TOOL_OUTPUT_FILTER_READ_MAX_LINES=60
+ENV OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_CHARS=8000
+ENV OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_LINES=100
+ENV OGMEM_TOOL_OUTPUT_FILTER_TEST_MAX_LINES=120
+ENV OGMEM_TOOL_OUTPUT_FILTER_DIFF_MAX_LINES=100
+ENV OGMEM_TOOL_OUTPUT_FILTER_ERROR_MAX_LINES=100
+ENV OGMEM_TOOL_OUTPUT_FILTER_GENERIC_MAX_LINES=80
+ENV OGMEM_TOOL_OUTPUT_FILTER_OUTPUT_MAX_CHARS=50000
+ENV OGMEM_TOOL_OUTPUT_FILTER_RECOVERY_MAX_CHARS=50000
+
+USER ogmem
+EXPOSE 8090 8091
+
+ENTRYPOINT ["/opt/entrypoint.sh"]

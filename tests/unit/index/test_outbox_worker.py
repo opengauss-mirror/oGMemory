@@ -849,7 +849,7 @@ class TestPostUpsertLivenessCheck:
                 assert event_id == event.event_id
                 return True
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, claimed_event, node_uri):
@@ -882,7 +882,7 @@ class TestPostUpsertLivenessCheck:
                 self.retry_calls = 0
                 self.release_calls = 0
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def processing_lock(self, _node_uri):
@@ -949,7 +949,7 @@ class TestPostUpsertLivenessCheck:
                     # Post-upsert DB error - re-raises
                     raise RuntimeError("DB down post-check")
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, event, node_uri):
@@ -994,7 +994,7 @@ class TestPostUpsertLivenessCheck:
                 cls._call_count += 1
                 return cls._call_count == 1  # True first time, False second time
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, event, node_uri):
@@ -1035,7 +1035,7 @@ class TestPostUpsertLivenessCheck:
                 # Pre-check returns False — event already gone
                 return False
 
-            def claim_batch(self, worker_id="default"):
+            def claim_batch(self, worker_id="default", *, exclude_event_types=None):
                 return [(event.uri, event)]
 
             def mark_done(self, event, node_uri):
@@ -1259,14 +1259,26 @@ class TestEnsureTableRaisesOnFailure:
 
     def test_ensure_table_raises_on_ddl_error(self):
         """_ensure_table must raise on DDL failure, not swallow it silently."""
+        from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+        from fs.sql_adapter.schema import _SCHEMA_SQL
+
         with patch("commit.sql_outbox_store.psycopg2"), \
              patch("commit.sql_outbox_store.Json", lambda x: x), \
              patch("commit.sql_outbox_store._HAS_PSYCOPG2", True):
             mock_conn = MagicMock()
+            mock_conn.get_transaction_status.return_value = TRANSACTION_STATUS_IDLE
+            mock_conn.autocommit = False
             mock_cursor = MagicMock()
             mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
             mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-            mock_cursor.execute.side_effect = RuntimeError("DDL failed")
+            mock_cursor.fetchone.return_value = None
+
+            def execute(statement):
+                if statement == _SCHEMA_SQL:
+                    raise RuntimeError("DDL failed")
+
+            mock_cursor.execute.side_effect = execute
 
             from commit.sql_outbox_store import SQLOutboxStore
 
@@ -1282,3 +1294,4 @@ class TestEnsureTableRaisesOnFailure:
                 store._ensure_table()
 
             mock_conn.rollback.assert_called_once()
+            assert any(call.args[0] == _SCHEMA_SQL for call in mock_cursor.execute.call_args_list)

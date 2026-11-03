@@ -25,6 +25,7 @@ from core.models import (
     TypedQuery,
 )
 from retrieval.hotness import hotness_score
+from retrieval.identity import memory_identity
 from retrieval.owner_scope import allowed_owner_space_filter
 
 logger = logging.getLogger(__name__)
@@ -72,15 +73,18 @@ class HierarchicalSearcher:
     ) -> list[dict[str, Any]]:
         effective_threshold = threshold if threshold is not None else self.cfg.default_score_threshold
         alpha = self.cfg.score_propagation_alpha
-        collected_by_uri: dict[str, dict[str, Any]] = {}
+        collected_by_uri: dict[tuple[str, str, int], dict[str, Any]] = {}
         dir_queue: list[tuple[float, str]] = []
         visited: set[str] = set()
-        prev_topk_uris: set[str] = set()
+        prev_topk_uris: set[tuple[str, str, int]] = set()
         convergence_rounds = 0
 
         for hit in initial_candidates:
             if hit.level == 2 and hit.uri:
-                collected_by_uri[hit.uri] = self._hit_to_dict(hit, hit.score)
+                identity = (*memory_identity(hit.uri, hit.metadata), hit.level)
+                previous = collected_by_uri.get(identity)
+                if previous is None or hit.score > previous["_final_score"]:
+                    collected_by_uri[identity] = self._hit_to_dict(hit, hit.score)
 
         for hit in starting_points:
             heapq.heappush(dir_queue, (-hit.score, hit.uri))
@@ -90,6 +94,8 @@ class HierarchicalSearcher:
             base_filters["context_type"] = typed_query.context_type
         if typed_query.resource_type:
             base_filters["resource_type"] = typed_query.resource_type
+        if typed_query.memory_directories is not None:
+            base_filters["memory_directory"] = typed_query.memory_directories
         owner_space = allowed_owner_space_filter(
             typed_query,
             ctx,
@@ -126,9 +132,10 @@ class HierarchicalSearcher:
                     continue
 
                 uri = child.uri
-                prev = collected_by_uri.get(uri)
+                identity = (*memory_identity(uri, child.metadata), child.level)
+                prev = collected_by_uri.get(identity)
                 if prev is None or final_score > prev.get("_final_score", 0):
-                    collected_by_uri[uri] = self._hit_to_dict(child, final_score)
+                    collected_by_uri[identity] = self._hit_to_dict(child, final_score)
 
                 if uri not in visited and child.level != 2:
                     heapq.heappush(dir_queue, (-final_score, uri))
@@ -138,7 +145,7 @@ class HierarchicalSearcher:
                 key=lambda x: x.get("_final_score", 0),
                 reverse=True,
             )[:limit]
-            current_topk_uris = {c["uri"] for c in current_topk}
+            current_topk_uris = {(*memory_identity(c["uri"], c["metadata"]), c["level"]) for c in current_topk}
 
             if current_topk_uris == prev_topk_uris and len(current_topk_uris) >= limit:
                 convergence_rounds += 1

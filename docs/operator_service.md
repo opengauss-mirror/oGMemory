@@ -448,7 +448,7 @@ uv run python -m pytest tests/unit/extraction/operators/ \
  tests/unit/service/test_operator_service.py \
  tests/unit/server/test_operators_api.py \
  tests/unit/test_graph.py -v
-``` 
+```
 
 `test_graph.py` 还包含 23 个图本体用例（`TestGraphModels` 7 + `TestMemoryGraphStore` 9 + `TestGraphService` 7），命令共收集 **161 个** 用例。
 

@@ -311,7 +311,7 @@ Use oGMemory as durable, cross-session context.
 ### Agent Skills
 
 - Use `ogm_search_skills` or `ogm_list_skills` to discover published Skills. Read a matching Skill with `ogm_read_skill` before using it.
-- Call `ogm_install_skill` or `ogm_update_skill` only when the user asks to install or replace an imported Skill package. Pass exactly one of `data`, `archive_base64`, or `path`; submit the complete package on updates. `path` is resolved on the MCP server.
+- Call `ogm_install_skill` or `ogm_update_skill` only when the user asks to install or replace an imported Skill package. Pass exactly one of `data`, `archive_base64`, or `path`; submit the complete package on updates. Server-local `path` imports require trusted stdio. For HTTP or SSE, upload the package using `data` or `archive_base64`.
 - Call `ogm_delete_skill` only after an explicit deletion request. Use the exact name and `source` returned by the catalog.
 
 ### Safety
@@ -484,6 +484,14 @@ Use oGMemory as durable, cross-session context.
 }
 ```
 
+写入被接受后，统一写入入口会按顺序采集本次提交消息的 Trace，并以
+`turn_end` 汇总为一个写入批次。stdio、Streamable HTTP 和 SSE 共用此行为。
+Trace 使用鉴权身份和 `session_id` 归属，内容经脱敏后每条最多保留 10,000
+字符；携带相同 `client_request_id` 重试相同消息时复用事件 ID。
+`user`、`assistant`、`tool`、`system` 分别记录为对应的 message 事件。
+同进程内，按租户、用户空间、Agent 和会话串行提交完整 Trace 批次及轮次汇总。
+Trace 存储异常写入服务日志，写入响应继续反映实际记忆写入结果。
+
 ### 7.5 `ogm_delete_memory`
 
 默认关闭。仅接受用户明确要求遗忘后的单条记忆 URI；执行软归档。
@@ -561,7 +569,7 @@ ZIP 上传使用 Base64：
 }
 ```
 
-服务端文件路径导入：
+可信 stdio 的服务端文件路径导入：
 
 ```json
 {
@@ -594,8 +602,9 @@ ZIP 上传使用 Base64：
 
 更新会完整替换 package。每次请求必须在 `data`、`archive_base64`、`path`
 中选择一种。`data` 支持 SKILL.md 字符串、结构化对象或包含 `SKILL.md` 的
-`files` 对象；`archive_base64` 是完整 Skill ZIP；`path` 是 MCP 服务端可读的
-SKILL.md、ZIP 或 Skill 目录。Base64 请求计入 `max_request_bytes`。安装和更新由 `read-write` 工具集或
+`files` 对象；`archive_base64` 是完整 Skill ZIP；`path` 仅限可信 stdio，指向 MCP 服务端可读的
+SKILL.md、ZIP 或 Skill 目录。HTTP 和 SSE 使用 `data` 或 `archive_base64` 上传包。
+Base64 请求计入 `max_request_bytes`。安装和更新由 `read-write` 工具集或
 `enable_write_tools` 开启，需要 `ADMIN` 或 `ROOT` 权限。
 
 `ogm_delete_skill`：

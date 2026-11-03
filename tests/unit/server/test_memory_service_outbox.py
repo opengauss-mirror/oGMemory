@@ -79,7 +79,27 @@ def test_shared_sql_pool_receives_configured_dialect(monkeypatch):
         connection_string="host=storage dbname=test",
         pool_size=5,
         dialect="opengauss",
+        deadline=None,
     )
+
+
+@pytest.mark.parametrize("dialect", ["opengauss", "postgresql"])
+def test_vector_index_shares_configured_sql_pool(monkeypatch, dialect):
+    dsn = "host=storage dbname=memory"
+    service = MemoryService(config=OgMemConfig(
+        provider="mock", vector_db_type="opengauss", storage_backend="sql",
+        sql_dialect=dialect, sql_connection_string=dsn,
+        opengauss_connection_string=dsn,
+    ))
+    pool = Mock()
+    index = Mock()
+    monkeypatch.setattr(service, "_get_shared_sql_pool", lambda: pool)
+    factory = Mock(return_value=index)
+    monkeypatch.setattr(service._provider_cfg, "create_vector_index", factory)
+
+    assert service._get_shared_vector_index() is index
+    assert service._get_shared_vector_index() is index
+    factory.assert_called_once_with(pool=pool)
 
 
 def test_instance_can_disable_class_batch_claim_capability():

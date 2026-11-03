@@ -23,6 +23,11 @@ def _ctx() -> RequestContext:
     return RequestContext("acct", "user", "agent", "session", "trace")
 
 
+@pytest.fixture(autouse=True)
+def local_session_backend(monkeypatch):
+    monkeypatch.setattr(MemoryService, "_get_context_fs", lambda self: None)
+
+
 def _artifact_service(tmp_path, *, response_chars=800) -> MemoryService:
     service = MemoryService(
         OgMemConfig(

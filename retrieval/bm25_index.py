@@ -6,6 +6,7 @@ Uses rank_bm25 library with English tokenization (NLTK).
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -15,7 +16,9 @@ from dataclasses import dataclass, field
 
 from rank_bm25 import BM25Okapi
 
+from core.memory_names import memory_directory
 from core.models import IndexRecord
+from retrieval.code_ordering import code_source_key
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +52,16 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _tokenize_code_field(text: str) -> list[str]:
-    """Tokenize identifiers and paths after making separators searchable."""
-    return _tokenize(re.sub(r"[^A-Za-z0-9]+", " ", str(text or "")))
+    """Keep whole identifiers and expose camel-case components on both sides."""
+    words = re.findall(r"[A-Za-z0-9]+", str(text or ""))
+    expanded = []
+    for word in words:
+        parts = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", word)
+        parts = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", parts)
+        expanded.append(word)
+        if parts != word:
+            expanded.append(parts)
+    return _tokenize(" ".join(expanded))
 
 
 @dataclass
@@ -92,18 +103,27 @@ _CODE_FIELD_WEIGHTS = {
 }
 
 
+def build_bm25_document(record: IndexRecord) -> Bm25Document:
+    """Preserve canonical node metadata when indexing an IndexRecord."""
+    return Bm25Document(
+        id=record.id,
+        text=record.text,
+        metadata={
+            **dict(record.metadata or {}),
+            **dict(record.filters or {}),
+            "uri": record.uri,
+            "level": record.level,
+        },
+    )
+
+
 def build_code_bm25_document(record: IndexRecord) -> Bm25Document | None:
     """Adapt a code IndexRecord to the shared lexical index contract."""
 
     # Validated IndexRecord filters are authoritative.  In particular, a
     # stale/conflicting metadata value must never move a document into another
     # account or resource subtype.
-    metadata = {
-        **dict(record.metadata or {}),
-        **dict(record.filters or {}),
-        "uri": record.uri,
-        "level": record.level,
-    }
+    metadata = build_bm25_document(record).metadata
     if (
         metadata.get("context_type") != "RESOURCE"
         or metadata.get("resource_type") != "code"
@@ -179,7 +199,10 @@ class Bm25Index:
         with self._lock:
             self._ids = all_ids
             self._texts = all_texts
-            self._metas = [m or {} for m in all_metas]
+            self._metas = [dict(m or {}) for m in all_metas]
+            for metadata in self._metas:
+                if "agent_memory_grounding_json" in metadata:
+                    metadata["grounding"] = json.loads(metadata.pop("agent_memory_grounding_json"))
             self._fields = [{} for _ in all_ids]
             self._tokenized = [_tokenize(t) for t in all_texts]
             self._field_tokenized = [{} for _ in all_ids]
@@ -518,7 +541,7 @@ class Bm25Index:
                     fields=dict(fields),
                 )
             )
-        scored.sort(key=lambda hit: (-hit.score, str(hit.metadata.get("uri") or hit.id)))
+        scored.sort(key=lambda hit: (-hit.score, code_source_key({"id": hit.id, "metadata": hit.metadata})))
         return scored[: max(0, top_k)]
 
     @property
@@ -536,7 +559,7 @@ class Bm25Index:
 def _matches_filters(metadata: dict, filters: dict) -> bool:
     """Check if metadata matches all filter criteria."""
     for key, expected in filters.items():
-        val = metadata.get(key)
+        val = memory_directory(metadata.get("uri", "")) if key == "memory_directory" else metadata.get(key)
         if val is None:
             return False
         if isinstance(expected, list):

@@ -49,11 +49,11 @@ export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/plugins/ogmemory"
 
 curl -fL \
-  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/hermes_memory_plugin/ogmemory/__init__.py \
+  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/plugins/hermes/ogmemory/__init__.py \
   -o "$HERMES_HOME/plugins/ogmemory/__init__.py"
 
 curl -fL \
-  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/hermes_memory_plugin/ogmemory/plugin.yaml \
+  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/plugins/hermes/ogmemory/plugin.yaml \
   -o "$HERMES_HOME/plugins/ogmemory/plugin.yaml"
 ```
 
@@ -104,6 +104,22 @@ OGMEMORY_AGENT_ID=customer-a-api-agent
 同一用户在不同会话中使用相同的 Account ID 和 User ID。不同用户使用不同的 User ID。
 
 ## 5. 体验跨会话记忆
+
+### 自动记忆控制
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+hermes
+```
+
+两个开关默认均开启，分别控制自动写入和自动召回。也可在 `$HERMES_HOME/ogmemory.json` 设置
+`"auto_capture": false`、`"auto_recall": true`，环境变量优先。`1`、`true`、`yes`
+（忽略大小写和首尾空格）开启，其余显式值关闭；修改后重启 Hermes。
+
+关闭自动写入后，跳过 `sync_turn`、Hermes 原生记忆写入的自动镜像及自动压缩/会话提交，
+不启动后台写入线程，不重放或删除已有恢复文件。重新开启后恢复待写入数据。
+`ogmemory_remember` 和 `ogmemory_search` 显式工具不受这两个自动开关限制。
 
 启动 Hermes：
 

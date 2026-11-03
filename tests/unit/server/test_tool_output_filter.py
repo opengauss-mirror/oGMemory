@@ -16,6 +16,7 @@ from service.tool_output_filtering import (
     legacy_read_reduction,
     passthrough_reduction,
     reduce_bash_output,
+    reduce_read_output,
 )
 
 
@@ -463,7 +464,7 @@ def test_read_adaptive_filter_preserves_middle_code_evidence():
     )
 
     result = service.filter_read(
-        {"relative_path": "module.py", "content": original},
+        {"relative_path": "code-excerpt.txt", "content": original},
         _ctx(),
     )
 
@@ -550,6 +551,38 @@ def test_content_detection_keeps_repeated_error_logs_out_of_test_strategy():
 
     assert detect_content(error_log, relative_path="service.log") == "log"
     assert detect_content("short test summary info\n1 failed in 0.01s") == "test_log"
+
+
+@pytest.mark.parametrize("suffix", ["py", "pyi", "pyx", "js", "ts", "java"])
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_source_read_is_not_classified_as_an_embedded_error_or_test_log(suffix, adaptive):
+    source = (
+        "class UserChangeForm:\n"
+        "    password = ReadOnlyPasswordHashField()\n"
+        "    def clean(self):\n"
+        "        try:\n            return self.password\n"
+        "        except ValueError:\n            return None\n"
+        "    example = '''Traceback (most recent call last):\n"
+        "ValueError: example\nshort test summary info\n1 failed'''\n"
+    )
+    source = "# padding\n" * 500 + source + "# tail\n" * 500
+    assert detect_content(source, relative_path=f"forms.{suffix}") == "code"
+    service, fs = _service(
+        tool_output_filter_adaptive_enabled=adaptive,
+        tool_output_filter_read_min_chars=1,
+        tool_output_filter_read_max_lines=2,
+        tool_output_filter_output_max_chars=100,
+    )
+    result = service.filter_read({"relative_path": f"forms.{suffix}", "content": source}, _ctx())
+    assert result["detected"] == "code"
+    assert result["was_shortened"] is False
+    assert result["strategy"] == "read_source_passthrough"
+    assert result["original_chars"] == result["filtered_chars"] == len(source)
+    outcome = reduce_read_output(source, relative_path=f"forms.{suffix}", config=service._cfg)
+    assert outcome.text == source
+    assert not fs.nodes
+    # Without a source filename the same diagnostic remains an actual error.
+    assert detect_content("Traceback (most recent call last):\nValueError: bad", relative_path="run.log") == "python_error"
 
 
 @pytest.mark.parametrize("max_lines", [1, 2, 12])

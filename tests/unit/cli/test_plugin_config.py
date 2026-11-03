@@ -29,7 +29,19 @@ def forbid(*args, **kwargs):
     raise AssertionError("configuration export must not run backend operations")
 
 
-@pytest.mark.parametrize("agent", [*plugin_config.NATIVE_AGENTS, "unadapted-agent"])
+def test_portable_plugin_export_uses_explicit_mcp_endpoint(tmp_path):
+    assert plugin_config.run(args_for(tmp_path, "agent-plugins")) == 1
+    assert plugin_config.run(args_for(
+        tmp_path, "agent-plugins", "--mcp-url", "https://memory.example:18091/mcp",
+        "--ogmem-api-key", "test-key", "--account-id", "a", "--user-id", "u", "--agent-id", "g",
+    )) == 0
+    config = json.loads((tmp_path / "export/agent-plugin.json").read_text(encoding="utf-8"))
+    assert config == {"mcp_url": "https://memory.example:18091/mcp", "api_key": "test-key",
+                      "account_id": "a", "user_id": "u", "agent_id": "g", "timeout_ms": 30000}
+    assert not (tmp_path / "export/mcp.config.json").exists()
+
+
+@pytest.mark.parametrize("agent", [*plugin_config.NATIVE_AGENTS, "agent-plugins", "unadapted-agent"])
 def test_export_needs_no_backend_and_preserves_active_files(tmp_path, monkeypatch, agent, capsys):
     monkeypatch.chdir(tmp_path)
     for path in ("config/ogmem.yaml", ".claude/settings.json", "openclaw.plugin.json"):
@@ -66,7 +78,7 @@ def test_openclaw_custom_port_and_manifest_compatibility(tmp_path):
     assert cfg["memoryApiBaseUrl"] == "http://127.0.0.1:18090"
     assert cfg["mode"] == "remote"
     assert patch["plugins"]["slots"]["contextEngine"] == "og-memory-context-engine"
-    schema = json.loads((ROOT / "openclaw_context_engine_plugin/openclaw.plugin.json").read_text())["configSchema"]
+    schema = json.loads((ROOT / "plugins/openclaw/openclaw.plugin.json").read_text())["configSchema"]
     assert not (cfg.keys() - schema["properties"].keys())
     for key, value in cfg.items():
         assert schema["properties"][key]["type"] == "string"
@@ -215,7 +227,7 @@ def test_claude_runtime_uses_export_over_backend_identity(tmp_path, monkeypatch)
                     "--ogmem-api-key", "key", "--account-id", "a", "--user-id", "u", "--agent-id", "g")
     assert onboard.run(args) == 0
     values = json.loads((tmp_path / "export/claude.settings.patch.json").read_text())["env"]
-    spec = importlib.util.spec_from_file_location("export_claude_hook", ROOT / "claude-plugin/scripts/ogm_plugin_request.py")
+    spec = importlib.util.spec_from_file_location("export_claude_hook", ROOT / "plugins/claude-code/scripts/ogm_plugin_request.py")
     hook = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hook)
     monkeypatch.setattr(hook, "_try_ogmem_config", lambda: SimpleNamespace(
@@ -269,7 +281,7 @@ console.log(JSON.stringify(config));
 """
     result = subprocess.run(
         ["node", "--input-type=module", "-e", script,
-         (ROOT / "opencode-plugin/lib/config.mjs").as_uri(),
+         (ROOT / "plugins/opencode/lib/config.mjs").as_uri(),
          str(tmp_path / "export/ogmemory-config.json")],
         capture_output=True, text=True, check=True,
     )
@@ -298,8 +310,8 @@ console.log(JSON.stringify({...config, resolvedKey: process.env[config.apiKeyEnv
     result = subprocess.run(
         ["bash", "-c", 'source "$1"; shift; exec node --input-type=module -e "$@"', "dsh-export",
          str(tmp_path / "export/ogmemory.env.sh"), script,
-         (ROOT / "deepseek-harness-plugin/lib/config.js").as_uri(),
-         str(ROOT / "deepseek-harness-plugin/cordis.patch.yml")],
+         (ROOT / "plugins/deepseek-harness/lib/config.js").as_uri(),
+         str(ROOT / "plugins/deepseek-harness/cordis.patch.yml")],
         capture_output=True, text=True, check=True,
     )
     cfg = json.loads(result.stdout)
@@ -326,7 +338,7 @@ print(json.dumps(module._load_settings()))
     result = subprocess.run(
         ["bash", "-c", 'source "$1"; shift; exec "$@"', "hermes-export",
          str(tmp_path / "export/ogmemory.env.sh"), sys.executable, "-c", script,
-         str(ROOT / "hermes_memory_plugin/ogmemory/__init__.py")],
+         str(ROOT / "plugins/hermes/ogmemory/__init__.py")],
         env={**os.environ, "HERMES_HOME": str(tmp_path / "empty-hermes")},
         capture_output=True, text=True, check=True,
     )

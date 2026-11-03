@@ -3,9 +3,12 @@
 Compresses conversation history into overview and abstract summaries.
 """
 
+import logging
 from typing import Optional
 
 from core.interfaces import LLM
+
+logger = logging.getLogger(__name__)
 
 
 class SessionCompressor:
@@ -112,8 +115,18 @@ IMPORTANT: The overview MUST use the four markdown sections (Main Topics, Decisi
         try:
             result = self.llm.complete_json(prompt, schema)
             overview = result.get("overview", "")
-            abstract = result.get("abstract", "")[:100]  # Ensure max length
-            return overview, abstract
+            abstract = result.get("abstract", "")
+            if not isinstance(overview, str) or not isinstance(abstract, str):
+                # Some compatible endpoints do not enforce nested JSON types.
+                # Never pass a dict/list into archive TEXT columns: use the
+                # existing deterministic fallback and retain the raw messages.
+                logger.warning(
+                    "Session summary fields must be strings (overview=%s, abstract=%s); "
+                    "using deterministic compression fallback",
+                    type(overview).__name__, type(abstract).__name__,
+                )
+                return self._fallback_compress(messages, prev_overview, prev_abstract)
+            return overview, abstract[:100]
 
         except Exception:
             # Fall back to simple compression on error

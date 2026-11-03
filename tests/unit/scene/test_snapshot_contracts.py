@@ -3,7 +3,7 @@ from dataclasses import replace
 
 from core.models import ContextNode
 from scene.models import SceneCluster, SceneMember, SceneRecord, SceneSnapshot
-from scene.store import SceneDecisionInput, SceneDecisionStore
+from scene.store import SceneDecisionInput, SceneDecisionStore, SceneSnapshotRepository
 
 
 class MemoryDecisionStore:
@@ -15,6 +15,9 @@ class MemoryDecisionStore:
 
     def load_input(self, account_id, owner_space):
         return deepcopy(self.inputs[account_id, owner_space])
+
+    def load_snapshot(self, account_id, owner_space):
+        return self.load_input(account_id, owner_space).snapshot
 
     def compare_and_swap(self, expected, replacement):
         scope = (expected.account_id, expected.owner_space)
@@ -51,6 +54,7 @@ def _input(account="account", owner="user:alice"):
 def test_snapshot_contract_publishes_scene_identity_and_revision():
     store: SceneDecisionStore = MemoryDecisionStore(_input())
     assert isinstance(store, SceneDecisionStore)
+    assert isinstance(store, SceneSnapshotRepository)
     batch = store.load_input("account", "user:alice")
     cluster = SceneCluster(
         owner_space=batch.snapshot.owner_space,
@@ -68,6 +72,31 @@ def test_snapshot_contract_publishes_scene_identity_and_revision():
     assert published.nodes == batch.nodes
     assert published.embeddings == batch.embeddings
     assert batch.snapshot == SceneSnapshot("account", "user:alice", 0)
+
+
+def test_snapshot_preserves_member_versions_sources_and_activity_boundary():
+    store = MemoryDecisionStore(_input())
+    snapshot = store.load_snapshot("account", "user:alice")
+    member = SceneMember(
+        "ctx://account/memories/event/0", 1.0,
+        node_version=7, source_refs=("archive-1", "archive-2"),
+    )
+    cluster = SceneCluster(
+        owner_space="user:alice", members=(member,), centroid=(1.0, 0.0),
+        quality=1.0, label="Conference preparation", summary="Prepare the launch.",
+        source_fingerprint="source-v7", boundary=(("goal", "conference launch"),),
+        time_start="2026-10-21", time_end="2026-10-22",
+    )
+    record = SceneRecord(
+        "scene-1", cluster, version=2, origin="manual", description_edited=True,
+    )
+    assert store.compare_and_swap(snapshot, replace(snapshot, revision=1, scenes=(record,)))
+    saved = store.load_snapshot("account", "user:alice").scenes[0]
+    assert saved == record
+    assert saved.status == "ACTIVE"
+    assert saved.cluster.members[0].node_version == 7
+    assert saved.cluster.members[0].source_refs == ("archive-1", "archive-2")
+    assert saved.cluster.boundary == (("goal", "conference launch"),)
 
 
 def test_snapshot_inputs_are_detached_from_store_state():

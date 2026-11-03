@@ -17,6 +17,13 @@ from uuid import uuid4
 
 from core.models import RequestContext
 
+from .fragments import (
+    best_query_match,
+    build_query_plan,
+    precise_fragment_from_window,
+    query_occurrences,
+    rank_structural_fragments,
+)
 from .models import (
     ArtifactMetadata,
     ExternalizationResult,
@@ -26,25 +33,18 @@ from .models import (
     SourceFragmentPassthrough,
     ToolResultPart,
 )
-from .fragments import (
-    best_query_match,
-    build_query_plan,
-    precise_fragment_from_window,
-    query_occurrences,
-    rank_structural_fragments,
-)
 from .multires import (
     ToolResultMultiresolutionBuilder,
     ranking_context_from_messages,
 )
+from .normalizer import ToolResultNormalizer, canonical_tool_call_id
+from .policy import SelectedPart, ToolResultPolicy
 from .records import (
     extract_record_candidates,
     is_hard_critical_record,
     record_covers_fact,
     retained_record_values,
 )
-from .normalizer import ToolResultNormalizer, canonical_tool_call_id
-from .policy import SelectedPart, ToolResultPolicy
 from .store_base import ArtifactNotVisibleError, ToolResultArtifactStore
 from .synopsis import ToolResultSynopsisBuilder
 
@@ -76,6 +76,10 @@ class BoundedDaemonIORunner:
     its semaphore slot until the underlying operation actually exits.  This
     bounds leaked work during a backend outage instead of spawning unbounded
     timeout threads.
+
+    An active SQL mutation guard instead executes on its owning thread. Its
+    capacity/deadline accounting is retained, but an in-progress synchronous
+    call cannot be cancelled or bounded by the former daemon caller timeout.
     """
 
     def __init__(self, max_inflight: int = 8) -> None:
@@ -87,6 +91,10 @@ class BoundedDaemonIORunner:
         self._inflight_by_key: dict[str, int] = {}
 
     def run(self, operation, *, deadline: float, operation_key: str | None = None):
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            guard.ensure_owned()
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not self._slots.acquire(timeout=remaining):
             raise ExternalizationTimeoutError("artifact I/O capacity deadline expired")
@@ -102,6 +110,10 @@ class BoundedDaemonIORunner:
 
         def worker() -> None:
             try:
+                if guard is not None:
+                    guard.ensure_owned()
+                    if time.monotonic() >= deadline:
+                        raise ExternalizationTimeoutError("artifact I/O deadline expired before execution")
                 outcome["value"] = operation()
             except BaseException as exc:  # surfaced in the requesting thread
                 outcome["error"] = exc
@@ -116,23 +128,30 @@ class BoundedDaemonIORunner:
                 self._slots.release()
                 done.set()
 
-        try:
-            thread = threading.Thread(
-                target=worker,
-                daemon=True,
-                name="ogmem-tool-result-io",
-            )
-            thread.start()
-        except BaseException:
-            if operation_key:
-                with self._inflight_lock:
-                    remaining_count = self._inflight_by_key.get(operation_key, 1) - 1
-                    if remaining_count > 0:
-                        self._inflight_by_key[operation_key] = remaining_count
-                    else:
-                        self._inflight_by_key.pop(operation_key, None)
-            self._slots.release()
-            raise
+        if guard is not None:
+            # SQL ownership cannot cross threads or reconnect on a worker.
+            # Inline I/O keeps the connection fence; the deadline cannot
+            # cancel a blocking owning query or arbitrary synchronous call.
+            worker()
+            guard.ensure_owned()
+        else:
+            try:
+                thread = threading.Thread(
+                    target=worker,
+                    daemon=True,
+                    name="ogmem-tool-result-io",
+                )
+                thread.start()
+            except BaseException:
+                if operation_key:
+                    with self._inflight_lock:
+                        remaining_count = self._inflight_by_key.get(operation_key, 1) - 1
+                        if remaining_count > 0:
+                            self._inflight_by_key[operation_key] = remaining_count
+                        else:
+                            self._inflight_by_key.pop(operation_key, None)
+                self._slots.release()
+                raise
 
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not done.wait(remaining):

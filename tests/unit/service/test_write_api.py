@@ -612,6 +612,7 @@ class TestWriteMemories:
 
         # Mock fs to allow real write_candidate execution
         self.mock_fs.exists.return_value = False
+        self.mock_fs.list_children.return_value = []
         self.mock_fs.write_node.return_value = None
 
         result = self.api.write_memories(candidates, self.ctx, parallel=False)

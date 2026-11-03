@@ -101,10 +101,16 @@ CREATE TABLE IF NOT EXISTS session_archives (
     PRIMARY KEY (account_id, session_id, archive_id)
 );
 
-ALTER TABLE session_archives
-    ADD COLUMN IF NOT EXISTS owner_user_id VARCHAR(128) NOT NULL DEFAULT '';
-ALTER TABLE session_archives
-    ADD COLUMN IF NOT EXISTS owner_agent_id VARCHAR(128) NOT NULL DEFAULT '';
+DO $$ BEGIN
+    ALTER TABLE session_archives
+        ADD COLUMN owner_user_id VARCHAR(128) NOT NULL DEFAULT '';
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+DO $$ BEGIN
+    ALTER TABLE session_archives
+        ADD COLUMN owner_agent_id VARCHAR(128) NOT NULL DEFAULT '';
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_sa_account_session ON session_archives (account_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_session         ON session_archives (session_id);
@@ -140,6 +146,17 @@ DO $$ BEGIN
         USING (account_id = current_setting('app.account_id', true))
         WITH CHECK (account_id = current_setting('app.account_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- Content-free recovery directory. The owner backfills existing accounts once;
+-- the atomic migration restores tenant enforcement before becoming visible.
+DO $$ BEGIN
+    CREATE TABLE extraction_work_accounts (account_id VARCHAR(128) PRIMARY KEY);
+    ALTER TABLE context_nodes NO FORCE ROW LEVEL SECURITY;
+    INSERT INTO extraction_work_accounts (account_id)
+        SELECT DISTINCT account_id FROM context_nodes WHERE category = 'state' AND status = 'ACTIVE';
+    ALTER TABLE context_nodes FORCE ROW LEVEL SECURITY;
+EXCEPTION WHEN duplicate_table THEN NULL;
 END $$;
 
 -- relation_edges
@@ -284,6 +301,9 @@ CREATE TABLE IF NOT EXISTS trace_events (
 );
 CREATE INDEX IF NOT EXISTS idx_trace_events_session
     ON trace_events (account_id, owner_space, agent_id, session_id, event_index);
+CREATE INDEX IF NOT EXISTS idx_trace_events_batch
+    ON trace_events (account_id, owner_space, agent_id, session_id,
+                     (COALESCE(content->>'write_batch_id', '')), event_index);
 CREATE INDEX IF NOT EXISTS idx_trace_events_hook_time
     ON trace_events (account_id, hook_type, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_trace_events_agent_time

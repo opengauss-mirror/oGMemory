@@ -113,6 +113,13 @@ class ContextFS(Protocol):
         ...
 
 
+@runtime_checkable
+class ArchiveLocator(Protocol):
+    """Optional canonical archive lookup scoped to the caller's account and owner."""
+
+    def find_archive_uri(self, archive_id: str, ctx: RequestContext) -> str | None: ...
+
+
 class RelationStore(Protocol):
     """Graph relation storage.
 
@@ -228,8 +235,9 @@ class VectorIndex(Protocol):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
-        """Read already-indexed vectors for offline derived projections."""
+        """Read scoped vectors, matching expected source text in the same index read."""
         ...
 
     def upsert(self, records: list[IndexRecord]) -> None:

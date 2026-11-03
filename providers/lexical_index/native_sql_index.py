@@ -348,7 +348,7 @@ class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
                 index_name = f"idx_{self._table}_native_bm25"
                 cur.execute(
                     f"""
-                    SELECT /*+ indexscan ({self._docs_table} {index_name}) */
+                    SELECT /*+ indexscan (d {index_name}) */
                            d.record_id,d.metadata_json,d.content <&> %s AS rank
                     FROM {self._docs_table} d
                     WHERE {where_sql}

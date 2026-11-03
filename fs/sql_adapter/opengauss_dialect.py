@@ -34,7 +34,15 @@ END $$;
 class OpenGaussDialect(PostgreSQLDialect):
     name = OPENGAUSS
     supports_batch_claim = False
-    lock_timeout_parameter = "lockwait_timeout"
+    # Ordinary roles cannot set lockwait_timeout. statement_timeout also bounds
+    # statements waiting for locks, without requiring an administrative role.
+    lock_timeout_parameter = None
+
+    def ensure_extraction_work_account(self, cursor: Any, account_id: str) -> None:
+        cursor.execute("MERGE INTO extraction_work_accounts target "
+                       "USING (SELECT %s::varchar AS account_id) source "
+                       "ON (target.account_id = source.account_id) "
+                       "WHEN NOT MATCHED THEN INSERT (account_id) VALUES (source.account_id)", (account_id,))
 
     def prepare_schema(self, schema_sql: str) -> str:
         table_names = list(dict.fromkeys(_POLICY_TABLE_RE.findall(schema_sql)))

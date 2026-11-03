@@ -37,6 +37,7 @@ dependencies = [
     "pydantic>=2.0",
     "python-dotenv>=1.0.0",
     "json-repair>=0.7.0",
+    "jsonschema>=4.20.0",
     "rank-bm25>=0.2.2",
     "nltk>=3.9.4",
     "mcp[cli]>=2.0.0,<3",
@@ -56,7 +57,7 @@ dev = [
     # Used by tests/unit/extraction/operators/test_video_frame_extractor.py.
     # headless build avoids the libgl dependency that opencv-python pulls in
     # on systems without X / display servers.
-    "opencv-python-headless>=4.8",
+    "opencv-python-headless>=4.8,<5",
     "numpy>=1.26",
     # Standalone CV inference service (scripts/cv_service.py) and its
     # in-process tests. FastAPI is the framework; uvicorn is only
@@ -66,7 +67,9 @@ dev = [
     "uvicorn>=0.27",
 ]
 opengauss = []  # psycopg2-binary now in core dependencies
+m3-budget = ["tokenizers>=0.20,<1"]
 chroma = ["chromadb>=0.4.0"]
+deepagents = ["deepagents>=0.7.23,<0.8"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 
 # Optional CV backend extras. ``insightface`` is heavy (340MB+ ONNX weights
@@ -145,6 +148,8 @@ packages = [
     "skills",
     "features",
     "scene",
+    "integrations",
+    "m3",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -164,6 +169,8 @@ include = [
     "/skills",
     "/features",
     "/scene",
+    "/integrations",
+    "/m3",
 ]
 
 [tool.pytest.ini_options]
@@ -188,7 +195,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]  # line-length handled by formatter
 
 [tool.ruff.lint.isort]
-known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server"]
+known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server", "integrations"]
 
 # MyPy configuration
 [tool.mypy]

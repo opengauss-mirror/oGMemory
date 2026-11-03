@@ -22,6 +22,10 @@ from providers.llm import MockLLM
 from providers.relation_store.sql_relation_store import SQLRelationStore
 from providers.unified_config import OgMemConfig
 from providers.vector_index import OpenGaussVectorIndex
+from server.mcp_resources import (
+    external_to_internal_uri_candidates,
+    internal_to_external_uri,
+)
 from server.memory_service import MemoryService
 from service.api import MemoryWriteAPI
 from session.sql_archive_store import SQLSessionArchiveStore
@@ -87,7 +91,7 @@ def _wait_for_pgvector_rows(
                     (account_id,),
                 )
                 last_vector_rows = cur.fetchall()
-                if len(last_vector_rows) == 3 and last_outbox_rows == 0:
+                if len(last_vector_rows) == 2 and last_outbox_rows == 0:
                     return last_outbox_rows, last_vector_rows
         finally:
             conn.close()
@@ -187,6 +191,7 @@ def cleanup_pgvector_account(pgvector_dsn, sql_account):
 def test_sql_session_archive_roundtrip(sql_dsn, sql_ctx, cleanup_sql_account):
     cfg = OgMemConfig(
         provider="mock",
+        after_turn_threshold=1,
         vector_db_type="memory",
         storage_backend="sql",
         sql_connection_string=sql_dsn,
@@ -204,7 +209,7 @@ def test_sql_session_archive_roundtrip(sql_dsn, sql_ctx, cleanup_sql_account):
                     {"role": "assistant", "content": "Stored."},
                 ],
                 "prePromptMessageCount": 0,
-                "commitTokenThreshold": 1,
+                "wait": True,
             }
         )
 
@@ -214,7 +219,10 @@ def test_sql_session_archive_roundtrip(sql_dsn, sql_ctx, cleanup_sql_account):
         store = SQLSessionArchiveStore(connection_string=sql_dsn)
         archives = store.list_archives(sql_ctx.session_id, sql_ctx)
         assert len(archives) == 1
-        assert archives[0].archive_id == result["archive_id"]
+        assert archives[0].archive_id
+        loaded = store.read_archive(sql_ctx.session_id, archives[0].archive_id, sql_ctx)
+        assert loaded.session_id == sql_ctx.session_id
+        assert loaded.messages[0]["content"] == "Remember that I prefer pour-over coffee."
     finally:
         service.shutdown()
 
@@ -244,6 +252,35 @@ def test_sql_context_fs_roundtrip_via_write_api(sql_dsn, sql_ctx, cleanup_sql_ac
 
     node = fs.read_node(uri, sql_ctx)
     assert "SQL storage" in node.content
+
+
+@pytest.mark.parametrize("directory,category,slug", [
+    ("entities", "entity", "李雷"),
+    ("preferences", "preference", "coffee%20shop"),
+])
+def test_sql_memory_uri_write_read_delete(
+    sql_dsn, sql_ctx, cleanup_sql_account, directory, category, slug,
+):
+    fs = SQLContextFS(connection_string=sql_dsn)
+    uri = f"ctx://{sql_ctx.account_id}/users/{sql_ctx.user_id}/memories/{directory}/{slug}"
+    fs.write_node(
+        ContextNode(
+            uri=uri, context_type="MEMORY", category=category, level=0,
+            owner_space=f"user:{sql_ctx.user_id}", abstract="Stored memory", overview="",
+            content="Stored memory", metadata={},
+        ),
+        sql_ctx,
+    )
+    public_uri = internal_to_external_uri(uri, category=category)
+    existing_uri = next(
+        candidate for candidate in external_to_internal_uri_candidates(public_uri, sql_ctx)
+        if fs.exists(candidate, sql_ctx)
+    )
+
+    assert existing_uri == uri
+    assert fs.read_node(existing_uri, sql_ctx).content == "Stored memory"
+    fs.delete_node(existing_uri, sql_ctx)
+    assert not fs.exists(uri, sql_ctx)
 
 
 def test_sql_relation_store_roundtrip(sql_dsn, sql_ctx, cleanup_sql_account):
@@ -321,14 +358,15 @@ def test_sql_pgvector_roundtrip_via_memory_service(
         )
 
         assert outbox_rows == 0
-        assert len(vector_rows) == 3
-        assert {row[2] for row in vector_rows} == {0, 1, 2}
+        assert len(vector_rows) == 2
+        assert {row[2] for row in vector_rows} == {0, 2}
         assert all(row[3] == 1536 for row in vector_rows)
         assert all(row[4] == sql_ctx.account_id for row in vector_rows)
 
         embedder = MockEmbedder(dimension=1536)
         index = OpenGaussVectorIndex(
             connection_string=pgvector_dsn,
+            dialect="postgresql",
             dimension=1536,
             table_name="vector_index",
         )
@@ -344,7 +382,7 @@ def test_sql_pgvector_roundtrip_via_memory_service(
             top_k=3,
         )
 
-        assert len(results) == 3
+        assert len(results) == 2
         assert results[0].uri.endswith("/content.md")
         assert results[0].score > 0.99
     finally:

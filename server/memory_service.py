@@ -13,6 +13,7 @@ import os
 import re as _re
 import threading
 from collections.abc import Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC
@@ -21,7 +22,16 @@ from functools import wraps
 from typing import Any
 from uuid import uuid4
 
-from core.errors import AccessDeniedError, ValidationError
+from commit.write_receipts import WriteOutcomeUnknownError
+from core.errors import (
+    AccessDeniedError,
+    ExtractionIncompleteError,
+    LLMTransientError,
+    MemoryCardFormatError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+    ValidationError,
+)
 from core.models import (
     ArchiveRef,
     ComposedContext,
@@ -32,10 +42,12 @@ from core.models import (
     SeedHit,
     TokenBudget,
 )
+from core.operation_deadline import check_deadline, operation_deadline
 from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 
 # Chunking support
 from extraction.chunking import ConversationChunker
+from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.token_tracker import request_usage_scope
@@ -51,7 +63,9 @@ from retrieval.code_retrieval import (
     format_code_evidence_entries,
 )
 from retrieval.context_reader import ContextReader
+from retrieval.evidence_selector import canonical_uri, hydrate_evidence, select_evidence
 from retrieval.hierarchical_searcher import HierarchicalSearcher
+from retrieval.identity import memory_identity, memory_unit_key
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.result_ranker import ResultRanker
@@ -77,6 +91,20 @@ from service.code_workspace_sync import (
     ResolvedCodeWorkspace,
     WorkspaceResolutionError,
 )
+from service.extraction_checkpoint import (
+    EXTENSION_KEY,
+    ExtractionBatchJournal,
+    RecoveryNeedsConfirmationError,
+    RecoveryPersistenceError,
+    recovery_owner,
+    request_message_id,
+)
+from service.extraction_retry import (
+    ExtractionRetryWorker,
+    is_frozen_source_retry,
+    retry_failed_source,
+)
+from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
 from session.rolling_compressor import RollingCompressor
@@ -103,6 +131,97 @@ except ImportError:
     _HAS_SQL = False
 
 logger = logging.getLogger("ogmem.service")
+
+
+def _ambiguous_pending_replay(pending, messages, client_request_id):
+    if not pending or client_request_id:
+        return False
+    source = {(value["role"], value["content"]) for value in pending["snapshot"]}
+    return any(
+        isinstance(message, dict) and not message.get("id")
+        and (message.get("role", "user"),
+             extract_content_and_tool_calls(message.get("content", "")).get("text", "")) in source
+        for message in messages
+    )
+
+
+def _after_turn_deadline(function):
+    """An explicit budget belongs to a synchronous caller, never a background job."""
+    @wraps(function)
+    def bounded(self, params):
+        params = params or {}
+        if "timeoutSeconds" not in params:
+            return function(self, params)
+        timeout = params["timeoutSeconds"]
+        if timeout is None:
+            raise ValueError("timeoutSeconds must be a positive finite number")
+        synchronous = bool(str(params.get("clientRequestId") or params.get("client_request_id") or "").strip())
+        if not synchronous and not self._param_bool(params, "wait", "wait", default=False):
+            raise ValueError("timeoutSeconds requires wait=true or clientRequestId")
+        try:
+            with operation_deadline(timeout):
+                return function(self, params)
+        except OperationDeadlineExceededError as exc:
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc)}
+    return bounded
+
+
+def _guard_session_mutation(function):
+    """Acquire ownership before reading or changing the cached session source."""
+    @wraps(function)
+    def guarded(self, params):
+        params = params or {}
+        if not params.get("sessionId") and params.get("session_id"):
+            params = {**params, "sessionId": params["session_id"]}
+        if function.__name__ in ("after_turn", "ingest") and not params.get("messages") and not params.get("message"):
+            return function(self, params)
+        if function.__name__ == "compose" and _code_memory_only_requested(params):
+            return function(self, params)
+        if function.__name__ == "govern_first_view_tool_result" and self._tool_result_governance is None:
+            return function(self, params)
+        if function.__name__ == "dispose" and not (params.get("sessionId") or params.get("session_id")):
+            return function(self, params)
+        from service.api import MemoryWriteAPI
+        fs = self._write_api._fs if isinstance(self._write_api, MemoryWriteAPI) else None
+        if not self._use_sql and self._write_api is None:
+            manager = self.get_session_manager()
+            fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
+            if fs is None:
+                return function(self, params)
+            manager._get_context_fs = lambda: fs
+        if (not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None))
+                and not callable(getattr(type(fs), "session_recovery_lock", None))):
+            return function(self, params)
+        from fs.sql_adapter.session_mutation import SessionMutationLostError
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            with self._session_mutation_scope(ctx, refresh=function.__name__ != "delete_session") as guard:
+                if (guard is not None and function.__name__ == "after_turn"
+                        and callable(getattr(guard, "identity_lock", None))):
+                    from service.extraction_retry import background_retry_running
+                    if (not background_retry_running() and (
+                            str(params.get("clientRequestId") or params.get("client_request_id") or "").strip()
+                            or self._param_bool(params, "wait", "wait", default=False))):
+                        guard.wait_for_identity_lock = True
+                if guard is not None and function.__name__ == "commit_session_buffer":
+                    params = {**params, "wait": True}
+                result = function(self, {**params, "_ctx": ctx})
+                if guard is not None:
+                    guard.ensure_owned()
+                    if (function.__name__ not in ("dispose", "delete_session")
+                            and result.get("ok", True)
+                            and not self.get_session_manager().save_session_state(ctx.session_id, ctx)):
+                        raise RecoveryNeedsConfirmationError("session source checkpoint was not acknowledged")
+            if guard is not None and guard.post_commit_drain:
+                drain = self.drain_outbox_sync(account_id=ctx.account_id)
+                if "drain" in result:
+                    result["drain"] = drain
+            return result
+        except SessionMutationBusyError:
+            return {"ok": False, "status": "processing", "retryable": True}
+        except (SessionMutationLostError, RecoveryNeedsConfirmationError) as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False, "error": str(exc)}
+    return guarded
 
 # Fallback archive-trim safety margin used only when incoming messages cannot
 # be aligned with the session buffer.  It preserves a likely in-flight
@@ -184,6 +303,30 @@ def _attribute_request_usage(method):
 def _run_with_usage_scope(ctx: RequestContext, target, *args):
     with request_usage_scope(ctx):
         return target(*args)
+
+
+class _DisposeOperationLease:
+    """Release only this dispose call's operation and flag, exactly once."""
+
+    def __init__(self, buffer):
+        self.buffer = buffer
+        self.worker_owned = False
+        self._owns_dispose = False
+        self._released = False
+
+    def claim_dispose(self):
+        with self.buffer.extraction_lock:
+            self.buffer.dispose_in_progress = True
+            self._owns_dispose = True
+
+    def release(self, *, local=False):
+        with self.buffer.extraction_lock:
+            if self._released or (local and self.worker_owned):
+                return
+            self._released = True
+            if self._owns_dispose:
+                self.buffer.dispose_in_progress = False
+            self.buffer.end_operation()
 
 
 def extract_content_text(content) -> str:
@@ -274,6 +417,9 @@ def _seed_hit_to_working_set_item(hit: SeedHit) -> dict:
 
 
 def _retrieved_block_to_seed_hit(hit) -> SeedHit:
+    metadata = {"source": "prefetch"}
+    if unit_key := memory_unit_key(getattr(hit, "metadata", None)):
+        metadata["unit_key"] = unit_key
     return SeedHit(
         uri=getattr(hit, "uri", "") or "",
         score=float(getattr(hit, "score", 0.0) or 0.0),
@@ -285,7 +431,7 @@ def _retrieved_block_to_seed_hit(hit) -> SeedHit:
             or getattr(hit, "content_excerpt", None)
             or ""
         ),
-        metadata={"source": "prefetch"},
+        metadata=metadata,
     )
 
 
@@ -526,7 +672,10 @@ class MemoryService:
     Each handler method accepts a plain dict and returns a plain dict.
     """
 
-    def __init__(self, config: OgMemConfig | None = None, tool_result_store=None):
+    def __init__(
+        self, config: OgMemConfig | None = None, tool_result_store=None,
+        *, scene_manager=None, scene_ranker=None, scene_source=None,
+    ):
         cfg = config or get_config()
         self._cfg = cfg
         self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
@@ -568,6 +717,8 @@ class MemoryService:
         self._bm25_index: Bm25Index | None = None
         self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
+        self._extraction_retry = ExtractionRetryWorker(self)
+        self._extraction_discovery = None
         self._outbox_listener = None
         self._control_store = None
         self._key_manager = None
@@ -586,6 +737,10 @@ class MemoryService:
         self._retrieval_monitoring: dict[tuple[str, str], dict[str, Any]] = {}
         self._retrieval_monitoring_lock = threading.Lock()
         self._init_lock = threading.RLock()
+        self._scene_manager = scene_manager
+        self._scene_ranker = scene_ranker
+        self._scene_source = scene_source
+        self._scene_service = None
         self._tool_result_store = None
         self._configured_tool_result_store = tool_result_store
         self._tool_result_externalizer = None
@@ -697,17 +852,26 @@ class MemoryService:
     def _use_sql(self) -> bool:
         return self._cfg.storage_backend == "sql" and _HAS_SQL and self._cfg.sql_connection_string
 
-    @_serialize_lazy_initialization("_sql_pool")
-    def _get_shared_sql_pool(self):
-        """Create (once) and return the shared connection pool for all SQL stores."""
-        if self._sql_pool is None and _HAS_SQL and self._cfg.sql_connection_string:
-            from fs.sql_adapter.pool import SharedConnectionPool
-            self._sql_pool = SharedConnectionPool(
-                connection_string=self._cfg.sql_connection_string,
-                pool_size=self._cfg.sql_pool_size,
-                dialect=self._cfg.sql_dialect,
-            )
-        return self._sql_pool
+    def _get_shared_sql_pool(self, *, deadline=None):
+        """Create the shared pool within the caller's optional acquisition budget."""
+        if self._sql_pool is not None:
+            return self._sql_pool
+        from fs.sql_adapter.pool import SharedConnectionPool, remaining_seconds
+        acquired = (self._init_lock.acquire() if deadline is None
+                    else self._init_lock.acquire(timeout=remaining_seconds(deadline)))
+        if not acquired:
+            raise TimeoutError("SQL pool initialization deadline elapsed")
+        try:
+            if self._sql_pool is None and _HAS_SQL and self._cfg.sql_connection_string:
+                self._sql_pool = SharedConnectionPool(
+                    connection_string=self._cfg.sql_connection_string,
+                    pool_size=self._cfg.sql_pool_size,
+                    dialect=self._cfg.sql_dialect,
+                    deadline=deadline,
+                )
+            return self._sql_pool
+        finally:
+            self._init_lock.release()
 
     def _get_context_fs(self):
         """Create the appropriate ContextFS implementation based on config."""
@@ -1373,9 +1537,17 @@ class MemoryService:
         ctx,
         session_id: str,
         write_api,
+        candidate_checkpoint=None,
     ) -> None:
         """Generate L0 structured summary for a session and write to storage."""
+        check_deadline()
         try:
+            if candidate_checkpoint is not None and candidate_checkpoint.load() is not None:
+                accepted = candidate_checkpoint.load()[0]
+                plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
+                if accepted and not plans:
+                    raise RuntimeError("summary rejected before writing")
+                return
             from extraction.summary_generator import SessionSummaryGenerator
 
             # Format messages into text
@@ -1396,12 +1568,17 @@ class MemoryService:
 
             messages_text = "\n".join(lines)
             if not messages_text.strip():
+                if candidate_checkpoint is not None:
+                    candidate_checkpoint.accept([], 0, 0)
                 return
 
             participants_str = ", ".join(participants) if participants else ""
             gen = SessionSummaryGenerator(llm=self.get_llm())
             summary = gen.generate(messages_text, session_time, participants_str)
+            check_deadline()
             if not summary:
+                if candidate_checkpoint is not None:
+                    candidate_checkpoint.accept([], 0, 0)
                 return
 
             formatted = gen.format_summary(summary)
@@ -1412,12 +1589,23 @@ class MemoryService:
                 participants=participants_str,
                 session_id=session_id,
             )
-            write_api.write_memory(candidate, ctx)
+            if candidate_checkpoint is not None:
+                check_deadline()
+                accepted = candidate_checkpoint.accept([candidate], 1, 0)
+                plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
+                if not plans:
+                    raise RuntimeError("summary rejected before writing")
+            else:
+                write_api.write_memory(candidate, ctx)
             logger.info(
                 "L0 summary written: session=%s len=%d",
                 session_id[:8], len(formatted),
             )
+        except OperationDeadlineExceededError:
+            raise
         except Exception as exc:
+            if candidate_checkpoint is not None:
+                raise
             logger.warning("L0 summary generation failed: %s", exc, exc_info=True)
 
     def _chunk_and_extract(
@@ -1431,6 +1619,7 @@ class MemoryService:
         extraction_run_id: str,
         session_id: str,
         archive_id: str | None = None,
+        extraction_journal=None,
     ) -> dict:
         """Extract memories from messages, optionally chunking first.
 
@@ -1441,6 +1630,13 @@ class MemoryService:
         When chunking is disabled (or produces a single chunk), falls back
         to a single commit_session() call — identical to the original path.
         """
+        from fs.sql_adapter.session_mutation import active_session_guard
+        check_deadline()
+        guard = active_session_guard()
+        if guard is not None:
+            guard.ensure_owned()
+        if extraction_journal is not None:
+            return self._chunk_and_extract_recoverable(write_api, ctx, session_id, extraction_journal)
         # Step 0: Generate L0 summary for the whole session
         self._generate_and_write_summary(
             messages, session_time, ctx, session_id, write_api,
@@ -1528,6 +1724,7 @@ class MemoryService:
         }
 
         for idx, chunk in enumerate(chunking_result.chunks):
+            check_deadline()
             logger.info(
                 "chunk_and_extract: processing chunk %d/%d, run=%s session=%s msgs=%d",
                 idx + 1, len(chunking_result.chunks),
@@ -1561,6 +1758,8 @@ class MemoryService:
                     )
                 except Exception as raw_exc:
                     logger.debug("raw chunk write failed (chunk %d): %s", idx, raw_exc)
+            except OperationDeadlineExceededError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "chunk_and_extract: chunk %d/%d failed, run=%s session=%s: %s",
@@ -1579,6 +1778,92 @@ class MemoryService:
             aggregated["writes_failed"],
         )
         return aggregated
+
+    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal):
+        batch = journal.batch
+        messages = batch["messages"]
+        session_time = _parse_session_time(batch.get("session_time"))
+
+        def make_chunks():
+            chunker = self._get_chunker()
+            return chunker.chunk_messages(messages, flush=True).chunks if chunker else [messages]
+
+        chunks = journal.chunks(make_chunks)
+        for index, chunk in enumerate(chunks):
+            write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
+                                     session_id=session_id, session_time=session_time,
+                                     candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
+        aggregated = {"candidates_extracted": 0, "candidates_filtered": 0,
+                      "writes_completed": 0, "writes_skipped": 0, "writes_failed": 0, "plans": []}
+        from service.extraction_retry import source_only_reason
+        reason = source_only_reason()
+        if reason:
+            for slot in list(journal.batch["slots"]):
+                if slot.startswith("raw:"):
+                    continue
+                checkpoint = journal.checkpoint(slot)
+                candidates, extracted, filtered = checkpoint.load()
+                plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
+                aggregated["candidates_extracted"] += extracted
+                aggregated["candidates_filtered"] += filtered
+                aggregated["writes_completed"] += sum(plan.action != "skip" for plan in plans)
+                aggregated["writes_skipped"] += sum(plan.action == "skip" for plan in plans)
+                aggregated["plans"].extend({"action": plan.action, "target_uri": plan.target_uri,
+                                             "merged_fields": plan.merged_fields} for plan in plans)
+            logger.warning("Extraction completed from preserved source session=%s archive=%s reason=%s",
+                           session_id, batch["archive_id"], reason)
+            return {**aggregated, "degraded": True, "recovery_mode": "source_only", "reason": reason}
+        self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
+                                         candidate_checkpoint=journal.checkpoint("summary"))
+        for index, chunk in enumerate(chunks):
+            check_deadline()
+            result = write_api.commit_session(
+                messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
+                session_time=session_time, session_summary=batch["session_summary"],
+                tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
+                candidate_checkpoint=journal.checkpoint(f"chunk:{index}"))
+            for key in ("candidates_extracted", "candidates_filtered", "writes_completed",
+                        "writes_skipped", "writes_failed"):
+                aggregated[key] += result.get(key, 0)
+            aggregated["plans"].extend(result.get("plans", []))
+        return aggregated
+
+    def _complete_extraction_source(self, ctx, archive_id, reason):
+        from service.extraction_retry import source_only_recovery
+        journal = self._extraction_retry._journal(ctx, archive_id)
+        if journal is None:
+            return {"ok": True, "status": "completed"}
+        batch = journal.batch
+        with source_only_recovery(ctx, archive_id, reason):
+            result = self.after_turn({
+                "_ctx": ctx, "sessionId": ctx.session_id, "wait": True,
+                "forceExtract": True, "timeoutSeconds": 1200,
+                "clientRequestId": batch["client_request_id"],
+                "messages": deepcopy(batch["request_messages"]),
+            })
+        if result.get("status") == "failed":
+            result.setdefault("retryable", True)
+        return result
+
+    def start_extraction_recovery(self):
+        from service.extraction_recovery_discovery import ExtractionRecoveryDiscovery
+        with self._init_lock:
+            if self._extraction_discovery is None:
+                self._extraction_discovery = ExtractionRecoveryDiscovery(
+                    self._get_context_fs, self._extraction_recovery_account_ids)
+                self._extraction_retry.start_discovery(self._extraction_discovery)
+
+    def _extraction_recovery_account_ids(self):
+        accounts = [self._default_account_id]
+        if self._cfg.role_control_enabled:
+            accounts.extend(item["account_id"] for item in self.get_key_manager().get_accounts()
+                            if item.get("account_id"))
+        else:
+            fs = self._get_context_fs()
+            enumerate_accounts = getattr(type(fs), "recovery_account_ids", None)
+            if enumerate_accounts is not None:
+                accounts.extend(enumerate_accounts(fs))
+        return accounts
 
     @staticmethod
     def _supports_batch_claim(outbox_store) -> bool:
@@ -1599,7 +1884,7 @@ class MemoryService:
 
         Empty strings from the plugin are treated as absent, so defaults apply.
         """
-        session_id = params.get("sessionId") or "unknown"
+        session_id = params.get("sessionId") or params.get("session_id") or "unknown"
         explicit_agent_id = params.get("agentId")
         user_id = params.get("userId") or params.get("user_id")
         if not user_id:
@@ -1793,12 +2078,12 @@ class MemoryService:
             if self._cfg.skill_sedimentation_enabled:
                 result = self._search_without_generated_skills(
                     read_api, query=query, ctx=ctx, top_k=15,
-                    fill_content_for_top_k=5,
+                    fill_content_for_top_k=0,
                 )
             else:
                 result = read_api.search_memory(
                     query=query, ctx=ctx, top_k=15,
-                    fill_content_for_top_k=5, mode="QUICK",
+                    fill_content_for_top_k=0, mode="QUICK",
                 )
             if result and result.hits:
                 ordinary_hits = list(result.hits)
@@ -1815,6 +2100,7 @@ class MemoryService:
                         "content": h.content_excerpt or "",
                         "score": h.score,
                         "category": h.category,
+                        "metadata": dict(h.metadata or {}),
                     }
                     for h in ordinary_hits
                 ]
@@ -1913,20 +2199,22 @@ class MemoryService:
             for hit in (getattr(result, "hits", []) or [])
             if (getattr(hit, "metadata", {}) or {}).get("ogmemory_generated") is not True
         ]
-        deduped = {hit.uri: hit for hit in candidates}
-        result.hits = sorted(
-            deduped.values(),
+        candidates.sort(
             key=lambda hit: float(
                 getattr(hit, "ranking_score", None)
                 if getattr(hit, "ranking_score", None) is not None
                 else getattr(hit, "score", 0.0)
             ),
             reverse=True,
-        )[:top_k]
+        )
+        deduped = {}
+        for hit in candidates:
+            deduped.setdefault(memory_identity(hit.uri, getattr(hit, "metadata", None)), hit)
+        result.hits = list(deduped.values())[:top_k]
         return result
 
     @staticmethod
-    def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.15) -> list[dict]:
+    def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.10) -> list[dict]:
         """Truncate items at the largest score gap.
 
         Finds the biggest relative score drop between consecutive items.
@@ -2007,7 +2295,10 @@ class MemoryService:
             text = text[:max_chars]
         return text
 
-    def _format_working_set(self, working_set: list[dict], budget: dict[str, int]) -> str:
+    def _format_working_set(
+        self, working_set: list[dict], budget: dict[str, int], *,
+        query: str = "", delivery_stats: dict | None = None,
+    ) -> str:
         """Build DYNAMIC working set as user message content.
 
         This goes into memoryUserMessage and changes every turn.
@@ -2049,19 +2340,19 @@ class MemoryService:
                 )
             )
 
-        for item in ordinary_items:
-            cat = item.get("category", "memory")
-            abstract = item.get("abstract", "")
-            overview = item.get("overview", "")
-            content = item.get("content", "")
-            text_to_show = overview or content or abstract
-
-            # Add temporal context if available
-            when = (item.get("metadata") or {}).get("when")
-            if when:
-                text_to_show = f"[{when}] {text_to_show}"
-
-            ws_lines.append(f"- [{cat}] {text_to_show}")
+        if ordinary_items:
+            reserved_chars = len("\n".join(ws_lines)) + 1
+            ordinary_budget = max(0, max_chars - reserved_chars)
+            evidence, selection_stats = select_evidence(
+                ordinary_items, query, ordinary_budget,
+                embedder_factory=self._get_shared_embedder,
+            )
+            if delivery_stats is not None:
+                delivery_stats.update(selection_stats)
+            if evidence:
+                ws_lines.append(evidence)
+            elif not code_items:
+                return ""
         ws_text = "\n".join(ws_lines)
         if len(ws_text) > max_chars and working_set_budget > 100:
             if not code_items:
@@ -2075,6 +2366,10 @@ class MemoryService:
                 ws_text = protected_text
                 if remaining and ordinary_text:
                     ws_text += "\n" + ordinary_text[:remaining]
+        if delivery_stats is not None:
+            delivery_stats.setdefault("delivered_uris", []).extend(
+                canonical_uri(item.get("uri", "")) for item in code_items
+            )
         return ws_text
 
     def _get_session_state(
@@ -2085,6 +2380,7 @@ class MemoryService:
         """Get or compress session window state (Layer 2)."""
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
+
         mgr.load_session_state(session_id, ctx)
         window_state = buf.window_state
         window_state.last_accessed_at = _dt.now(UTC).isoformat()
@@ -2244,7 +2540,13 @@ class MemoryService:
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            vector_index = self._provider_cfg.create_vector_index()
+            if (self._use_sql and self._cfg.vector_db_type == "opengauss"
+                    and self._cfg.opengauss_connection_string == self._cfg.sql_connection_string):
+                vector_index = self._provider_cfg.create_vector_index(
+                    pool=self._get_shared_sql_pool(),
+                )
+            else:
+                vector_index = self._provider_cfg.create_vector_index()
             projection_index = vector_index
             lexical_index = None
             if getattr(self._cfg, "retrieval_hybrid_enabled", False):
@@ -2382,6 +2684,9 @@ class MemoryService:
                 fs=fs,
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
+                agent_memory_handler=self._process_agent_memory,
+                memory_projection_handler=self._scene_projection_changed
+                    if self._cfg.scene_enabled and self._cfg.scene_generation_enabled else None,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2464,6 +2769,15 @@ class MemoryService:
         if not _HAS_AGFS and not _HAS_SQL:
             return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
         try:
+            from fs.sql_adapter.session_mutation import active_session_guard
+            guard = active_session_guard()
+            if guard is not None:
+                guard.ensure_owned()
+                if account_id is not None and account_id != guard.ctx.account_id:
+                    guard.poison("projection request changed its mutation account")
+                    guard.check_active()
+                guard.post_commit_drain = True
+                return {"processed": 0, "succeeded": 0, "failed": 0, "deferred": True}
             from index.outbox_worker import OutboxWorker
 
             vector_index = self._get_shared_projection_index()
@@ -2485,6 +2799,9 @@ class MemoryService:
                 fs=fs,
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
+                agent_memory_handler=self._process_agent_memory,
+                memory_projection_handler=self._scene_projection_changed
+                    if self._cfg.scene_enabled and self._cfg.scene_generation_enabled else None,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2509,6 +2826,14 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        if self._scene_manager is not None and not self._scene_manager.stop(timeout=join_timeout):
+            logger.warning("Scene worker is completing its current request")
+            return
+        self._extraction_retry.close(join_timeout)
+        scene_index = getattr(self._scene_source, "candidate_index", None)
+        if scene_index is not None and not scene_index.close(timeout=join_timeout):
+            logger.warning("Scene lexical index is still closing")
+            return
         if self._code_workspace_sync_service is not None:
             try:
                 self._code_workspace_sync_service.shutdown()
@@ -2594,6 +2919,100 @@ class MemoryService:
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
 
+    def _ensure_scene_runtime(self):
+        if not self._cfg.scene_enabled or self._scene_manager is not None:
+            return
+        with self._init_lock:
+            if self._scene_manager is not None:
+                return
+            from scene.adapters import CanonicalSceneAdapter
+            from scene.config import SceneConfig
+            from scene.decision import SceneDecisionEngine
+            from scene.manager import SceneMemoryManager
+            from scene.retrieval import SceneRanker
+            from scene.service import SceneService
+            from scene.sql_store import SQLSceneConfigProvider, SQLSceneJobStore, SQLSceneRepository
+
+            if not self._use_sql:
+                raise RuntimeError("scene memory requires a configured durable scene-store adapter")
+            pool = self._get_shared_sql_pool()
+            config = SceneConfig().merged(self._cfg.scene_options)
+            repository = SQLSceneRepository(pool)
+            provider = SQLSceneConfigProvider(pool, default=config)
+            from copy import copy
+
+            from providers.lexical_index.factory import create_lexical_index
+            from scene.candidate_index import LazySceneIndex, SceneIndexRefresh
+
+            lexical_config = copy(self._cfg)
+            lexical_config.retrieval_lexical_options = {
+                **self._cfg.retrieval_lexical_options, "table_name": "scene_lexical_v1",
+            }
+            candidate_index = LazySceneIndex(lambda: create_lexical_index(lexical_config),
+                                             projection_queue=repository)
+            refresh_projection = SceneIndexRefresh(repository, candidate_index)
+
+            def projection_refresh():
+                if candidate_index.initialized:
+                    refresh_projection()
+            try:
+                adapter = CanonicalSceneAdapter(
+                    repository, self._get_context_fs(), self._get_shared_vector_index(),
+                    self._get_shared_embedder(), config=config, config_provider=provider,
+                    archive_store=self._get_archive_store(), candidate_index=candidate_index,
+                )
+                manager = SceneMemoryManager(
+                    SQLSceneJobStore(pool), adapter,
+                    SceneDecisionEngine(self.get_llm(), config, evidence_reader=adapter),
+                    config=config, config_provider=provider, projection_refresh=projection_refresh,
+                )
+                scene_service = SceneService(
+                    repository, adapter, manager, provider, self._get_shared_embedder(),
+                )
+                if self._cfg.scene_generation_enabled:
+                    manager.start()
+            except Exception:
+                candidate_index.close()
+                raise
+            self._scene_source = adapter
+            self._scene_ranker = SceneRanker(config)
+            self._scene_service = scene_service
+            self._scene_manager = manager
+
+    def get_scene_service(self):
+        self._ensure_scene_runtime()
+        if self._scene_service is None:
+            raise RuntimeError("scene memory is disabled")
+        return self._scene_service
+
+    def _scene_projection_changed(self, event, ctx):
+        if not self._cfg.scene_enabled or not self._cfg.scene_generation_enabled:
+            return
+        from urllib.parse import urlsplit
+
+        from core.errors import NodeNotFoundError
+
+        parsed = urlsplit(event.uri)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) < 4 or parts[0] not in {"users", "agents"} or parts[2] != "memories":
+            return
+        self._ensure_scene_runtime()
+        owner = f"{parts[0][:-1]}:{parts[1]}"
+        tokens = 0
+        try:
+            node = self._get_context_fs().read_node(event.uri, ctx)
+            if node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+                return
+            tokens = max(1, (len(node.content or node.abstract) + 3) // 4)
+        except NodeNotFoundError:
+            if event.event_type == "UPSERT_CONTEXT":
+                return
+        self._scene_manager.after_memory_write(
+            parsed.netloc, owner, [event.uri], token_count=tokens,
+            force=event.event_type in {"ARCHIVE_CONTEXT", "DELETE_CONTEXT"},
+            notice_id=event.event_id,
+        )
+
     @_serialize_lazy_initialization("_write_api")
     def get_write_api(self):
         if self._write_api is None:
@@ -2608,6 +3027,9 @@ class MemoryService:
             try:
                 from extraction.schemas.registry import SchemaRegistry
                 schema_registry = SchemaRegistry()
+                if self._cfg.agent_memory_enabled:
+                    for category in ("case", "tool", "skill"):
+                        schema_registry.register(replace(schema_registry.get(category), enabled=False))
                 if self._cfg.skill_sedimentation_enabled:
                     schema_registry.unregister("skill")
                 logger.info("SchemaRegistry initialized for dynamic tool generation")
@@ -2628,6 +3050,7 @@ class MemoryService:
             # Get shared vector_index and embedder for prefetch
             vector_index = self._get_shared_vector_index()
             embedder = self._get_shared_embedder()
+            self._ensure_scene_runtime()
 
             self._write_api = MemoryWriteAPI(
                 fs=fs,
@@ -2639,6 +3062,10 @@ class MemoryService:
                 uri_resolver=uri_resolver,
 internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_mode=self._cfg.extraction_mode,
+                source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
+                card_format_enabled=self._cfg.card_format_enabled,
+                dual_pass_enabled=self._cfg.dual_pass_enabled,
+                node_processing_enabled=self._cfg.node_processing_enabled,
                 directory_summary_enabled=self._cfg.directory_summary_enabled,
             )
             logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)
@@ -2662,22 +3089,29 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             raise RuntimeError("ContextFS unavailable for forget_memory")
 
         node = fs.read_node(uri, ctx)
-        if node.category == "profile" or uri.rstrip("/").endswith("/memories/profile"):
+        stored_uri = node.uri
+        if node.category == "profile" or stored_uri.rstrip("/").endswith("/memories/profile"):
             raise AuthorizationError("profile memory cannot be forgotten via MCP")
 
         role = ctx.role if isinstance(ctx.role, Role) else Role(ctx.role)
-        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in uri
+        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in stored_uri
         if agent_scoped and role not in (Role.ADMIN, Role.ROOT):
             raise AuthorizationError("agent-scoped memory forget requires ADMIN or ROOT")
 
         original_node = deepcopy(node)
-        fs.archive_node(uri, ctx)
+        fs.archive_node(stored_uri, ctx)
 
         outbox_event_id = None
         outbox = self._get_outbox_store(fs)
         if outbox is not None:
             try:
-                event = outbox.register_archive(uri, ctx)
+                if original_node.metadata.get("agent_memory_version") == 1:
+                    from index.index_record_builder import agent_memory_index_ids
+                    event = outbox.register_archive(
+                        stored_uri, ctx, record_ids=agent_memory_index_ids(original_node),
+                    )
+                else:
+                    event = outbox.register_archive(stored_uri, ctx)
                 outbox_event_id = getattr(event, "event_id", None)
             except Exception:
                 try:
@@ -2685,7 +3119,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 except Exception as rollback_exc:
                     logger.error(
                         "forget_memory rollback failed after outbox registration error uri=%s: %s",
-                        uri,
+                        stored_uri,
                         rollback_exc,
                         exc_info=True,
                     )
@@ -2694,13 +3128,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         self.get_audit_service().record(
             ctx.account_id,
             actor=ctx.user_id,
-            target=external_uri or uri,
+            target=external_uri or stored_uri,
             action="mcp.delete_memory",
             result="success",
             trace_id=ctx.trace_id,
             details={
                 "mode": "archive",
-                "internal_uri": uri,
+                "internal_uri": stored_uri,
                 "external_uri": external_uri,
                 "category": node.category,
                 "owner_space": node.owner_space,
@@ -2728,8 +3162,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if self._read_api is None:
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
+            self._ensure_scene_runtime()
 
             cfg = RetrievalConfig(
+                include_agent_memories=self._cfg.agent_memory_enabled,
+                expand_hierarchy=getattr(self._cfg, "retrieval_expand_hierarchy", True),
                 max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50),
                 default_top_k=getattr(self._cfg, "retrieval_default_top_k", 10),
                 global_search_topk=getattr(self._cfg, "retrieval_global_search_topk", 30),
@@ -2787,6 +3224,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
                 context_reader=context_reader,
+                scene_ranker=self._scene_ranker,
+                scene_source=self._scene_source,
+                scene_enabled=self._cfg.scene_retrieval_enabled,
             )
 
             self._read_api = ReadAPI(
@@ -3207,12 +3647,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             # Ledger and TTL state even when the ordinary bridge is disabled.
             # With externalization disabled, the historical bridge-off path
             # remains a strict no-op and does not initialize ContextFS.
+            from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+            checkpoint_fs = (self._write_api._fs
+                             if isinstance(self._write_api, _CheckpointWriteAPI) else None)
             durable_runtime_state_enabled = bool(
                 getattr(self._cfg, "session_state_bridge_enabled", True)
                 or self._tool_result_externalizer is not None
+                or checkpoint_fs is not None
             )
             session_state_context_fs = (
-                self._get_context_fs
+                (lambda: checkpoint_fs) if checkpoint_fs is not None else self._get_context_fs
                 if durable_runtime_state_enabled
                 else None
             )
@@ -3529,6 +3973,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             _operation_held=_operation_held,
         )
 
+    @_guard_session_mutation
     def add_session_message(self, params: dict) -> dict:
         if self._tool_result_governance is not None:
             return self._tool_result_governance.add_session_message(params)
@@ -3542,6 +3987,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             created_at=params.get("created_at"),
         )
 
+    @_guard_session_mutation
     def commit_session_buffer(self, params: dict) -> dict:
         if self._tool_result_governance is not None:
             return self._tool_result_governance.commit_session_buffer(params)
@@ -3590,6 +4036,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             raise self._externalization_disabled_error()
         return self._tool_result_governance.search_tool_result_artifacts(params)
 
+    @_guard_session_mutation
     def delete_session(self, params: dict) -> dict:
         """Delete all oGMemory resources owned by one Agent Session.
 
@@ -3707,6 +4154,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
 
     @_attribute_request_usage
+    @_guard_session_mutation
     def compose(self, params: dict) -> dict:
         """Guard compose-only Artifact writes against concurrent session cleanup."""
         # The explicit code-only path is isolated from generic Compose and its
@@ -3943,26 +4391,32 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
+        injection_snapshot = None
         try:
             if topic_buffer is not None:
-                pending_hits = topic_buffer.get_pending_injection() or []
+                injection_snapshot = topic_buffer.injection_snapshot()
+                pending_hits = injection_snapshot[0] or []
                 if pending_hits:
-                    existing_uris = {
-                        item.get("uri") for item in working_set
+                    existing_memories = {
+                        memory_identity(item["uri"], item.get("metadata")) for item in working_set
                         if isinstance(item, dict) and item.get("uri")
                     }
-                    injected_uris: list[str] = []
                     for hit in pending_hits:
-                        if not hit.uri or hit.uri in existing_uris or topic_buffer.was_injected(hit.uri):
+                        uri = canonical_uri(hit.uri)
+                        identity = memory_identity(uri, hit.metadata)
+                        if not uri or identity in existing_memories or topic_buffer.was_injected(uri, hit.metadata):
                             continue
                         working_set.append(_seed_hit_to_working_set_item(hit))
-                        existing_uris.add(hit.uri)
-                        injected_uris.append(hit.uri)
-                    if injected_uris:
-                        topic_buffer.mark_injected(injected_uris)
-                    topic_buffer.clear_pending_injection()
+                        existing_memories.add(identity)
         except Exception as exc:
             logger.warning("assemble pending injection merge failed: %s", exc)
+
+        delivery_stats = {}
+        if any(item.get("category") != "code" for item in working_set):
+            working_set, delivery_stats = hydrate_evidence(
+                working_set, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs), ctx,
+            )
+            search_stats["evidence_delivery"] = delivery_stats
 
         # Each step degrades independently — a failure in one doesn't kill the rest
 
@@ -4012,7 +4466,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Step 5c: Build dynamic working set → user message (preserves KV cache)
         working_set_msg = ""
         try:
-            working_set_msg = self._format_working_set(working_set, budget_allocation)
+            working_set_msg = self._format_working_set(
+                working_set, budget_allocation, query=query, delivery_stats=delivery_stats,
+            )
         except Exception as exc:
             logger.warning("assemble working_set_msg build failed: %s", exc)
 
@@ -4281,7 +4737,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 system_prompt_suffix=system_prompt_suffix,
             )
 
-            return self._to_response(result)
+            response = self._to_response(result)
+            if topic_buffer is not None and injection_snapshot is not None:
+                topic_buffer.consume_injection(
+                    injection_snapshot, delivery_stats.get("delivered_uris", []) if working_set_msg else [],
+                    delivered_units=delivery_stats.get("delivered_units", []) if working_set_msg else [],
+                )
+            return response
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
             trimmed_messages = self._finalize_tool_result_projection(
@@ -4443,6 +4905,18 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": True,
             }
 
+    def _process_agent_memory(self, event):
+        from server.agent_memory import process_trace_memory
+
+        fs = self._get_context_fs()
+        with request_usage_scope(RequestContext(**event.payload["context"])):
+            process_trace_memory(
+                event, trace_store=self._get_trace_event_store(),
+                outbox=self._get_outbox_store(fs), fs=fs, llm=self.get_llm(),
+                directory_summary_enabled=self._cfg.directory_summary_enabled,
+                vector_index=self._get_shared_vector_index(), embedder=self._get_shared_embedder(),
+            )
+
     def finalize_session_trace(self, params: dict) -> dict:
         """Finalize the turn-end-bounded turn containing ``stopEventIndex``."""
         ctx = params.get("_ctx")
@@ -4481,6 +4955,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_id=session_id,
                 stop_event_index=stop_event_index,
             )
+            if self._cfg.agent_memory_enabled and ctx.agent_id and finalized.get("uri"):
+                from server.agent_memory import trace_memory_event
+
+                outbox = self._get_outbox_store(self._get_context_fs())
+                if outbox is None:
+                    raise RuntimeError("agent memory outbox unavailable")
+                event = trace_memory_event(finalized["uri"], replace(ctx, session_id=session_id))
+                outbox.register_once(event, ctx)
+                finalized["agent_memory_event_id"] = event.event_id
+                self._start_outbox_worker()
             if self._cfg.skill_sedimentation_enabled:
                 queued = store.enqueue_skill_candidate_from_trace(
                     account_id=ctx.account_id,
@@ -4516,11 +5000,115 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": True,
             }
 
+    @contextmanager
+    def _session_mutation_scope(self, ctx, *, refresh=True):
+        import time
+        from fs.sql_adapter.session_mutation import active_session_guard
+        from service.api import MemoryWriteAPI
+        nested = active_session_guard() is not None
+        if self._write_api is None and self._use_sql:
+            from psycopg2 import InterfaceError, OperationalError
+            deadline = time.monotonic() + 1.0
+            try:
+                pool = self._get_shared_sql_pool(deadline=deadline)
+            except (TimeoutError, InterfaceError, OperationalError) as exc:
+                raise SessionMutationBusyError("session mutation dialect discovery unavailable") from exc
+            with SQLContextFS.configured_session_mutation_lock(
+                self._cfg.sql_connection_string, ctx, dialect=pool.sql_dialect.name,
+                timeout_seconds=max(0, deadline - time.monotonic()),
+            ) as guard:
+                try:
+                    if refresh and not nested:
+                        self._load_extraction_recovery_before_accumulation(ctx.session_id, ctx, force_reload=True)
+                except SessionOperationInProgress:
+                    raise
+                except Exception as exc:
+                    raise RecoveryNeedsConfirmationError("durable session refresh failed: " + str(exc)) from exc
+                yield guard
+            return
+        if isinstance(self._write_api, MemoryWriteAPI):
+            fs = self._write_api._fs
+        elif self._write_api is not None:
+            yield None
+            return
+        else:
+            manager = self.get_session_manager()
+            fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
+            if fs is not None:
+                manager._get_context_fs = lambda: fs
+        acquire = (getattr(type(fs), "session_mutation_lock", None)
+                   or getattr(type(fs), "session_recovery_lock", None))
+        if not callable(acquire):
+            yield None
+            return
+        if callable(getattr(type(fs), "active_session_recovery", None)):
+            nested = fs.active_session_recovery() is not None
+        from session.session_state import SessionState
+        with acquire(fs, SessionState.state_uri(ctx.account_id, ctx.session_id), ctx) as guard:
+            try:
+                if refresh and not nested:
+                    self._load_extraction_recovery_before_accumulation(ctx.session_id, ctx, force_reload=True)
+            except SessionOperationInProgress:
+                raise
+            except Exception as exc:
+                raise RecoveryNeedsConfirmationError("durable session refresh failed: " + str(exc)) from exc
+            yield guard
+
+    def _load_extraction_recovery_before_accumulation(self, session_id, ctx, *, force_reload=False):
+        """Load once without creating any model, embedder or extraction API."""
+        from service.api import MemoryWriteAPI
+        manager = self.get_session_manager()
+        if manager.extraction_recovery_loaded(session_id, ctx) and not force_reload:
+            return
+        if isinstance(self._write_api, MemoryWriteAPI):
+            fs = self._write_api._fs
+        elif self._write_api is not None:
+            # Legacy integrations with mocked/in-process writers do not have
+            # the persistent accepted-candidate and node-receipt contract.
+            return
+        elif callable(manager._get_context_fs):
+            fs = manager._get_context_fs()
+        else:
+            fs = self._get_context_fs()
+        if fs is None:
+            return
+        if not (callable(getattr(type(fs), "read_node", None))
+                and callable(getattr(type(fs), "write_node", None))):
+            return
+        manager.require_extraction_recovery(session_id)
+        # Bind a new, empty buffer only after its durable owner is validated.
+        manager.get_or_create(session_id)
+        manager.enable_extraction_recovery(session_id, ctx, fs, force_reload=force_reload)
+
+    def _queue_card_format_recovery(self, ctx, error, *, archive_id, client_request_id):
+        from service.extraction_retry import background_retry_running
+        if not isinstance(error, MemoryCardFormatError) or background_retry_running():
+            return None
+        task = self._extraction_retry.register(
+            ctx, {"error": str(error), "failure_kind": "memory_card_format",
+                  "extraction_archive_id": archive_id, "client_request_id": client_request_id})
+        if task is None or task.get("status") not in {"queued", "running"}:
+            return None
+        return {"ok": True, "status": "queued", "reason": "memory_card_format",
+                "recovery_task": task, "last_error": str(error)}
+
+    @retry_failed_source
+    @_after_turn_deadline
     @_attribute_request_usage
+    @_guard_session_mutation
     def after_turn(self, params: dict) -> dict:
         messages = params.get("messages", [])
         if not messages:
             return {"ok": True}
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(params.get("sessionId", "unknown"), ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
 
         client_request_id = str(
             params.get("clientRequestId") or params.get("client_request_id") or ""
@@ -4530,7 +5118,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if len(client_request_id) > 128:
             raise ValueError("client_request_id must be at most 128 characters")
 
-        ctx = params.get("_ctx") or self.build_context(params)
         buf = self.get_session_manager().get_or_create(
             params.get("sessionId", "unknown"),
             ctx=ctx,
@@ -4551,7 +5138,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except Exception:
             buf.release_request(client_request_id)
             raise
-        if result.get("ok", True) is False:
+        if result.get("ok", True) is False or result.get("status") == "queued":
             buf.release_request(client_request_id)
         return result
 
@@ -4573,6 +5160,27 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             buf.end_operation()
 
     def _after_turn_impl(self, params: dict) -> dict:
+        """Reserve ordinary source preparation without serializing ordinary turns."""
+        if not params.get("messages"):
+            return self._after_turn_source_impl(params)
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        buf = self.get_session_manager().get_or_create(session_id, ctx=ctx)
+        with buf.extraction_lock:
+            if buf.lifecycle_prepare_in_progress:
+                return {"ok": False, "status": "processing", "retryable": True,
+                        "reason": "lifecycle_preparing"}
+            if lifecycle_kind(buf) is not None:
+                return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                        "error": "resume the pending lifecycle batch before after_turn"}
+            buf.ordinary_turns_in_progress += 1
+        try:
+            return self._after_turn_source_impl(params)
+        finally:
+            with buf.extraction_lock:
+                buf.ordinary_turns_in_progress -= 1
+
+    def _after_turn_source_impl(self, params: dict) -> dict:
         """Unified write entry point: accumulate session buffer + extract memories.
 
         Step 1 (every turn): add new messages to session buffer (lightweight).
@@ -4588,6 +5196,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         client_request_id = str(
             params.get("clientRequestId") or params.get("client_request_id") or ""
         ).strip()
+        automatic_card_identity = (self._cfg.card_format_enabled or self._cfg.node_processing_enabled) and not client_request_id
+        if automatic_card_identity:
+            client_request_id = "card-" + uuid4().hex
+            params = {**params, "clientRequestId": client_request_id}
         if len(client_request_id) > 128:
             raise ValueError("client_request_id must be at most 128 characters")
         pre_prompt_count = _bounded_message_count(
@@ -4604,10 +5216,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
 
+        if lifecycle_kind(buf) is not None:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "resume the pending lifecycle batch before after_turn"}
+
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+
         def _save_idempotency_state() -> bool:
             if (
                 self._tool_result_externalizer is None
                 and not getattr(self._cfg, "session_state_bridge_enabled", True)
+                and not isinstance(self._write_api, _CheckpointWriteAPI)
             ):
                 return True
             return mgr.save_session_state(session_id, ctx)
@@ -4641,7 +5260,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ):
             raise ValueError("invalid tool-result governance fallback token")
 
-        if client_request_id and buf.request_completed(client_request_id):
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+        pending_request_retry = bool(client_request_id and pending.get("client_request_id") == client_request_id)
+        if client_request_id and buf.request_completed(client_request_id) and not pending_request_retry:
             if not _save_idempotency_state():
                 return {
                     "ok": False,
@@ -4658,7 +5279,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
         after_turn_governance = None
-        if self._tool_result_governance is not None:
+        if pending_request_retry and is_frozen_source_retry(ctx, pending):
+            new_messages = deepcopy(pending["request_messages"])
+        elif self._tool_result_governance is not None:
             after_turn_governance = self._tool_result_governance.prepare_after_turn(
                 params,
                 messages,
@@ -4670,6 +5293,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             new_messages = after_turn_governance.new_messages
         else:
             new_messages = messages[pre_prompt_count:]
+        if (pending_request_retry and not new_messages and after_turn_governance is not None
+                and after_turn_governance.semantic_messages is not None):
+            new_messages = after_turn_governance.semantic_messages
+        if pending_request_retry and pending.get("request_messages") != new_messages:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "the pending request source messages changed"}
+
+        if _ambiguous_pending_replay(pending, new_messages, client_request_id):
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "a stable source ID is required to distinguish a pending replay from a new message"}
         if not new_messages:
             return _complete_request({"ok": True, "status": "no_new_messages"})
 
@@ -4681,30 +5314,37 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 break
 
         # Threshold comes from unified config first; env fallback is handled by OgMemConfig.
-        threshold = _positive_int(getattr(self._cfg, "after_turn_threshold", 200), 200)
+        threshold = _positive_int(getattr(self._cfg, "after_turn_threshold", 400), 400)
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
         from extraction.tool_collector import update_buffer_stats
         governance_result = None
-        if after_turn_governance is not None:
+        if after_turn_governance is not None and not pending_request_retry:
             governance_result = self._tool_result_governance.persist_after_turn(
                 after_turn_governance,
                 buf=buf,
                 ctx=ctx,
                 session_id=session_id,
             )
-        else:
+        elif not pending_request_retry:
             # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest().
             buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
-            for msg in new_messages:
+            for index, msg in enumerate(new_messages):
                 role = msg.get("role", "user")
                 content_raw = msg.get("content", "")
                 parsed = extract_content_and_tool_calls(content_raw)
                 content = parsed["text"]
-                if content and buf_snapshot:
+                message_id = msg.get("id") or (request_message_id(ctx, client_request_id, index)
+                                              if client_request_id else None)
+                if content and buf_snapshot and not msg.get("id"):
                     for existing in buf_snapshot:
-                        if existing.role == role and existing.content == content:
+                        if (existing.id not in buf.pending_extraction_ids()
+                                and (existing.id in buf.ingest_handoff_ids
+                                     or not existing.id.startswith("msg_request_"))
+                                and existing.role == role and existing.content == content):
+                            buf.ingest_handoff_ids.discard(existing.id)
+                            buf_snapshot.remove(existing)
                             content = None
                             break
                 if content:
@@ -4719,7 +5359,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         content,
                         ctx,
                         created_at=created_at,
+                        message_id=message_id,
                     )
+                    buf.ingest_handoff_ids.discard(message_id)
                 if parsed["tool_calls"]:
                     update_buffer_stats(
                         buf.usage_stats,
@@ -4742,17 +5384,24 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             params, "forceExtract", "force_extract", default=False
         )
 
-        if pending_tokens < threshold and not force_extract:
+        if pending_tokens < threshold and not force_extract and not buf.pending_extraction_ids():
             return _complete_request(
                 {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
             )
 
         # Step 2: Threshold reached → extract memories + write + index + archive
+        check_deadline()
         write_api = self.get_write_api()
         if write_api is None:
             logger.warning("after_turn: write API unavailable, session commit only")
             result = mgr.commit(session_id, ctx, wait=bool(client_request_id))
             return _complete_request({"ok": True, **result})
+
+        checkpoint_enabled = isinstance(write_api, _CheckpointWriteAPI)
+        if checkpoint_enabled:
+            mgr.enable_extraction_recovery(session_id, ctx, write_api._fs)
+            if client_request_id and buf.request_completed(client_request_id):
+                return _complete_request({"ok": True, "status": "duplicate"})
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
         # Use INCREMENTAL messages (after watermark) + extraction summary
@@ -4783,6 +5432,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 buf,
                 incremental=incremental,
             )
+            check_deadline()
         except Exception:
             buf.rewind_watermark_to_ids({message.id for message in incremental})
             if extraction_claim["extraction_started"]:
@@ -4798,6 +5448,41 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # is None, but after_turn must pass it explicitly across both calls.
         from session.session_manager import generate_archive_id
         archive_id = generate_archive_id()
+        extraction_journal = None
+        if checkpoint_enabled:
+            try:
+                extraction_journal = ExtractionBatchJournal(
+                    mgr, buf, ctx, archive_snapshot, archive_id=archive_id,
+                    messages=extraction_messages,
+                    session_time=extraction_state["session_time"] or request_session_time,
+                    session_summary=extraction_claim["extraction_summary"],
+                    tool_stats_text=extraction_state["tool_stats_text"],
+                    client_request_id=client_request_id, request_messages=new_messages)
+                archive_id = extraction_journal.batch["archive_id"]
+            except Exception as exc:
+                buf.rewind_watermark_to_ids(archive_snapshot_ids)
+                if extraction_claim["extraction_started"]:
+                    buf.end_extraction()
+                return {"ok": False, "status": "needs_confirmation" if isinstance(exc, RecoveryNeedsConfirmationError) else "failed",
+                        "error": str(exc), "retryable": not isinstance(exc, RecoveryNeedsConfirmationError)}
+
+        def _finish_archived_batch():
+            if extraction_journal is not None:
+                extraction_journal.finish()
+                return len(archive_snapshot)
+            removed = buf.remove_messages_by_id(archive_snapshot_ids)
+            if removed:
+                mgr.save_session_state(session_id, ctx)
+            return removed
+
+        def _completion_status():
+            if (extraction_journal is not None
+                    and client_request_id != extraction_journal_request_id and buf.messages):
+                return "accumulating"
+            return "completed"
+
+        extraction_journal_request_id = (extraction_journal.batch.get("client_request_id", "")
+                                         if extraction_journal is not None else client_request_id)
 
         def _rewind_failed_archive_watermark() -> bool:
             rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
@@ -4829,13 +5514,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 getattr(buf, "extraction_active_count", 0),
             )
         if not extraction_messages:
-            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
-            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+            try:
+                check_deadline()
+                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                check_deadline()
+                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+            except OperationDeadlineExceededError:
+                _rewind_failed_archive_watermark()
+                if extraction_claim["extraction_started"]:
+                    buf.end_extraction()
+                raise
             removed = 0
             if commit_result.get("archived"):
-                removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                if removed:
-                    mgr.save_session_state(session_id, ctx)
+                removed = _finish_archived_batch()
             logger.info(
                 "after_turn no-extractable snapshot commit: run=%s session=%s "
                 "archived=%s removed=%d reason=%s",
@@ -4896,13 +5587,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     extraction_run_id=extraction_run_id,
                     session_id=session_id,
                     archive_id=archive_id,
+                    extraction_journal=extraction_journal,
                 )
                 if self._write_result_has_failures(write_result):
                     raise RuntimeError("memory extraction write failed")
                 self._invalidate_identity_cache_if_profile_written(session_id, write_result)
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
-                    "after_turn background extract done: run=%s session=%s "
+                    "after_turn background extraction writes ready: run=%s session=%s "
                     "extracted=%d filtered=%d writes=%d skipped=%d failed=%d "
                     "watermark=%d->%d buffer_len_now=%d elapsed_ms=%d",
                     extraction_run_id,
@@ -4951,9 +5643,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         commit_result.get("error", "archive commit failed"),
                     )
                 elif commit_result.get("archived"):
-                    removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                    if removed:
-                        mgr.save_session_state(session_id, ctx)
+                    removed = _finish_archived_batch()
                 logger.info(
                     "after_turn background snapshot commit done: run=%s session=%s "
                     "archived=%s reason=%s removed=%d buffer_len=%d watermark=%d",
@@ -4967,18 +5657,62 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
                 if commit_result.get("status") != "failed":
                     _complete_request({"ok": True, "status": "completed"})
+                    # Bench clients use this marker as a completion barrier.
+                    # Emitting it before commit_snapshot could announce
+                    # success even when durable session archival later failed.
+                    logger.info(
+                        "after_turn background extract done: run=%s session=%s "
+                        "extracted=%d writes=%d archived=%s elapsed_ms=%d",
+                        extraction_run_id,
+                        session_id[:8],
+                        write_result.get("candidates_extracted", 0),
+                        write_result.get("writes_completed", 0),
+                        commit_result.get("archived"),
+                        int((_time.monotonic() - start_time) * 1000),
+                    )
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
+                self._queue_card_format_recovery(
+                    ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
                 logger.error(
                     "after_turn background extract failed for run=%s session=%s "
                     "rewound=%s: %s",
                     extraction_run_id, session_id[:8], rewound, exc, exc_info=True,
                 )
+                if (isinstance(exc, (ExtractionIncompleteError, ToolCallProtocolError, SessionMutationBusyError))
+                        and not isinstance(exc, OperationDeadlineExceededError)):
+                    self._extraction_retry.register_background_failure(ctx, extraction_journal, exc)
             finally:
                 buf.end_extraction()
 
-        if client_request_id or self._param_bool(params, "wait", "wait", default=False):
+        def _background_owned():
+            """The child acquires its own connection after the HTTP handoff."""
+            ran = False
             try:
+                with self._session_mutation_scope(ctx) as guard:
+                    if guard is not None and extraction_journal is not None:
+                        latest = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+                        if latest.get("archive_id") != archive_id:
+                            if archive_snapshot_ids.intersection(message.id for message in buf.messages):
+                                raise RecoveryNeedsConfirmationError("the scheduled source batch changed")
+                            # Another fenced worker durably finished the original source.
+                            return
+                    ran = True
+                    _background_extract_write()
+                if guard is not None and guard.post_commit_drain:
+                    self._async_drain(account_id=ctx.account_id)
+            except Exception as exc:
+                logger.error("fenced background extraction stopped session=%s: %s", session_id[:8], exc)
+                self._extraction_retry.wake(ctx, pending_task or {})
+            finally:
+                if not ran:
+                    buf.end_extraction()
+
+        def _extract_synchronously():
+            try:
+                recovering_source = (extraction_journal is not None
+                                     and is_frozen_source_retry(ctx, extraction_journal.batch))
+                check_deadline()
                 write_result = self._chunk_and_extract(
                     messages=extraction_messages,
                     write_api=write_api,
@@ -4989,6 +5723,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     extraction_run_id=extraction_run_id,
                     session_id=session_id,
                     archive_id=archive_id,
+                    extraction_journal=extraction_journal,
                 )
                 if self._write_result_has_failures(write_result):
                     rewound = _rewind_failed_archive_watermark()
@@ -5005,6 +5740,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "ok": False,
                         "status": "failed",
                         "error": "memory extraction write failed",
+                        "retryable": (extraction_journal is not None
+                                      and extraction_journal.has_retryable_write_failure()),
                         "commit": None,
                         "extraction_run_id": extraction_run_id,
                     }
@@ -5013,7 +5750,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     buf.extraction_summary = _update_extraction_summary(
                         buf.extraction_summary, write_result
                     )
+                check_deadline()
                 drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                check_deadline()
                 commit_result = mgr.commit_snapshot(
                     session_id,
                     archive_snapshot,
@@ -5021,7 +5760,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     wait=True,
                     archive_id=archive_id,
                 )
-                removed = 0
                 if commit_result.get("status") == "failed":
                     rewound = _rewind_failed_archive_watermark()
                     logger.error(
@@ -5042,21 +5780,37 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "extraction_run_id": extraction_run_id,
                     }
                 if commit_result.get("archived"):
-                    removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                    if removed:
-                        mgr.save_session_state(session_id, ctx)
-                return _complete_request(
+                    _finish_archived_batch()
+                result = _complete_request(
                     {
                         "ok": True,
                         **write_result,
-                        "status": "completed",
+                        "status": _completion_status(),
                         "extraction_run_id": extraction_run_id,
                         "drain": drain_stats,
                         "commit": commit_result,
                     }
                 )
+                if result.get("status") == "completed" and recovering_source:
+                    logger.info(
+                        "after_turn background extract done: run=%s session=%s "
+                        "archive=%s request=%s extracted=%d writes=%d archived=%s recovery=true",
+                        extraction_run_id, session_id[:8], archive_id,
+                        extraction_journal_request_id,
+                        write_result.get("candidates_extracted", 0),
+                        write_result.get("writes_completed", 0), commit_result.get("archived"),
+                    )
+                return result
             except Exception as exc:
                 rewound = _rewind_failed_archive_watermark()
+                if (isinstance(exc, SessionMutationBusyError) and extraction_journal is not None
+                        and is_frozen_source_retry(ctx, extraction_journal.batch)):
+                    return {"ok": False, "status": "processing", "retryable": True,
+                            "error": str(exc), "extraction_run_id": extraction_run_id}
+                queued = self._queue_card_format_recovery(
+                    ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
+                if queued is not None:
+                    return {**queued, "extraction_run_id": extraction_run_id}
                 logger.error(
                     "after_turn wait extraction failed for run=%s session=%s "
                     "rewound=%s: %s",
@@ -5068,23 +5822,41 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
                 return {
                     "ok": False,
-                    "status": "failed",
+                    "status": "needs_confirmation" if isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)) else "failed",
                     "error": str(exc),
+                    "retryable": not isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)),
                     "extraction_run_id": extraction_run_id,
+                    "failure_kind": ("memory_card_format" if isinstance(exc, MemoryCardFormatError) else
+                                     "llm_transient" if isinstance(exc, LLMTransientError) else ""),
                 }
             finally:
                 buf.end_extraction()
 
+        if (client_request_id and not automatic_card_identity) or self._param_bool(params, "wait", "wait", default=False):
+            result = _extract_synchronously()
+            if result.get("ok") is False and extraction_journal is not None:
+                result.update(extraction_archive_id=archive_id,
+                              client_request_id=extraction_journal_request_id)
+            return result
+
+        try:
+            pending_task = self._extraction_retry.register_pending_source(ctx, extraction_journal)
+            if extraction_journal is not None:
+                extraction_journal_request_id = extraction_journal.batch.get("client_request_id", "")
+        except Exception as exc:
+            _rewind_failed_archive_watermark()
+            buf.end_extraction()
+            logger.exception("Cannot register background extraction session=%s", session_id[:8])
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc),
+                    "extraction_archive_id": archive_id, "client_request_id": extraction_journal_request_id}
         try:
             t = threading.Thread(
-                target=lambda: _run_with_usage_scope(ctx, _background_extract_write),
+                target=lambda: _run_with_usage_scope(ctx, _background_owned),
                 daemon=True,
                 name=f"extract-{session_id[:8]}",
             )
             t.start()
         except Exception as exc:
-            # Thread spawn failed — fall back to synchronous (better than losing data)
-            buf.end_extraction()
             logger.error(
                 "Failed to spawn background extract thread: run=%s session=%s %s",
                 extraction_run_id,
@@ -5092,91 +5864,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 exc,
                 exc_info=True,
             )
-            # Sync fallback: use chunking-aware extraction
-            write_result = self._chunk_and_extract(
-                messages=extraction_messages,
-                write_api=write_api,
-                ctx=ctx,
-                session_time=session_time,
-                session_summary=extraction_summary,
-                tool_stats_text=tool_stats_text,
-                extraction_run_id=extraction_run_id,
-                session_id=session_id,
-                archive_id=archive_id,
-            )
-            if self._write_result_has_failures(write_result):
-                rewound = _rewind_failed_archive_watermark()
-                logger.error(
-                    "after_turn sync extraction write failed: "
-                    "run=%s session=%s rewound=%s write_result=%s",
-                    extraction_run_id,
-                    session_id[:8],
-                    rewound,
-                    write_result,
-                )
-                return {
-                    **write_result,
-                    "ok": False,
-                    "status": "failed",
-                    "error": "memory extraction write failed",
-                    "commit": None,
-                    "extraction_run_id": extraction_run_id,
-                }
-            buf.extraction_watermark = len(buf.messages)
-            self._invalidate_identity_cache_if_profile_written(session_id, write_result)
-            if write_result.get("candidates_extracted", 0) > 0:
-                buf.extraction_summary = _update_extraction_summary(
-                    buf.extraction_summary, write_result
-                )
-            try:
-                self._async_drain()
-            except Exception:
-                pass
-            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
-            removed = 0
-            if commit_result.get("status") == "failed":
-                rewound = _rewind_failed_archive_watermark()
-                logger.error(
-                    "after_turn sync snapshot commit failed: "
-                    "run=%s session=%s rewound=%s error=%s",
-                    extraction_run_id,
-                    session_id[:8],
-                    rewound,
-                    commit_result.get("error", "archive commit failed"),
-                )
-                return {
-                    **write_result,
-                    "ok": False,
-                    "status": "failed",
-                    "error": commit_result.get("error", "archive commit failed"),
-                    "commit": commit_result,
-                    "extraction_run_id": extraction_run_id,
-                }
-            if commit_result.get("archived"):
-                removed = buf.remove_messages_by_id(archive_snapshot_ids)
-                if removed:
-                    mgr.save_session_state(session_id, ctx)
-            logger.info(
-                "after_turn sync snapshot commit done: run=%s session=%s "
-                "archived=%s removed=%d reason=%s",
-                extraction_run_id,
-                session_id[:8],
-                commit_result.get("archived"),
-                removed,
-                commit_result.get("reason", ""),
-            )
-            return _complete_request(
-                {
-                    "ok": True,
-                    "status": "completed",
-                    "extraction_run_id": extraction_run_id,
-                    **write_result,
-                }
-            )
+            return _extract_synchronously()
 
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
     @_attribute_request_usage
+    @_guard_session_mutation
     def ingest(self, params: dict) -> dict:
         """Ingest messages into the session buffer.
 
@@ -5195,7 +5888,32 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if not messages:
             return {"ingested": True}
         ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(session_id, ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
         mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        with buf.extraction_lock:
+            if buf.lifecycle_prepare_in_progress:
+                return {"ok": False, "ingested": False, "status": "processing", "retryable": True,
+                        "reason": "lifecycle_preparing"}
+            if lifecycle_kind(buf) is not None:
+                return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                        "error": "resume the pending lifecycle batch before ingest"}
+            buf.begin_operation()
+            buf.ordinary_turns_in_progress += 1
+        try:
+            return self._ingest_source_impl(params, messages, ctx, session_id, mgr)
+        finally:
+            with buf.extraction_lock:
+                buf.ordinary_turns_in_progress -= 1
+                buf.end_operation()
+
+    def _ingest_source_impl(self, params, messages, ctx, session_id, mgr):
         if self._tool_result_governance is not None:
             return self._tool_result_governance.defer_user_message_ingest(
                 params,
@@ -5204,16 +5922,35 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_id=session_id,
             )
         if self._tool_result_externalizer is None:
+            client_request_id = str(params.get("clientRequestId") or params.get("client_request_id") or "").strip()
+            if len(client_request_id) > 128:
+                raise ValueError("client_request_id must be at most 128 characters")
+            buf = mgr.get_or_create(session_id, ctx=ctx)
+            pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+            if client_request_id and pending.get("client_request_id") == client_request_id:
+                if pending.get("request_messages") == messages:
+                    return {"ingested": True, "count": 0}
+                return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                        "error": "the pending request source messages changed"}
+            if _ambiguous_pending_replay(pending, messages, client_request_id):
+                return {"ok": False, "ingested": False, "status": "needs_confirmation", "retryable": False,
+                        "error": "ingest requires a stable source ID to distinguish a pending replay from a new message"}
             count = 0
-            for msg in messages:
+            for index, msg in enumerate(messages):
                 role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
                 content_raw = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
                 content = extract_content_and_tool_calls(content_raw).get("text", "")
                 created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
                 if content:
-                    mgr.add_message(session_id, role, content, ctx, created_at=created_at)
+                    message_id = (msg.get("id") if isinstance(msg, dict) else getattr(msg, "id", None))
+                    message_id = message_id or (request_message_id(ctx, client_request_id, index)
+                                                if client_request_id else None)
+                    added = mgr.add_message(session_id, role, content, ctx, created_at=created_at, message_id=message_id)
+                    with buf.extraction_lock:
+                        buf.ingest_handoff_ids.add(added["message_id"])
                     count += 1
             return {"ingested": True, "count": count}
+    @_guard_session_mutation
     def govern_first_view_tool_result(self, params: dict) -> dict:
         """Delegate trusted first-view governance to the optional coordinator."""
         if self._tool_result_governance is None:
@@ -5231,13 +5968,29 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         """Batch ingest through the standard externalization path."""
         return self.ingest(params)
 
+    @_guard_session_mutation
     def compact(self, params: dict) -> dict:
         """Run the complete compaction flow under the shared session operation guard."""
+        if params.get("prepared") and not params.get("prepareToken"):
+            raise ValueError("prepare token required when prepared=true")
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(session_id, ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "compacted": False, "status": "needs_confirmation",
+                    "retryable": False, "error": "durable extraction state unavailable: " + str(exc)}
         buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
         try:
-            return self._compact_impl(params)
+            with buf.lifecycle_lock:
+                return self._compact_impl(params)
+        except (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError) as exc:
+            return {"ok": False, "compacted": False, "status": "needs_confirmation",
+                    "retryable": False, "error": str(exc)}
+        except RecoveryPersistenceError as exc:
+            return {"ok": False, "compacted": False, "status": "failed", "retryable": True, "error": str(exc)}
         finally:
             buf.end_operation()
 
@@ -5267,19 +6020,28 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         tokens_before = session.get("pending_tokens", 0)
 
         # Commit synchronously (wait=true)
-        commit_result = mgr.commit(
-            session_id,
-            ctx,
-            wait=True,
-            archive_id=prepared.get("archive_id"),
-        )
+        journal = prepared.get("_lifecycle_journal")
+        if journal is not None:
+            commit_result = mgr.commit_snapshot(session_id, journal.snapshot, ctx, wait=True,
+                                                 archive_id=journal.batch["archive_id"],
+                                                 archive_checkpoint=journal)
+            if commit_result.get("archived") and commit_result.get("status") == "completed":
+                try:
+                    journal.finish(reset_window_state=True)
+                except Exception as exc:
+                    return {"ok": False, "compacted": False, "status": "failed",
+                            "retryable": True, "error": str(exc), "commit": commit_result}
+        else:
+            commit_result = mgr.commit(
+                session_id, ctx, wait=True, archive_id=prepared.get("archive_id"))
 
-        if not commit_result.get("archived"):
-            if commit_result.get("status") == "failed":
+        if not commit_result.get("archived") or commit_result.get("status") in {"failed", "needs_confirmation"}:
+            if commit_result.get("status") in {"failed", "needs_confirmation"}:
                 return {
                     "ok": False,
                     "compacted": False,
-                    "status": "failed",
+                    "status": commit_result["status"],
+                    "retryable": commit_result["status"] != "needs_confirmation",
                     "error": commit_result.get("error", "archive commit failed"),
                     "commit": commit_result,
                     "result": {
@@ -5369,13 +6131,31 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
-        extraction_state = self._build_incremental_extraction_state(buf)
+        kind = lifecycle_kind(buf)
+        if buf.pending_extraction_ids() and kind != "compaction":
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "session_id": session_id,
+                    "error": "resume the pending memory batch before compaction"}
+        with buf.extraction_lock:
+            if kind == "compaction":
+                batch = buf.runtime_extensions[EXTENSION_KEY]["batch"]
+                source_snapshot = buf.capture_lifecycle_source(
+                    [SessionMessage(**value) for value in batch["snapshot"]])
+                extraction_state = {"incremental": source_snapshot,
+                                    "messages": deepcopy(batch["messages"]),
+                                    "session_time": _parse_session_time(batch.get("session_time")),
+                                    "tool_stats_text": batch["tool_stats_text"]}
+            else:
+                source_snapshot = buf.capture_lifecycle_source()
+                extraction_state = self._build_incremental_extraction_state(
+                    buf, incremental=source_snapshot[buf.extraction_watermark:])
 
         result = {
             "session_id": session_id,
             "ctx": ctx,
             "mgr": mgr,
             "buffer": buf,
+            "source_snapshot": source_snapshot,
             **extraction_state,
         }
 
@@ -5424,6 +6204,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if result.get("ok") is False:
             return result
         ttl_seconds = _positive_int(getattr(self._cfg, "compact_prepare_token_ttl", 300), 300)
+        if lifecycle_kind(result["buffer"]) == "compaction":
+            journal = self._compaction_journal(result)
+            prepared = journal.prepare_state(ttl_seconds)
+            if prepared is None or prepared["prepareToken"] != prepare_token:
+                raise ValueError("invalid prepare token")
+            result.update(prepared)
+            result["_lifecycle_journal"] = journal
+            return result
         archive_id = result["mgr"].get_compaction_prepare_archive_id(result["session_id"])
         if not result["mgr"].consume_compaction_prepare_token(
             result["session_id"],
@@ -5482,13 +6270,34 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if self._write_result_updates_profile(write_result):
             self.get_session_manager().invalidate_topic_slot(session_id, "identity")
 
+    @_guard_session_mutation
     def prepare_compaction(self, params: dict) -> dict:
         """Prepare extraction while preventing lifecycle cleanup from interleaving."""
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            self._load_extraction_recovery_before_accumulation(session_id, ctx)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
         buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
         try:
-            return self._prepare_compaction_impl(params)
+            with buf.lifecycle_lock:
+                with buf.lifecycle_source_scope() as conflict:
+                    if conflict is not None:
+                        return {"ok": False, "status": "processing", "retryable": True,
+                                "session_id": session_id, "reason": conflict}
+                    buf.begin_extraction()
+                    try:
+                        return self._prepare_compaction_impl(params)
+                    finally:
+                        buf.end_extraction()
+        except (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError) as exc:
+            return {"ok": False, "status": "needs_confirmation", "retryable": False, "error": str(exc)}
+        except RecoveryPersistenceError as exc:
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc)}
         finally:
             buf.end_operation()
 
@@ -5502,6 +6311,36 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         incremental = result["incremental"]
         ttl_seconds = _positive_int(getattr(self._cfg, "compact_prepare_token_ttl", 300), 300)
 
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+        write_api = self.get_write_api() if result["messages"] else self._write_api
+        if (lifecycle_kind(buf) == "compaction"
+                or isinstance(write_api, _CheckpointWriteAPI) and result["source_snapshot"]):
+            journal = self._compaction_journal(result)
+            result["archive_id"] = journal.batch["archive_id"]
+            result["_lifecycle_journal"] = journal
+            prepared = journal.prepare_state(ttl_seconds)
+            if prepared is not None:
+                result.update(prepared)
+                return result
+            if journal.batch["messages"]:
+                write_result = self._chunk_and_extract(
+                    messages=journal.batch["messages"], write_api=write_api, ctx=result["ctx"],
+                    session_time=result["session_time"], session_summary=journal.batch["session_summary"],
+                    tool_stats_text=journal.batch["tool_stats_text"], extraction_run_id="prepare_compaction",
+                    session_id=result["session_id"], archive_id=journal.batch["archive_id"],
+                    extraction_journal=journal)
+                if self._write_result_has_failures(write_result):
+                    raise RuntimeError("compaction extraction write failed")
+                self._invalidate_identity_cache_if_profile_written(result["session_id"], write_result)
+                if write_result.get("candidates_extracted", 0) > 0:
+                    buf.extraction_summary = _update_extraction_summary(buf.extraction_summary, write_result)
+                result["write_result"] = write_result
+            result["prepareToken"] = journal.issue_prepare_token()
+            source_ids = set(journal.batch["message_ids"])
+            buf.extraction_watermark = max((index + 1 for index, message in enumerate(buf.messages)
+                                           if message.id in source_ids), default=buf.extraction_watermark)
+            return result
+
         existing_prepare = result["mgr"].get_compaction_prepare_state(
             result["session_id"],
             ttl_seconds=ttl_seconds,
@@ -5512,7 +6351,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return result
 
         from session.session_manager import generate_archive_id
-        archive_id = generate_archive_id()
+        archive_id = result["mgr"].get_compaction_prepare_archive_id(result["session_id"]) or generate_archive_id()
         result["archive_id"] = archive_id
 
         if not incremental:
@@ -5562,6 +6401,18 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         result["write_result"] = write_result
         return result
 
+    def _compaction_journal(self, result):
+        from session.session_manager import generate_archive_id
+        buf = result["buffer"]
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        snapshot = result["source_snapshot"]
+        return LifecycleBatchJournal(result["mgr"], buf, result["ctx"], snapshot,
+            kind="compaction", archive_id=(pending["archive_id"] if pending
+                else buf.compaction_prepare_archive_id or generate_archive_id()),
+            messages=result["messages"],
+            session_time=result["session_time"], session_summary=buf.extraction_summary,
+            tool_stats_text=result["tool_stats_text"])
+
     def bootstrap(self, params: dict) -> dict:
         return {"bootstrapped": True}
 
@@ -5571,15 +6422,109 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def on_subagent_ended(self, params: dict) -> dict:
         return {"cleaned": True}
 
-    def _run_dispose_background(self, mgr, session_id: str, params: dict, ctx, buf) -> None:
+    def _save_dispose_snapshot(self, mgr, session_id, params, buf, snapshot_ids):
+        with buf.session_state_save_lock, mgr._lock, buf.extraction_lock:
+            rollback = buf.capture_rollback_state()
+            try:
+                buf.remove_messages_by_id(snapshot_ids)
+                self._save_session_state_best_effort(mgr, session_id, params)
+            except Exception:
+                buf.restore_rollback_state(rollback)
+                buf.rewind_watermark_to_ids(snapshot_ids)
+                raise
+
+    def _run_dispose_background(self, mgr, session_id: str, params: dict, ctx, buf, source_snapshot=None, operation=None) -> None:
+        try:
+            from service.api import MemoryWriteAPI
+            fs = self._write_api._fs if isinstance(self._write_api, MemoryWriteAPI) else None
+            if (not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None))
+                    and not callable(getattr(type(fs), "session_recovery_lock", None))):
+                with buf.lifecycle_lock:
+                    _run_with_usage_scope(ctx, self._run_dispose_background_impl,
+                                          mgr, session_id, params, ctx, buf, source_snapshot)
+                return
+            try:
+                effective_ctx = ctx or self.build_context(params)
+                while True:
+                    # The ordinary extraction worker needs its own SQL connection.
+                    # Never wait for its event while holding the session advisory lock.
+                    with buf.extraction_lock:
+                        event = buf.extraction_done_event if buf.extraction_in_progress else None
+                    if event is not None and not event.wait(timeout=600):
+                        return
+                    with self._session_mutation_scope(effective_ctx) as guard:
+                        # An ordinary worker may have started before acquisition.
+                        # Release ownership and wait outside it before taking source.
+                        with buf.extraction_lock:
+                            extraction_active = buf.extraction_in_progress
+                        if extraction_active:
+                            continue
+                        with buf.lifecycle_lock:
+                            _run_with_usage_scope(effective_ctx, self._run_dispose_background_impl,
+                                                  mgr, session_id, params, effective_ctx, buf, source_snapshot)
+                        if guard is not None:
+                            guard.ensure_owned()
+                    if guard is not None and guard.post_commit_drain:
+                        self._async_drain(account_id=effective_ctx.account_id)
+                    break
+            except Exception as exc:
+                logger.error("fenced dispose stopped session=%s: %s", session_id[:8], exc)
+        finally:
+            if operation is not None:
+                operation.release()
+
+    def _dispose_journal(self, mgr, buf, ctx, snapshot):
+        from session.session_manager import generate_archive_id
+        state = self._build_incremental_extraction_state(buf, incremental=snapshot)
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        return LifecycleBatchJournal(mgr, buf, ctx, snapshot, kind="dispose",
+            archive_id=pending["archive_id"] if pending else generate_archive_id(), messages=state["messages"],
+            session_time=state["session_time"], session_summary=buf.extraction_summary,
+            tool_stats_text=state["tool_stats_text"])
+
+    def _prepare_dispose_source(self, mgr, buf, ctx, params):
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+
+        with buf.lifecycle_lock:
+            if self._tool_result_externalizer is not None:
+                ctx = ctx or self.build_context(params)
+                governance = self._govern_pending_buffer(buf.session_id, ctx, _operation_held=True)
+                if governance.get("retryable"):
+                    return {"ok": False, "status": "tool_result_governance_pending",
+                            "retryable": True, "governance": governance}
+            with buf.extraction_lock:
+                if buf.extraction_in_progress:
+                    return {"source_snapshot": None}
+                pending_ids = buf.pending_extraction_ids()
+                snapshot = buf.capture_lifecycle_source(
+                    [message for message in buf.messages if message.id in pending_ids]
+                    if pending_ids else buf.messages[buf.extraction_watermark:])
+                durable_flush = (snapshot and sum(len(message.content) // 4 for message in snapshot) >= 200
+                                 and any(message.role != "assistant" for message in snapshot))
+            if durable_flush and (isinstance(self._write_api, _CheckpointWriteAPI)
+                    or getattr(self.get_write_api, "__func__", None) is MemoryService.get_write_api):
+                write_api = self.get_write_api()
+                if isinstance(write_api, _CheckpointWriteAPI):
+                    ctx = ctx or self.build_context(params)
+                    self._load_extraction_recovery_before_accumulation(buf.session_id, ctx)
+                    self._dispose_journal(mgr, buf, ctx, snapshot)
+            return {"source_snapshot": snapshot}
+
+    def _run_dispose_background_impl(self, mgr, session_id: str, params: dict, ctx, buf, source_snapshot=None) -> None:
         snapshot_ids: set[str] = set()
         extraction_started = False
         succeeded = False
         effective_ctx = ctx
+        journal = None
+        source_stack = ExitStack()
         try:
             with buf.extraction_lock:
                 event = buf.extraction_done_event if buf.extraction_in_progress else None
             if event is not None:
+                from fs.sql_adapter.session_mutation import active_session_guard
+                if active_session_guard() is not None:
+                    logger.warning("dispose source became active; preserving pending session=%s", session_id[:8])
+                    return
                 event.wait(timeout=600)
                 with buf.extraction_lock:
                     if buf.extraction_in_progress:
@@ -5590,8 +6535,20 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         return
 
             with buf.extraction_lock:
+                if buf.pending_extraction_ids() and lifecycle_kind(buf) != "dispose":
+                    return
+            conflict = source_stack.enter_context(buf.lifecycle_source_scope())
+            if conflict is not None:
+                logger.warning("dispose source preparation busy session=%s: %s", session_id[:8], conflict)
+                return
+
+            with buf.extraction_lock:
                 original_watermark = buf.extraction_watermark
-                snapshot = list(buf.messages[original_watermark:])
+                pending_ids = buf.pending_extraction_ids()
+                snapshot = buf.capture_lifecycle_source(
+                    [SessionMessage(**value) for value in buf.runtime_extensions[EXTENSION_KEY]["batch"]["snapshot"]]
+                    if pending_ids else source_snapshot if source_snapshot is not None
+                    else buf.messages[original_watermark:])
                 snapshot_ids = {message.id for message in snapshot}
                 pending_tokens = sum(len(message.content) // 4 for message in snapshot)
                 extraction_messages = [
@@ -5600,22 +6557,22 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     if message.role != "assistant"
                 ]
                 if snapshot:
-                    buf.extraction_watermark = len(buf.messages)
+                    buf.extraction_watermark = max(index + 1 for index, message in enumerate(buf.messages)
+                                                   if message.id in snapshot_ids)
                 if pending_tokens >= 200 and extraction_messages:
                     buf.begin_extraction()
                     extraction_started = True
                     extraction_summary = buf.extraction_summary
 
-            if not snapshot:
-                succeeded = True
-            elif pending_tokens < 200 or not extraction_messages:
-                buf.remove_messages_by_id(snapshot_ids)
-                succeeded = True
-            else:
+            if pending_tokens >= 200 and extraction_messages:
                 write_api = self.get_write_api()
                 if write_api is None:
                     raise RuntimeError("dispose write API unavailable")
                 effective_ctx = ctx or self.build_context(params)
+                from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+                if isinstance(write_api, _CheckpointWriteAPI):
+                    journal = self._dispose_journal(mgr, buf, effective_ctx, snapshot)
+                    extraction_messages = journal.batch["messages"]
                 tool_stats_text = ""
                 try:
                     from extraction.tool_collector import format_tool_stats_text
@@ -5633,46 +6590,55 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     tool_stats_text=tool_stats_text,
                     extraction_run_id=run_id,
                     session_id=session_id,
+                    archive_id=journal.batch["archive_id"] if journal is not None else None,
+                    extraction_journal=journal,
                 )
                 if self._write_result_has_failures(write_result):
                     raise RuntimeError("dispose extraction write failed")
                 self._invalidate_identity_cache_if_profile_written(session_id, write_result)
                 self.drain_outbox_sync(account_id=effective_ctx.account_id)
-                removed = buf.remove_messages_by_id(snapshot_ids)
-                if removed:
-                    mgr.save_session_state(session_id, effective_ctx)
+                if journal is not None:
+                    journal.finish()
+                else:
+                    self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
                 succeeded = True
                 logger.info(
-                    "dispose background flush done: run=%s session=%s extracted=%d writes=%d removed=%d",
+                    "dispose background flush done: run=%s session=%s extracted=%d writes=%d",
                     run_id,
                     session_id[:8],
                     write_result.get("candidates_extracted", 0),
                     write_result.get("writes_completed", 0),
-                    removed,
                 )
-        except Exception:
+            else:
+                self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+                succeeded = True
+        except Exception as exc:
             if snapshot_ids:
                 buf.rewind_watermark_to_ids(snapshot_ids)
+            if journal is not None:
+                try:
+                    failure = {
+                        "status": "needs_confirmation" if isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)) else "failed",
+                        "retryable": not isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)), "error": str(exc)}
+                    journal.mutate(lambda batch: batch["lifecycle"].update(last_error=failure))
+                except Exception:
+                    logger.exception("dispose failure checkpoint unavailable: session=%s", session_id[:8])
             logger.exception("dispose background flush failed: session=%s", session_id[:8])
         finally:
+            source_stack.close()
             if extraction_started:
                 buf.end_extraction()
-            try:
-                if succeeded:
-                    self._save_session_state_best_effort(mgr, session_id, params)
-                    removed_session = mgr.remove_session_if_empty(
-                        session_id,
-                        buf,
-                        ctx=effective_ctx,
-                    )
-                    if removed_session:
-                        self._flush_session_tool_usage_async(session_id, effective_ctx)
-            finally:
-                with buf.extraction_lock:
-                    buf.dispose_in_progress = False
-                    buf.end_operation()
+            if succeeded:
+                removed_session = mgr.remove_session_if_empty(
+                    session_id,
+                    buf,
+                    ctx=effective_ctx,
+                )
+                if removed_session:
+                    self._flush_session_tool_usage_async(session_id, effective_ctx)
 
     @_attribute_request_usage
+    @_guard_session_mutation
     def dispose(self, params: dict | None = None) -> dict:
         """Session end: safely dispatch a non-blocking pending-memory flush."""
         params = params or {}
@@ -5683,6 +6649,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         mgr = self.get_session_manager()
         ctx = params.get("_ctx")
+        if ctx is not None and mgr.has_session(session_id) and not mgr.has_session(session_id, ctx=ctx):
+            return {"disposed": True, "flushed": False, "reason": "session_not_found"}
+        from service.api import MemoryWriteAPI as _CheckpointWriteAPI
+        if (isinstance(self._write_api, _CheckpointWriteAPI) or callable(mgr._get_context_fs)
+                or not mgr.has_session(session_id)):
+            ctx = ctx or self.build_context(params)
+            try:
+                self._load_extraction_recovery_before_accumulation(session_id, ctx)
+            except SessionOperationInProgress:
+                raise
+            except Exception as exc:
+                return {"disposed": False, "flushed": False, "status": "needs_confirmation",
+                        "retryable": False, "error": "durable extraction state unavailable: " + str(exc)}
         try:
             buf = mgr.begin_managed_operation(
                 session_id,
@@ -5702,49 +6681,62 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
         if buf is None:
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
-        with buf.extraction_lock:
-            if buf.dispose_in_progress:
-                buf.end_operation()
-                return {
-                    "disposed": True,
-                    "flushed": False,
-                    "status": "background_flush_dispatched",
-                    "reason": "dispose_in_progress",
-                }
-            buf.dispose_in_progress = True
-
+        operation = _DisposeOperationLease(buf)
+        source_stack = ExitStack()
         try:
-            if self._tool_result_externalizer is not None:
-                ctx = ctx or self.build_context(params)
-                governance = self._govern_pending_buffer(
-                    session_id,
-                    ctx,
-                    _operation_held=True,
-                )
-                if governance.get("retryable"):
-                    with buf.extraction_lock:
-                        buf.dispose_in_progress = False
-                        buf.end_operation()
-                    return {
-                        "disposed": False,
-                        "flushed": False,
-                        "status": "tool_result_governance_pending",
-                        "retryable": True,
-                        "governance": governance,
-                    }
-        except Exception:
             with buf.extraction_lock:
-                buf.dispose_in_progress = False
-                buf.end_operation()
+                if buf.ordinary_turns_in_progress:
+                    return {"disposed": False, "flushed": False, "status": "processing",
+                            "retryable": True, "reason": "ordinary_turn_in_progress"}
+                pending_kind = lifecycle_kind(buf)
+                ordinary_worker_active = pending_kind is None and buf.extraction_in_progress
+                if buf.pending_extraction_ids() and pending_kind != "dispose" and not ordinary_worker_active:
+                    return {"disposed": False, "flushed": False, "status": "needs_confirmation",
+                            "retryable": False, "reason": "pending_memory_batch"}
+                if buf.dispose_in_progress:
+                    return {
+                        "disposed": True,
+                        "flushed": False,
+                        "status": "background_flush_dispatched",
+                        "reason": "dispose_in_progress",
+                    }
+                operation.claim_dispose()
+            source_stack.enter_context(buf.lifecycle_lock)
+            conflict = source_stack.enter_context(buf.lifecycle_source_scope(allow_active_extraction=True))
+            if conflict is not None:
+                return {"disposed": False, "flushed": False, "status": "processing",
+                        "retryable": True, "reason": conflict}
+            return self._dispose_source_impl(mgr, buf, ctx, params, source_stack, operation)
+        finally:
+            try:
+                source_stack.close()
+            finally:
+                operation.release(local=True)
+
+    def _dispose_source_impl(self, mgr, buf, ctx, params, source_stack, operation):
+        session_id = buf.session_id
+        try:
+            source_state = self._prepare_dispose_source(mgr, buf, ctx, params)
+            if source_state.get("ok") is False:
+                return {"disposed": False, "flushed": False, **source_state}
+            source_snapshot = source_state["source_snapshot"]
+        except Exception as exc:
+            if isinstance(exc, RecoveryPersistenceError):
+                return {"disposed": False, "flushed": False, "status": "failed",
+                        "retryable": True, "error": str(exc)}
+            if isinstance(exc, RecoveryNeedsConfirmationError):
+                return {"disposed": False, "flushed": False, "status": "needs_confirmation",
+                        "retryable": False, "error": str(exc)}
             raise
 
         fast_path_reason = None
+        snapshot_ids = set()
         with buf.extraction_lock:
             extraction_active = buf.extraction_in_progress
             reason = "extraction_in_progress" if extraction_active else "background_flush_dispatched"
             pending_tokens = None
-            if not extraction_active:
-                unextracted = list(buf.messages[buf.extraction_watermark:])
+            if not extraction_active and source_snapshot is not None:
+                unextracted = source_snapshot
                 pending_tokens = sum(len(message.content) // 4 for message in unextracted)
                 if not unextracted:
                     reason = "no_pending_messages"
@@ -5761,23 +6753,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     fast_path_reason = reason
                     if unextracted:
                         snapshot_ids = {message.id for message in unextracted}
-                        buf.extraction_watermark = len(buf.messages)
-                        buf.remove_messages_by_id(snapshot_ids)
 
         if fast_path_reason is not None:
-            try:
-                self._save_session_state_best_effort(mgr, session_id, params)
-                removed_session = mgr.remove_session_if_empty(
-                    session_id,
-                    buf,
-                    ctx=ctx,
-                )
-                if removed_session:
-                    self._flush_session_tool_usage_async(session_id, ctx)
-            finally:
-                with buf.extraction_lock:
-                    buf.dispose_in_progress = False
-                    buf.end_operation()
+            self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+            removed_session = mgr.remove_session_if_empty(
+                session_id,
+                buf,
+                ctx=ctx,
+            )
+            if removed_session:
+                self._flush_session_tool_usage_async(session_id, ctx)
 
             result = {
                 "disposed": True,
@@ -5788,17 +6773,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 result["pending_tokens"] = pending_tokens
             return result
 
+        # The fixed durable batch now owns eligible real-writer source. The
+        # worker acquires its own preparation scope, including inline callers.
+        source_stack.close()
         try:
+            operation.worker_owned = True
             threading.Thread(
-                target=_run_with_usage_scope,
-                args=(ctx, self._run_dispose_background, mgr, session_id, params, ctx, buf),
+                target=self._run_dispose_background,
+                args=(mgr, session_id, params, ctx, buf, source_snapshot, operation),
                 daemon=True,
                 name=f"dispose-{session_id[:8]}",
             ).start()
         except Exception as exc:
-            with buf.extraction_lock:
-                buf.dispose_in_progress = False
-                buf.end_operation()
+            operation.release()
             logger.error(
                 "dispose background thread unavailable: session=%s: %s",
                 session_id[:8],
@@ -5819,6 +6806,37 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_attribute_request_usage
     def wait_until_idle(self, params: dict | None = None) -> dict:
+        import time
+
+        params = params or {}
+        started = time.monotonic()
+        result = self._wait_until_session_idle(params)
+        if (not result.get("idle") or not self._cfg.scene_enabled or not self._cfg.scene_generation_enabled
+                or not self._param_bool(params, "waitScenes", "wait_scenes", default=False)):
+            return result
+        self._ensure_scene_runtime()
+        ctx = params.get("_ctx") or self.build_context(params)
+        owners = (ctx.user_space_name(), ctx.agent_space_name())
+        for owner in owners:
+            self._scene_manager.flush(ctx.account_id, owner)
+        deadline = started + self._idle_timeout_seconds(params)
+        while True:
+            states = {owner: self._scene_manager.jobs.summary(ctx.account_id, owner) for owner in owners}
+            busy_owners = {owner for owner, state in states.items()
+                           if state["pending_nodes"] or (state.get("active_job") or {}).get("status")
+                           in {"PENDING", "RUNNING"}}
+            failed = self._scene_manager.halted or any(
+                owner not in busy_owners and (state.get("last_job") or {}).get("status") == "FAILED"
+                for owner, state in states.items()
+            )
+            busy = bool(busy_owners)
+            if failed or not busy or time.monotonic() >= deadline:
+                return {**result, "idle": not failed and not busy,
+                        "reason": "scene_failed" if failed else "scene_in_progress_timeout" if busy else result["reason"],
+                        "scenes": states}
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+
+    def _wait_until_session_idle(self, params: dict | None = None) -> dict:
         """Wait for process-local dispose/extraction/indexing to settle."""
         params = params or {}
         session_id = params.get("sessionId") or params.get("session_id") or ""
@@ -5829,6 +6847,38 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ctx = params.get("_ctx") or self.build_context(params)
         drain_outbox = self._param_bool(params, "drainOutbox", "drain_outbox", default=True)
         wait_outbox = self._param_bool(params, "waitOutbox", "wait_outbox", default=not drain_outbox)
+        had_local_session = mgr.has_session(session_id, ctx=ctx)
+        try:
+            # Preserve the public not-found contract for a known foreign local
+            # buffer. An absent local buffer still requires the strict read.
+            if had_local_session or not mgr.has_session(session_id):
+                local_busy = had_local_session and mgr.get_or_create(
+                    session_id, ctx=ctx).active_operation_count > 0
+                scope = nullcontext() if local_busy else self._session_mutation_scope(ctx, refresh=False)
+                with scope as guard:
+                    local_active = False
+                    if had_local_session:
+                        local = mgr.get_or_create(session_id, ctx=ctx)
+                        with local.extraction_lock:
+                            local_active = bool(local.active_operation_count or local.dispose_in_progress
+                                                or local.extraction_in_progress or local.commit_in_progress)
+                    if guard is None or not local_active:
+                        self._load_extraction_recovery_before_accumulation(
+                            session_id, ctx, force_reload=guard is not None)
+        except SessionOperationInProgress:
+            raise
+        except Exception as exc:
+            if isinstance(exc, SessionMutationBusyError):
+                return {"idle": False, "reason": "session_mutation_in_progress", "retryable": True}
+            return {"idle": False, "reason": "recovery_state_unavailable",
+                    "status": "needs_confirmation", "retryable": False,
+                    "error": "durable extraction state unavailable: " + str(exc)}
+        if not had_local_session and mgr.has_session(session_id, ctx=ctx):
+            # Strict observation can materialize an empty finished state. Keep
+            # idle from resurrecting a disposed buffer, without removing any
+            # source or operation that arrived during that read.
+            mgr.remove_session_if_empty(session_id, mgr.get_or_create(session_id, ctx=ctx),
+                                        ctx=ctx, require_quiescent=True)
         if not mgr.has_session(session_id, ctx=ctx):
             if drain_outbox:
                 drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
@@ -5896,6 +6946,35 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_event.wait(timeout=remaining)
             else:
                 _time.sleep(min(0.01, remaining))
+
+        with buf.extraction_lock:
+            extension = deepcopy(buf.runtime_extensions.get(EXTENSION_KEY))
+        if extension is not None:
+            batch = extension.get("batch") if isinstance(extension, dict) else None
+            if (not isinstance(extension, dict) or extension.get("version") != 1
+                    or not isinstance(batch, dict) or batch.get("owner") != recovery_owner(ctx)):
+                return {"idle": False, "reason": "extraction_recovery_pending",
+                        "status": "needs_confirmation", "retryable": False,
+                        "error": "pending extraction batch has a different owner or format"}
+            lifecycle = batch.get("lifecycle")
+            if "lifecycle" in batch and (not isinstance(lifecycle, dict)
+                    or lifecycle.get("kind") not in {"compaction", "dispose"}):
+                return {"idle": False, "reason": "lifecycle_recovery_pending",
+                        "status": "needs_confirmation", "retryable": False,
+                        "error": "pending lifecycle checkpoint is invalid"}
+            failure = (lifecycle or {}).get("last_error", {})
+            task = batch.get("retry_task")
+            if task is not None and not lifecycle:
+                self._extraction_retry.wake(ctx, task)
+                return {"idle": False, "reason": "extraction_retry_task",
+                        "status": task["status"], "recovery_task": deepcopy(task),
+                        "retryable": task["status"] in {"queued", "running", "failed"},
+                        "extraction_in_progress": False, "dispose_in_progress": False}
+            return {"idle": False, "reason": "lifecycle_recovery_pending" if lifecycle
+                    else "extraction_recovery_pending",
+                    "status": failure.get("status", "pending"),
+                    "retryable": failure.get("retryable", True),
+                    "extraction_in_progress": False, "dispose_in_progress": False}
 
         if drain_outbox:
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
@@ -5994,8 +7073,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     ) -> None:
         try:
             ctx = params.get("_ctx") or self.build_context(params)
-            mgr.save_session_state(session_id, ctx)
+            saved = mgr.save_session_state(session_id, ctx)
+            from fs.sql_adapter.session_mutation import active_session_guard
+            if active_session_guard() is not None and not saved:
+                raise RecoveryNeedsConfirmationError("dispose checkpoint was not acknowledged")
         except Exception as exc:
+            from fs.sql_adapter.session_mutation import active_session_guard
+            if active_session_guard() is not None:
+                raise
             logger.warning("dispose session state save skipped session=%s: %s", session_id, exc)
 
     def get_cumulative_token_usage(self, reset: bool = False) -> dict:

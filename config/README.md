@@ -57,6 +57,29 @@ cp config/deploy.env.reference deploy/deploy.env
 
 Priority per field: YAML value > environment variable > code default
 
+### Hierarchical retrieval expansion
+
+`retrieval.expand_hierarchy` defaults to `true`, preserving hierarchical
+retrieval. Set it to `false` to search only L2 content. This skips roots,
+hierarchical expansion, and child searches entirely, including empty-result
+fallbacks. L0 abstracts and L1 overviews do not participate in search. Existing
+ranking, top-k limits, access scope, optional content filling, and public
+URI/read behavior still apply.
+
+```yaml
+retrieval:
+  expand_hierarchy: false
+```
+
+If the YAML field is omitted, `OGMEM_RETRIEVAL_EXPAND_HIERARCHY=false` provides
+the same setting. Priority is YAML > environment > `true`. The flag accepts
+booleans or `true`/`false`, `yes`/`no`, and `1`/`0`; invalid values fail
+configuration loading. It applies to the whole service instance across HTTP,
+MCP, and internal retrieval callers, with no per-user or per-request override.
+Restart every worker after changing it. Skipping expansion removes tree-search
+work but can lose results discovered through L0/L1 summaries; measure recall
+and ranking in both modes on your workload.
+
 ## Mode annotations in ogmem.reference.yaml
 
 - `[all]` — applies to all deployment modes

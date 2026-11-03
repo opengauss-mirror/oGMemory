@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,7 +15,7 @@ import pytest
 from core.errors import LLMCallError
 import providers.llm as llm_package
 import providers.llm.openai_llm as openai_llm_module
-from core.errors import ToolCallProtocolError
+from core.errors import LLMOutputTruncatedError, LLMTransientError, ToolCallProtocolError
 
 
 def _chat_response(
@@ -55,6 +57,188 @@ def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock
 
 
 class TestOpenAILLM:
+    @pytest.mark.parametrize("mode", [
+        "structured", "text", "tools", "messages", "multimodal", "multimodal_text",
+    ])
+    @pytest.mark.parametrize("failure", ["timeout", "connection", 429, 500, 503])
+    def test_transient_provider_failure_retains_retry_type_and_then_completes(self, fake_client, mode, failure):
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        if failure == "timeout":
+            error = APITimeoutError(request=request)
+        elif failure == "connection":
+            error = APIConnectionError(request=request)
+        else:
+            error = APIStatusError("temporary service failure", response=httpx.Response(failure, request=request), body={})
+        payload = '{"value":"recovered"}'
+        calls = [SimpleNamespace(function=SimpleNamespace(name="extract", arguments=payload))]
+        fake_client.chat.completions.create.side_effect = [error, _chat_response(content=payload, tool_calls=calls)]
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", json_mode=mode in {"structured", "multimodal"},
+        )
+        schema = {"type": "object", "required": ["value"]}
+        tool = {"name": "extract", "description": "Extract", "input_schema": schema}
+
+        def complete():
+            if mode.startswith("multimodal"):
+                return llm.complete_multimodal(
+                    [{"role": "user", "content": "Extract"}], schema,
+                )
+            if mode in {"structured", "text"}:
+                return llm.complete_json("Extract", schema)
+            if mode == "tools":
+                return llm.complete_with_tools("Extract", [tool], tool_choice="required")[0]["input"]
+            return llm.complete_with_tools_messages([{"role": "user", "content": "Extract"}], [tool])[0][0]["input"]
+
+        with pytest.raises(LLMTransientError) as caught:
+            complete()
+        assert caught.value.__cause__ is error
+        assert complete() == {"value": "recovered"}
+
+    @pytest.mark.parametrize("mode", ["structured", "text", "tools", "messages"])
+    @pytest.mark.parametrize("content", ["not even trying", '{"other":1}'])
+    def test_output_protocol_error_can_be_repaired_on_next_response(self, fake_client, mode, content):
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=mode == "structured")
+        schema = {"type": "object", "required": ["value"]}
+        tool = {"name": "extract", "description": "Extract", "input_schema": schema}
+        broken = content if mode in {"structured", "text"} else "not even trying"
+        fake_client.chat.completions.create.side_effect = [
+            _chat_response(content=broken, tool_calls=[SimpleNamespace(function=SimpleNamespace(name="extract", arguments=broken))]),
+            _chat_response(content='{"value":"repaired"}', tool_calls=[SimpleNamespace(
+                function=SimpleNamespace(name="extract", arguments='{"value":"repaired"}'))]),
+        ]
+
+        def complete():
+            if mode in {"structured", "text"}:
+                return llm.complete_json("Extract", schema)
+            if mode == "tools":
+                return llm.complete_with_tools("Extract", [tool], tool_choice="required")[0]["input"]
+            return llm.complete_with_tools_messages([{"role": "user", "content": "Extract"}], [tool])[0][0]["input"]
+
+        with pytest.raises(ToolCallProtocolError):
+            complete()
+        assert complete() == {"value": "repaired"}
+
+    @pytest.mark.parametrize("tools", [None, []])
+    def test_streamed_final_text_round_completes_with_sdk_and_usage(self, tools):
+        from openai import OpenAI
+
+        chunks = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "[]"},
+                           "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}},
+        ]
+        events = "".join("data: " + json.dumps({"id": "final-round", "created": 1,
+                            "object": "chat.completion.chunk", "model": "extraction-model", **chunk})
+                         + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=events)
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", extra_body={"stream": True})
+        llm.token_tracker = Mock()
+        with OpenAI(api_key="test-key", base_url="https://example.test/v1",
+                    http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
+            llm._client = client
+            result = llm.complete_with_tools_messages(
+                [{"role": "user", "content": "Finish the remaining operations."}],
+                tools=tools, tool_choice="none")
+
+        assert result == ([], "[]")
+        assert len(requests) == 1
+        llm.token_tracker.record_llm.assert_called_once_with(
+            20, 2, 0, 0, usage_known=True, model="extraction-model")
+
+    @pytest.mark.parametrize("json_mode", [False, True])
+    def test_streamed_review_returns_json_and_records_usage(self, fake_client, json_mode):
+        response = _chat_response(content='{"checks": [], "issues": []}')
+        response.model = "review-model"
+        response.usage = SimpleNamespace(prompt_tokens=20, completion_tokens=10)
+        stream = Mock()
+        stream.get_final_completion.return_value = response
+        fake_client.beta.chat.completions.stream.return_value = nullcontext(stream)
+        parameters = {"stream": True, "thinking": {"type": "enabled"},
+                      "reasoning_effort": "low"}
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="review-model", json_mode=json_mode,
+            extra_body=parameters)
+        llm.token_tracker = Mock()
+        result = llm.complete_json("Review these supported facts.", {"type": "object"})
+        assert result == {"checks": [], "issues": []}
+        request = fake_client.beta.chat.completions.stream.call_args.kwargs
+        assert request["extra_body"] == {
+            "thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+        assert request["stream_options"] == {"include_usage": True}
+        assert parameters["stream"] is True
+        llm.token_tracker.record_llm.assert_called_once_with(
+            20, 10, 0, 0, usage_known=True, model="review-model")
+
+    @pytest.mark.parametrize("use_messages", [False, True])
+    @pytest.mark.parametrize("tool_choice", ["required", "auto"])
+    @pytest.mark.parametrize("invalid_json", [False, True])
+    def test_vllm_required_output_array_error_is_protocol_only(
+        self, fake_client, use_messages, tool_choice, invalid_json,
+    ):
+        message = (
+            "1 validation error for list[function-wrap[__log_extra_fields__()]]\n"
+            "  Input should be a valid array [type=list_type, "
+            "input_value={'name': 'extract_event', 'arguments': {}}, input_type=dict]"
+        )
+        if invalid_json:
+            message = (
+                "1 validation error for list[function-wrap[__log_extra_fields__()]]\n"
+                "Invalid JSON: expected value at line 1 column 1 "
+                "[type=json_invalid, input_value='<tool>invalid</tool>', input_type=str]"
+            )
+        fake_client.chat.completions.create.side_effect = _bad_request(message)
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        tools = [{"name": "extract_event", "description": "Extract",
+                  "input_schema": {"type": "object"}}]
+        expected = ToolCallProtocolError if tool_choice == "required" else LLMCallError
+        with pytest.raises(expected):
+            if use_messages:
+                llm.complete_with_tools_messages(
+                    [{"role": "user", "content": "prompt"}], tools,
+                    tool_choice=tool_choice,
+                )
+            else:
+                llm.complete_with_tools("prompt", tools, tool_choice=tool_choice)
+        assert fake_client.chat.completions.create.call_count == 1
+        assert llm._required_tool_choice_capability == "unknown"
+
+    @pytest.mark.parametrize("tools", [None, []])
+    def test_no_tools_request_does_not_classify_required_output_error(self, fake_client, tools):
+        error = _bad_request(
+            "1 validation error for list[function-wrap[__log_extra_fields__()]]\n"
+            "Input should be a valid array [type=list_type, input_type=dict]"
+        )
+        fake_client.chat.completions.create.side_effect = error
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        with pytest.raises(LLMCallError) as caught:
+            llm.complete_with_tools_messages(
+                [{"role": "user", "content": "Finish"}], tools, tool_choice="required",
+            )
+        assert caught.value.status_code == 400
+        request = fake_client.chat.completions.create.call_args.kwargs
+        assert "tools" not in request
+        assert "tool_choice" not in request
+
+    @pytest.mark.parametrize("message", [
+        "maximum context length exceeded",
+        "Invalid tool schema",
+        "Input should be a valid array [type=list_type, input_type=dict]",
+        "1 validation error for ChatCompletionRequest\n"
+        "Input should be a valid array [type=list_type, input_type=dict]",
+    ])
+    def test_request_errors_do_not_become_tool_output_errors(self, message):
+        assert not openai_llm_module.OpenAILLM._is_required_tool_output_parse_error(
+            _bad_request(message)
+        )
+
     def test_custom_request_timeout(self, fake_openai_ctor):
         openai_llm_module.OpenAILLM(api_key="test-key", request_timeout_seconds=300)
         fake_openai_ctor.assert_called_once_with(timeout=300, api_key="test-key")
@@ -78,7 +262,7 @@ class TestOpenAILLM:
             content="private text", tool_calls=tool_calls, finish_reason="length",
         )
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
-        with pytest.raises(LLMCallError, match="output truncated"):
+        with pytest.raises(LLMOutputTruncatedError, match="token limit"):
             if use_messages:
                 llm.complete_with_tools_messages(
                     [{"role": "user", "content": "prompt"}], [],
@@ -88,7 +272,7 @@ class TestOpenAILLM:
                 llm.complete_with_tools("prompt", [], tool_choice="required")
         assert fake_client.chat.completions.create.call_count == 1
         assert "private text" not in caplog.text
-        assert "max_tokens=4096" in caplog.text
+        assert llm._max_tokens == 4096
 
     def test_lazy_loader_returns_classes(self):
         openai_llm, cached_llm = llm_package.get_openai_llm()
@@ -232,6 +416,30 @@ class TestOpenAILLM:
 
         assert result == [{"name": "one"}, {"name": "two"}]
 
+    @pytest.mark.parametrize("prefix", ["", "Review result: "])
+    def test_complete_json_closes_outer_object_and_preserves_complete_checks(self, fake_client, prefix):
+        expected = {"checks": [
+            {"device": "Vega", "result": "passed", "note": 'Label contains } and [ and "quoted" text.'},
+            {"device": "Cedar", "result": "scheduled", "date": "2025-03-11"},
+        ]}
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content=prefix + json.dumps(expected)[:-1])
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        result = llm.complete_json("Preserve the device checks.",
+                                   {"type": "object", "required": ["checks"]})
+
+        assert result == expected
+        assert fake_client.chat.completions.create.call_count == 1
+
+    def test_extract_json_values_preserves_separate_complete_records(self):
+        records = [{"device": "Vega", "checks": ["pressure"]},
+                   {"device": "Cedar", "checks": ["connector"]}]
+        content = "First result: " + json.dumps(records[0]) + "\nSecond result: " + json.dumps(records[1])
+
+        result = openai_llm_module.OpenAILLM._extract_json_values_from_text(content)
+
+        assert result == records
     @pytest.mark.parametrize("prefix", ["Note [unfinished ", "Note {unfinished "])
     def test_complete_json_skips_unmatched_prefix(self, fake_client: Mock, prefix):
         fake_client.chat.completions.create.return_value = _chat_response(
@@ -266,11 +474,10 @@ class TestOpenAILLM:
         )
         fake_client.chat.completions.create.return_value = response
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
-        with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
+        with pytest.raises(LLMOutputTruncatedError) as caught:
             llm.complete_json("Extract text memory", {"type": "object"})
-        assert "finish_reason=length" in caplog.text
-        assert "reasoning_tokens=4096" in caplog.text
-        assert "visible_len=0" in caplog.text
+        assert "finish_reason=length" in str(caught.value)
+        assert "max_tokens=4096" in str(caught.value)
         assert "private conversation" not in caplog.text
 
     @pytest.mark.parametrize(
@@ -291,14 +498,14 @@ class TestOpenAILLM:
         # json_mode=False means it will use text fallback
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=False)
 
-        with pytest.raises(ValueError, match="parse LLM response as JSON"):
+        with pytest.raises(ToolCallProtocolError, match="Invalid JSON response"):
             llm.complete_json("broken", {"type": "object"})
 
     def test_complete_json_validates_required_properties(self, fake_client: Mock):
         fake_client.chat.completions.create.return_value = _chat_response(content='{"other": 1}')
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(ValueError, match="Missing required property"):
+        with pytest.raises(ToolCallProtocolError, match="Missing required property"):
             llm.complete_json(
                 "missing field",
                 {
@@ -568,14 +775,11 @@ class TestOpenAILLM:
         assert exc_info.value.status_code == 400
         assert "BadRequestError" in str(exc_info.value)
 
-    def test_complete_with_tools_messages_raises_llm_call_error_on_500(
+    def test_complete_with_tools_messages_raises_transient_error_on_500(
         self, fake_client: Mock,
     ):
-        """A 500 (APIStatusError) surfaces as LLMCallError with
-        status_code=500 so the driver can react."""
+        """A 500 retains the retryable provider error and its status."""
         from openai import APIStatusError
-
-        from core.errors import LLMCallError
 
         fake_response = Mock(status_code=500)
         fake_client.chat.completions.create.side_effect = APIStatusError(
@@ -585,13 +789,13 @@ class TestOpenAILLM:
         )
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(LLMCallError) as exc_info:
+        with pytest.raises(LLMTransientError) as exc_info:
             llm.complete_with_tools_messages(
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[{"name": "x", "description": "x",
                         "input_schema": {"type": "object"}}],
             )
-        assert exc_info.value.status_code == 500
+        assert exc_info.value.__cause__.status_code == 500
 
     def test_complete_with_tools_empty_required_tool_calls_does_not_log_text_content(
         self,
@@ -731,9 +935,8 @@ class TestOpenAILLMCompleteMultimodal:
         assert sent_messages[1] == messages[0]  # user multimodal content forwarded
         assert call.kwargs["response_format"] == {"type": "json_object"}
 
-    def test_complete_multimodal_drops_caller_system_messages(self, fake_client, fake_openai_ctor):
-        """Caller-supplied system messages are dropped — the schema-derived
-        system message is authoritative for JSON-mode guarantees."""
+    def test_complete_multimodal_preserves_task_instructions(self, fake_client, fake_openai_ctor):
+        """Schema formatting must not remove the memory extraction policy."""
         llm = openai_llm_module.OpenAILLM(
             api_key="test-key", model="gpt-4o", json_mode=True,
         )
@@ -741,14 +944,55 @@ class TestOpenAILLMCompleteMultimodal:
             content='{"description": "ok"}',
         )
         messages = [
-            {"role": "system", "content": "ignore me"},
+            {"role": "system", "content": "Preserve specific objects and locations from speech."},
+            {"role": "system", "content": [{"type": "text", "text": "Do not replace facts with generic room descriptions."}]},
             {"role": "user", "content": "describe"},
         ]
         llm.complete_multimodal(messages, {"type": "object"})
         sent = fake_client.chat.completions.create.call_args.kwargs["messages"]
-        # Only one system message (the schema-driven one), no caller system.
-        assert all(m["role"] != "system" or "JSON" not in m["content"]
-                   for m in sent if m.get("content") == "ignore me")
+        assert len(sent) == 2 and sent[0]["role"] == "system"
+        assert "Preserve specific objects and locations from speech." in sent[0]["content"]
+        assert "Do not replace facts with generic room descriptions." in sent[0]["content"]
+        assert "Respond ONLY with valid JSON" in sent[0]["content"]
+        assert sent[1] == messages[2]
+        assert messages[0]["content"] == "Preserve specific objects and locations from speech."
+
+    @pytest.mark.parametrize("json_mode", [True, False])
+    def test_truncated_multimodal_output_is_not_repaired_into_success(self, fake_client, json_mode):
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=json_mode)
+        response = _chat_response(
+            content='{"description":"unfinished', finish_reason="length",
+        )
+        response.usage = SimpleNamespace(
+            prompt_tokens=100, completion_tokens=4096,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=4000),
+        )
+        fake_client.chat.completions.create.return_value = response
+        with pytest.raises(LLMOutputTruncatedError, match="multimodal output truncated") as caught:
+            llm.complete_multimodal([{"role": "user", "content": "describe"}], {"type": "object"})
+        assert "completion_tokens=4096" in str(caught.value)
+        assert "reasoning_tokens=4000" in str(caught.value)
+        assert fake_client.chat.completions.create.call_count == 1
+
+    @pytest.mark.parametrize("json_mode", [True, False])
+    def test_multimodal_keeps_deadline_error_after_response(self, fake_client, monkeypatch, json_mode):
+        from core.errors import OperationDeadlineExceededError
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=json_mode)
+        deadline = OperationDeadlineExceededError("response arrived after deadline")
+        response = _chat_response(content='{"description":"complete"}')
+
+        def complete(**kwargs):
+            def expired():
+                raise deadline
+            monkeypatch.setattr(openai_llm_module, "check_deadline", expired)
+            return response
+
+        fake_client.chat.completions.create.side_effect = complete
+        with pytest.raises(OperationDeadlineExceededError) as caught:
+            llm.complete_multimodal([{"role": "user", "content": "describe"}], {"type": "object"})
+        assert caught.value is deadline
+        assert fake_client.chat.completions.create.call_count == 1
 
     def test_complete_multimodal_text_fallback_on_bad_request(
         self, fake_client, fake_openai_ctor,
@@ -772,7 +1016,8 @@ class TestOpenAILLMCompleteMultimodal:
             _chat_response(content='{"description": "fallback ok"}'),
         ]
         result = llm.complete_multimodal(
-            [{"role": "user", "content": "describe"}],
+            [{"role": "system", "content": "Keep speech facts."},
+             {"role": "user", "content": "describe"}],
             {"type": "object", "properties": {"description": {"type": "string"}}},
         )
         assert result["description"] == "fallback ok"
@@ -781,6 +1026,7 @@ class TestOpenAILLMCompleteMultimodal:
         # Second call has no response_format (text mode).
         second_kwargs = fake_client.chat.completions.create.call_args_list[1].kwargs
         assert "response_format" not in second_kwargs
+        assert "Keep speech facts." in second_kwargs["messages"][0]["content"]
 
 
 @pytest.mark.parametrize('json_mode', [False, True])
@@ -829,3 +1075,37 @@ def test_json_values_preserve_literal_content(value, wrapper):
     assert openai_llm_module.OpenAILLM._extract_json_from_text(
         wrapper.format(json.dumps(payload)),
     ) == payload
+
+@pytest.mark.parametrize("with_ids", [True, False])
+def test_search_compaction_uses_unambiguous_provider_call_ids(fake_client, monkeypatch, with_ids):
+    from core.models import RequestContext
+    from core.react_loop import ReactLoop
+    from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
+
+    raw_calls = [SimpleNamespace(
+        **({"id": f"search_{i}"} if with_ids else {}),
+        function=SimpleNamespace(name="Search", arguments=json.dumps({"query": query})),
+    ) for i, query in enumerate(("scissors", "glue", "scissors"))]
+    fake_client.chat.completions.create.return_value = _chat_response(tool_calls=raw_calls)
+    llm = openai_llm_module.OpenAILLM(api_key="test-key")
+    calls, _ = llm.complete_with_tools_messages(
+        [{"role": "user", "content": "Where?"}],
+        [{"name": "Search", "description": "Search", "input_schema": {"type": "object"}}],
+    )
+    if with_ids:
+        assert [call["id"] for call in calls] == ["search_0", "search_1", "search_2"]
+    adapter = OGMemoryControlAdapter(llm=llm, graph=Mock(), embedder=Mock())
+    ctx = RequestContext(account_id="a", user_id="u", agent_id="g", session_id="s", trace_id="t")
+    messages = adapter._build_messages(ctx, M3TaskContext(question="Where?"))
+    monkeypatch.setattr(ReactLoop, "_execute_tool", lambda self, name, args, ctx: {
+        "hits": [{"node_id": args["query"], "description": "Full original evidence"}],
+        "context_hits": [], "boundary_hits": [],
+    })
+    adapter._execute_and_append_tool_calls(messages, calls, [], set(), ctx)
+    results = [m for m in messages if m["role"] == "tool"]
+    ids = [m["tool_call_id"] for m in results]
+    assert len(set(ids)) == 3
+    assert "unknown" not in ids
+    assert [m["tool_calls"][0]["id"] for m in messages if m.get("tool_calls")] == ids
+    assert json.loads(results[2]["content"])["evidence_reference_tool_call_id"] == ids[0]
+    assert all(not json.loads(m["content"]).get("evidence_payload_omitted") for m in results[:2])

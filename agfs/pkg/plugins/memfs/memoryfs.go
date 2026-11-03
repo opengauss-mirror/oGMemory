@@ -385,7 +385,7 @@ func (mfs *MemoryFS) Rename(oldPath, newPath string) error {
 		return err
 	}
 
-	if _, exists := newParent.Children[newName]; exists {
+	if target, exists := newParent.Children[newName]; exists && (node.IsDir || target.IsDir) {
 		return fmt.Errorf("file already exists: %s", newPath)
 	}
 
@@ -797,4 +797,3 @@ func (mfs *MemoryFS) CloseHandle(id int64) error {
 
 // Ensure MemoryFS implements HandleFS interface
 var _ filesystem.HandleFS = (*MemoryFS)(nil)
-

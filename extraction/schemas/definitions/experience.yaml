@@ -1,0 +1,24 @@
+memory_type: experience
+version: "1.0"
+enabled: false
+description: Model conclusions and explicit reasoning summaries from agent traces.
+operation_mode: upsert
+owner_scope: agent
+directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/memories/experiences"
+filename_template: "{{ routing_key }}.md"
+fields:
+  - name: routing_key
+    type: string
+    required: true
+  - name: abstract
+    type: string
+    required: true
+  - name: overview
+    type: string
+    required: true
+  - name: content
+    type: string
+    required: true
+  - name: confidence
+    type: number
+    required: true

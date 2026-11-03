@@ -54,6 +54,12 @@ logger = logging.getLogger(__name__)
 # format the tool call, which lands verbatim in ``predicted_answer`` via
 # ``_parse_output``. These aren't real answers — flag them as invalid.
 _PROTOCOL_SCAFFOLDING_RE = re.compile(r"\[(Search|Answer)\]", re.IGNORECASE)
+_TOOL_CALL_LEAK_RE = re.compile(
+    r"\b(?:Search|Answer)\s*\("
+    r"|</?tool(?:s|_call)?(?:\s[^>]*)?>"
+    r'|"name"\s*:\s*"(?:Search|Answer)"',
+    re.IGNORECASE,
+)
 
 
 def _has_protocol_scaffolding(text: str) -> bool:
@@ -64,7 +70,9 @@ def _has_protocol_scaffolding(text: str) -> bool:
     depth — catches rows written by older drivers that didn't run the
     new check).
     """
-    return bool(text) and bool(_PROTOCOL_SCAFFOLDING_RE.search(text))
+    return bool(text) and bool(
+        _PROTOCOL_SCAFFOLDING_RE.search(text) or _TOOL_CALL_LEAK_RE.search(text)
+    )
 
 
 _ANSWER_TAG_RE = re.compile(r"\[Answer\]", re.IGNORECASE)
@@ -87,6 +95,8 @@ def _salvage_scaffolding(text: str) -> str:
     if not matches:
         return ""
     body = text[matches[-1].end():]
+    if _TOOL_CALL_LEAK_RE.search(body):
+        return ""
     cleaned = _PROTOCOL_SCAFFOLDING_RE.sub(" ", body)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n.-:|\\\"'")
     return cleaned
@@ -509,6 +519,8 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
     # OGMemoryControlAdapter.run() is not re-entrant (it rejects
     # concurrent questions), so each worker thread gets its own adapter
     # over the shared, thread-safe graph / embedder / LLM.
+    from m3.context_budget import load_context_budget
+
     def _build_adapter() -> OGMemoryControlAdapter:
         return OGMemoryControlAdapter(
             llm=llm,
@@ -524,6 +536,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
             transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
             context_k=getattr(args, "context_k", 0),
             include_neighbors=getattr(args, "include_neighbors", 1),
+            context_budget=load_context_budget(args.config),
         )
 
     adapter_factory = ThreadLocalModels(_build_adapter, name="qa_adapter")
@@ -700,7 +713,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         "QA wrote %d answered records to %s (%d failed, %d skipped)",
         answered, output_path, failed, skipped,
     )
-    return 2 if failed and answered == 0 else 0
+    return 2 if failed else 0
 
 
 def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

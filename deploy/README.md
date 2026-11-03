@@ -461,7 +461,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `auth.admin_api_keys` | `OG_ADMIN_API_KEYS` | 空 | `account_id:key` 或 `key`，多个值逗号分隔 | Admin API Keys 列表 |
 | `sharing.agent_shared_mode` | `OG_AGENT_SHARED_MODE` | `off` | `off` / `user` | Agent 共享模式 |
 | `sharing.agent_shared_list` | `OG_AGENT_SHARED_LIST` | 空 | 逗号分隔 Agent ID，例如 `shared-agent,agent-handbook` | 共享 Agent ID 列表 |
-| `memory.after_turn_threshold` | `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 正整数 | 达到阈值后触发记忆提取 |
+| `memory.after_turn_threshold` | `OGMEM_AFTER_TURN_THRESHOLD` | `400` | 正整数 | 达到阈值后触发记忆提取 |
 | `memory.rolling_compress_enabled` | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | `true` / `false` | 是否启用滚动压缩 |
 | `memory.compact_prepare_token_ttl` | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | 正整数，单位秒 | prepare_compaction token 有效期 |
 | `memory.directory_summary_enabled` | `OGMEM_DIRECTORY_SUMMARY_ENABLED` | `false` | `true` / `false` | 是否启用目录摘要 |
@@ -990,3 +990,7 @@ deploy/
 ├── ogmemory.example.yaml    # oGMemory 配置模板（复制为 ogmemory.yaml 后编辑）
 └── ogmemory.yaml            # oGMemory 实际配置（用户创建，不纳入版本控制）
 ```
+
+## Agent 工具与经验记忆
+
+部署模板默认关闭 Agent 记忆抽取。需要启用时，按 [Agent 记忆部署说明](agent-memory.md) 修改挂载 YAML、重启服务并验证配置和 Trace 抽取结果。

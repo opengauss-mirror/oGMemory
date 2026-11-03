@@ -328,12 +328,12 @@ def test_agfs_delete_payload_failure_eventually_converges_and_allows_rewrite(
     real_delete_node_payload = agfs.delete_node_payload
     payload_cleanup_attempts = 0
 
-    def fail_first_payload_cleanup(uri, cleanup_ctx):
+    def fail_first_payload_cleanup(uri, cleanup_ctx, *, mutation_lease=None):
         nonlocal payload_cleanup_attempts
         payload_cleanup_attempts += 1
         if payload_cleanup_attempts == 1:
             raise RuntimeError("transient AGFS payload delete failure")
-        real_delete_node_payload(uri, cleanup_ctx)
+        real_delete_node_payload(uri, cleanup_ctx, mutation_lease=mutation_lease)
 
     setattr(agfs, "delete_node_payload", fail_first_payload_cleanup)
 

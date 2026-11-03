@@ -12,8 +12,8 @@ Run:
 import json
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 BASE = "http://localhost:8090/api/v1"
 SESSION_ID = "e2e-session-001"
@@ -78,7 +78,7 @@ def wait_for_commit(session_id, common, timeout=10):
     return http_get(f"/sessions/{session_id}", common)
 
 
-def test_add_messages_and_check_pending():
+def check_add_messages_and_check_pending():
     """Step 1: Add messages to session buffer, check pending_tokens."""
     print("\n=== Step 1: Add messages to session buffer ===")
 
@@ -114,7 +114,7 @@ def test_add_messages_and_check_pending():
     return common
 
 
-def test_after_turn_accumulates(common):
+def check_after_turn_accumulates(common):
     """Step 2: afterTurn with messages below threshold (should accumulate)."""
     print("\n=== Step 2: afterTurn (below threshold) ===")
 
@@ -138,7 +138,7 @@ def test_after_turn_accumulates(common):
     print("  PASSED")
 
 
-def test_commit_session(common):
+def check_commit_session(common):
     """Step 3: Commit session (archive + extract) and wait for completion."""
     print("\n=== Step 3: Commit session ===")
 
@@ -160,7 +160,7 @@ def test_commit_session(common):
     print("  PASSED")
 
 
-def test_get_context(common):
+def check_get_context(common):
     """Step 4: Get session context (should have archive info)."""
     print("\n=== Step 4: Get session context ===")
 
@@ -178,7 +178,7 @@ def test_get_context(common):
     print("  PASSED")
 
 
-def test_compact(common):
+def check_compact(common):
     """Step 5: Compact (compress + archive + return summary)."""
     print("\n=== Step 5: Compact ===")
 
@@ -209,7 +209,7 @@ def test_compact(common):
     print("  PASSED")
 
 
-def test_assemble(common):
+def check_assemble(common):
     """Step 6: Assemble (should return systemPromptAddition)."""
     print("\n=== Step 6: Assemble ===")
 
@@ -229,6 +229,46 @@ def test_assemble(common):
     print("  PASSED")
 
 
+def run_session_lifecycle():
+    common = check_add_messages_and_check_pending()
+    check_after_turn_accumulates(common)
+    check_commit_session(common)
+    check_get_context(common)
+    check_compact(common)
+    check_assemble(common)
+
+
+def test_session_lifecycle():
+    import importlib
+    import threading
+    import uuid
+    from unittest.mock import patch
+
+    from werkzeug.serving import make_server
+
+    from providers.unified_config import OgMemConfig
+    from server.memory_service import MemoryService
+
+    http_server = importlib.import_module("server.app")
+    service = MemoryService(config=OgMemConfig(
+        provider="mock", embedding_provider="mock", vector_db_type="memory",
+        after_turn_threshold=100_000,
+    ))
+    server = make_server("127.0.0.1", 0, http_server.app, threaded=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    with patch.object(http_server, "_service", service), patch.dict(
+        globals(), BASE=f"http://127.0.0.1:{server.server_port}/api/v1",
+        SESSION_ID=f"e2e-session-{uuid.uuid4().hex}",
+    ):
+        thread.start()
+        try:
+            run_session_lifecycle()
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            service.shutdown()
+
+
 def main():
     print("=" * 60)
     print("E2E Session Lifecycle Test")
@@ -245,12 +285,7 @@ def main():
         sys.exit(1)
 
     try:
-        common = test_add_messages_and_check_pending()
-        test_after_turn_accumulates(common)
-        test_commit_session(common)
-        test_get_context(common)
-        test_compact(common)
-        test_assemble(common)
+        run_session_lifecycle()
 
         print("\n" + "=" * 60)
         print("ALL E2E TESTS PASSED")

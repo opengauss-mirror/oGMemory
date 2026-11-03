@@ -586,7 +586,7 @@ def test_build_judge_llm_with_explicit_endpoint_uses_openai_transport(monkeypatc
 
     class _FakeOpenAILLM:
         def __init__(self, *, api_key, base_url, model, temperature=0.0,
-                     max_tokens=None, json_mode=False):
+                     max_tokens=None, json_mode=False, request_timeout_seconds=120.0):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
             captured["model"] = model
@@ -622,7 +622,7 @@ def test_build_judge_llm_cli_overrides_yaml(monkeypatch, tmp_path):
 
     class _FakeOpenAILLM:
         def __init__(self, *, api_key, base_url, model, temperature=0.0,
-                     max_tokens=None, json_mode=False):
+                     max_tokens=None, json_mode=False, request_timeout_seconds=120.0):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
             captured["model"] = model
@@ -676,7 +676,7 @@ def test_build_judge_llm_defaults_to_minimax(monkeypatch):
 
     class _FakeMiniMaxLLM:
         def __init__(self, *, api_key, base_url, model, temperature=0.0,
-                     max_tokens=None, json_mode=False):
+                     max_tokens=None, json_mode=False, request_timeout_seconds=120.0):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
             captured["model"] = model

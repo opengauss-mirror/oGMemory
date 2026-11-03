@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ogmemory",
+  "version": "0.1.0",
+  "description": "Recall and persist long-term memory through an existing oGMemory service.",
+  "author": {"name": "openGauss oGMemory"},
+  "repository": "https://gitcode.com/opengauss/oGMemory",
+  "license": "MulanPSL-2.0",
+  "keywords": ["memory", "mcp", "agent-plugins"]
+}

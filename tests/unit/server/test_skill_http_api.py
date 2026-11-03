@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import io
+import os
 import zipfile
+from pathlib import Path
+from threading import Thread
 
+import pytest
+from werkzeug.serving import make_server
 from werkzeug.test import EnvironBuilder
 
 from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server import app as app_module
-from server.auth import ResolvedIdentity
+from server.auth import AuthService, ResolvedIdentity
 from skills.artifact import internal_skill_uri, is_governed_skill
 
 
@@ -493,3 +499,57 @@ def test_session_end_trace_events_wake_worker_after_persistence(monkeypatch):
         assert response.status_code == 200
 
     assert service.wake_count == 2
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("source", ["generated", "imported"])
+def test_codex_skill_authentication_diagnostic(monkeypatch, capsys, enabled, source):
+    from skills import management
+
+    service = _Service()
+    decoded_files = []
+    deserialize = management.deserialize_package_file
+
+    def track_file_decode(record):
+        decoded_files.append(record["size"])
+        return deserialize(record)
+
+    monkeypatch.setattr(management, "deserialize_package_file", track_file_decode)
+    if source == "imported":
+        monkeypatch.setattr(service, "list_published_skills", lambda *args, **kwargs: {
+            "skills": [{"name": "managed-skill", "description": "Review code.", "source": "imported"}],
+            "truncated": False,
+        })
+    config = OgMemConfig(role_control_enabled=enabled, root_api_key="test-root" if enabled else None)
+    auth = AuthService(config, None)
+    monkeypatch.setattr(service, "get_auth_service", lambda: auth)
+    monkeypatch.setattr(app_module, "_service", service)
+    path = Path(__file__).resolve().parents[3] / "plugins/ogmemory/scripts/ogmemory_codex_hook.py"
+    spec = importlib.util.spec_from_file_location("codex_hook_auth_test", path)
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+    monkeypatch.setattr(hook, "_plugin_config", lambda: {})
+    monkeypatch.setattr(hook, "_post_json", lambda *args: {"identityContext": "MEMORY-MARKER"})
+    for key in list(os.environ):
+        if key.startswith(("OG_", "OGMEM_")):
+            monkeypatch.delenv(key)
+    server = make_server("127.0.0.1", 0, app_module.app)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("OG_MEMORY_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setenv("OG_MEMORY_AGENT_ID", "bot")
+    monkeypatch.setenv("OG_MEMORY_ACCOUNT_ID", "acct-1")
+    monkeypatch.setenv("OG_MEMORY_API_KEY", "test-root" if enabled else "")
+    try:
+        output = hook._recall("session", "review code", "UserPromptSubmit")
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert "MEMORY-MARKER" in context
+    if enabled:
+        assert ("# Managed" if source == "imported" else "# Review code") in context
+        assert decoded_files == [], f"Unused attachments decoded: {decoded_files} bytes"
+    else:
+        assert "Skill HTTP 401" in capsys.readouterr().err

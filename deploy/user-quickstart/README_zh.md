@@ -295,3 +295,7 @@ docker logs "${INSTANCE_NAME}_ogmemory" --since 10m
 docker logs "${INSTANCE_NAME}_openclaw_ce" --since 10m
 docker logs "${INSTANCE_NAME}_openclaw_mcp" --since 10m
 ```
+
+## Agent 工具与经验记忆
+
+部署模板默认关闭 Agent 记忆抽取。需要启用时，按 [Agent 记忆部署说明](../agent-memory.md) 修改挂载 YAML、重启服务并验证配置和 Trace 抽取结果。

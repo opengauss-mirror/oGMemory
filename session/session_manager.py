@@ -6,21 +6,25 @@ Accumulate → threshold commit → archive + extract session model.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
 import uuid
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Callable, Optional
 
+from core.errors import NodeNotFoundError
 from core.models import ContextNode, RequestContext
 from providers.token_tracker import UsageTracker
 from session.models import ArchiveEntry, SessionMessage, SessionMeta, SessionWindowState
-from session.topic_buffer import SessionTopicBuffer
 from session.session_state import Commitment, SessionState, TaskState
+from session.topic_buffer import SessionTopicBuffer
 
 logger = logging.getLogger("ogmem.session")
 
@@ -61,6 +65,8 @@ class SessionBuffer:
     """In-memory buffer for a single session's messages."""
 
     session_id: str
+    durable_state_token: tuple[str, str | None] | None = field(default=None, repr=False, kw_only=True)
+    ingest_handoff_ids: set[str] = field(default_factory=set, repr=False, kw_only=True)
     messages: list[SessionMessage] = field(default_factory=list)
     meta: SessionMeta = field(default_factory=SessionMeta)
     commit_in_progress: bool = False
@@ -105,6 +111,10 @@ class SessionBuffer:
         default_factory=threading.RLock,
         repr=False,
     )
+    lifecycle_lock: object = field(default_factory=threading.RLock, repr=False)
+    lifecycle_prepare_in_progress: bool = False
+    lifecycle_source_ids: set[str] = field(default_factory=set, repr=False)
+    ordinary_turns_in_progress: int = 0
     dispose_in_progress: bool = False
     active_operation_count: int = 0
     cleaning: bool = False
@@ -124,11 +134,40 @@ class SessionBuffer:
         self.usage_stats.merge_tool_stats(stats)
 
     def _invalidate_compaction_prepare(self) -> None:
+        # Extracted provenance keeps this archive identity until the source is archived.
         self.compaction_prepare_token = ""
-        self.compaction_prepare_archive_id = ""
         self.compaction_prepare_message_count = 0
         self.compaction_prepare_watermark = 0
         self.compaction_prepare_token_created_at = ""
+
+    @contextmanager
+    def lifecycle_source_scope(self, *, allow_active_extraction=False):
+        """Reserve source capture through its durable lifecycle checkpoint."""
+        with self.extraction_lock:
+            conflict = ("ordinary_turn_in_progress" if self.ordinary_turns_in_progress
+                        else "lifecycle_preparing" if self.lifecycle_prepare_in_progress
+                        else "extraction_in_progress" if self.extraction_in_progress
+                        and not allow_active_extraction else None)
+            if conflict is None:
+                self.lifecycle_prepare_in_progress = True
+        try:
+            yield conflict
+        finally:
+            if conflict is None:
+                with self.extraction_lock:
+                    self.lifecycle_source_ids.clear()
+                    self.lifecycle_prepare_in_progress = False
+
+    def capture_lifecycle_source(self, source=None):
+        """Detach the original source; later appends stay outside this snapshot."""
+        with self.extraction_lock:
+            snapshot = deepcopy(self.messages if source is None else source)
+            source_ids = {message.id for message in snapshot}
+            if source is not None and [message for message in self.messages if message.id in source_ids] != snapshot:
+                raise ValueError("lifecycle source snapshot changed before capture")
+            if self.lifecycle_prepare_in_progress:
+                self.lifecycle_source_ids = source_ids
+            return snapshot
 
     def add(
         self,
@@ -149,7 +188,8 @@ class SessionBuffer:
                         continue
                     if existing.role == role and existing.content == content:
                         return existing
-                    if index < self.extraction_watermark:
+                    if (index < self.extraction_watermark or existing.id in self.pending_extraction_ids()
+                            or existing.id in self.lifecycle_source_ids):
                         raise ValueError("cannot rewrite a message in an extraction snapshot")
                     replacement = SessionMessage(
                         id=message_id,
@@ -195,9 +235,11 @@ class SessionBuffer:
             for index, message in enumerate(self.messages):
                 if message.id != message_id:
                     continue
-                if index < self.extraction_watermark:
+                if (index < self.extraction_watermark or message.id in self.pending_extraction_ids()
+                        or message.id in self.lifecycle_source_ids):
                     raise ValueError("cannot remove a message in an extraction snapshot")
                 self.messages.pop(index)
+                self.ingest_handoff_ids.discard(message_id)
                 self.turn_count = sum(1 for item in self.messages if item.role == "user")
                 self._invalidate_compaction_prepare()
                 self.meta.message_count = len(self.messages)
@@ -214,7 +256,12 @@ class SessionBuffer:
         """
         with self.extraction_lock:
             original_watermark = self.extraction_watermark
-            extraction_in_progress_before = self.extraction_in_progress
+            extraction_in_progress_before = self.extraction_in_progress or self.lifecycle_prepare_in_progress
+            pending = self.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+            # A lifecycle may reserve the source after after_turn's initial
+            # check. Never re-claim its accepted source as an ordinary batch.
+            if isinstance(pending, dict) and "lifecycle" in pending:
+                extraction_in_progress_before = True
             if extraction_in_progress_before:
                 return {
                     "incremental": [],
@@ -224,13 +271,19 @@ class SessionBuffer:
                     "extraction_summary": self.extraction_summary,
                 }
 
-            incremental = list(self.messages[original_watermark:])
+            pending_ids = self.pending_extraction_ids()
+            incremental = ([message for message in self.messages if message.id in pending_ids]
+                           if pending_ids else list(self.messages[original_watermark:]))
+            if pending_ids and len(incremental) != len(pending_ids):
+                raise ValueError("pending extraction source messages are missing")
             extraction_started = bool(
                 incremental and any(message.role != "assistant" for message in incremental)
             )
 
             if incremental:
-                self.extraction_watermark = len(self.messages)
+                last_id = incremental[-1].id
+                self.extraction_watermark = next(index + 1 for index, message in enumerate(self.messages)
+                                                if message.id == last_id)
             if extraction_started:
                 self.begin_extraction()
 
@@ -241,6 +294,11 @@ class SessionBuffer:
                 "extraction_started": extraction_started,
                 "extraction_summary": self.extraction_summary,
             }
+
+    def pending_extraction_ids(self):
+        extension = self.runtime_extensions.get("memory_extraction_recovery", {})
+        batch = extension.get("batch", {}) if isinstance(extension, dict) else {}
+        return set(batch.get("message_ids", [])) if isinstance(batch, dict) else set()
 
     def request_completed(self, request_id: str) -> bool:
         with self.extraction_lock:
@@ -277,6 +335,16 @@ class SessionBuffer:
         tokens_since = self.pending_tokens - self.window_state.token_count_at_last_compress
         return turns_since >= turn_threshold or tokens_since >= token_threshold
 
+    def _check_source_clear_allowed(self) -> None:
+        """Keep recovery sources intact; caller holds extraction_lock."""
+        extension = self.runtime_extensions.get("memory_extraction_recovery", {})
+        pending = extension.get("batch", {})
+        if (self.lifecycle_prepare_in_progress or self.lifecycle_source_ids
+                or isinstance(pending, dict) and "lifecycle" in pending):
+            raise SessionOperationInProgress(conflict_type="lifecycle_source_reserved", retryable=True)
+        if "batch" in extension:
+            raise SessionOperationInProgress(conflict_type="extraction_source_reserved", retryable=True)
+
     def snapshot_and_clear(self) -> list[SessionMessage]:
         """Return a copy of messages and clear the buffer.
 
@@ -284,24 +352,26 @@ class SessionBuffer:
         snapshots because they track which memories have been extracted, not
         which messages are in the buffer.
         """
-        snap = list(self.messages)
-        extracted_count = self.extraction_watermark
-        summary = self.extraction_summary
-        self.messages.clear()
-        self.turn_count = 0
-        self.window_state = SessionWindowState()
-        self.meta.message_count = 0
-        self.meta.updated_at = datetime.now(timezone.utc).isoformat()
-        # Preserve extraction state — watermark is relative to messages,
-        # so adjust for the cleared buffer
-        self.extraction_watermark = 0
-        self.extraction_summary = summary
-        self.compaction_prepare_token = ""
-        self.compaction_prepare_archive_id = ""
-        self.compaction_prepare_message_count = 0
-        self.compaction_prepare_watermark = 0
-        self.compaction_prepare_token_created_at = ""
-        return snap
+        with self.extraction_lock:
+            self._check_source_clear_allowed()
+            snap = list(self.messages)
+            summary = self.extraction_summary
+            self.messages.clear()
+            self.turn_count = 0
+            self.window_state = SessionWindowState()
+            self.meta.message_count = 0
+            self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+            # Preserve extraction state — watermark is relative to messages,
+            # so adjust for the cleared buffer
+            self.extraction_watermark = 0
+            self.extraction_summary = summary
+            self.ingest_handoff_ids.clear()
+            self.compaction_prepare_token = ""
+            self.compaction_prepare_archive_id = ""
+            self.compaction_prepare_message_count = 0
+            self.compaction_prepare_watermark = 0
+            self.compaction_prepare_token_created_at = ""
+            return snap
 
     def capture_rollback_state(self) -> dict:
         """Capture buffer fields that snapshot_and_clear mutates."""
@@ -313,6 +383,7 @@ class SessionBuffer:
             "meta_updated_at": self.meta.updated_at,
             "extraction_watermark": self.extraction_watermark,
             "extraction_summary": self.extraction_summary,
+            "ingest_handoff_ids": set(self.ingest_handoff_ids),
             "compaction_prepare_token": self.compaction_prepare_token,
             "compaction_prepare_archive_id": self.compaction_prepare_archive_id,
             "compaction_prepare_message_count": self.compaction_prepare_message_count,
@@ -335,6 +406,7 @@ class SessionBuffer:
             len(self.messages),
         )
         self.extraction_summary = state.get("extraction_summary", "")
+        self.ingest_handoff_ids.update(state.get("ingest_handoff_ids", ()))
         self.compaction_prepare_token = state.get("compaction_prepare_token", "")
         self.compaction_prepare_archive_id = state.get("compaction_prepare_archive_id", "")
         self.compaction_prepare_message_count = int(
@@ -405,6 +477,10 @@ class SessionBuffer:
 
             if removed:
                 self.messages = kept
+                self.ingest_handoff_ids.difference_update(message_ids)
+                self._invalidate_compaction_prepare()
+                if not kept:
+                    self.compaction_prepare_archive_id = ""
                 self.turn_count = sum(1 for msg in self.messages if msg.role == "user")
                 self.window_state.session_state_sync_turn_count = min(
                     self.window_state.session_state_sync_turn_count,
@@ -469,6 +545,9 @@ class SessionManager:
         self._get_context_fs = get_context_fs
         self._session_state = session_state or SessionState()
         self._session_state_loaded: set[str] = set()
+        self._extraction_recovery_loaded: set[str] = set()
+        self._extraction_recovery_present: set[tuple[str, ...]] = set()
+        self._extraction_recovery_required: set[str] = set()
         self._session_state_missing_until: dict[str, float] = {}
         self._session_load_events: dict[str, threading.Event] = {}
         self._topic_buffers: dict[str, SessionTopicBuffer] = {}
@@ -517,22 +596,141 @@ class SessionManager:
             fs = self._get_context_fs()
             if fs is None:
                 return False
-            status, payload = self._session_state.load_with_payload_status(
-                session_id, fs, ctx
-            )
+            status, payload = self._session_state.load_with_payload_status(session_id, fs, ctx)
             if status == "loaded":
                 self._restore_runtime_state_from_payload(session_id, payload or {})
                 with self._lock:
                     self._session_state_loaded.add(session_id)
             elif status == "missing":
                 with self._lock:
-                    self._session_state_missing_until[session_id] = (
-                        monotonic() + _SESSION_STATE_MISSING_TTL_SECONDS
-                    )
+                    self._session_state_missing_until[session_id] = monotonic() + _SESSION_STATE_MISSING_TTL_SECONDS
             return status == "loaded"
         except Exception as exc:
             logger.warning("load_session_state failed session=%s: %s", session_id, exc)
             return False
+
+    def extraction_recovery_loaded(self, session_id: str, ctx: RequestContext) -> bool:
+        with self._lock:
+            buf = self._sessions.get(session_id)
+            if buf is not None:
+                self._ensure_session_visible(buf, ctx)
+                if buf.cleaning:
+                    raise SessionOperationInProgress(conflict_type="session_deleting", retryable=False)
+            return session_id in self._extraction_recovery_loaded
+
+    def require_extraction_recovery(self, session_id: str) -> None:
+        """Prevent the legacy best-effort loader from preceding strict validation."""
+        with self._lock:
+            self._extraction_recovery_required.add(session_id)
+
+    def enable_extraction_recovery(self, session_id: str, ctx: RequestContext, fs, *, force_reload=False) -> None:
+        """Load the durable runtime journal even when ordinary bridge injection is off."""
+        if ctx.session_id != session_id:
+            raise ValueError("extraction recovery context must match its session")
+        self.require_extraction_recovery(session_id)
+        with self._lock:
+            buf = self._sessions[session_id]
+        with buf.session_state_save_lock:
+            with self._lock:
+                if (session_id in self._extraction_recovery_loaded or buf.messages
+                        or buf.runtime_extensions or buf.active_operation_count):
+                    self._ensure_session_visible(buf, ctx)
+                if session_id in self._extraction_recovery_loaded and not force_reload:
+                    self._get_context_fs = lambda: fs
+                    return
+            payload = None
+            state_token = (self._session_state.state_uri(ctx.account_id, session_id), None)
+            for uri in (self._session_state.state_uri(ctx.account_id, session_id),
+                        self._session_state.legacy_state_uri(ctx.account_id, session_id)):
+                try:
+                    node = fs.read_node(uri, ctx)
+                except NodeNotFoundError:
+                    continue
+                if (node.category != "state" or node.owner_space != f"session:{session_id}"
+                        or node.metadata.get("owner_user_id") != ctx.user_id
+                        or node.metadata.get("owner_agent_id") != ctx.agent_id):
+                    raise ValueError("durable extraction state belongs to another owner")
+                state_token = (uri, hashlib.sha256(node.content.encode()).hexdigest())
+                payload = json.loads(node.content or "{}")
+                if (not isinstance(payload, dict)
+                        or self._session_state._has_malformed_commitments(payload)):
+                    raise ValueError("durable extraction state is invalid")
+                stored_messages = payload.get("buffer_messages", [])
+                def valid_messages(values):
+                    return (isinstance(values, list) and all(
+                        isinstance(value, dict) and all(isinstance(value.get(field), str)
+                                                       for field in ("id", "role", "content", "created_at"))
+                        for value in values) and len({value["id"] for value in values}) == len(values))
+                if not valid_messages(stored_messages):
+                    raise ValueError("durable extraction buffer messages are invalid")
+                prepared = payload.get("compaction_prepare", {})
+                if (not isinstance(prepared, dict)
+                        or any(not isinstance(prepared.get(key, ""), str)
+                               for key in ("token", "archive_id", "created_at"))
+                        or any(type(prepared.get(key, 0)) is not int
+                               or not 0 <= prepared.get(key, 0) <= len(stored_messages)
+                               for key in ("message_count", "watermark"))):
+                    raise ValueError("durable compaction preparation is invalid")
+                handoff_ids = payload.get("ingest_handoff_ids", [])
+                if (not isinstance(handoff_ids, list)
+                        or any(not isinstance(value, str) for value in handoff_ids)):
+                    raise ValueError("durable ingest handoff IDs are invalid")
+                extension = payload.get("runtime_extensions", {}).get("memory_extraction_recovery")
+                if extension is not None:
+                    from service.extraction_checkpoint import recovery_owner
+                    batch = extension.get("batch")
+                    if (extension.get("version") != 1 or not isinstance(batch, dict)
+                            or batch.get("owner") != recovery_owner(ctx)):
+                        raise ValueError("durable extraction batch belongs to another owner or format")
+                    snapshot = batch.get("snapshot")
+                    message_ids = batch.get("message_ids")
+                    if (not valid_messages(snapshot) or not isinstance(message_ids, list)
+                            or not all(isinstance(value, str) for value in message_ids)
+                            or len(set(message_ids)) != len(message_ids)
+                            or [value.get("id") for value in snapshot] != message_ids):
+                        raise ValueError("durable extraction source snapshot is invalid")
+                    by_id = {value.get("id"): value for value in stored_messages}
+                    if any(by_id.get(value["id"]) != value for value in snapshot):
+                        raise ValueError("durable extraction source snapshot changed")
+                break
+            if (force_reload and payload is None
+                    and (self._recovery_owner_key(ctx) in self._extraction_recovery_present
+                         or (buf.durable_state_token is not None and buf.durable_state_token[1] is not None)
+                         or ((buf.messages or buf.runtime_extensions) and buf.durable_state_token != state_token))):
+                from service.extraction_checkpoint import RecoveryNeedsConfirmationError
+                raise RecoveryNeedsConfirmationError("previously durable session state is missing")
+            if payload is not None:
+                with self._lock, buf.extraction_lock:
+                    current_messages = [] if force_reload else list(buf.messages)
+                    stored_by_id = {value["id"]: value for value in payload.get("buffer_messages", [])}
+                    for message in current_messages:
+                        stored = stored_by_id.get(message.id)
+                        if stored is not None and (stored["role"], stored["content"]) != (message.role, message.content):
+                            raise ValueError("durable extraction source message changed")
+                    self._session_state.load_dict(session_id, payload)
+                    if force_reload:
+                        buf.runtime_extensions = {}
+                        buf.completed_request_ids = []
+                    self._restore_runtime_state_from_payload(session_id, payload)
+                    by_id = {message.id: message for message in buf.messages}
+                    for message in current_messages:
+                        stored = by_id.get(message.id)
+                        if stored is not None:
+                            if (stored.role, stored.content) != (message.role, message.content):
+                                raise ValueError("durable extraction source message changed")
+                        else:
+                            buf.messages.append(message)
+                    buf.turn_count = sum(message.role == "user" for message in buf.messages)
+                    buf.meta.message_count = len(buf.messages)
+            self._get_context_fs = lambda: fs
+            with self._lock:
+                buf.durable_state_token = state_token
+                if payload is not None:
+                    self._extraction_recovery_present.add(self._recovery_owner_key(ctx))
+                buf.meta.account_id, buf.meta.user_id, buf.meta.agent_id = ctx.account_id, ctx.user_id, ctx.agent_id
+                self._extraction_recovery_loaded.add(session_id)
+                self._session_state_loaded.add(session_id)
+                self._session_state_missing_until.pop(session_id, None)
 
     def _cached_session_state_load(self, session_id: str) -> bool | None:
         if session_id in self._session_state_loaded:
@@ -541,6 +739,61 @@ class SessionManager:
             return False
         self._session_state_missing_until.pop(session_id, None)
         return None
+
+    @staticmethod
+    def _recovery_owner_key(ctx):
+        return (ctx.account_id, ctx.user_id, ctx.agent_id, ctx.session_id)
+
+    def _require_sql_mutation(self, ctx, fs=None):
+        fs = fs if fs is not None else (self._get_context_fs() if self._get_context_fs else None)
+        sql_fs = callable(getattr(type(fs), "session_mutation_lock", None))
+        archive = None
+        if not sql_fs and self._get_archive_store is not None:
+            from session.sql_archive_store import SQLSessionArchiveStore
+            try:
+                store = self._get_archive_store()
+            except Exception:
+                if self._archive_store_required:
+                    raise
+                store = None  # Preserve optional generic-store fallback.
+            if issubclass(type(store), SQLSessionArchiveStore):
+                archive = store
+        if archive is not None:
+            return self._require_sql_archive_mutation(archive, ctx.session_id, ctx)
+        if sql_fs:
+            self._get_context_fs = lambda: fs
+            from fs.sql_adapter.session_mutation import (
+                SessionMutationLostError,
+                active_session_guard,
+            )
+            guard = active_session_guard()
+            if guard is None:
+                raise SessionMutationLostError("SQL session state mutation requires its guard")
+            guard.check_context(ctx)
+            guard.ensure_owned()
+            return True
+        return False
+
+    @staticmethod
+    def _require_sql_archive_mutation(store, session_id, ctx):
+        """Validate the resolved archive store before any mutation workflow."""
+        from session.sql_archive_store import SQLSessionArchiveStore
+        if not issubclass(type(store), SQLSessionArchiveStore):
+            return False
+        from fs.sql_adapter.session_mutation import (
+            SessionMutationLostError,
+            active_session_guard,
+        )
+        guard = active_session_guard()
+        if guard is None:
+            raise SessionMutationLostError("SQL archive mutation requires its guard")
+        guard.check_context(ctx)
+        if session_id != guard.ctx.session_id:
+            guard.poison("SQL archive mutation changed its owning session")
+            guard.check_active()
+        guard.check_database(store._connection_string, store._sql_dialect)
+        guard.ensure_owned()
+        return True
 
     def save_session_state(self, session_id: str, ctx: RequestContext) -> bool:
         if self._get_context_fs is None:
@@ -557,6 +810,7 @@ class SessionManager:
             fs = self._get_context_fs()
             if fs is None:
                 return False
+            self._require_sql_mutation(ctx, fs)
             save_lock = pinned_buffer.session_state_save_lock
             with save_lock:
                 with self._lock:
@@ -592,10 +846,19 @@ class SessionManager:
                             for message in buf.messages
                         ]
                         payload["extraction_watermark"] = buf.extraction_watermark
+                        payload["ingest_handoff_ids"] = sorted(buf.ingest_handoff_ids)
+                        payload["compaction_prepare"] = {
+                            "token": buf.compaction_prepare_token,
+                            "archive_id": buf.compaction_prepare_archive_id,
+                            "message_count": buf.compaction_prepare_message_count,
+                            "watermark": buf.compaction_prepare_watermark,
+                            "created_at": buf.compaction_prepare_token_created_at,
+                        }
                         if buf.runtime_extensions:
                             payload["runtime_extensions"] = deepcopy(
                                 buf.runtime_extensions
                             )
+                from service.extraction_recovery_discovery import DISCOVERY_KEY, recovery_discovery_hint
                 now = datetime.now(timezone.utc).isoformat()
                 node = ContextNode(
                     uri=self._session_state.state_uri(ctx.account_id, session_id),
@@ -610,11 +873,14 @@ class SessionManager:
                         "session_id": session_id,
                         "owner_user_id": ctx.user_id,
                         "owner_agent_id": ctx.agent_id,
+                        DISCOVERY_KEY: recovery_discovery_hint(payload),
                         "updated_at": now,
                     },
                 )
                 fs.write_node(node, ctx)
                 with self._lock:
+                    buf.durable_state_token = (node.uri, hashlib.sha256(node.content.encode()).hexdigest())
+                    self._extraction_recovery_present.add(self._recovery_owner_key(ctx))
                     self._session_state_loaded.add(session_id)
                     self._session_state_missing_until.pop(session_id, None)
             return True
@@ -740,9 +1006,24 @@ class SessionManager:
                 except (TypeError, ValueError):
                     extraction_watermark = 0
                 buf.extraction_watermark = max(0, min(extraction_watermark, len(restored_messages)))
+            handoff_ids = payload.get("ingest_handoff_ids", [])
+            handoff_ids = set(handoff_ids) if isinstance(handoff_ids, list) else set()
+            buf.ingest_handoff_ids = {message.id for message in buf.messages if message.id in handoff_ids}
+            prepared = payload.get("compaction_prepare", {})
+            buf.compaction_prepare_token = prepared.get("token", "")
+            buf.compaction_prepare_archive_id = prepared.get("archive_id", "")
+            buf.compaction_prepare_message_count = prepared.get("message_count", 0)
+            buf.compaction_prepare_watermark = prepared.get("watermark", 0)
+            buf.compaction_prepare_token_created_at = prepared.get("created_at", "")
             runtime_extensions = payload.get("runtime_extensions")
             if isinstance(runtime_extensions, dict):
                 buf.runtime_extensions = deepcopy(runtime_extensions)
+                pending_ids = buf.pending_extraction_ids()
+                if pending_ids:
+                    for index, message in enumerate(buf.messages):
+                        if message.id in pending_ids:
+                            buf.extraction_watermark = min(buf.extraction_watermark, index)
+                            break
 
             if (
                 self._session_state_bridge_enabled
@@ -776,6 +1057,11 @@ class SessionManager:
     ) -> None:
         if self._get_archive_store is None:
             return
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            guard.ensure_owned()
+            wait = True
 
         def _run() -> None:
             try:
@@ -798,6 +1084,8 @@ class SessionManager:
         store = self._get_archive_store()
         if store is None:
             return False
+
+        self._require_sql_archive_mutation(store, session_id, ctx)
 
         entries = store.list_archives(session_id, ctx)
         if len(entries) < 2 or len(entries) < self._archive_merge_threshold:
@@ -929,7 +1217,8 @@ class SessionManager:
             load_event = self._session_load_events.get(session_id)
             if load_event is not None and not load_event.is_set():
                 wait_for_load = True
-            elif ctx is not None and self._cached_session_state_load(session_id) is None:
+            elif (ctx is not None and session_id not in self._extraction_recovery_required
+                  and self._cached_session_state_load(session_id) is None):
                 should_load = True
                 load_event = threading.Event()
                 self._session_load_events[session_id] = load_event
@@ -1016,62 +1305,59 @@ class SessionManager:
         )
         evicted: list[str] = []
         with self._lock:
-            candidates = [
-                (
-                    session_id,
-                    buf.window_state.last_accessed_at,
-                    buf.commit_in_progress,
-                    buf.extraction_in_progress,
-                    len(buf.messages),
-                    buf.extraction_watermark,
-                    deepcopy(buf.meta),
-                )
-                for session_id, buf in self._sessions.items()
-            ]
-        for (
-            session_id,
-            last,
-            commit_in_progress,
-            extraction_in_progress,
-            message_count,
-            extraction_watermark,
-            session_meta,
-        ) in candidates:
-            if not last:
+            candidates = list(self._sessions.items())
+        for session_id, buf in candidates:
+            if not self._is_idle_for_eviction(buf, now, max_idle_seconds):
                 continue
             try:
-                accessed = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if (now - accessed).total_seconds() > max_idle_seconds:
-                if (
-                    commit_in_progress
-                    or extraction_in_progress
-                    or message_count > extraction_watermark
-                ):
-                    continue
-                if ctx is not None:
-                    self.save_session_state(
-                        session_id,
-                        self._session_state_context(session_id, session_meta, ctx),
-                    )
-                with self._lock:
-                    buf = self._sessions.get(session_id)
-                    if buf is None:
+                fs = self._get_context_fs() if self._get_context_fs else None
+                session_ctx = self._session_state_context(
+                    session_id, buf.meta, ctx or RequestContext(
+                        buf.meta.account_id, buf.meta.user_id, buf.meta.agent_id,
+                        session_id, "idle-eviction"))
+                acquire = getattr(type(fs), "session_mutation_lock", None)
+                scope = (fs.session_mutation_lock(self._session_state.state_uri(
+                    session_ctx.account_id, session_id), session_ctx)
+                    if callable(acquire) else nullcontext())
+                with scope, buf.session_state_save_lock, self._lock, buf.extraction_lock:
+                    if (self._sessions.get(session_id) is not buf
+                            or not self._is_idle_for_eviction(buf, now, max_idle_seconds)):
                         continue
-                    if (
-                        buf.commit_in_progress
-                        or buf.extraction_in_progress
-                        or len(buf.messages) > buf.extraction_watermark
-                    ):
+                    if callable(acquire) and not self._durable_state_matches(buf, fs, session_ctx):
                         continue
-                    self._sessions.pop(session_id, None)
-                    self._topic_buffers.pop(session_id, None)
-                    self._session_state_loaded.discard(session_id)
-                    self._session_state_missing_until.pop(session_id, None)
-                logger.debug("Removed session buffer: %s", session_id)
-                evicted.append(session_id)
+                    if fs is not None and not self.save_session_state(session_id, session_ctx):
+                        continue
+                    self.remove_session(session_id)
+                    evicted.append(session_id)
+            except Exception as exc:
+                logger.warning("idle eviction deferred session=%s: %s", session_id, exc)
         return evicted
+
+    @staticmethod
+    def _durable_state_matches(buf, fs, ctx):
+        if buf.durable_state_token is None:
+            return False
+        current_uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
+        for uri in (current_uri, SessionState.legacy_state_uri(ctx.account_id, ctx.session_id)):
+            try:
+                node = fs.read_node(uri, ctx)
+            except NodeNotFoundError:
+                continue
+            return (uri, hashlib.sha256(node.content.encode()).hexdigest()) == buf.durable_state_token
+        return buf.durable_state_token == (current_uri, None)
+
+    @staticmethod
+    def _is_idle_for_eviction(buf, now, max_idle_seconds):
+        with buf.extraction_lock:
+            if (buf.active_operation_count or buf.cleaning or buf.dispose_in_progress
+                    or buf.commit_in_progress or buf.extraction_in_progress
+                    or len(buf.messages) > buf.extraction_watermark):
+                return False
+            try:
+                accessed = datetime.fromisoformat(buf.window_state.last_accessed_at.replace("Z", "+00:00"))
+                return (now - accessed).total_seconds() > max_idle_seconds
+            except (AttributeError, TypeError, ValueError):
+                return False
 
     def issue_compaction_prepare_token(self, session_id: str, archive_id: str = "") -> str:
         buf = self.get_or_create(session_id)
@@ -1146,11 +1432,7 @@ class SessionManager:
 
     @staticmethod
     def _clear_compaction_prepare_token_locked(buf: SessionBuffer) -> None:
-        buf.compaction_prepare_token = ""
-        buf.compaction_prepare_archive_id = ""
-        buf.compaction_prepare_message_count = 0
-        buf.compaction_prepare_watermark = 0
-        buf.compaction_prepare_token_created_at = ""
+        buf._invalidate_compaction_prepare()
 
     @staticmethod
     def _compaction_prepare_token_is_fresh(created_at: str, ttl_seconds: int) -> bool:
@@ -1251,14 +1533,19 @@ class SessionManager:
                 (used when caller already performed extraction, e.g. after_turn).
             session_time: Optional datetime for temporal resolution in extraction.
         """
+        sql_mutation = self._require_sql_mutation(ctx)
+        if sql_mutation:
+            wait = True  # A session owning connection is never handed to another thread.
         buf = self.get_or_create(session_id, ctx=ctx)
 
-        with self._lock:
+        with self._lock, buf.extraction_lock:
             if not buf.messages:
                 return {"ok": True, "archived": False, "reason": "empty_buffer"}
 
             if buf.commit_in_progress:
                 return {"ok": True, "archived": False, "reason": "commit_in_progress"}
+
+            buf._check_source_clear_allowed()
 
             # Phase 1: snapshot + clear
             buf.begin_operation()
@@ -1306,8 +1593,9 @@ class SessionManager:
                     should_save = self._commit_succeeded(task_snapshot)
                     if task_snapshot.get("status") == "failed":
                         buf.restore_rollback_state(rollback_state)
-                if should_save:
-                    self.save_session_state(session_id, ctx)
+                if should_save and not self.save_session_state(session_id, ctx) and sql_mutation:
+                    self._update_task(task_info, status="failed", error="session checkpoint was not acknowledged")
+                    task_snapshot = dict(task_info)
             finally:
                 buf.end_operation()
             return {
@@ -1341,8 +1629,8 @@ class SessionManager:
                         should_save = self._commit_succeeded(task_snapshot)
                         if task_snapshot.get("status") == "failed":
                             buf.restore_rollback_state(rollback_state)
-                    if should_save:
-                        self.save_session_state(session_id, ctx)
+                    if should_save and not self.save_session_state(session_id, ctx) and sql_mutation:
+                        self._update_task(task_info, status="failed", error="session checkpoint was not acknowledged")
                 finally:
                     buf.end_operation()
 
@@ -1376,8 +1664,12 @@ class SessionManager:
         ctx: RequestContext,
         wait: bool = True,
         archive_id: str | None = None,
+        archive_checkpoint=None,
     ) -> dict:
         """Archive a fixed message snapshot without reading/clearing live buffer."""
+        sql_mutation = self._require_sql_mutation(ctx)
+        if sql_mutation:
+            wait = True
         if not snapshot:
             return {"ok": True, "archived": False, "reason": "empty_snapshot"}
 
@@ -1403,21 +1695,26 @@ class SessionManager:
 
         if wait:
             try:
-                self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx)
+                self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx,
+                                       **({"archive_checkpoint": archive_checkpoint}
+                                          if archive_checkpoint is not None else {}))
             except Exception as exc:
                 logger.error(
                     "commit_snapshot phase2 failed session=%s: %s",
                     session_id, exc, exc_info=True,
                 )
-                self._update_task(task_info, status="failed", error=str(exc))
+                from service.extraction_checkpoint import RecoveryNeedsConfirmationError
+                self._update_task(task_info, status="needs_confirmation" if isinstance(
+                    exc, RecoveryNeedsConfirmationError) else "failed", error=str(exc))
             try:
                 with self._lock:
                     buf.meta.commit_count += 1
                     buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
                     task_snapshot = dict(task_info)
                     should_save = self._commit_succeeded(task_snapshot)
-                if should_save:
-                    self.save_session_state(session_id, ctx)
+                if should_save and not self.save_session_state(session_id, ctx) and sql_mutation:
+                    self._update_task(task_info, status="failed", error="session checkpoint was not acknowledged")
+                    task_snapshot = dict(task_info)
             finally:
                 buf.end_operation()
             return {
@@ -1431,7 +1728,9 @@ class SessionManager:
 
         def _commit_snapshot_thread():
             try:
-                self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx)
+                self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx,
+                                       **({"archive_checkpoint": archive_checkpoint}
+                                          if archive_checkpoint is not None else {}))
             except Exception as exc:
                 logger.error(
                     "commit_snapshot phase2 failed session=%s: %s",
@@ -1445,8 +1744,8 @@ class SessionManager:
                         buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
                         task_snapshot = dict(task_info)
                         should_save = self._commit_succeeded(task_snapshot)
-                    if should_save:
-                        self.save_session_state(session_id, ctx)
+                    if should_save and not self.save_session_state(session_id, ctx) and sql_mutation:
+                        self._update_task(task_info, status="failed", error="session checkpoint was not acknowledged")
                 finally:
                     buf.end_operation()
 
@@ -1480,6 +1779,7 @@ class SessionManager:
         ctx: RequestContext,
         skip_extraction: bool = False,
         session_time=None,
+        archive_checkpoint=None,
     ) -> None:
         """Background work: compress → write archive.
 
@@ -1492,15 +1792,26 @@ class SessionManager:
             for m in snapshot
         ]
 
-        prev_overview, prev_abstract = self._get_latest_archive_context(
-            session_id, ctx,
-        )
-        overview, abstract = self._compress(
-            messages_dicts,
-            prev_overview=prev_overview,
-            prev_abstract=prev_abstract,
-        )
+        if archive_checkpoint is not None and archive_checkpoint.archive_record() is not None:
+            archive_result = archive_checkpoint.archive_recover(self)
+            self._update_task(task_info, archived=True, archive_uri=archive_result["uri"],
+                              status="completed")
+            self.invalidate_topic_slot(session_id, "archive_history")
+            return
+
+        from service.extraction_retry import source_only_reason
+        recovery_reason = source_only_reason()
+        if recovery_reason:
+            from session.compressor import SessionCompressor
+            overview, abstract = SessionCompressor(llm=None).compress(messages_dicts)
+        else:
+            prev_overview, prev_abstract = self._get_latest_archive_context(session_id, ctx)
+            overview, abstract = self._compress(
+                messages_dicts, prev_overview=prev_overview, prev_abstract=prev_abstract)
         archive_metadata: dict = {}
+        if recovery_reason:
+            archive_metadata.update(memory_extraction_degraded=True,
+                                    memory_extraction_recovery_reason=recovery_reason[:1000])
         if self._compression_quality_enabled:
             try:
                 from session.compression_quality import CompressionQualityEvaluator
@@ -1519,6 +1830,15 @@ class SessionManager:
                     session_id,
                     exc,
                 )
+        if archive_checkpoint is not None:
+            archive_metadata.update({
+                "memory_lifecycle_source_sha256": archive_checkpoint.batch["lifecycle"]["source_digest"],
+                "memory_lifecycle_archive_id": archive_id,
+                "owner_user_id": ctx.user_id, "owner_agent_id": ctx.agent_id,
+                "session_id": session_id,
+            })
+            archive_checkpoint.archive_begin({"messages": messages_dicts, "overview": overview,
+                                               "abstract": abstract, "metadata": archive_metadata})
         archive_result = self._write_archive(
             session_id,
             archive_id,
@@ -1528,6 +1848,9 @@ class SessionManager:
             ctx,
             metadata=archive_metadata,
         )
+
+        if archive_checkpoint is not None and archive_result.get("success", False):
+            archive_checkpoint.archive_complete(archive_result.get("uri", ""))
 
         self._update_task(
             task_info,
@@ -1544,7 +1867,22 @@ class SessionManager:
 
         self._update_task(task_info, status="completed")
         self.invalidate_topic_slot(session_id, "archive_history")
-        self._maybe_merge_archives(session_id, ctx)
+        # A lifecycle archive must stay readable until its durable source claim
+        # is released. Its journal triggers auto-merge after that checkpoint.
+        if archive_checkpoint is None and not recovery_reason:
+            self._maybe_merge_archives(session_id, ctx)
+
+    def read_archive_for_recovery(self, session_id, archive_id, ctx):
+        """Read the exact archive through the same backend used for writes."""
+        if self._get_archive_store is not None:
+            store = self._get_archive_store()
+        elif self._get_agfs is not None:
+            fs = self._get_agfs()
+            from session.archive_store import SessionArchiveStore
+            store = SessionArchiveStore(fs=fs) if fs is not None else None
+        else:
+            store = None
+        return store.read_archive(session_id, archive_id, ctx) if store is not None else None
 
     def _compress(
         self,
@@ -1553,6 +1891,10 @@ class SessionManager:
         prev_abstract: str = "",
     ) -> tuple[str, str]:
         """Compress messages into overview + abstract, fusing with previous archive."""
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            guard.ensure_owned()
         try:
             if self._get_llm is not None:
                 llm = self._get_llm()
@@ -1588,8 +1930,10 @@ class SessionManager:
 
         When ``archive_store_required`` is enabled, archive persistence
         failures are surfaced instead of silently degrading to an in-memory
-        URI.
+        URI. A resolved actual SQL store is always durable: an uncertain write
+        cannot be acknowledged through an in-memory fallback.
         """
+        sql_archive = False
         try:
             store = None
             if self._get_archive_store is not None:
@@ -1608,6 +1952,7 @@ class SessionManager:
                     store = SessionArchiveStore(fs=agfs)
 
             if store is not None:
+                sql_archive = self._require_sql_archive_mutation(store, session_id, ctx)
                 result = store.write_archive(
                     session_id=session_id,
                     overview=overview,
@@ -1624,7 +1969,7 @@ class SessionManager:
                         "archive_id": result.archive_id,
                     }
                 logger.warning("Archive write failed: %s", result.error)
-                if self._archive_store_required:
+                if self._archive_store_required or sql_archive:
                     return {
                         "success": False,
                         "uri": result.uri,
@@ -1633,7 +1978,8 @@ class SessionManager:
                     }
         except Exception as exc:
             logger.warning("Archive write failed: %s", exc, exc_info=True)
-            if self._archive_store_required:
+            from fs.sql_adapter.session_mutation import SessionMutationLostError
+            if self._archive_store_required or sql_archive or isinstance(exc, SessionMutationLostError):
                 return {
                     "success": False,
                     "uri": "",
@@ -1848,6 +2194,8 @@ class SessionManager:
             # A later recreation must reload durable runtime_extensions (Turn
             # Ledger, TTL state, and other bridges) before it can save again.
             self._session_state_loaded.discard(session_id)
+            self._extraction_recovery_loaded.discard(session_id)
+            self._extraction_recovery_required.discard(session_id)
             self._session_state_missing_until.pop(session_id, None)
         if removed:
             logger.debug("Removed session buffer: %s", session_id)
@@ -1857,6 +2205,8 @@ class SessionManager:
         session_id: str,
         expected_buffer: SessionBuffer,
         ctx: RequestContext | None = None,
+        *,
+        require_quiescent: bool = False,
     ) -> bool:
         """Remove only the expected buffer when no unextracted work remains.
 
@@ -1870,6 +2220,11 @@ class SessionManager:
             if ctx is not None and not self._session_visible_to_ctx(buf, ctx):
                 return False
             with buf.extraction_lock:
+                if require_quiescent and (
+                    buf.messages or buf.runtime_extensions.get("memory_extraction_recovery")
+                    or buf.active_operation_count or buf.dispose_in_progress
+                ):
+                    return False
                 if (
                     buf.extraction_in_progress
                     or len(buf.messages) > buf.extraction_watermark
@@ -1880,6 +2235,8 @@ class SessionManager:
                 # Do not let the replacement buffer inherit a stale "loaded"
                 # claim and overwrite durable extensions with an empty state.
                 self._session_state_loaded.discard(session_id)
+                self._extraction_recovery_loaded.discard(session_id)
+                self._extraction_recovery_required.discard(session_id)
                 self._session_state_missing_until.pop(session_id, None)
         logger.debug("Removed empty session buffer: %s", session_id)
         return True
@@ -1929,7 +2286,13 @@ class SessionManager:
                 self._sessions.pop(session_id, None)
                 self._topic_buffers.pop(session_id, None)
                 self._session_state_loaded.discard(session_id)
+                self._extraction_recovery_loaded.discard(session_id)
+                self._extraction_recovery_required.discard(session_id)
                 self._session_state.clear_session(session_id)
+                meta = expected_buffer.meta
+                self._extraction_recovery_present.discard(
+                    (meta.account_id, meta.user_id, meta.agent_id, session_id))
+                self._session_state_missing_until.pop(session_id, None)
                 expected_buffer.deleted_by_cleanup = True
             expected_buffer.cleanup_retry_pending = bool(retry_pending and not remove)
             expected_buffer.cleaning = bool(retry_pending and not remove)
@@ -2003,6 +2366,7 @@ class SessionManager:
         store = self._get_archive_store()
         if store is None:
             return 0
+        self._require_sql_archive_mutation(store, session_id, ctx)
         if hasattr(store, "delete_session_archives"):
             return int(store.delete_session_archives(session_id, ctx) or 0)
         deleted = 0
@@ -2019,6 +2383,7 @@ class SessionManager:
         fs = self._get_context_fs()
         if fs is None:
             return 0
+        self._require_sql_mutation(ctx, fs)
         deleted = 0
         for uri in (
             self._session_state.state_uri(ctx.account_id, session_id),

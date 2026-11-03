@@ -11,16 +11,18 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
+from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
 from core.models import (
     LeafHit,
+    RequestContext,
     RetrievalConfig,
     RetrievedBlock,
-    RequestContext,
+    SeedHit,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
-
+from retrieval.identity import memory_identity, memory_unit_key
+from scene.retrieval import select_scene_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +212,7 @@ class ResultRanker:
         *,
         fill_content_for_top_k: int = 0,
         context_reader=None,
+        direct_evidence_reserve: float | None = None,
     ) -> list[RetrievedBlock]:
         candidates = list(leaf_hits) if leaf_hits else []
 
@@ -218,15 +221,25 @@ class ResultRanker:
 
         l2_only = [h for h in candidates if h.level == 2]
 
-        # Deduplicate by URI, keeping the highest-scored hit per URI
-        seen_uris: dict[str, LeafHit] = {}
+        # Keep the highest-scored hit for each node or knowledge unit.
+        seen_uris: dict[tuple[str, str], LeafHit] = {}
         for hit in l2_only:
-            if hit.uri not in seen_uris or hit.score > seen_uris[hit.uri].score:
-                seen_uris[hit.uri] = hit
+            identity = memory_identity(hit.uri, hit.metadata)
+            if identity not in seen_uris or hit.score > seen_uris[identity].score:
+                seen_uris[identity] = hit
         l2_only = list(seen_uris.values())
 
+        is_visible = getattr(context_reader, "is_visible", None)
+        if ctx is not None and callable(is_visible):
+            l2_only = [hit for hit in l2_only if is_visible(hit.uri, ctx)]
+
         ranked = self._ranker.rank(typed_query, l2_only)
-        top = ranked[: typed_query.top_k]
+        top = select_scene_evidence(
+            ranked, typed_query.top_k, direct_evidence_reserve,
+            lambda item: bool(item.hit.metadata.get("scene_expanded")),
+        )
+        if direct_evidence_reserve is not None:
+            top.sort(key=lambda item: (item.rank_score, item.hit.score), reverse=True)
 
         blocks: list[RetrievedBlock] = []
         for item in top:
@@ -248,18 +261,27 @@ class ResultRanker:
             )
 
         # Fill content_excerpt for top-K results (read full content from AGFS)
+        unavailable = set()
         if fill_content_for_top_k > 0 and context_reader and ctx:
             top_k_to_fill = min(fill_content_for_top_k, len(blocks))
             for i in range(top_k_to_fill):
                 block = blocks[i]
                 try:
-                    content_block = context_reader.read(block.uri, ctx)
+                    unit_key = memory_unit_key(block.metadata)
+                    content_block = context_reader.read(
+                        block.uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
+                    block.metadata.update(content_block.metadata or {})
                     if content_block.overview:
                         block.overview = content_block.overview
                     if content_block.content_excerpt:
                         block.content_excerpt = content_block.content_excerpt
+                except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
+                    unavailable.add(i)
                 except Exception as exc:
                     logger.debug("content fill failed for %s: %s", block.uri, exc)
+
+        if unavailable:
+            blocks = [block for index, block in enumerate(blocks) if index not in unavailable]
 
         # Fill relations from relation store
         if self._relation_store and ctx:

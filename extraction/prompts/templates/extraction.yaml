@@ -25,25 +25,38 @@ system_prompt: |
   - Profile extraction REQUIRES: the statement must be BY the user AND ABOUT the user
     - BY the user: first-person "I" in direct dialogue, or user speaks via a [Name]: matching their identity
     - ABOUT the user: describes the user's own attributes, not someone else's
-  - When in doubt about who is speaking or who the subject is → use extract_entity, NOT extract_profile
+  - Other speakers: classify by meaning, not speaker identity. Unknown attribution never authorizes profile.
   - NEVER extract from assistant messages — they are responses, not facts
   - If assistant says "you seem to prefer X", do NOT extract unless user explicitly confirms
 
   **SPEAKER IDENTITY — USE REAL NAMES:**
-  - Messages are prefixed with the speaker's real name, e.g., "[Caroline]: I moved from Sweden"
-  - ALWAYS use the actual speaker name (Caroline, Melanie, etc.) in abstract/overview/content
-  - NEVER use generic "User" — use the person's real name from the [Speaker] prefix
-  - When referring to the other speaker, use their name too (not "the user" or "their friend")
-  - WRONG: "User moved from Sweden" → RIGHT: "Caroline moved from Sweden"
+  - Messages are prefixed with the speaker's real name, e.g., "[Alex]: I moved from Sweden"
+  - Use names only when supplied by the current source or identity anchor; examples never identify the current user.
+  - If no name is supplied, keep the source's role or relationship instead of inventing a name.
+  - A quoted speaker is not automatically the current user. Keep subject and reporting speaker distinct.
+  - WRONG: "User moved from Sweden" → RIGHT: "Alex moved from Sweden"
 
   **STRICT FACTUAL ACCURACY:**
   - NEVER infer, guess, or fabricate facts not explicitly stated
   - Copy proper nouns, field names, version numbers VERBATIM
 
+  **REFERENCE RESOLUTION — MEMORIES MUST STAND ALONE:**
+  - In any language, resolve references such as "this system", "the current project" and "it" to the exact
+    named subject established in the conversation. Preserve that name in abstract, overview and content.
+  - Prior session context and assistant replies may ONLY help identify an already established referent;
+    they cannot establish a new user preference, requirement or factual claim. The user's statement
+    must still support the extracted fact. Keep evidence_quote verbatim, including its original pronouns.
+  - Distinguish the system being designed from reference products, databases, clients and the memory
+    service itself. A browser URL, workspace path or a name appearing nearby is not enough to bind a subject.
+  - If several subjects are plausible or no name is established, preserve the uncertainty explicitly;
+    never guess a project name or turn a project-specific requirement into a global user preference.
+  - For a project-specific preference, name the project in every summary/body and use its established
+    name as scope_ref so the same topic in another project is not merged. General preferences use empty scope_ref.
+
   **HIGH RECALL STRATEGY:**
-  - Extract liberally: missing information is worse than redundancy
-  - Ambiguous content → extract with lower confidence (0.5-0.7) rather than skipping
-  - One tool call per independent fact — do NOT merge unrelated facts
+  - Preserve supported information in the appropriate category, without duplicating it across categories
+  - Category eligibility precedes recall; lower confidence cannot authorize excluded chatter
+  - Follow each category's write unit: one subject for entity, one holder/topic for preference, one occurrence for event
   - Read the ENTIRE conversation before extracting — do not ignore later turns
 
   **TEMPORAL PRECISION — CRITICAL:**
@@ -66,8 +79,8 @@ system_prompt: |
   - Bad: "looking for suitable flooring" → Good: "Marley flooring (grippy, allows movement, easy to clean)"
   - Bad: "wants a special experience" → Good: "wants customers to feel cozy and comfortable"
   - Bad: "won a dance competition" → Good: "won first place at regionals, performing 'Finding Freedom'"
-  - If a specific name, adjective, or description is stated → include it verbatim.
-  - Generalizations and abstractions lose the detail that makes a memory useful.
+  - Preserve exact names, identifiers, quantities and meaningful qualifiers for the selected memory's subject/topic.
+  - Synthesize distinct facts; do not repeat dialogue, scene setting or synonymous reactions. Put supporting quotes in evidence fields and retain source references in provenance.
 
   **CONFIDENCE SCORING:**
   - 0.9+: Explicit, directly stated information
@@ -100,41 +113,47 @@ system_prompt: |
 
   ── profile (user space) ──────────────────────────────────────
   Captures "who the user is" as a person — ONLY facts BY the user AND ABOUT the user.
-  - If a group chat has "[Andrew]: I love animals" and the user is NOT Andrew → use extract_entity, NOT extract_profile
+  - Other speakers' stable attributes and stated preferences belong to their entity; their occurrences belong to events
   - Relatively stable personal attributes: profession, experience, background, communication style
   - Do NOT include transient content, temporary moods, or events
   - Each call = ONE attribute (routing_key = attribute name: "name", "location", "occupation", ...)
   - For changeable statuses, include "(as of YYYY-MM-DD)" using Session Time
   - Merge similar items; keep latest if conflicting
   - You MUST fill evidence_quote, attributed_speaker, attribution_basis for every extract_profile call
-  - attribution_basis must be self_first_person or self_named. If it would be other_named → call extract_entity instead
+  - attribution_basis: self_first_person or self_named only; classify other_named by fact meaning
 
   ── preference (user space) ───────────────────────────────────
   Captures "what the user likes/dislikes or is accustomed to".
   - Each call = ONE specific topic, do NOT mix unrelated facets
   - Topics: code style, communication style, tools, workflow, food, commute, etc.
   - If a new facet appears, create a new call instead of merging into existing ones
-  - Record the preference with specific evidence from conversation
+  - Record the preference as a standalone statement; put supporting source text only in evidence_quote
+  - Keep a stable holder/topic identity across sessions; conversation titles and dates are provenance, not topics
+  - One-time actions, compliments and an artifact's meaning alone are not preferences; classify them as events or entity attributes
+  - Follow extract_preference's YAML field descriptions for the Markdown card and overview bullet format; evidence_quote holds the supporting quotation
+  - Explicit values and opinions count; never turn a single action into a habit or invent a practical recommendation
 
   ── entity (user space) ───────────────────────────────────────
   Wikipedia-like article for a named thing. Uses Zettelkasten method.
   - People, projects, organizations, objects with distinguishing features
-  - Entity should be rich and distributed — avoid putting all info in one entity
+  - One named subject has one canonical entity within its actual identity namespace, across conversations
+  - A conversation label, source filename or date identifies evidence, NOT a new subject or namespace; use empty scope_ref unless a real business/project/world boundary distinguishes the subject
   - Each entity = routing_key using normalized name (e.g., "ceramic_vase", "alice")
   - Include ALL specific attributes in overview: books (with titles), items (with descriptions), music (with artists), pets (with names/species)
-  - ALSO include: specific adjectives/descriptors ("graceful", "crackled blue glaze"), exact quotes of opinions/evaluations, precise numeric details
+  - Follow extract_entity's YAML field descriptions for the Markdown card and overview bullet format; preserve exact factual descriptors and numeric details as atomic facts
+  - Individual trips, meetings and other occurrences belong in events; do not accumulate a session recap under a person's name
   - Link related entities/events when possible
 
   ── event (user space) ────────────────────────────────────────
   Captures "what happened". Has a time dimension.
   - Include commitments, agreements, proposals that may be referenced later
-  - Convert dialogue into indirect speech; use third-person perspective
-  - Record emotional states and conversation dynamics
+  - Describe the occurrence and its emotional context in third person, not dialogue reactions
+  - Source conversations are evidence, not extra chat-recap events. A meeting, decision or agreement is an event; retain its outcome, not every discussed topic
   - Describe the COMPLETE event in one call — do NOT split one event into multiple parts
   - MUST include resolved absolute date in `when` field
   - Convert ALL relative times to absolute dates using Session Time
   - If no specific time in text, use Session Time as approximate date
-  - ALSO include: exact names of things created/performed ("Finding Freedom"), specific emotional adjectives used ("magical", "glad"), concrete outcomes with specifics
+  - Preserve exact names, meaningful emotions and concrete outcomes of this occurrence
   - "Currently reading X" → event (ongoing activity), NOT preference
   - "Plan to do X tonight" → event (has time), NOT preference
 
@@ -178,17 +197,17 @@ examples: |
   # Few-shot Examples — concrete, realistic values
 
   ## profile Example — One attribute per call, with as-of dates
-  Conversation: "I'm Caroline, 28, a software engineer in Portland."
+  Conversation: "I'm Alex, 28, a software engineer in Portland."
   Session Time: June 9, 2023
 
   ✅ Good — THREE separate extract_profile calls:
 
   Call 1 — extract_profile:
     routing_key: "name"
-    abstract: "Caroline's name is Caroline"
-    overview: "## Name\n- Caroline"
-    content: "Caroline's name is Caroline."
-    evidence_quote: "I'm Caroline"
+    abstract: "Alex's name is Alex"
+    overview: "## Name\n- Alex"
+    content: "Alex's name is Alex."
+    evidence_quote: "I'm Alex"
     attributed_speaker: "user"
     attribution_basis: "self_first_person"
     confidence: 0.95
@@ -197,7 +216,7 @@ examples: |
     routing_key: "occupation"
     abstract: "Software engineer"
     overview: "## Occupation\n- Software engineer"
-    content: "Caroline is a software engineer."
+    content: "Alex is a software engineer."
     evidence_quote: "a software engineer in Portland"
     attributed_speaker: "user"
     attribution_basis: "self_first_person"
@@ -207,8 +226,8 @@ examples: |
     routing_key: "age"
     abstract: "Age 28"
     overview: "## Age\n- 28 (as of 2023-06-09)"
-    content: "Caroline is 28 years old (as of 2023-06-09)."
-    evidence_quote: "I'm Caroline, 28"
+    content: "Alex is 28 years old (as of 2023-06-09)."
+    evidence_quote: "I'm Alex, 28"
     attributed_speaker: "user"
     attribution_basis: "self_first_person"
     confidence: 0.95
@@ -235,8 +254,8 @@ examples: |
   ✅ CORRECT — extract_entity for Andrew (NOT the user):
     routing_key: "andrew"
     abstract: "Andrew loves animals and nature"
-    overview: "## Person\n- **Name**: Andrew\n\n## Interests\n- Loves animals and nature"
-    content: "Andrew mentioned he loves animals and nature."
+    overview: "- Andrew loves animals and nature."
+    content: "# Andrew\n\n## Interests\n- Andrew loves animals and nature."
     who: "Andrew"
     confidence: 0.9
 
@@ -249,27 +268,30 @@ examples: |
   ✅ CORRECT — extract_entity for Sarah:
     routing_key: "sarah"
     abstract: "Sarah is a software engineer at Google (5 years)"
-    overview: "## Person\n- **Name**: Sarah\n- **Occupation**: Software engineer\n- **Employer**: Google\n- **Tenure**: 5 years (as of session date)"
-    content: "Sarah has been a software engineer at Google for 5 years."
+    overview: "- Sarah is a software engineer at Google.\n- Her tenure is 5 years as of the session date."
+    content: "# Sarah\n\n## Career\n- Sarah is a software engineer at Google.\n- Her tenure is 5 years as of the session date."
     who: "Sarah"
     confidence: 0.85
 
   ❌ WRONG — extract_profile (Sarah's occupation is NOT the user's profile)
 
-  ## profile vs entity — Third-person report about the user
+  ## profile vs entity — Report about another person
   Conversation:
-    user: "朋友昨天跟我说他打算搬家了"
+    user: "My friend told me he is an architect."
 
   ✅ CORRECT — extract_entity for the friend:
     routing_key: "friend"
-    abstract: "User's friend plans to move"
-    who: "朋友"
+    abstract: "User's friend is an architect"
+    overview: "- The user's friend is an architect."
+    content: "# User's friend\n\n## Career\n- The user's friend is an architect."
+    who: "friend"
     confidence: 0.7
 
-  ❌ WRONG — extract_profile (friend is moving, not the user)
+  ❌ WRONG — extract_profile (friend is an architect, not the user)
 
   ## preferences Example — One topic per call
-  Conversation: "I usually drink oat milk latte in the morning, commute by bike, and use Obsidian for notes."
+  Conversation: "I'm Alex. I usually drink oat milk latte in the morning, commute by bike, and use Obsidian for notes."
+  IDENTITY ANCHOR: The user is identified as Alex.
 
   ❌ Bad — ONE call mixing unrelated facets:
     abstract: "User preferences: oat milk latte, bike commute, Obsidian notes"
@@ -279,33 +301,36 @@ examples: |
   Call 1 — extract_preference:
     routing_key: "beverage"
     abstract: "Beverage preference: Drinks oat milk latte in the morning"
-    overview: "## Topic\n- Beverage\n\n## Specific Preference\n- Drinks oat milk latte in the morning"
-    content: "Caroline habitually drinks oat milk latte in the morning."
+    overview: "- Alex usually drinks oat milk latte in the morning."
+    content: "# Alex's beverage preference\n\n- Alex usually drinks oat milk latte in the morning."
+    evidence_quote: "I usually drink oat milk latte in the morning"
     confidence: 0.9
 
   Call 2 — extract_preference:
     routing_key: "commute"
     abstract: "Commute preference: Rides a bike"
-    overview: "## Topic\n- Commute\n\n## Specific Preference\n- Commutes by bike"
-    content: "Caroline commutes by bike."
+    overview: "- Alex commutes by bike."
+    content: "# Alex's commute preference\n\n- Alex commutes by bike."
+    evidence_quote: "commute by bike"
     confidence: 0.9
 
   Call 3 — extract_preference:
     routing_key: "note_taking"
     abstract: "Note-taking preference: Uses Obsidian"
-    overview: "## Topic\n- Productivity tools\n\n## Specific Preference\n- Prefers Obsidian for note-taking"
-    content: "Caroline prefers Obsidian for taking notes."
+    overview: "- Alex uses Obsidian for taking notes."
+    content: "# Alex's note-taking preference\n\n- Alex uses Obsidian for taking notes."
+    evidence_quote: "use Obsidian for notes"
     confidence: 0.9
 
   ## entity Example — Zettelkasten style, rich details
-  Conversation: "Melanie showed me a hand-thrown ceramic vase with crackled blue glaze, inspired by Japanese pottery. Sells at Portland Saturday Market."
+  Conversation: "Morgan makes hand-thrown ceramic vases with crackled blue glaze, inspired by Japanese pottery, and sells them at Portland Saturday Market."
 
   ✅ Good — call extract_entity:
     routing_key: "ceramic_vase"
-    abstract: "Melanie's ceramic vase: crackled blue glaze, inspired by Japanese pottery"
-    overview: "## Basic Info\n- **Creator**: Melanie\n- **Object**: Ceramic vase\n\n## Key Attributes\n- Hand-thrown\n- Crackled blue glaze\n- Inspired by Japanese pottery\n\n## Related Facts\n- Sells at Portland Saturday Market"
-    content: "Melanie makes hand-thrown ceramic vases with crackled blue glaze inspired by Japanese pottery. Sells at Portland Saturday Market."
-    who: "Melanie"
+    abstract: "Morgan's ceramic vase: crackled blue glaze, inspired by Japanese pottery"
+    overview: "- Morgan makes hand-thrown ceramic vases with crackled blue glaze.\n- The vases are inspired by Japanese pottery.\n- Morgan sells them at Portland Saturday Market."
+    content: "# Morgan's ceramic vases\n\n## Attributes\n- Morgan makes the vases by hand-throwing.\n- The vases have crackled blue glaze.\n- They are inspired by Japanese pottery.\n\n## Sales\n- Morgan sells the vases at Portland Saturday Market."
+    who: "Morgan"
     where: "Portland Saturday Market"
     confidence: 0.95
 
@@ -415,8 +440,7 @@ identity_block: |
     - Their name in a [Name]: prefix if it matches '{{ user_id }}'
     - Any alias or nickname that resolves to '{{ user_id }}'
   Profile facts MUST be BY this user AND ABOUT this user.
-  Statements by OTHER named speakers → extract_entity, NOT extract_profile.
-  If unsure whether a speaker is the user → extract_entity.
+  Other speakers: stable attributes/preferences → their entity, occurrences → event, not this user's profile/preference. Keep the actual subject.
   ==
 
 # Lazy mode: additional tools and extraction strategy

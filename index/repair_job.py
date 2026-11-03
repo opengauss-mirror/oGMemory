@@ -1,6 +1,6 @@
 """RepairJob: Scan and repair corrupted AGFS nodes.
 
-Branch logic MUST match AGFS write order spec (docs/agfs_directory_spec.md).
+Branch logic MUST match AGFS write order spec (docs/architecture/agfs-directory-spec.md).
 The write order determines what the repair job can recover:
 
 Write Order (from spec):

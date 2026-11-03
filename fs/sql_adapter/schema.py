@@ -4,20 +4,16 @@ All SQL DDL lives in ``db_schema.sql`` (next to this file).  Every store
 calls :func:`ensure_schema` from its ``_ensure_table`` method so that
 the schema is applied exactly once, idempotently, regardless of which
 store is instantiated first.
-
-Cold-start under parallel workers is guarded two ways:
-
-* a session-scoped PostgreSQL advisory lock serialises the DDL so
-  concurrent processes cannot deadlock on ``AccessExclusiveLock`` while
-  racing ``CREATE TABLE IF NOT EXISTS``;
-* a ``to_regclass('public.graph_nodes')`` presence check short-circuits
-  the whole DDL re-run once the schema is already applied (the script is
-  one idempotent block), so fresh worker processes never take the heavy
-  locks at all.
 """
 
 import logging
+import threading
+from contextlib import nullcontext
 from pathlib import Path
+from uuid import uuid4
+
+from psycopg2.errors import DuplicateObject, DuplicateTable, UniqueViolation
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE, TRANSACTION_STATUS_INTRANS
 
 from fs.sql_adapter.dialect import SQLDialect, resolve_sql_dialect
 
@@ -25,81 +21,106 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA_SQL = (Path(__file__).parent / "db_schema.sql").read_text(encoding="utf-8")
 
-# Arbitrary stable int identifying the schema-DDL advisory lock.
-_SCHEMA_LOCK_KEY = 741010016003217
-
-# Process-level guard: ensure_schema only needs to run once.
-# Without this, concurrent SQLContextFS instantiations all run DDL
-# simultaneously, causing PG deadlocks (ACCESS EXCLUSIVE lock contention).
-_schema_ensured: set[str] = set()
+# Serialize DDL only for the same resolved storage target, across store pools.
+_schema_ensured: set[tuple] = set()
+_schema_locks: dict[tuple, threading.Lock] = {}
+_schema_locks_guard = threading.Lock()
+_unidentified_schema_lock = threading.Lock()
 
 
-def _backend_is_postgres(conn) -> bool:
-    """True only for real psycopg connections.
+def _schema_target(conn, raw, adapter, *, in_transaction):
+    savepoint = "schema_lookup_" + uuid4().hex if in_transaction else None
+    with conn.cursor() as cur:
+        if savepoint:
+            cur.execute(f"SAVEPOINT {savepoint}")
+        try:
+            cur.execute(
+                "SELECT pg_catalog.inet_server_addr()::pg_catalog.text, pg_catalog.inet_server_port(), "
+                "pg_catalog.current_database(), "
+                "(SELECT oid FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()), "
+                "current_user, pg_catalog.current_schema(), pg_catalog.current_schemas(true)"
+            )
+            row = cur.fetchone()
+            namespaces = {}
+            if row and len(row) == 7 and isinstance(row[6], (list, tuple)):
+                cur.execute("SELECT nspname, oid FROM pg_catalog.pg_namespace "
+                            "WHERE nspname = ANY(pg_catalog.current_schemas(true))")
+                namespaces = dict(cur.fetchall())
+        except Exception:
+            if savepoint:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            if savepoint:
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+    if not row or len(row) != 7:
+        return None
+    address, port, database, database_oid, role, schema, search_path = row
+    if not database or not database_oid or not role or not schema or not isinstance(search_path, (list, tuple)):
+        return None
+    if schema not in namespaces or any(name not in namespaces for name in search_path):
+        return None
+    if address and port:
+        endpoint = ("tcp", address, port)
+    else:
+        info = raw.info
+        if not info.host or not info.host.startswith(("/", "@")) or not info.port:
+            return None
+        endpoint = ("unix", info.host, info.port)
+    resolved_path = tuple((name, namespaces[name]) for name in search_path)
+    return adapter.name, endpoint, database, database_oid, role, schema, resolved_path
 
-    Mock/fake connections lack an integral ``server_version`` and silently
-    skip the advisory lock and short-circuit (their tests drive the DDL
-    directly).
-    """
-    return isinstance(getattr(conn, "server_version", None), int)
+
+def _target_lock(target):
+    if target is None:
+        return _unidentified_schema_lock
+    with _schema_locks_guard:
+        return _schema_locks.setdefault(target, threading.Lock())
 
 
 def ensure_schema(conn, dialect: str | SQLDialect = "postgresql") -> None:
     """Apply the canonical schema (idempotent).
 
-    Runs the full ``db_schema.sql`` within a single psycopg2 transaction.
-    Uses libpq's ``PQexec`` via ``autocommit`` mode to correctly handle
-    multi-statement SQL with ``DO $$ ... $$`` blocks.
-
-    Guarded by a process-level flag so DDL only executes once, even when
-    multiple SQLContextFS instances are created concurrently.  On real
-    PostgreSQL backends a session-scoped advisory lock serialises DDL
-    execution across processes, and the presence of ``graph_nodes``
-    (the schema's keystone table) short-circuits the DDL re-run entirely.
+    Cache only complete, durable initialization of a resolved server/database,
+    effective search path and role. An existing caller transaction keeps its
+    pending work and owns any uncached DDL; that DDL is not cached before commit.
     """
     adapter = resolve_sql_dialect(dialect)
-    if adapter.name in _schema_ensured:
-        return
-    was_autocommit = conn.autocommit
-    locked = False
+    from fs.sql_adapter.session_mutation import active_session_guard
+
+    guard = active_session_guard()
+    raw = guard.raw if guard is not None and conn is guard.connection else conn
+    if raw is not conn:
+        guard.check_active()
+    transaction_status = raw.get_transaction_status()
+    if transaction_status not in (TRANSACTION_STATUS_IDLE, TRANSACTION_STATUS_INTRANS):
+        raise RuntimeError("Schema initialization requires an idle connection or usable transaction")
+    idle = transaction_status == TRANSACTION_STATUS_IDLE
+    was_autocommit = raw.autocommit
     try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            if _backend_is_postgres(conn):
-                # Session-scoped lock: safe under autocommit, each process
-                # waits its turn before touching any DDL.
-                cur.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_LOCK_KEY,))
-                locked = True
-                cur.execute("SELECT to_regclass('public.graph_nodes') IS NOT NULL")
-                row = cur.fetchone()
-                if row and row[0]:
-                    # db_schema.sql is one idempotent block: if the keystone
-                    # table exists the whole schema is already applied.
-                    # ASSUMPTION (known trade-off): the DDL runs in
-                    # autocommit, so a historical crash mid-script could
-                    # leave graph_nodes present while later statements
-                    # (indexes, triggers, tables created after it) are
-                    # missing — that partially-applied state is NOT
-                    # detectable here and will never be repaired by this
-                    # short-circuit. Recovery in that case: drop/rename the
-                    # schema manually, or temporarily disable the
-                    # short-circuit (see AGENTS.md ops notes).
-                    _schema_ensured.add(adapter.name)
-                    logger.info(
-                        "Schema already applied (graph_nodes present, dialect=%s); "
-                        "DDL skipped (assumes fully-applied DDL history)",
-                        adapter.name,
-                    )
-                    return
-            adapter.validate_connection(cur)
-            cur.execute(adapter.prepare_schema(_SCHEMA_SQL))
-        _schema_ensured.add(adapter.name)
-        logger.info("Schema ensured from db_schema.sql (dialect=%s)", adapter.name)
+        if idle and not was_autocommit:
+            raw.autocommit = True
+        target = _schema_target(conn, raw, adapter, in_transaction=not idle)
+        # Caller transactions can already hold DDL locks awaited by an idle initializer.
+        # Keep their subsequent DDL in database lock ordering alone.
+        with _target_lock(target) if idle else nullcontext():
+            if target is not None and target in _schema_ensured:
+                return
+            with conn.cursor() as cur:
+                adapter.validate_connection(cur)
+                ddl = adapter.prepare_schema(_SCHEMA_SQL)
+                try:
+                    cur.execute(ddl)
+                except (DuplicateObject, DuplicateTable, UniqueViolation):
+                    if not idle:
+                        raise
+                    # A transactional initializer may have committed while this
+                    # autocommit DDL waited on its newly created catalog rows.
+                    cur.execute(ddl)
+            if idle and target is not None:
+                _schema_ensured.add(target)
+            logger.info("Schema ensured from db_schema.sql (dialect=%s)", adapter.name)
     finally:
-        if locked:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK_KEY,))
-            except Exception:
-                logger.warning("Failed to release schema advisory lock", exc_info=True)
-        conn.autocommit = was_autocommit
+        if idle and raw.autocommit != was_autocommit:
+            raw.autocommit = was_autocommit

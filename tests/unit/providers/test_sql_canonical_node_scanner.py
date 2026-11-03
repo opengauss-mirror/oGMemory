@@ -106,7 +106,7 @@ def test_projection_quiescence_blocks_only_runnable_events():
     )
     assert "'PENDING','PROCESSING'" in query
     assert "FAILED" not in query
-    assert params == ("acct",)
+    assert params == ("acct", "EXTRACT_AGENT_MEMORY")
     assert any(
         params == ("statement_timeout", "30000")
         for _sql, params in pool.connection.cursor_value.executed

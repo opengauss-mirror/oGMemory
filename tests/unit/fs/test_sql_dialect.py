@@ -23,7 +23,12 @@ class _Cursor:
         self.statements.append((sql, params))
 
     def fetchone(self):
+        if self.statements[-1][0].startswith("SELECT pg_catalog.inet_server_addr"):
+            return ("127.0.0.1", 5432, "test", 1, "tester", "public", ["pg_catalog", "public"])
         return ("PG",)
+
+    def fetchall(self):
+        return [("pg_catalog", 11), ("public", 2200)]
 
 
 class _Connection:
@@ -34,6 +39,9 @@ class _Connection:
     def cursor(self):
         return self.cursor_instance
 
+    def get_transaction_status(self):
+        return 0
+
 
 def test_postgresql_schema_is_applied_through_dialect():
     conn = _Connection()
@@ -41,7 +49,7 @@ def test_postgresql_schema_is_applied_through_dialect():
 
     schema_module.ensure_schema(conn, "postgresql")
 
-    schema_sql = conn.cursor_instance.statements[0][0]
+    schema_sql = conn.cursor_instance.statements[-1][0]
     assert "current_setting('app.account_id', true)" in schema_sql
     assert conn.autocommit is False
     schema_module._schema_ensured.clear()
@@ -53,8 +61,8 @@ def test_opengauss_schema_preserves_tenant_write_isolation():
 
     schema_module.ensure_schema(conn, "opengauss")
 
-    assert conn.cursor_instance.statements[0][0] == "SHOW sql_compatibility"
-    schema_sql = conn.cursor_instance.statements[1][0]
+    assert any(statement[0] == "SHOW sql_compatibility" for statement in conn.cursor_instance.statements)
+    schema_sql = conn.cursor_instance.statements[-1][0]
     assert "current_setting('app.account_id')" in schema_sql
     assert "current_setting('app.account_id', true)" not in schema_sql
     assert "WITH CHECK (account_id" not in schema_sql

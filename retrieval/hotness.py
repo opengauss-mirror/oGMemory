@@ -13,6 +13,19 @@ from datetime import datetime, timezone
 DEFAULT_HALF_LIFE_DAYS: float = 7.0
 
 
+def blend_hotness(score: float, active_count: int, updated_at, config) -> float:
+    """Apply the existing per-node blend without hierarchy propagation."""
+    if isinstance(updated_at, str):
+        try:
+            updated_at = datetime.fromisoformat(updated_at)
+        except (ValueError, TypeError):
+            updated_at = None
+    if not isinstance(updated_at, datetime):
+        updated_at = None
+    heat = hotness_score(active_count, updated_at, half_life_days=config.hotness_half_life_days)
+    return (1 - config.hotness_alpha) * score + config.hotness_alpha * heat
+
+
 def hotness_score(
     active_count: int,
     updated_at: datetime | None,

@@ -95,6 +95,13 @@ def llm() -> MockLLM:
     return MockLLM()
 
 
+@pytest.fixture
+def offline_transcript_tokenizer(monkeypatch):
+    from tests.unit.m3.test_transcript_rerank import _mock_tokenize
+
+    monkeypatch.setattr("retrieval.bm25_index._tokenize", _mock_tokenize)
+
+
 def _scripted(script: list[dict]) -> _ScriptedLLM:
     return _ScriptedLLM(script)
 
@@ -179,6 +186,17 @@ def test_search_tool_schema_exposes_only_query_and_top_k(graph, embedder, llm):
     assert answer["input_schema"]["required"] == ["final_answer"]
 
 
+def test_prompt_uses_function_names_not_literal_protocol_tags(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+    messages = adapter._build_messages(_ctx(), M3TaskContext(question="Where?"))
+    system = messages[0]["content"]
+    assert "Search function" in system
+    assert "Answer function" in system
+    assert "provided tool-call interface" in system
+    assert "[Search]" not in system
+    assert "[Answer]" not in system
+
+
 @pytest.mark.parametrize("hits", [[], [{"description": "a bedroom"}]])
 def test_repeated_search_reuses_results_and_preserves_tool_messages(
     graph, embedder, llm, hits,
@@ -200,6 +218,30 @@ def test_repeated_search_reuses_results_and_preserves_tool_messages(
     assert "duplicate_query" not in used[0]["result"]
     assert [h["cache_hit"] for h in task.search_history] == [False, True]
     assert [m["tool_call_id"] for m in messages if m["role"] == "tool"] == ["s1", "s2"]
+
+
+def test_cached_search_compacts_model_context_but_keeps_full_audit(graph, embedder, llm):
+    import json
+    adapter = OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+    ctx, task = _ctx(), M3TaskContext(question="Where?")
+    messages = adapter._build_messages(ctx, task)
+    hits = [{"node_id": "n1", "description": "Important full evidence. " * 500}]
+    calls = [
+        {"id": "s1", "name": "Search", "input": {"query": "scissors"}},
+        {"id": "s2", "name": "Search", "input": {"query": "scissors"}},
+    ]
+    used = []
+    with patch("core.react_loop.ReactLoop._execute_tool", return_value={"hits": hits}):
+        adapter._execute_and_append_tool_calls(messages, calls, used, set(), ctx)
+    tool_messages = [m for m in messages if m["role"] == "tool"]
+    assert json.loads(tool_messages[0]["content"])["hits"] == hits
+    repeated = json.loads(tool_messages[1]["content"])
+    assert repeated["evidence_reference_tool_call_id"] == "s1"
+    assert repeated["hits"] == [{"node_id": "n1"}]
+    assert used[1]["result"]["hits"] == hits
+    assert [h["node_ids"] for h in task.search_history] == [["n1"], ["n1"]]
+    assert task.search_history[1]["new_evidence_count"] == 0
+    assert task.search_history[1]["cache_hit"] is True
 
 
 def test_search_cache_keeps_depth_queries_and_runs_separate(graph, embedder, llm):
@@ -1233,6 +1275,7 @@ class TestMergeHitsByNode:
 # Tests: dual-path retrieval end-to-end
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("offline_transcript_tokenizer")
 class TestDualPathRetrieval:
     """The headline P1 #6 fix: when the question names a person whose
     correct clip doesn't make the first top-k (cosine drops because the

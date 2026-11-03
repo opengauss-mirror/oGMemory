@@ -5,6 +5,14 @@ description: |
   ONLY for preferences stated BY the user ABOUT the user. Other people's preferences → extract_entity.
   Call once per distinct topic (e.g., coffee, coding style, music).
   Each independent topic gets its own call.
+  A preference expresses a holder's choice, taste or habitual inclination about a topic.
+  A one-time action, another speaker's praise, or the meaning of a single artifact alone is not a preference.
+  Keep the same topic key across conversations; source titles and observation dates are not topics.
+  Store a reusable statement of the preference, not a retelling of how it was expressed.
+  Resolve project/system references to their established exact name in abstract, overview and content.
+  Keep project-specific requirements scoped to that named project; never generalize them to all projects.
+  Use scope_ref for the established project boundary. If its name is unresolved, state that uncertainty rather than guessing.
+  Explicit values and opinions are eligible; do not infer habits or stronger commitments from a single action.
 directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/preferences"
 filename_template: "{{ routing_key }}.md"
 operation_mode: upsert
@@ -22,11 +30,16 @@ fields:
   - name: overview
     type: string
     required: true
-    description: "Must include: topic, specific preference, evidence from conversation"
+    description: "Markdown '- ' bullets stating the holder/topic preference and supported conditions or changes, one core fact per bullet. Source quotations remain in evidence_quote."
   - name: content
     type: string
     required: true
-    description: "Full detailed content"
+    description: >-
+      Markdown preference card: exactly one '# Topic' heading followed by '- ' bullets.
+      Each bullet states who prefers or values what, including any supported conditions or changes.
+      Keep one distinct reusable preference detail per bullet and consolidate repetition.
+      Source quotations belong in evidence_quote. Conversation recaps, scene setting and paragraph bodies
+      violate this format. A one-time action does not establish a habit or practical recommendation.
   - name: confidence
     type: number
     required: true
@@ -34,7 +47,7 @@ fields:
   - name: evidence_quote
     type: string
     required: false
-    description: "Verbatim quote from the source text supporting this preference extraction."
+    description: "A short continuous verbatim source quote supporting this preference and its holder; keep it separate from abstract, overview and content."
   - name: when
     type: string
     required: false

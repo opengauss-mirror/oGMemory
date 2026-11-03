@@ -517,7 +517,7 @@ def test_capacity_remainders_preserve_all_evidence(basis, count):
 
 
 @pytest.mark.parametrize("structured", [False, True])
-def test_hashed_entity_uses_preserved_actor_name(structured):
+def test_entity_uses_preserved_actor_name(structured):
     from commit.archive_builder import ArchiveBuilder
     from core.models import CandidateMemory, RequestContext, WritePlan
     from core.validation import validate_candidate
@@ -536,7 +536,7 @@ def test_hashed_entity_uses_preserved_actor_name(structured):
             who=name,
         )
     )
-    assert extracted.routing_key.startswith("auto-")
+    assert extracted.routing_key == name
     nodes = [_node(i) for i in range(3)]
     nodes[0] = ArchiveBuilder(MockLLM()).build(
         extracted,

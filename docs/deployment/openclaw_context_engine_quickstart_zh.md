@@ -287,7 +287,7 @@ memory:
 - `vector_db.type: chroma` 提供本地持久化向量检索；
 - `dimension` 必须等于 Embedding 接口实际返回维度；
 - 上例 `text-embedding-v3` 按 1024 维配置；使用其他模型时必须同步修改；
-- `after_turn_threshold: 1` 便于教程立即观察记忆写入；正式环境可改回 `200` 或按成本调整。
+- `after_turn_threshold: 1` 便于教程立即观察记忆写入；正式环境可改为默认的 `400`，或按成本调整。
 
 检查解析后的配置。密钥会被遮蔽：
 
@@ -356,11 +356,11 @@ curl -fsS http://127.0.0.1:8090/api/v1/health
 
 ```bash
 cd "$OGMEM_REPO"
-npm test --prefix openclaw_context_engine_plugin
+npm test --prefix plugins/openclaw
 
 export OGMEM_PLUGIN_DST="$HOME/.openclaw/extensions/og-memory-context-engine"
 mkdir -p "$OGMEM_PLUGIN_DST"
-cp -a "$OGMEM_REPO/openclaw_context_engine_plugin/." "$OGMEM_PLUGIN_DST/"
+cp -a "$OGMEM_REPO/plugins/openclaw/." "$OGMEM_PLUGIN_DST/"
 ```
 
 OpenClaw `2026.6.9` 不允许 `plugins install --link` 与当前插件包的 Hook 元数据组合使用，因此本教程使用与容器镜像相同的扩展目录加载方式。修改插件源码后，重新执行上述 `cp -a` 并重启 Gateway。
@@ -726,8 +726,8 @@ grep -E 'ERROR|Traceback|FAILED|PROCESSING' \
 
 ## 仓库内参考
 
-- [`openclaw_context_engine_plugin/README.md`](../../openclaw_context_engine_plugin/README.md)
-- [`openclaw_context_engine_plugin/ENV.md`](../../openclaw_context_engine_plugin/ENV.md)
+- [`plugins/openclaw/README.md`](../../plugins/openclaw/README.md)
+- [`plugins/openclaw/ENV.md`](../../plugins/openclaw/ENV.md)
 - [`config/ogmem.reference.yaml`](../../config/ogmem.reference.yaml)
 - [`config/env.example`](../../config/env.example)
 - [`agfs/Makefile`](../../agfs/Makefile)

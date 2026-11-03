@@ -18,12 +18,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
+from uuid import uuid4
 
+from core.errors import ExtractionIncompleteError
 from core.interfaces import LLM
 from core.models import RequestContext
+from core.operation_deadline import check_deadline
 from core.errors import LLMCallError
 from core.tools.operational_tool_spec import OperationalToolSpec, call_with_injection
-from uuid import uuid4
 
 logger = getLogger(__name__)
 
@@ -141,6 +143,7 @@ class ReactLoop(ABC):
         last_llm_error: Exception | None = None
 
         while iteration < max_iterations:
+            check_deadline()
             iteration += 1
             iter_start = time.monotonic()
             logger.info(f"ReAct iteration {iteration}/{max_iterations}")
@@ -159,10 +162,7 @@ class ReactLoop(ABC):
             if is_last_iteration:
                 messages.append({
                     "role": "user",
-                    "content": (
-                        "You have reached the maximum number of tool call iterations. "
-                        "Do not call any more tools - return your final result directly now."
-                    ),
+                    "content": self._build_final_instruction(),
                 })
 
             try:
@@ -191,6 +191,7 @@ class ReactLoop(ABC):
                 finish_reason = "llm_error"
                 last_llm_error = e
                 break
+            check_deadline()
             iter_latency = time.monotonic() - iter_start
 
             iter_trace = self._create_iter_trace(
@@ -210,7 +211,8 @@ class ReactLoop(ABC):
                     self._disable_tools_for_iteration = True
                     logger.info("Unknown tool called, disabling tools for next iteration")
 
-                if iteration >= max_iterations and self._allow_tool_iteration_extension():
+                if (iteration >= max_iterations and max_iterations == self._max_iterations
+                        and self._allow_tool_iteration_extension()):
                     max_iterations += 1
                     self._disable_tools_for_iteration = True
                     logger.info(f"Extended max_iterations to {max_iterations} for tool call")
@@ -228,11 +230,15 @@ class ReactLoop(ABC):
 
             if content:
                 parsed = self._parse_output(content)
-                if parsed:
+                if parsed is not None:
+                    messages.append({"role": "assistant", "content": content})
                     should_continue = self._should_continue_after_output(
                         parsed, messages, ctx, iter_trace
                     )
                     if should_continue:
+                        if is_last_iteration and max_iterations == self._max_iterations:
+                            max_iterations += 1
+                            self._disable_tools_for_iteration = True
                         trace.iterations.append(iter_trace)
                         continue
 
@@ -297,6 +303,12 @@ class ReactLoop(ABC):
 
     def _execute_custom_tool(self, name: str, input: dict, ctx: RequestContext) -> dict | str:
         return {"error": f"Unknown tool: {name}"}
+
+    def _build_final_instruction(self) -> str:
+        return (
+            "You have reached the maximum number of tool call iterations. "
+            "Do not call any more tools - return your final result directly now."
+        )
 
     @abstractmethod
     def _build_messages(
@@ -414,16 +426,8 @@ class ReactLoop(ABC):
         self,
         messages: list[dict],
     ) -> tuple[list[dict] | None, str | None]:
-        """Call LLM with tools.
-
-        Raises:
-            LLMCallError: The LLM API call itself failed (400, 500,
-                network, etc.). The base loop's ``run`` translates this
-                into ``finish_reason="llm_error"``; do not swallow it
-                here — the previous silent-return-(None, None) behaviour
-                was responsible for turning hard server errors into
-                "[Search] … [Answer] …" protocol-garbage answers.
-        """
+        """Call LLM with tools."""
+        check_deadline()
         tools = None
         tool_choice = "none"
         if not self._disable_tools_for_iteration:
@@ -448,9 +452,7 @@ class ReactLoop(ABC):
 
             return None, None
 
-        except LLMCallError:
-            # Already classified by the LLM provider — let the base
-            # loop's run() catch it and set finish_reason="llm_error".
+        except (ExtractionIncompleteError, LLMCallError):
             raise
         except Exception as e:
             # Unknown transport failure (e.g. socket error, JSON decode
@@ -471,10 +473,11 @@ class ReactLoop(ABC):
         has_unknown = False
 
         for tool_call in tool_calls:
+            check_deadline()
             # Support both formats: {"tool": ...} from OpenAILLM and {"name": ...} from other sources
             tool_name = tool_call.get("name", "") or tool_call.get("tool", "")
             tool_input = tool_call.get("input", {})
-            call_id = tool_call.get("id", "unknown")
+            call_id = tool_call.get("id") or f"call_{uuid4().hex}"
 
             # Skip empty tool names to avoid API errors
             if not tool_name or not tool_name.strip():

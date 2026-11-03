@@ -12,7 +12,8 @@ from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
 from core.temporal import contains_time, seconds
 from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
-from fs.sql_adapter.pool import PoolAdapterMixin
+from fs.sql_adapter.pool import PoolAdapterMixin, resolve_connection_dialect
+from fs.sql_adapter.dialect import normalize_sql_dialect
 
 try:
     import psycopg2
@@ -97,10 +98,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
     The two backends diverge only on the extension bootstrap
     (in ``_ensure_table``):
 
-    - **openGauss** (1.x / 2.x / 3.x): the ``vector(N)`` type and
-      the HNSW ``vector_cosine_ops`` opclass are built in. The
-      ``CREATE EXTENSION`` statement is a syntax error on openGauss;
-      we catch and ignore it so the CREATE TABLE proceeds.
+    - **openGauss**: the configured dialect uses its built-in
+      ``vector(N)`` type and HNSW ``vector_cosine_ops`` opclass.
     - **PostgreSQL 15+ with pgvector**: requires the
       ``pgvector/pgvector:pg16`` Docker image (or the
       ``pgvector`` package installed server-side). The CREATE
@@ -124,6 +123,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         table_name: str = "vector_index",
         pool_size: int = 5,
         pool=None,
+        dialect=None,
     ):
         """Initialize OpenGauss index.
 
@@ -132,7 +132,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             dimension: Embedding vector dimension (default 1536)
             table_name: Table name for vector storage (must be valid identifier)
             pool_size: Connection pool size (when pool is not provided)
-            pool: Optional shared connection pool
+            pool: Optional shared connection pool with matching SQL dialect
+            dialect: Explicit dialect or auto detection; omitted inherits the pool or openGauss
 
         Raises:
             ImportError: If psycopg2 is not installed
@@ -146,7 +147,12 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
         self._dimension = dimension
         self._table_name = _validate_table_name(table_name)
-        self._init_pool(pool, connection_string, pool_size)
+        if dialect is None or (pool is not None and normalize_sql_dialect(dialect) == "auto"):
+            dialect = pool.sql_dialect if pool is not None else "opengauss"
+        dialect = resolve_connection_dialect(dialect, connection_string)
+        if pool is not None and pool.sql_dialect.name != dialect.name:
+            raise ValueError("vector index dialect must match shared pool dialect")
+        self._init_pool(pool, connection_string, pool_size, dialect=dialect)
 
         self._ensure_table()
 
@@ -178,11 +184,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
           no-op when the extension is already installed (e.g. via the
           ``pgvector/pgvector:pg16`` Docker image, where the bits are
           preloaded into ``shared_preload_libraries``).
-        - **openGauss**: openGauss has the ``vector(N)`` type and the
-          HNSW opclass built in (no extension to load). The
-          ``CREATE EXTENSION`` statement raises a syntax error which
-          we catch and ignore so the migration proceeds to the
-          regular CREATE TABLE step.
+        - **openGauss**: the configured dialect uses its built-in
+          ``vector(N)`` type and HNSW opclass directly.
 
         ``psycopg2`` talks the same wire protocol to both servers, so
         nothing else in this class needs to special-case the backend.
@@ -191,24 +194,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         dim = self._dimension
         conn = self._get_connection()
         try:
-            # ---- extension bootstrap (PostgreSQL + pgvector only) ----
-            # Best-effort: openGauss doesn't speak this statement and
-            # raises ``syntax error at or near "EXTENSION"``; we log
-            # and continue because openGauss ships vector(N) natively.
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                conn.commit()
-            except Exception as exc:
-                conn.rollback()
-                # Use DEBUG so a real PG deployment without pgvector
-                # installed surfaces loudly at the next failure (the
-                # CREATE TABLE below will error on the ``vector``
-                # type) without spamming a successful openGauss boot.
-                logger.debug(
-                    "CREATE EXTENSION vector skipped (expected on openGauss): %s",
-                    exc,
-                )
+            if self.sql_dialect.name == "postgresql":
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    conn.commit()
+                except Exception as exc:
+                    conn.rollback()
+                    logger.debug("CREATE EXTENSION vector unavailable: %s", exc)
             with conn.cursor() as cur:
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS {tbl} (
@@ -339,8 +332,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     WHERE account_id IS NULL OR owner_space IS NULL
                        OR node_uri IS NULL OR node_status IS NULL
                 """)
-                cur.execute("""SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = current_schema() AND table_name = 'context_nodes'""")
+                cur.execute("""SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'context_nodes'
+                      AND column_name = 'node_id'""")
                 if cur.fetchone() is not None:
                     cur.execute(f"""
                         UPDATE {tbl} vi SET node_id = cn.node_id
@@ -375,13 +369,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         """
         return psycopg2.connect(self._connection_string)
 
-    def _return_connection(self, conn):
-        """Return a connection, rolling back dirty transactions.
-
-        openGauss can leave a connection inside an open transaction after
-        errors; a dirty pooled connection would poison the next borrower,
-        so roll back first (or drop the connection when that fails).
-        """
+    @staticmethod
+    def _reset_connection(conn):
+        """End the index transaction before the connection becomes idle."""
         if conn.closed != 0:
             # Slot release is handled by the mixin; closed conns are
             # simply never pooled again.
@@ -391,10 +381,23 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             if conn.info.transaction_status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
                 conn.rollback()
         except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            conn.close()
+
+    def _return_shared_connection(self, conn):
+        try:
+            self._reset_connection(conn)
+        finally:
+            self._shared_pool.return_connection(conn)
+
+    def _return_connection(self, conn):
+        """Return a connection to the pool, rolling back dirty transactions.
+
+        openGauss can leave a connection inside an open transaction after
+        errors; a dirty pooled connection would poison the next borrower,
+        so reset it first, then hand it to the bounded standalone pool
+        (lock + semaphore slot release live in the mixin).
+        """
+        self._reset_connection(conn)
         self._standalone_return_connection(conn)
 
     def upsert(self, records: list[IndexRecord]) -> None:
@@ -710,6 +713,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
@@ -719,7 +723,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT uri, embedding::text FROM {self._table_name} "
+                    f"SELECT uri, embedding::text{', text' if expected_texts is not None else ''} FROM {self._table_name} "
                     f"WHERE {where} AND uri=ANY(%(uris)s)",
                     params,
                 )
@@ -727,7 +731,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         finally:
             self._return_connection(conn)
         output: dict[str, list[float]] = {}
-        for uri, raw in rows:
+        for uri, raw, *source in rows:
+            if expected_texts is not None and (not source or source[0] != expected_texts.get(str(uri))):
+                continue
             text = str(raw).strip().strip("[]")
             output[str(uri)] = [float(value) for value in text.split(",") if value]
         return output
@@ -806,6 +812,11 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 clauses.append("metadata @> %(f_ctx_type)s::jsonb")
                 ct = json.dumps({"context_type": ct})
             params["f_ctx_type"] = ct
+        if "memory_directory" in f:
+            clauses.append("""CASE WHEN split_part(uri, '/', 6) = 'memories'
+                THEN split_part(uri, '/', 7) ELSE split_part(uri, '/', 6) END
+                = ANY(%(f_memory_directory)s)""")
+            params["f_memory_directory"] = f["memory_directory"]
         if "category" in f:
             cat = f["category"]
             if isinstance(cat, list):
@@ -904,7 +915,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             context_type=meta.get("context_type", ""),
             category=meta.get("category", ""),
             owner_space=owner,
-            abstract=row.get("text", "")[:200],
+            abstract=meta.get("abstract", row.get("text", "")[:200]),
             has_overview=meta.get("has_overview", False),
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),

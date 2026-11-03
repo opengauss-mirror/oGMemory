@@ -12,29 +12,24 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "tests" / "e2e"))
 
-from run_openclaw_mcp_locomo import (  # noqa: E402
+from eval import build_parser  # noqa: E402
+from eval import validate_dataset  # noqa: E402
+from run_mcp_locomo import (  # noqa: E402
     _copy_auth_state,
     _evaluation_config,
-    _judge_settings,
-    _load_dataset,
-    _new_run_id,
-    _prepare_run_dir,
-    _sample_scope,
+    _load_model_config,
     _start_gateway,
-    _validate_ingest_result,
     _validate_mcp_user_scope,
-    _validate_qa_csv,
-    build_parser,
-    main,
 )
 
 
-def test_runner_requires_only_dataset_path(tmp_path: Path) -> None:
+def test_runner_accepts_stage_and_dataset_path(tmp_path: Path) -> None:
     dataset = tmp_path / "locomo.json"
     dataset.write_text("[]", encoding="utf-8")
 
-    args = build_parser().parse_args([str(dataset)])
+    args = build_parser().parse_args(["ingest", str(dataset)])
 
+    assert args.mode == "ingest"
     assert args.dataset == dataset
     assert args.output_dir is None
     assert args.sample is None
@@ -58,7 +53,7 @@ def test_dataset_validation_accepts_locomo_shape(tmp_path: Path) -> None:
     ]
     dataset.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert _load_dataset(dataset) == payload
+    assert validate_dataset(dataset) == payload
 
 
 @pytest.mark.parametrize(
@@ -111,35 +106,7 @@ def test_dataset_validation_reports_required_field(tmp_path: Path, mutation, mes
     dataset.write_text(json.dumps([item]), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
-        _load_dataset(dataset)
-
-
-def test_dataset_validation_rejects_duplicate_sample_ids(tmp_path: Path) -> None:
-    dataset = tmp_path / "locomo.json"
-    item = {
-        "sample_id": "s0",
-        "conversation": {"speaker_a": "A", "speaker_b": "B", "session_1": []},
-        "qa": [{"question": "Who spoke?", "answer": "A"}],
-    }
-    dataset.write_text(json.dumps([item, item]), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="item at index 1: duplicate sample_id 's0'"):
-        _load_dataset(dataset)
-
-
-def test_runner_rejects_duplicate_sample_indices(tmp_path: Path) -> None:
-    dataset = tmp_path / "locomo.json"
-    payload = [
-        {
-            "sample_id": "s0",
-            "conversation": {"speaker_a": "A", "speaker_b": "B", "session_1": []},
-            "qa": [{"question": "Who spoke?", "answer": "A"}],
-        }
-    ]
-    dataset.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="Duplicate --sample"):
-        main([str(dataset), "--sample", "0", "--sample", "0"])
+        validate_dataset(dataset)
 
 
 def test_gateway_starts_with_isolated_state(tmp_path: Path) -> None:
@@ -153,11 +120,7 @@ def test_gateway_starts_with_isolated_state(tmp_path: Path) -> None:
         "gateway": {"port": 23456, "auth": {"token": "test-token"}},
         "agents": {"list": [{"id": "main", "agentDir": str(auth_source_dir)}]},
         "models": {
-            "providers": {
-                "stored-provider": {
-                    "baseUrl": "https://configured.example.invalid/v1"
-                }
-            }
+            "providers": {"stored-provider": {"baseUrl": "https://configured.example.invalid/v1"}}
         },
     }
     (auth_source_dir / "auth-profiles.json").write_text(
@@ -181,10 +144,14 @@ def test_gateway_starts_with_isolated_state(tmp_path: Path) -> None:
 
     with (
         patch.dict(os.environ, {"HOME": "original-home", "USERPROFILE": "original-profile"}),
-        patch("run_openclaw_mcp_locomo.subprocess.Popen", return_value=proc) as popen,
-        patch("run_openclaw_mcp_locomo.requests.get", return_value=Mock(ok=True)),
+        patch("run_mcp_locomo.subprocess.Popen", return_value=proc) as popen,
+        patch("run_mcp_locomo.requests.get", return_value=Mock(ok=True)),
     ):
-        returned_proc, env = _start_gateway(config, runtime_home, log_path, auth_source_dir)
+        resolved = _load_model_config(config, auth_source_dir)
+        _start_gateway(resolved, runtime_home, log_path, auth_source_dir)
+        returned_proc, env = _start_gateway(
+            resolved, runtime_home, log_path, auth_source_dir, command="custom-openclaw"
+        )
 
     state_dir = runtime_home / ".openclaw"
     assert returned_proc is proc
@@ -204,7 +171,8 @@ def test_gateway_starts_with_isolated_state(tmp_path: Path) -> None:
     }
     assert config["agents"]["list"][0]["agentDir"] == str(auth_source_dir)
     assert (state_dir / "agents" / "main" / "agent" / "auth-profiles.json").is_file()
-    assert popen.call_args.args[0] == ["openclaw", "gateway", "--port", "23456"]
+    assert popen.call_count == 2
+    assert popen.call_args.args[0] == ["custom-openclaw", "gateway", "--port", "23456"]
 
 
 def test_auth_copy_exports_only_auth_tables(tmp_path: Path) -> None:
@@ -232,29 +200,6 @@ def test_auth_copy_exports_only_auth_tables(tmp_path: Path) -> None:
         json.loads((destination / "auth-profiles.json").read_text(encoding="utf-8"))["version"] == 1
     )
     assert not (destination / "openclaw-agent.sqlite").exists()
-
-
-def test_ingest_validation_rejects_recorded_session_error(tmp_path: Path) -> None:
-    result_path = tmp_path / "ingest.json"
-    result_path.write_text(
-        json.dumps(
-            [
-                {"session": "session_1", "reply": "stored"},
-                {"session": "session_2", "reply": "[ERROR] model call failed"},
-            ]
-        ),
-        encoding="utf-8",
-    )
-    item = {
-        "conversation": {
-            "session_1": [],
-            "session_1_date_time": "today",
-            "session_2": [],
-        }
-    }
-
-    with pytest.raises(RuntimeError, match="failed=.*session_2"):
-        _validate_ingest_result(result_path, item)
 
 
 def test_eval_config_isolates_mcp_tools_and_competing_memory_plugins() -> None:
@@ -340,7 +285,7 @@ def test_eval_config_preserves_openclaw_answer_model() -> None:
 def test_mcp_user_scope_rejects_member_key() -> None:
     response = Mock(status_code=403)
 
-    with patch("run_openclaw_mcp_locomo.requests.get", return_value=response):
+    with patch("run_mcp_locomo.requests.get", return_value=response):
         with pytest.raises(RuntimeError, match="requires an Admin or Root"):
             _validate_mcp_user_scope(
                 "http://127.0.0.1:8091/mcp",
@@ -350,106 +295,10 @@ def test_mcp_user_scope_rejects_member_key() -> None:
 
 def test_mcp_user_scope_allows_disabled_role_control() -> None:
     response = Mock(status_code=503)
+    response.json.return_value = {"error": "Admin API is unavailable when role control is disabled"}
 
-    with patch("run_openclaw_mcp_locomo.requests.get", return_value=response):
+    with patch("run_mcp_locomo.requests.get", return_value=response):
         _validate_mcp_user_scope(
             "http://127.0.0.1:8091/mcp",
             {"X-API-Key": "root-key", "X-Account-ID": "acct-1"},
         )
-
-
-def test_sample_scope_isolates_user_and_agent() -> None:
-    first = _sample_scope("run", 0)
-    second = _sample_scope("run", 1)
-
-    assert first == ("run-conv-0", "run-conv-0-agent")
-    assert second == ("run-conv-1", "run-conv-1-agent")
-    assert first[0] != second[0]
-    assert first[1] != second[1]
-
-
-def test_run_id_includes_random_nonce() -> None:
-    with (
-        patch("run_openclaw_mcp_locomo.time.strftime", return_value="20260804_120000"),
-        patch("run_openclaw_mcp_locomo.secrets.token_hex", return_value="a1b2c3d4"),
-    ):
-        run_id = _new_run_id()
-
-    assert run_id == "openclaw_mcp_locomo_20260804_120000_a1b2c3d4"
-
-
-def test_judge_settings_require_explicit_credentials() -> None:
-    env_names = (
-        "LOCOMO_JUDGE_API_KEY",
-        "OGMEM_API_KEY",
-        "LOCOMO_JUDGE_BASE_URL",
-        "LOCOMO_JUDGE_MODEL",
-        "LOCOMO_JUDGE_API_MODE",
-        "LOCOMO_OGMEM_CONFIG",
-    )
-    with patch.dict(os.environ, {name: "" for name in env_names}):
-        with pytest.raises(RuntimeError, match="Judge credentials unavailable"):
-            _judge_settings()
-
-
-def test_judge_settings_use_environment() -> None:
-    env = {
-        "LOCOMO_JUDGE_API_KEY": "judge-key",
-        "OGMEM_API_KEY": "",
-        "LOCOMO_JUDGE_BASE_URL": "https://example.invalid/v1",
-        "LOCOMO_JUDGE_MODEL": "judge-model",
-        "LOCOMO_JUDGE_API_MODE": "responses",
-        "LOCOMO_OGMEM_CONFIG": "",
-    }
-    with patch.dict(os.environ, env):
-        settings = _judge_settings()
-
-    assert settings == (
-        "judge-key",
-        "https://example.invalid/v1",
-        "judge-model",
-        "responses",
-    )
-
-
-def test_run_dir_must_be_new_or_empty(tmp_path: Path) -> None:
-    run_dir = tmp_path / "results"
-    run_dir.mkdir()
-    (run_dir / "old-result.csv").write_text("stale", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="new or empty"):
-        _prepare_run_dir(run_dir)
-
-
-def test_qa_validation_rejects_missing_answers(tmp_path: Path) -> None:
-    qa_csv = tmp_path / "qa.csv"
-    qa_csv.write_text("sample_id,qi,question,expected,response\n", encoding="utf-8")
-    data = [
-        {
-            "sample_id": "s0",
-            "conversation": {},
-            "qa": [{"question": "Q", "answer": "A", "category": 1}],
-        }
-    ]
-
-    with pytest.raises(RuntimeError, match="expected=1, actual=0"):
-        _validate_qa_csv(qa_csv, data, [0])
-
-
-@pytest.mark.parametrize("response", ["", "[ERROR: could not extract text]"])
-def test_qa_validation_rejects_invalid_response(tmp_path: Path, response: str) -> None:
-    qa_csv = tmp_path / "qa.csv"
-    qa_csv.write_text(
-        f"sample_id,qi,question,expected,response\ns0,1,Q,A,{response}\n",
-        encoding="utf-8",
-    )
-    data = [
-        {
-            "sample_id": "s0",
-            "conversation": {},
-            "qa": [{"question": "Q", "answer": "A", "category": 1}],
-        }
-    ]
-
-    with pytest.raises(RuntimeError, match=r"empty or error responses: \['s0/Q1'\]"):
-        _validate_qa_csv(qa_csv, data, [0])

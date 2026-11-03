@@ -1,0 +1,8 @@
+# Optional: connect only the application to an existing model-service network.
+services:
+  ogmemory:
+    networks: [memory, model]
+networks:
+  model:
+    external: true
+    name: ${MODEL_DOCKER_NETWORK:?Set the existing MODEL_DOCKER_NETWORK in .env}

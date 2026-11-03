@@ -204,6 +204,7 @@ def test_code_memory_public_http_and_mcp_protocol(
         "X-API-Key": _ROOT_API_KEY,
         "X-Account-ID": account_id,
         "X-User-ID": "protocol-user",
+        "X-Agent-ID": agent_id,
     }
     try:
         base_url = f"http://127.0.0.1:{flask_port}"
@@ -417,12 +418,13 @@ def test_code_memory_public_http_and_mcp_protocol(
             recovery_uri,
             original_marker,
             recovered_http["diagnostics"],
+            mcp.log_path,
         )
         code_text = mcp_payloads["code"]
         assert isinstance(code_text, str)
         assert "# code_search status:" in code_text
         assert "# query: protocol_feature_marker" in code_text
-        assert "# protocol-root/src/service.py" in code_text
+        assert "protocol-root/src/service.py" in code_text
         assert "updated-code-memory-marker" in code_text
         assert "diagnostics" not in code_text
         assert code_uri not in code_text
@@ -454,15 +456,17 @@ async def _exercise_streamable_mcp(
     recovery_uri: str,
     original_marker: str,
     expected_recovery_diagnostics: dict[str, Any],
+    log_path: Path,
 ) -> dict[str, Any]:
     async with httpx.AsyncClient(headers=headers, timeout=30.0) as http_client:
         async with streamable_http_client(
             f"http://127.0.0.1:{port}/mcp",
             http_client=http_client,
-        ) as (read_stream, write_stream, _get_session_id):
+        ) as streams:
+            read_stream, write_stream = streams[:2]
             async with ClientSession(read_stream, write_stream) as session:
                 initialized = await session.initialize()
-                assert initialized.serverInfo.name == "oGMemory"
+                assert initialized.server_info.name == "oGMemory"
                 tool_names = {tool.name for tool in (await session.list_tools()).tools}
                 assert {
                     "ogm_query_memory",
@@ -485,10 +489,10 @@ async def _exercise_streamable_mcp(
                         "budget": {"result_limit": 2},
                     },
                 )
-                assert code_result.isError is False
+                assert code_result.is_error is False
                 code_payload = _tool_text(code_result)
                 assert "# code_search status:" in code_payload
-                assert "# protocol-root/src/service.py" in code_payload
+                assert "protocol-root/src/service.py" in code_payload
                 assert "updated-code-memory-marker" in code_payload
 
                 edit_result = await session.call_tool(
@@ -499,7 +503,7 @@ async def _exercise_streamable_mcp(
                         "new_string": "mcp-edited-code-memory-marker",
                     },
                 )
-                assert edit_result.isError is False
+                assert edit_result.is_error is False
                 edit_payload = _tool_json(edit_result)
                 assert edit_payload["ok"] is True
                 assert edit_payload["relative_path"] == "src/service.py"
@@ -513,7 +517,7 @@ async def _exercise_streamable_mcp(
                         "budget": {"result_limit": 2},
                     },
                 )
-                assert code_after_edit_result.isError is False
+                assert code_after_edit_result.is_error is False
                 code_after_edit_payload = _tool_text(code_after_edit_result)
                 assert "mcp-edited-code-memory-marker" in code_after_edit_payload
 
@@ -522,16 +526,21 @@ async def _exercise_streamable_mcp(
                     {
                         "uri": recovery_uri,
                         "recover_original": True,
-                        "max_chars": 160,
+                        "max_chars": 1600,
                         "agent_id": "protocol-agent",
                     },
                 )
-                assert recovery_result.isError is False
+                assert recovery_result.is_error is False, log_path.read_text()[-8000:]
                 recovery_payload = _tool_json(recovery_result)
                 assert recovery_payload["ok"] is True
                 assert original_marker in recovery_payload["original"]
-                assert recovery_payload["returned_chars"] <= 160
-                assert recovery_payload["diagnostics"] == expected_recovery_diagnostics
+                assert len(json.dumps(recovery_payload, ensure_ascii=False, sort_keys=True)) <= 1600
+                assert recovery_payload["diagnostics"] == {
+                    **expected_recovery_diagnostics,
+                    "output_chars": len(recovery_payload["original"]),
+                    "truncated": recovery_payload["truncated"],
+                    "budget": {"configured_max_chars": 50000, "effective_max_chars": 1600},
+                }
                 return {
                     "code": code_payload,
                     "edit": edit_payload,

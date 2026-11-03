@@ -240,6 +240,7 @@ def _assert_no_trace_provenance(*payloads: dict[str, Any]) -> None:
 
 def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
     SQLTraceEventStore(connection_string=dsn, pool_size=1)
+    candidate_id = f"protocol-candidate-{account_id}"
     uri = f"ctx://{account_id}/agents/{agent_id}/skills/protocol-review"
     content = "---\nname: protocol-review\ndescription: Review protocol behavior.\n---\n# Protocol review\n"
     conn = psycopg2.connect(dsn)
@@ -252,7 +253,7 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
             )
             cur.execute(
                 "DELETE FROM skill_candidates WHERE account_id = %s AND candidate_id = %s",
-                (account_id, "protocol-candidate"),
+                (account_id, candidate_id),
             )
             cur.execute("DELETE FROM context_nodes WHERE uri = %s", (uri,))
             cur.execute(
@@ -292,10 +293,11 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
                 INSERT INTO skill_candidates
                     (candidate_id, account_id, agent_id, capability_key,
                      state, assessment)
-                VALUES ('protocol-candidate', %s, %s, 'protocol-review-candidate',
+                VALUES (%s, %s, %s, 'protocol-review-candidate',
                         'assessed', %s::jsonb)
                 """,
                 (
+                    candidate_id,
                     account_id,
                     agent_id,
                     json.dumps(
@@ -310,10 +312,11 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
                 """
                 INSERT INTO skill_candidate_evidence
                     (account_id, candidate_id, evidence_uri, evidence_type, session_id)
-                VALUES (%s, 'protocol-candidate', %s, 'trace', 'secret-protocol-session')
+                VALUES (%s, %s, %s, 'trace', 'secret-protocol-session')
                 """,
                 (
                     account_id,
+                    candidate_id,
                     f"ctx://{account_id}/agents/{agent_id}/traces/protocol-candidate-turn",
                 ),
             )

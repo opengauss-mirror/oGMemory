@@ -13,6 +13,7 @@ from typing import Any
 
 from core.clip_lookup import clip_ordinal, validate_clip_lookup
 from core.interfaces import VectorIndex
+from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
 from core.temporal import contains_time, seconds, within_scope
 from core.transcript_lexical import indexed_metadata, transcript_score, validate_transcript_request
@@ -156,11 +157,14 @@ class InMemoryVectorIndex(VectorIndex):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         wanted = set(uris)
         output: dict[str, list[float]] = {}
         for record_id, record in self._records.items():
             if record.uri not in wanted or record.level != level:
+                continue
+            if expected_texts is not None and record.text != expected_texts.get(record.uri):
                 continue
             if self._matches_raw_filters(record, filters):
                 output[record.uri] = list(self._vectors[record_id])
@@ -198,7 +202,10 @@ class InMemoryVectorIndex(VectorIndex):
         ):
             return False
         for key, expected in filters.items():
-            if key == "level":
+            if key == "memory_directory":
+                if memory_directory(record.uri) not in expected:
+                    return False
+            elif key == "level":
                 if isinstance(expected, list):
                     if record.level not in expected:
                         return False
@@ -232,7 +239,7 @@ class InMemoryVectorIndex(VectorIndex):
             context_type=meta.get("context_type", ""),
             category=meta.get("category", ""),
             owner_space=record.filters.get("owner_space", ""),
-            abstract=record.text[:200],
+            abstract=meta.get("abstract", record.text[:200]),
             has_overview=meta.get("has_overview", False),
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),

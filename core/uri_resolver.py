@@ -5,11 +5,14 @@ RequestContext and field values. Provides sanitization to prevent
 directory traversal attacks.
 """
 
-import jinja2
+import unicodedata
 from logging import getLogger
 
-from extraction.schemas.registry import SchemaRegistry
+import jinja2
+
 from core.models import RequestContext
+from core.validation import validate_utf8
+from extraction.schemas.registry import SchemaRegistry
 
 logger = getLogger(__name__)
 
@@ -37,11 +40,16 @@ class URIResolver:
         self._registry = registry
         self._jinja_env = jinja2.Environment(autoescape=False)
 
+    @property
+    def schema_registry(self) -> SchemaRegistry:
+        return self._registry
+
     def resolve(self, memory_type: str, fields: dict, ctx: RequestContext) -> str:
         """Render directory + filename_template → complete URI.
 
         Automatically injects: account_id, user_id, agent_id + any values
-        from fields dict. Sanitizes all values to prevent directory traversal.
+        from fields dict. Context identities remain exact; content fields are
+        sanitized for use as path slugs and cannot replace context identities.
 
         Args:
             memory_type: Memory type identifier (e.g., "profile", "preference")
@@ -58,18 +66,13 @@ class URIResolver:
         if schema is None:
             raise ValueError(f"Unknown memory_type: {memory_type}")
 
-        # Build template variables with context fields
+        context_vars = self._context_template_vars(ctx, schema.owner_scope)
         template_vars = {
-            "account_id": ctx.account_id,
-            "user_id": ctx.user_id,
-            "agent_id": ctx.agent_id,
+            k: self._sanitize(str(v))
+            for k, v in fields.items()
+            if v is not None and k not in context_vars
         }
-
-        # Add provided fields, filtering out None values
-        template_vars.update({k: v for k, v in fields.items() if v is not None})
-
-        # Sanitize all values to prevent directory traversal
-        template_vars = {k: self._sanitize(str(v)) for k, v in template_vars.items()}
+        template_vars.update(context_vars)
 
         # Render directory template
         dir_path = self._jinja_env.from_string(schema.directory).render(**template_vars)
@@ -106,13 +109,32 @@ class URIResolver:
         if schema is None:
             raise ValueError(f"Unknown memory_type: {memory_type}")
 
-        template_vars = {
+        template_vars = self._context_template_vars(ctx, schema.owner_scope)
+
+        return self._jinja_env.from_string(schema.directory).render(**template_vars)
+
+    @staticmethod
+    def _context_template_vars(ctx: RequestContext, owner_scope: str) -> dict[str, str]:
+        """Keep authenticated identities as exact, unencoded URI segments."""
+        values = {
             "account_id": ctx.account_id,
             "user_id": ctx.user_id,
             "agent_id": ctx.agent_id,
         }
-
-        return self._jinja_env.from_string(schema.directory).render(**template_vars)
+        required_owner = "agent_id" if owner_scope == "agent" else "user_id"
+        for name, value in values.items():
+            if not isinstance(value, str) or (not value and name in {"account_id", required_owner}):
+                raise ValueError(f"{name} must be one safe URI path segment")
+            validate_utf8(value, name)
+            # Backends compare raw identities, so encoded principal syntax is
+            # unsupported. Dot paths/separators are normalized by filesystem
+            # routing; controls cannot be represented safely by the backends.
+            # Reject '..' anywhere to retain validate_uri's existing boundary.
+            if (value == "." or ".." in value
+                    or any(char in value for char in "/\\%")
+                    or any(unicodedata.category(char) in {"Cc", "Cs"} for char in value)):
+                raise ValueError(f"{name} must be one safe URI path segment")
+        return values
 
     def validate_uri(self, uri: str, ctx: RequestContext) -> bool:
         """Check if URI is within the schema-declared namespace.

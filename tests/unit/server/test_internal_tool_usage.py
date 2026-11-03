@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from core.models import RequestContext
 from providers.token_tracker import TokenTracker, usage_scope
@@ -500,6 +501,7 @@ def test_tool_usage_flush_failure_is_available_from_pending_snapshot():
 
 def test_dispose_flushes_tool_usage_for_completed_session(tmp_path):
     service = MemoryService(config=OgMemConfig())
+    service._get_context_fs = Mock(return_value=None)
     service._internal_tool_usage_store = InternalToolUsageStore(
         ControlPlaneStore(mount_prefix="", local_root=str(tmp_path))
     )

@@ -10,7 +10,6 @@ RUN_ROOT="${RUN_ROOT:-data/m3_runs_yuanjian/m3bench_random${SAMPLE_SIZE}_seed${S
 CONFIG="${CONFIG:-data/ogmem_test_lyj.resolved.yaml}"
 ANNOTATIONS="${ANNOTATIONS:-data/m3/annotations/robot.json}"
 VIDEOS_ROOT="${VIDEOS_ROOT:-data/m3/videos}"
-CV_SERVICE_URL="${CV_SERVICE_URL:-http://localhost:8081}"
 # false matches the successful 0918 experiment. Set true for an LLM that
 # cannot accept input_audio; ASR text will still be used.
 NO_AUDIO="${NO_AUDIO:-false}"
@@ -24,6 +23,10 @@ case "$ASR_VAD_MODE" in
 esac
 
 extra=()
+if [[ -n "${CV_SERVICE_URL:-}" ]]; then
+    # Explicit legacy override only; otherwise honor cv_service in --config.
+    extra+=(--set "detect_faces.params.cv_service_url=$CV_SERVICE_URL")
+fi
 if [[ -n "${EXCLUDE:-}" ]]; then
     extra+=(--exclude "$EXCLUDE")
 fi
@@ -61,10 +64,9 @@ uv run python scripts/run_m3_bench_subset.py \
     --set episodic_memory.params.force=true \
     --set "episodic_memory.params.no_audio=$NO_AUDIO" \
     --set detect_faces.params.backend=http \
-    --set "detect_faces.params.cv_service_url=$CV_SERVICE_URL" \
     --set detect_faces.params.force=true \
     --set "voice_asr.params.force=$asr_vad_force" \
     --set speaker_diarization.params.force=true \
     --set speaker_embedding.params.force=true \
     --set "voice_segmentation.params.force=$asr_vad_force" \
-    --judge "${extra[@]}" "$@" 2>&1 | tee -a "$RUN_ROOT/driver.log"
+    --judge ${extra[@]+"${extra[@]}"} "$@" 2>&1 | tee -a "$RUN_ROOT/driver.log"

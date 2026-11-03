@@ -14,12 +14,16 @@ def main():
     parser.add_argument('--dsn-env', default='VECTOR_DB_DSN', help='Environment variable holding DSN')
     parser.add_argument('--table', default='vector_index')
     parser.add_argument('--dimension', type=int, default=1536)
+    parser.add_argument('--dialect', choices=('opengauss', 'postgresql', 'auto'), default='opengauss')
     args = parser.parse_args()
     dsn = os.environ.get(args.dsn_env)
     if not dsn:
         parser.error(f'Set {args.dsn_env} to the vector database DSN')
-    index = OpenGaussVectorIndex(dsn, table_name=args.table, dimension=args.dimension)
-    changed = index.migrate_legacy_rows()
+    index = OpenGaussVectorIndex(dsn, table_name=args.table, dimension=args.dimension, dialect=args.dialect)
+    try:
+        changed = index.migrate_legacy_rows()
+    finally:
+        index.close()
     print('Legacy vector backfill completed.' if changed else 'Already migrated; no rows scanned.')
 
 

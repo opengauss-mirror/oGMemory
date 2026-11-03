@@ -527,6 +527,8 @@ def run(args: argparse.Namespace) -> int:
     # OGMemoryControlAdapter.run() is not re-entrant: each worker
     # thread gets its own adapter over the shared thread-safe graph /
     # embedder / answer LLM. The judge LLM is shared (thread-safe).
+    from m3.context_budget import load_context_budget
+
     def _build_adapter() -> OGMemoryControlAdapter:
         return OGMemoryControlAdapter(
             llm=answer_llm,
@@ -541,6 +543,7 @@ def run(args: argparse.Namespace) -> int:
             include_neighbors=getattr(args, "include_neighbors", 1),
             timeout_seconds=args.timeout_seconds,
             default_video_id=args.default_video_id,
+            context_budget=load_context_budget(args.config),
         )
 
     adapter_factory = ThreadLocalModels(_build_adapter, name="eval_adapter")

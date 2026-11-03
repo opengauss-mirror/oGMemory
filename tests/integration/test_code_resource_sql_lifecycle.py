@@ -66,10 +66,10 @@ def _node(account_id: str, slug: str) -> ContextNode:
     )
 
 
-def _assert_resource_round_trip(fs, account_id: str, slug: str) -> None:
+def _assert_resource_round_trip(fs, account_id: str, slug: str, outbox) -> None:
     ctx = _ctx(account_id)
     node = _node(account_id, slug)
-    fs.write_node(node, ctx)
+    fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
 
     loaded = fs.read_node(node.uri, ctx)
     fields = fs.read_node_fields(node.uri, ctx, "abstract")
@@ -322,12 +322,10 @@ def test_sql_code_resource_metadata_round_trip():
     slug = uuid.uuid4().hex
     pool = SharedConnectionPool(dsn, pool_size=1)
     fs = SQLContextFS(pool=pool)
-    node_uri = f"ctx://{account_id}/resources/{slug}"
     try:
-        _assert_resource_round_trip(fs, account_id, slug)
+        _assert_resource_round_trip(fs, account_id, slug, SQLOutboxStore(pool=pool, fs=fs))
     finally:
-        if fs.exists(node_uri, _ctx(account_id)):
-            fs.delete_node(node_uri, _ctx(account_id))
+        _cleanup_sql_account(pool, account_id)
         pool.close_all()
 
 @pytest.mark.integration

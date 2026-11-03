@@ -6,7 +6,9 @@ Across every phase of the Agent loop, manage what goes **in**, what **stays**, w
 Seven context types. Three-level cache hierarchy. One virtual filesystem.
 Cut token cost. Preserve signal density. Survive session boundaries.
 
-English | [中文](readme_zh.md)
+English | [中文](README_zh.md)
+
+Documentation: [docs/README.md](docs/README.md)
 </div>
 
 ---
@@ -288,6 +290,18 @@ The write path is designed so that the synchronous portion (extraction through a
 
 One vector search, not three sequential passes. L0/L1 hits serve as directory entry points for tree expansion — discovering relevant L2 content that flat search would miss due to embedding dilution in long documents.
 
+Hierarchical expansion is enabled by default. To search only L2 content,
+set `retrieval.expand_hierarchy: false` in the service YAML, or
+`OGMEM_RETRIEVAL_EXPAND_HIERARCHY=false` when the YAML field is omitted.
+The setting applies to the whole service instance and requires restarting
+every worker. When disabled, retrieval searches L2 directly and skips roots,
+hierarchical expansion, and child searches, including empty-result fallbacks.
+Existing ranking, top-k limits, access scope, optional content filling, and
+public URI/read behavior still apply. This removes expansion work but can
+lose results discovered through L0/L1 summaries; measure recall on your
+workload. See [retrieval configuration](config/README.md#hierarchical-retrieval-expansion)
+for precedence and accepted values.
+
 **Namespace isolation:** Queries are scoped by intent type. MEMORY queries search both `users/{user}/memories/` and `agents/{agent}/memories/`. SKILL queries search only `agents/{agent}/skills/`. The `owner_space` filter is set by the QueryPlanner based on `context_type` and `visible_owner_spaces`, enforced at the vector index level — callers cannot override it.
 
 ---
@@ -351,6 +365,15 @@ ContextEngine is not "vector RAG with extra steps." The fundamental differences 
 | **Compression** | Signal scoring + protected nodes + summary chain (Phase 2) | None | None |
 
 The core distinction: ContextEngine treats context as a **managed lifecycle**, not a store-and-retrieve problem. Write policies are not configuration — they're architectural decisions derived from information semantics. Retrieval is not a single operation — it's a three-stage decision process with budget awareness. And the system is designed to run continuously across sessions, not just serve queries.
+
+---
+
+## oGMemory Evaluation Results
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
+  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
+</picture>
 
 ---
 
@@ -527,8 +550,18 @@ result = write_api.commit_session([
 <summary><strong>Docker / HTTP API Reference</strong></summary>
 
 ```bash
-docker compose --profile with-db up   # Server on :8090, PostgreSQL on :5432
+# Configure .env, then follow deploy/compose/README_zh.md.
+bash deploy/compose/deploy.sh start
+
+# Multimodal stack: see deploy/README.md.
+cd deploy
+docker compose --profile with-db up
 ```
+
+The Compose stack runs oGMemory and openGauss images and preserves memory and database data in host directories.
+The current database image requires ARM64. Database and AGFS ports are internal.
+See [Docker Compose deployment and verification](deploy/compose/README_zh.md) for configuration,
+networking, model connectivity checks and cross-session persistence tests.
 
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
@@ -566,7 +599,7 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 | `SQL_CONNECTION_STRING` | — | SQL database DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
 | `OGMEM_CONFIG` | `ogmem.yaml` | Path to YAML config file |
-| `OGMEM_AFTER_TURN_THRESHOLD` | `200` | Pending token threshold before automatic after-turn extraction |
+| `OGMEM_AFTER_TURN_THRESHOLD` | `400` | Pending token threshold before automatic after-turn extraction |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | Enable Layer 2 rolling session compression |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | Use rule-based rolling fallback when LLM compression is unavailable |
 | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | One-time prepare token TTL in seconds |
@@ -579,41 +612,15 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 
 ### Repository Layout
 
-```
-ContextEngine/
-├── core/                   # Domain models, Protocol interfaces, enums, errors
-├── fs/sql_adapter/         # ContextFS → PostgreSQL adapter (atomic upsert, RLS tenant isolation)
-├── extraction/             # CandidateExtractor (ReAct loop + YAML SchemaRegistry)
-│   ├── prompts/            #   LLM prompt templates
-│   └── schemas/            #   YAML extraction schemas per context type
-├── commit/                 # Write chain: PolicyRouter → MergePolicy → ContextWriter
-├── index/                  # Async indexing: OutboxWorker → IndexRecordBuilder → VectorDB
-├── retrieval/              # Read chain: IntentClassifier → SeedRetriever → ResultRanker
-├── providers/              # External adapters: LLM, Embedder, VectorIndex, RelationStore
-│   ├── llm/                #   OpenAI-compatible LLM provider
-│   ├── embedder/           #   4 embedder backends (OpenAI, Volcengine, etc.)
-│   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   PostgreSQL relation store
-├── service/                # API layer: MemoryWriteAPI, MemoryReadAPI, multi-tenant
-├── server/                 # HTTP REST server (Flask), auth/RBAC, sessions
-├── session/                # SessionManager, TopicBuffer, RollingCompressor
-├── tests/
-│   ├── contract/           # Cross-team contract tests (invariants)
-│   ├── unit/               # Per-package unit tests
-│   ├── integration/        # End-to-end integration tests
-│   ├── e2e/                # LoCoMo benchmark evaluation framework
-│   └── fixtures/           # Shared test data
-├── docs/                   # Architecture, deployment, quickstart guides
-├── examples/               # Usage examples (SDK, Claude Code integration)
-├── cli/                    # Unified management CLI (ogmem command)
-├── plugins/ogmemory/       # Codex plugin (full-lifecycle HTTP hooks)
-├── openclaw_context_engine_plugin/  # OpenClaw plugin (TypeScript bridge)
-└── scripts/                # Auxiliary scripts
-```
+[Source directories](docs/architecture/repository-layout.md) · [Documentation](docs/README.md) · [Client integrations](docs/integrations/README.md)
 
 ---
 
 ## Codex Integration
+
+For portable memory retrieval and writing across clients, see the
+[Agent Plugin package](plugins/agent-plugins/README.md) and
+[client tutorial](docs/integrations/agent-plugins.md).
 
 The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all Codex lifecycle hooks to a local or remote oGMemory HTTP service. It captures sessions, prompts, tools, permissions, compaction, subagents, completed turns, and session shutdown. See the [Codex integration guide](docs/integrations/codex.md).
 
@@ -621,15 +628,15 @@ The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all C
 
 ## OpenCode Integration
 
-The npm-ready [`opencode-plugin`](opencode-plugin/) package provides automatic memory recall, incremental conversation write-back, and canonical Trace capture through OpenCode lifecycle hooks. It targets OpenCode 1.15.11 or later and operates above MCP; MCP remains available for explicit memory tools.
+The npm-ready [`plugins/opencode`](plugins/opencode/) package provides automatic memory recall, incremental conversation write-back, and canonical Trace capture through OpenCode lifecycle hooks. It targets OpenCode 1.15.11 or later and operates above MCP; MCP remains available for explicit memory tools.
 
-For source installation, configuration, privacy controls, and verification steps, see the [plugin README](opencode-plugin/README.md).
+For source installation, configuration, privacy controls, and verification steps, see the [plugin README](plugins/opencode/README.md).
 
 ---
 
 ## DeepSeek Harness Integration
 
-The installable [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle connects
+The installable [`plugins/deepseek-harness`](plugins/deepseek-harness/) bundle connects
 DeepSeek Harness to an oGMemory HTTP service and provides automatic cross-session
 memory recall.
 
@@ -637,9 +644,18 @@ See the [DeepSeek Harness integration guide](docs/integrations/deepseek-harness.
 
 ---
 
+## LangChain Deep Agents Integration
+
+Install `python -m pip install '.[deepagents]'` and pass
+`OGMemoryMiddleware` from `integrations.deepagents` to
+`create_deep_agent(middleware=[...])` for automatic recall and turn capture.
+Both sync and async execution are supported, with `configurable.thread_id`
+isolating sessions. See the [Deep Agents integration guide](docs/integrations/deepagents.md)
+and [example](examples/deepagents_memory.py).
+
 ## Hermes Agent Integration
 
-The native [`hermes_memory_plugin`](hermes_memory_plugin/) provider adds automatic
+The native [`plugins/hermes`](plugins/hermes/) provider adds automatic
 recall, turn write-back, session commit, and explicit `ogmemory_search` and
 `ogmemory_remember` tools to Hermes Agent.
 
@@ -653,14 +669,14 @@ See the [Hermes Agent integration guide](docs/integrations/hermes.md).
 ogmem onboard --mode plugin
 
 # Or install manually from the plugin source directory
-cd openclaw_context_engine_plugin && openclaw plugins install -l .
+cd plugins/openclaw && openclaw plugins install -l .
 ```
 
 `ogmem onboard --mode plugin` exports connection configuration for an **existing
 Agent and independently deployed oGMemory service**. It does not install the
 Agent/plugin, change active Agent settings, install backend dependencies, or
 start services. Select OpenClaw, Claude Code, Codex, OpenCode, DeepSeek Harness,
-or Hermes with `--agent`; other Agent names generate HTTP MCP configuration.
+Hermes, or Deep Agents with `--agent`; other Agent names generate HTTP MCP configuration.
 
 ```bash
 ogmem onboard --mode plugin --agent openclaw --non-interactive \
@@ -711,9 +727,9 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist and the remaining operational hardening for ⑥ session_end + dispose.
 
-**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
+**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](plugins/openclaw/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
 
-**MCP:** [Protocol compatibility](docs/mcp_protocol_compatibility.md)
+**MCP:** [Protocol compatibility](docs/integrations/mcp-protocol-compatibility.md)
 
 **Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
 
@@ -752,6 +768,10 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 ### Infrastructure
 - oGMemory uses an AGFS-backed hierarchical storage layer for durable, session-scoped memory resources
 - [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
+
+## SWE-bench reference workflow
+
+See [SWE-bench Lite testing guide and scripts](benchmarks/swebench/README.md) for baseline versus oGMemory with openGauss SQL storage, official evaluation, and usage reporting (guide in Chinese).
 
 ## License
 

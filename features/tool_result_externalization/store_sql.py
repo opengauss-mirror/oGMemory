@@ -77,6 +77,7 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
         return ArtifactMetadata.from_dict(raw)
 
     def write(self, metadata: ArtifactMetadata, output_text: str, ctx: RequestContext) -> bool:
+        self.bind_context(ctx, session_id=metadata.session_id)
         require_session_owner(metadata.session_id, ctx)
         if not metadata_visible(metadata, metadata.session_id, ctx):
             raise ArtifactNotVisibleError("not_found_or_not_visible")
@@ -145,6 +146,7 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
     def read_all(
         self, artifact_id: str, session_id: str, ctx: RequestContext
     ) -> tuple[ArtifactMetadata, str]:
+        self.bind_context(ctx, session_id=session_id)
         require_session_owner(session_id, ctx)
         conn = self._get_connection()
         try:
@@ -183,6 +185,7 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
         session_id: str,
         ctx: RequestContext,
     ) -> ArtifactMetadata:
+        self.bind_context(ctx, session_id=session_id)
         require_session_owner(session_id, ctx)
         conn = self._get_connection()
         try:
@@ -211,6 +214,7 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
         return metadata
 
     def read_range(self, artifact_id, session_id, ctx, offset_bytes, length_bytes):
+        self.bind_context(ctx, session_id=session_id)
         require_session_owner(session_id, ctx)
         if offset_bytes < 0 or length_bytes < 1:
             raise ValueError("offset_bytes must be non-negative and length_bytes must be positive")
@@ -263,6 +267,7 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
     def list(
         self, session_id: str, ctx: RequestContext, limit: int = 50, cursor: str | None = None
     ) -> dict:
+        self.bind_context(ctx, session_id=session_id)
         require_session_owner(session_id, ctx)
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
@@ -321,6 +326,7 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
         }
 
     def delete_session_artifacts(self, session_id: str, ctx: RequestContext) -> int:
+        self.bind_context(ctx, session_id=session_id)
         require_session_owner(session_id, ctx)
         conn = self._get_connection()
         try:

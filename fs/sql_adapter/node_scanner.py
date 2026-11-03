@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 
+from core.enums import EventType
 from core.models import ContextNode
 from fs.sql_adapter.pool import PoolAdapterMixin
 
@@ -43,9 +44,10 @@ class SQLCanonicalNodeScanner:
                     SELECT 1 FROM outbox_events
                     WHERE account_id=%s
                       AND status IN ('PENDING','PROCESSING')
+                      AND event_type <> %s
                     LIMIT 1
                     """,
-                    (account_id,),
+                    (account_id, EventType.EXTRACT_AGENT_MEMORY.value),
                 )
                 pending = cur.fetchone()
             conn.rollback()

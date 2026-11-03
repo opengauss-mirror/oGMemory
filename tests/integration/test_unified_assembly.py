@@ -19,19 +19,17 @@ Dependencies:
 Run with: pytest tests/integration/test_unified_assembly.py -v -s
 """
 
-import pytest
 import sys
 from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.models import RequestContext, RetrievedBlock, SearchMemoryResult
-from retrieval.result_ranker import ResultRanker
-from core.models import TokenBudget
-from retrieval.pipeline import RetrievalConfig
 from server.memory_service import MemoryService
 
 
@@ -492,7 +490,7 @@ class TestResultRankerIntegration:
     @patch('server.memory_service.MemoryService.get_read_api')
     def test_assembly_with_mock_providers(self, mock_get_read_api, sample_messages, sample_context):
         """Assembly works with mock providers (no external services)."""
-        from core.models import SearchMemoryResult, RetrievedBlock
+        from core.models import RetrievedBlock, SearchMemoryResult
 
         mock_api = Mock()
         mock_api.search_memory.return_value = SearchMemoryResult(
@@ -525,7 +523,10 @@ class TestResultRankerIntegration:
         assert isinstance(result["messages"], list)
 
         # Mock was called for memory search
-        mock_api.search_memory.assert_called_once()
+        assert mock_api.search_memory.call_count == 2
+        searches = mock_api.search_memory.call_args_list
+        assert searches[0].kwargs["top_k"] == 15
+        assert searches[1].kwargs["categories"] == ["session_summary"]
 
     def test_assembly_performance(self, sample_messages, sample_context):
         """Assembly completes within acceptable time limits."""

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import pytest
 
 from core.models import RequestContext
 from server.mcp_resources import (
     external_to_internal_uri,
+    external_to_internal_uri_candidates,
     internal_to_external_uri,
     parse_ogmemory_uri,
 )
@@ -58,6 +61,26 @@ def test_internal_uri_maps_to_external_without_leaking_ctx_uri():
         internal_to_external_uri("ctx://acct-1/users/alice/memories/preferences/coding")
         == "ogmemory://memories/preference/coding"
     )
+
+
+def test_public_uri_preserves_encoded_storage_fallback():
+    assert external_to_internal_uri_candidates(
+        "ogmemory://memories/preference/coffee%20shop", _ctx(),
+    ) == [
+        "ctx://acct-1/users/alice/memories/preferences/coffee shop",
+        "ctx://acct-1/users/alice/memories/preferences/coffee%20shop",
+    ]
+
+
+@pytest.mark.parametrize("directory,public_type,owner", [
+    ("entities", "entity", "users/alice"),
+    ("patterns", "pattern", "agents/bot"),
+])
+def test_unicode_memory_uri_roundtrip_matches_stored_uri(directory, public_type, owner):
+    internal = f"ctx://acct-1/{owner}/memories/{directory}/李雷"
+    public = internal_to_external_uri(internal, category=public_type)
+
+    assert external_to_internal_uri(public, _ctx()) == internal
 
 
 def test_internal_skill_uri_maps_to_public_skill_type():
@@ -143,3 +166,43 @@ def test_legacy_agent_pattern_uri_maps_to_scoped_public_uri():
 def test_public_uri_validation_rejects_unsafe_inputs(uri):
     with pytest.raises(ValueError):
         parse_ogmemory_uri(uri)
+
+
+@pytest.mark.parametrize("uri", [
+    "http://example.test/memory",
+    "https://example.test/memory",
+    "ogmemory://memories/preference/target?view=content",
+    "ogmemory://memories/preference/target#content",
+    "ogmemory://memories/preference/target?",
+    "ogmemory://memories/preference/target#",
+    "\nogmemory://memories/preference/target",
+    "ogmemory://memories/preference/tar\tget",
+    "ogmemory://memories/preference/target%00",
+    "ogmemory://memories/preference//target",
+    "ogmemory://memories/preference/target/",
+    "ogmemory://memories/preference/",
+    "ogmemory://status/",
+    "ogmemory://memories/preference/coffee shop",
+    "ogmemory://memories/preference/bad%GG",
+    "ogmemory://memories/preference/bad%FF",
+])
+def test_public_uri_rejects_text_that_changes_during_parsing(uri):
+    with pytest.raises(ValueError):
+        parse_ogmemory_uri(uri)
+
+
+def test_encoded_reserved_characters_remain_part_of_memory_name():
+    assert external_to_internal_uri(
+        "ogmemory://memories/preference/Symbols%3FHash%23%E6%A0%87%E8%AE%B0", _ctx()
+    ) == "ctx://acct-1/users/alice/memories/preferences/Symbols?Hash#标记"
+
+
+def test_historical_percent_escape_fallback_preserves_ascii_case():
+    encoded = quote("Mixed历史", safe="")
+    assert external_to_internal_uri_candidates(
+        "ogmemory://memories/preference/" + encoded, _ctx()
+    ) == [
+        "ctx://acct-1/users/alice/memories/preferences/Mixed历史",
+        "ctx://acct-1/users/alice/memories/preferences/" + encoded,
+        "ctx://acct-1/users/alice/memories/preferences/Mixed" + quote("历史", safe="").lower(),
+    ]

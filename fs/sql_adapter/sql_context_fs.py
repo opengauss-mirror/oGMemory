@@ -244,9 +244,11 @@ _RESOURCE_MUTATION_LOCK_NAMESPACE = "ogmemory:sql:code-resource-mutation:v1"
 # by ``SQLOutboxStore.processing_lock``.
 _TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS = 5
 _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS = 5.0
+_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS = 120.0
 _TOOL_OUTPUT_LOCK_POLL_SECONDS = 0.05
 _TOOL_OUTPUT_LOCK_MAX_CONNECTIONS = 8
 _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS = threading.BoundedSemaphore(_TOOL_OUTPUT_LOCK_MAX_CONNECTIONS)
+_MEMORY_IDENTITY_LOCK_STATE = threading.local()
 
 
 def _resource_mutation_lock_key(account_id: str, uri: str) -> int:
@@ -308,6 +310,62 @@ class SQLContextFS(PoolAdapterMixin):
             conn.rollback()
             raise RuntimeError(f"Failed to ensure schema: {exc}") from exc
         finally:
+            self._return_connection(conn)
+
+    def recovery_account_ids(self):
+        """Read the content-free scheduler directory before binding tenant RLS."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('statement_timeout', '30000', true)")
+                cur.execute("SELECT account_id FROM extraction_work_accounts ORDER BY account_id")
+                return [row[0] for row in cur.fetchall()]
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def find_archive_uri(self, archive_id: str, ctx: RequestContext) -> str | None:
+        """Resolve a unique canonical archive under the caller's account and owner."""
+        if not (ctx.user_id or ctx.agent_id):
+            return None
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT uri FROM context_nodes WHERE account_id = %s AND category = 'history' "
+                    "AND status = 'ACTIVE' AND metadata->>'archive_id' = %s "
+                    "AND metadata->>'owner_user_id' = %s "
+                    "AND (%s = '' OR metadata->>'owner_agent_id' = %s) LIMIT 2",
+                    (ctx.account_id, archive_id, ctx.user_id, ctx.agent_id, ctx.agent_id),
+                )
+                rows = cur.fetchall()
+            return rows[0][0] if len(rows) == 1 else None
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def scan_session_recovery(self, account_id, *, cursor=None, limit=32):
+        """Page through canonical session metadata for the service recovery worker."""
+        limit = max(1, min(int(limit), 50))
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('statement_timeout', '30000', true)")
+                cur.execute(
+                    "SELECT uri, owner_space, metadata, version, updated_at FROM context_nodes "
+                    "WHERE account_id=%s AND category='state' AND status='ACTIVE' AND uri>%s "
+                    "ORDER BY uri LIMIT %s",
+                    (account_id, cursor or "", limit),
+                )
+                rows = [{"uri": row[0], "owner_space": row[1],
+                         "metadata": json.loads(row[2]) if isinstance(row[2], str) else row[2],
+                         "version": row[3], "updated_at": str(row[4])}
+                        for row in cur.fetchall()]
+            return rows, rows[-1]["uri"] if len(rows) == limit else None
+        finally:
+            conn.rollback()
             self._return_connection(conn)
 
     def read_code_workspace_root_binding(
@@ -397,7 +455,8 @@ class SQLContextFS(PoolAdapterMixin):
     # Access control (reuses parse_uri from agfs_adapter)
     # ------------------------------------------------------------------
 
-    def _is_accessible(self, uri: str, ctx: RequestContext) -> bool:
+    @staticmethod
+    def _is_accessible(uri: str, ctx: RequestContext) -> bool:
         """Check URI accessibility with visible_owner_spaces support (SQL mode)."""
         try:
             components = parse_uri(uri)
@@ -405,8 +464,13 @@ class SQLContextFS(PoolAdapterMixin):
         except ValueError:
             return False
 
-    def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
-        if not self._is_accessible(uri, ctx):
+    @classmethod
+    def _ensure_accessible(cls, uri: str, ctx: RequestContext) -> None:
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            guard.check_context(ctx)
+        if not cls._is_accessible(uri, ctx):
             try:
                 components = parse_uri(uri)
                 owner_id = components.get("owner_id", "")
@@ -484,7 +548,38 @@ class SQLContextFS(PoolAdapterMixin):
         )
 
     @contextmanager
-    def tool_output_mutation_lock(self, uri: str, ctx: RequestContext):
+    def session_mutation_lock(self, uri: str, ctx: RequestContext, *, timeout_seconds=1.0):
+        """Fence session mutations on the same SQL connection as their writes."""
+        from session.session_state import SessionState
+        if uri != SessionState.state_uri(ctx.account_id, ctx.session_id):
+            raise ValueError("session mutation lock requires its canonical state URI")
+        self._ensure_accessible(uri, ctx)
+        with self.configured_session_mutation_lock(
+            self._connection_string, ctx, timeout_seconds=timeout_seconds, dialect=self._sql_dialect,
+        ) as guard:
+            yield guard
+
+    def requires_thread_bound_access(self):
+        """Native extraction must keep lazy reads on its owning SQL thread."""
+        from fs.sql_adapter.session_mutation import active_session_guard
+        return active_session_guard() is not None
+
+    @staticmethod
+    @contextmanager
+    def configured_session_mutation_lock(dsn, ctx, *, timeout_seconds=1.0, dialect="postgresql"):
+        """Acquire before constructing stores, which otherwise borrow from their pool."""
+        from fs.sql_adapter.session_mutation import session_mutation_scope
+        from session.session_state import SessionState
+        uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
+        with session_mutation_scope(dsn, ctx, _resource_mutation_lock_key(ctx.account_id, uri),
+                                    _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS, timeout_seconds,
+                                    dialect=dialect) as guard:
+            yield guard
+
+    @contextmanager
+    def tool_output_mutation_lock(
+        self, uri: str, ctx: RequestContext, *, timeout_seconds: float = _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS,
+    ):
         """Hold a shared account/Agent lock for Tool Output retention.
 
         Tool-output repository operations use separate ContextFS calls, so a
@@ -498,11 +593,20 @@ class SQLContextFS(PoolAdapterMixin):
         """
 
         self._ensure_accessible(uri, ctx)
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            with guard.identity_lock(
+                _resource_mutation_lock_key(ctx.account_id, str(uri).rstrip("/")), ctx,
+                min(timeout_seconds, 1.0),
+            ):
+                yield
+            return
         connect = getattr(psycopg2, "connect", None)
         if not callable(connect):
             raise RuntimeError("PostgreSQL advisory locking is unavailable")
 
-        deadline = time.monotonic() + _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.acquire(timeout=remaining):
             raise TimeoutError("timed out waiting for a SQL tool-output lock connection")
@@ -537,7 +641,7 @@ class SQLContextFS(PoolAdapterMixin):
                     if acquired:
                         break
                     time.sleep(min(_TOOL_OUTPUT_LOCK_POLL_SECONDS, remaining))
-            yield
+            yield conn
         finally:
             try:
                 if acquired and conn is not None:
@@ -569,6 +673,36 @@ class SQLContextFS(PoolAdapterMixin):
                             exc_info=True,
                         )
                 _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.release()
+
+    @contextmanager
+    def memory_identity_lock(self, directory: str, ctx: RequestContext):
+        from fs.sql_adapter.session_mutation import SQLSessionGuard, active_session_guard
+        active = active_session_guard()
+        guard = active or getattr(_MEMORY_IDENTITY_LOCK_STATE, "guard", None)
+        key = _resource_mutation_lock_key(ctx.account_id, directory)
+        if guard is not None:
+            self._ensure_accessible(directory, ctx)
+            guard.check_database(self._connection_string, self.sql_dialect.name)
+            timeout = 1.0 if active else _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS
+            if active and getattr(active, "wait_for_identity_lock", False):
+                from core.operation_deadline import remaining_seconds
+                remaining = remaining_seconds()
+                timeout = (_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS if remaining is None
+                           else min(_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS, remaining))
+            with guard.identity_lock(key, ctx, timeout):
+                yield
+            return
+        with self.tool_output_mutation_lock(
+            directory, ctx, timeout_seconds=_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS,
+        ) as conn:
+            conn.rollback()
+            # Reuse the lock session while ordinary store operations keep their own transactions.
+            _MEMORY_IDENTITY_LOCK_STATE.guard = SQLSessionGuard(
+                conn, self._connection_string, ctx, key, self.sql_dialect.name)
+            try:
+                yield
+            finally:
+                _MEMORY_IDENTITY_LOCK_STATE.guard = None
 
     def _guard_code_resource_write(
         self,
@@ -612,6 +746,8 @@ class SQLContextFS(PoolAdapterMixin):
 
         Shared by write_node and write_node_with_outbox to avoid duplication.
         """
+        if node.category == "state":
+            self.sql_dialect.ensure_extraction_work_account(cur, account_id)
         if expected_version is not None and not create_only:
             cur.execute(
                 """
@@ -829,21 +965,23 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT uri, context_type, category, level, owner_space,
-                           abstract, overview, content, relations, metadata,
-                           status, created_at, updated_at, version
-                    FROM context_nodes
-                    WHERE uri = %s
-                    """,
-                    (uri,),
-                )
-                row = cur.fetchone()
+                return self.read_node_with_cursor(cur, uri, ctx)
         finally:
             conn.rollback()  # Reset SET LOCAL for RLS
             self._return_connection(conn)
 
+    @classmethod
+    def read_node_with_cursor(cls, cursor, uri: str, ctx: RequestContext) -> ContextNode:
+        """Read canonical evidence inside the caller's tenant-bound transaction."""
+        cls._ensure_accessible(uri, ctx)
+        cursor.execute(
+            "SELECT uri, context_type, category, level, owner_space, "
+            "abstract, overview, content, relations, metadata, "
+            "status, created_at, updated_at, version "
+            "FROM context_nodes WHERE account_id=%s AND uri=%s",
+            (ctx.account_id, uri),
+        )
+        row = cursor.fetchone()
         if row is None:
             raise NodeNotFoundError(uri)
 
@@ -995,6 +1133,23 @@ class SQLContextFS(PoolAdapterMixin):
                 return cur.fetchone() is not None
         finally:
             conn.rollback()  # Reset SET LOCAL for RLS
+            self._return_connection(conn)
+
+    def archived_node_version(self, uri: str, ctx: RequestContext) -> int | None:
+        self._ensure_accessible(uri, ctx)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT version FROM context_nodes "
+                    "WHERE uri = %s AND account_id = %s AND status = 'ARCHIVED'",
+                    (uri, ctx.account_id),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            conn.rollback()
             self._return_connection(conn)
 
     def delete_node(self, uri: str, ctx: RequestContext) -> None:
@@ -1245,6 +1400,49 @@ class SQLContextFS(PoolAdapterMixin):
                 children.append(child_uri)
 
         return children
+
+    def count_memory_children(self, ctx: RequestContext) -> dict[str, int]:
+        """Count active memory items by parent directory in one scoped query."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT regexp_replace(uri, '/[^/]+$', '') AS parent, category, COUNT(*)
+                    FROM context_nodes
+                    WHERE account_id = %s AND status = 'ACTIVE'
+                      AND category = ANY(%s)
+                      AND (position('/memories/' in uri) > 0)
+                    GROUP BY parent, category
+                    """,
+                    (
+                        ctx.account_id,
+                        ["profile", "preference", "entity", "event", "case", "pattern",
+                         "tool", "experience", "session_summary", "session_archive"],
+                    ),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        directories = {}
+        allowed = {
+            "profile": "profile", "preferences": "preference", "entities": "entity",
+            "events": "event", "cases": "case", "patterns": "pattern",
+            "tools": "tool", "tool_units": "tool", "experiences": "experience", "session_summaries": "session_summary",
+            "session_archives": "session_archive",
+        }
+        for parent, category, count in rows:
+            parts = parent.split("/")
+            if len(parts) == 7 and parts[3] in {"users", "agents"} and parts[5] == "memories":
+                if allowed.get(parts[6]) == category:
+                    directories[parent] = int(count)
+            elif len(parts) == 6 and parts[3] == "users" and parts[5] == "memories":
+                if category == "profile":
+                    directories[parent + "/profile"] = int(count)
+        return directories
 
     def list_node_summaries(
         self, uri: str, ctx: RequestContext, limit: int = 50

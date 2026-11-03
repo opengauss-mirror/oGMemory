@@ -48,6 +48,8 @@ def mock_store():
          patch("session.sql_archive_store.Json", mock_json), \
          patch("session.sql_archive_store._HAS_PSYCOPG2", True):
         mock_conn = MagicMock()
+        mock_conn.autocommit = False
+        mock_conn.get_transaction_status.return_value = 0
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)

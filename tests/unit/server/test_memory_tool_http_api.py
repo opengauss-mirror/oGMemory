@@ -153,3 +153,26 @@ def test_memory_read_routes_reject_invalid_integer_parameters(
     )
 
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize("session_key", ["sessionId", "session_id"])
+def test_write_route_persists_trace_for_the_requested_session(monkeypatch, session_key):
+    from tests.unit.server.test_mcp_tools_write import _StoredService
+
+    service = _StoredService()
+    monkeypatch.setattr(app_module, "_service", service)
+    monkeypatch.setattr(app_module, "_build_authenticated_context", service.build_context)
+    client = app_module.app.test_client()
+    for session_id in ["session-a", "session-b", "session-a"]:
+        response = client.post("/api/v1/memories/write", json={
+            session_key: session_id, "text": "Remember blue.", "client_request_id": "same-request",
+        })
+        assert response.status_code == 200
+        assert response.json["ok"] is True
+        turns = service.store._read_state(
+            "acct-1", collections=("turns",), session_id=session_id,
+        )["turns"]
+        assert len(turns) == 1
+        turn = next(iter(turns.values()))
+        assert turn["session_id"] == session_id
+        assert [event["event_type"] for event in turn["content"]] == ["user_message", "turn_end"]

@@ -167,6 +167,17 @@ def test_tool_output_mutation_lock_uses_a_shared_session_advisory_lock(mock_sql_
     conn.close.assert_called_once()
 
 
+def test_memory_identity_lock_holds_a_session_advisory_lock(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    directory = "ctx://acme/users/alice/memories/preferences"
+
+    with fs.memory_identity_lock(directory, _ctx()):
+        assert any("pg_try_advisory_lock" in sql for sql in _sql_calls(cursor))
+
+    assert any("pg_advisory_unlock" in sql for sql in _sql_calls(cursor))
+    conn.close.assert_called_once()
+
+
 def test_tool_output_mutation_lock_times_out_without_unlocking_unowned_lock(
     mock_sql_fs,
 ):
@@ -223,6 +234,28 @@ def test_tool_output_mutation_lock_bounds_extra_connection_slots(mock_sql_fs):
     cursor.execute.assert_not_called()
 
 
+@pytest.mark.parametrize("remaining, expected", [(None, 120.0), (3.0, 3.0)])
+def test_guarded_memory_identity_wait_uses_caller_deadline(mock_sql_fs, remaining, expected):
+    from contextlib import nullcontext
+
+    fs, _, _ = mock_sql_fs
+    guard = MagicMock()
+    guard.wait_for_identity_lock = True
+    guard.identity_lock.return_value = nullcontext()
+    directory = "ctx://acme/users/alice/memories/preferences"
+
+    with (
+        patch("fs.sql_adapter.session_mutation.active_session_guard", return_value=guard),
+        patch("core.operation_deadline.remaining_seconds", return_value=remaining),
+        fs.memory_identity_lock(directory, _ctx()),
+    ):
+        pass
+
+    guard.identity_lock.assert_called_once_with(
+        _resource_mutation_lock_key("acme", directory), _ctx(), expected,
+    )
+
+
 @pytest.fixture
 def mock_sql_fs():
     """Create SQLContextFS with mocked psycopg2."""
@@ -255,6 +288,17 @@ def mock_sql_fs():
         fs._return_connection = lambda c: None
 
         yield fs, mock_conn, mock_cursor
+
+
+def test_inventory_counts_agent_tools_and_experiences(mock_sql_fs):
+    fs, _, cursor = mock_sql_fs
+    tools = "ctx://acme/agents/main/memories/tools"
+    experiences = "ctx://acme/agents/main/memories/experiences"
+    cursor.fetchall.return_value = [(tools, "tool", 3), (experiences, "experience", 2)]
+
+    assert fs.count_memory_children(_ctx()) == {tools: 3, experiences: 2}
+    query = next(call for call in cursor.execute.call_args_list if "GROUP BY parent" in call.args[0])
+    assert {"tool", "experience"} <= set(query.args[1][1])
 
 
 class TestSQLContextFSWriteNode:
@@ -678,6 +722,14 @@ class TestSQLContextFSExists:
         cursor.fetchone.return_value = None
 
         assert fs.exists("ctx://acme/users/alice/memories/profile", ctx) is False
+
+    def test_archived_node_version(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        ctx = _ctx()
+        cursor.fetchone.return_value = (4,)
+
+        assert fs.archived_node_version("ctx://acme/users/alice/memories/preferences/pets", ctx) == 4
+        assert "status = 'ARCHIVED'" in _sql_calls(cursor)[-1]
 
     def test_exists_access_denied(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs

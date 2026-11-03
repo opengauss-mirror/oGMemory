@@ -11,6 +11,10 @@ from fs.sql_adapter.dialect import POSTGRESQL, SQLDialect
 class PostgreSQLDialect(SQLDialect):
     name = POSTGRESQL
 
+    def ensure_extraction_work_account(self, cursor: Any, account_id: str) -> None:
+        cursor.execute("INSERT INTO extraction_work_accounts (account_id) VALUES (%s) "
+                       "ON CONFLICT (account_id) DO NOTHING", (account_id,))
+
     def ensure_workspace_root(self, cursor: Any, account_id: str, root_id: str) -> None:
         cursor.execute(
             "INSERT INTO code_workspace_sync_roots (account_id, root_id) "

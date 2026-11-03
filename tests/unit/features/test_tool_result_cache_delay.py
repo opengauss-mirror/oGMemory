@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import providers.unified_config as unified_config
 from core.models import RequestContext
 from features.tool_result_externalization.externalizer import (
     ToolResultExternalizer,
@@ -19,7 +20,6 @@ from features.tool_result_externalization.store_base import (
 from features.tool_result_externalization.store_local import LocalToolResultArtifactStore
 from features.tool_result_externalization.synopsis import ToolResultSynopsisBuilder
 from features.tool_result_optimization.cache_delay import ToolResultCacheDelay
-import providers.unified_config as unified_config
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 
@@ -87,7 +87,9 @@ def _register_user_message_turn(
 
 def _isolate_service(service: MemoryService) -> MemoryService:
     service._get_archive_store = lambda: None
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     return service
@@ -458,12 +460,15 @@ def test_memory_service_cache_delay_persists_stub_then_switches_caller_after_ttl
             tool_result_cache_delay_enabled=True,
             tool_result_cache_delay_chars=10,
             tool_result_cache_delay_idle_ttl_seconds=30,
+            after_turn_threshold=999_999,
         ),
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     )
     now = [datetime.now(UTC) + timedelta(seconds=1)]
     service._tool_result_governance._tool_result_cache_delay.clock = lambda: now[0]
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     turn = _user_message_tool_turn("d" * 2_500, "message-1")
@@ -514,7 +519,9 @@ def test_cache_delay_never_cold_rewrites_bounded_read_source_fragments(tmp_path)
     start = datetime(2026, 1, 1, tzinfo=UTC)
     now = [start]
     service._tool_result_governance._tool_result_cache_delay.clock = lambda: now[0]
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     first_view = service.govern_first_view_tool_result({
@@ -603,7 +610,9 @@ def test_cache_delay_never_cold_rewrites_precise_search_source_collection(tmp_pa
     start = datetime(2026, 1, 1, tzinfo=UTC)
     now = [start]
     service._tool_result_governance._tool_result_cache_delay.clock = lambda: now[0]
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     first_view = service.govern_first_view_tool_result({
@@ -691,7 +700,9 @@ def test_cache_delay_turn_completion_anchors_first_post_ttl_cold_view(tmp_path):
     start = datetime(2026, 1, 1, tzinfo=UTC)
     now = [start]
     service._tool_result_governance._tool_result_cache_delay.clock = lambda: now[0]
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     turn = _user_message_tool_turn("a" * 2_500, "async-message")
@@ -750,7 +761,9 @@ def test_memory_service_cache_delay_threshold_boundaries(tmp_path):
         ),
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     )
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
 
@@ -800,18 +813,19 @@ def test_memory_service_cache_delay_state_save_failure_preserves_hot_caller(tmp_
         ),
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     )
+    service._get_context_fs = lambda: None
     message = _tool_message("f" * 20, "message-1")
     service.ingest({
         "sessionId": "session", "messages": [message], "_ctx": _ctx(),
     })
     controller = service._tool_result_governance._tool_result_cache_delay
     controller.clock = lambda: datetime(2026, 1, 2, tzinfo=UTC)
-    buffer = service.get_session_manager().get_or_create("session", ctx=_ctx())
+    manager = service.get_session_manager()
+    buffer = manager.get_or_create("session", ctx=_ctx())
     buffer.runtime_extensions[controller.STATE_KEY] = {
         "last_model_request_at": "2026-01-01T00:00:00+00:00",
         "cold_cutover_before": "2026-01-01T00:00:00+00:00",
     }
-    manager = service.get_session_manager()
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: False
 

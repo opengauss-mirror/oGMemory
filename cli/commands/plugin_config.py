@@ -18,8 +18,8 @@ from urllib.parse import urlsplit
 from cli.lib.colors import fail, info, ok
 from cli.lib.prompt import input_masked, input_validated, select
 
-NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "opencode", "deepseek-harness", "hermes")
-ALIASES = {"claude": "claude-code", "claude_hooks": "claude-code", "dsh": "deepseek-harness"}
+NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "opencode", "deepseek-harness", "hermes", "deepagents")
+ALIASES = {"claude": "claude-code", "claude_hooks": "claude-code", "dsh": "deepseek-harness", "deepagent": "deepagents"}
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,29 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
     """Render only formats consumed by the existing native adapters or MCP."""
     c = connection
     identity = {"accountId": c.account_id, "userId": c.user_id, "agentId": c.agent_id}
-    if adapter == "openclaw":
+    if adapter == "agent-plugins":
+        if urlsplit(c.url).scheme == "http" and urlsplit(c.url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("The Agent Plugin requires HTTPS for non-loopback endpoints")
+        files = {"agent-plugin.json": _json({
+            "mcp_url": c.url, "api_key": c.api_key or "<OGMEM_TENANT_API_KEY>",
+            "account_id": c.account_id, "user_id": c.user_id,
+            "agent_id": c.agent_id, "timeout_ms": 30000,
+        })}
+        steps = (
+            "1. Obtain the plugins/agent-plugins/ directory from the oGMemory repository or release ZIP. "
+            "Install Node.js 22 or newer on the Agent machine.\n"
+            "2. Copy agent-plugin.json to ~/.ogmemory/agent-plugin.json or set "
+            "OGMEM_AGENT_PLUGIN_CONFIG to its absolute path. Replace any key placeholder.\n"
+            "3. Load plugins/agent-plugins/ in an Agent Plugins 1.0 client. For a generic MCP client, "
+            "configure command=node, args=[/absolute/path/plugins/agent-plugins/servers/mcp-proxy.mjs] "
+            "and load skills/ogmemory-memory/SKILL.md as a Skill or Agent instruction.\n"
+            "4. Run node /absolute/path/plugins/agent-plugins/scripts/doctor.mjs. "
+            "The expected tools are ogm_query_memory, ogm_read_memory and ogm_write_memory. "
+            "The service must enable memory writes for the third tool.\n"
+            "5. Follow docs/integrations/agent-plugins.md for OpenClaw, DSH, Claude Code and Codex. "
+            "This is model-driven memory, without lifecycle hooks.\n"
+        )
+    elif adapter == "openclaw":
         files = {"openclaw.config.patch.json": _json({
             "plugins": {
                 "slots": {"contextEngine": "og-memory-context-engine"},
@@ -94,7 +116,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
         })}
         steps = (
             "1. If needed, install the plugin on the Agent machine:\n\n"
-            "       openclaw plugins install --link /path/to/oGMemory/openclaw_context_engine_plugin\n\n"
+            "       openclaw plugins install --link /path/to/oGMemory/plugins/openclaw\n\n"
             "2. Merge openclaw.config.patch.json into the active OpenClaw config "
             "(OPENCLAW_CONFIG_PATH, or the selected profile's openclaw.json). "
             "Preserve unrelated settings and entries. If a plugins.allow list exists, "
@@ -113,7 +135,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "1. Merge the env entries from claude.settings.patch.json into the "
             "target project's .claude/settings.json or your user settings; preserve other settings.\n"
             "2. Load the oGMemory plugin. For a source checkout on the Agent machine:\n\n"
-            "       claude --plugin-dir /path/to/oGMemory/claude-plugin\n\n"
+            "       claude --plugin-dir /path/to/oGMemory/plugins/claude-code\n\n"
             "   If already installed through your marketplace, reload that plugin instead.\n"
             "3. Review/trust its hooks and open a new session. Hook scripts require Python 3.\n"
         )
@@ -149,7 +171,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "2. Copy ogmemory-config.json to ~/.config/opencode/ogmemory-config.json "
             "(Windows: %USERPROFILE%/.config/opencode/ogmemory-config.json).\n"
             "3. Restart OpenCode; it installs the declared npm plugin. Requires OpenCode >= 1.15.11 "
-            "and Node.js >= 18. Source installation is described in opencode-plugin/INSTALL-ZH.md.\n"
+            "and Node.js >= 18. Source installation is described in plugins/opencode/INSTALL-ZH.md.\n"
         )
     elif adapter == "deepseek-harness":
         if urlsplit(c.url).scheme == "http" and urlsplit(c.url).hostname not in {"localhost", "127.0.0.1"}:
@@ -166,6 +188,38 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "from that shell. Substitute your existing profile for web if appropriate.\n"
             "3. Use 'dsh --profile web --dump-config' to check ogmemory-lifecycle is loaded.\n"
         )
+    elif adapter == "deepagents":
+        files = _environment_files({
+            "OGMEM_URL": c.url, "OGMEM_API_KEY": c.api_key,
+            "OGMEM_ACCOUNT_ID": c.account_id, "OGMEM_USER_ID": c.user_id,
+            "OGMEM_AGENT_ID": c.agent_id,
+        })
+        files["ogmemory_deepagents.py"] = (
+            "from deepagents import create_deep_agent\n"
+            "from integrations.deepagents import OGMemoryMiddleware\n"
+            "from langgraph.checkpoint.memory import InMemorySaver\n\n"
+            "memory = OGMemoryMiddleware.from_env()\n"
+            "agent = create_deep_agent(middleware=[memory], checkpointer=InMemorySaver())\n\n"
+            "if __name__ == '__main__':\n"
+            "    from uuid import uuid4\n"
+            "    thread_id = str(uuid4())\n"
+            "    result = agent.invoke(\n"
+            "        {'messages': [{'role': 'user', 'content': 'What do you remember about me?'}]},\n"
+            "        config={'configurable': {'thread_id': thread_id}},\n"
+            "    )\n"
+            "    print(result['messages'][-1].content)\n"
+            "    memory.dispose(thread_id)\n"
+        )
+        steps = (
+            "1. Install this oGMemory checkout on the Agent machine: "
+            "python -m pip install '.[deepagents]'.\n"
+            "2. Load one of the environment scripts and configure your Deep Agents "
+            "model provider credentials separately.\n"
+            "3. Run ogmemory_deepagents.py or pass OGMemoryMiddleware.from_env() "
+            "in your existing create_deep_agent(middleware=[...]) call.\n"
+            "4. Supply a stable configurable.thread_id per conversation; use a new ID "
+            "for a new conversation. Call memory.dispose(thread_id) when it ends.\n"
+        )
     elif adapter == "hermes":
         files = {"hermes.config.patch.yaml": "memory:\n  provider: ogmemory\n"}
         files.update(_environment_files({
@@ -174,7 +228,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "OGMEMORY_AGENT_ID": c.agent_id,
         }))
         steps = (
-            "1. If needed, copy the repository's hermes_memory_plugin/ogmemory/ directory "
+            "1. If needed, copy the repository's plugins/hermes/ogmemory/ directory "
             "to the active HERMES_HOME/plugins/ogmemory/ directory "
             "(default: ~/.hermes/plugins/ogmemory/) on the Agent machine.\n"
             "2. Merge hermes.config.patch.yaml into that profile's config.yaml. "
@@ -223,7 +277,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
         + (
             "Check MCP connection/authentication and tool listing from the Agent. "
             "A REST health check alone does not verify MCP.\n"
-            if adapter == "mcp" else
+            if adapter in {"mcp", "agent-plugins"} else
             "Check /api/v1/health on the configured oGMemory API from the Agent machine, "
             "then complete a test conversation and verify its recall/writeback in a new session. "
             "A reachable server alone does not prove the plugin is installed or active.\n"
@@ -252,21 +306,22 @@ def run(args) -> int:
     interactive = not getattr(args, "non_interactive", False) and sys.stdin.isatty()
     requested = getattr(args, "agent", None)
     if not requested:
-        choices = [*NATIVE_AGENTS, "Other Agent (MCP)"]
+        choices = [*NATIVE_AGENTS, "Other Agent (MCP)", "agent-plugins"]
         requested = choices[select("Existing Agent:", choices)] if interactive else "openclaw"
     requested = requested.strip().lower()
     agent = ALIASES.get(requested, requested)
-    adapter = agent if agent in NATIVE_AGENTS else "mcp"
+    adapter = agent if agent in (*NATIVE_AGENTS, "agent-plugins") else "mcp"
+    uses_mcp = adapter in {"mcp", "agent-plugins"}
 
     try:
-        field = "mcp_url" if adapter == "mcp" else "ogmem_url"
+        field = "mcp_url" if uses_mcp else "ogmem_url"
         url = getattr(args, field, None)
         if not url:
-            if adapter == "mcp" and not interactive:
+            if uses_mcp and not interactive:
                 raise ValueError("MCP export requires --mcp-url with the full MCP port and path")
-            default = "http://127.0.0.1:8091/mcp" if adapter == "mcp" else f"http://127.0.0.1:{args.port}"
-            url = input_validated("MCP URL" if adapter == "mcp" else "oGMemory API base URL", default) if interactive else default
-        url = normalize_url(url, mcp=adapter == "mcp")
+            default = "http://127.0.0.1:8091/mcp" if uses_mcp else f"http://127.0.0.1:{args.port}"
+            url = input_validated("MCP URL" if uses_mcp else "oGMemory API base URL", default) if interactive else default
+        url = normalize_url(url, mcp=uses_mcp)
 
         key = getattr(args, "ogmem_api_key", None)
         key_env = getattr(args, "ogmem_api_key_env", None)

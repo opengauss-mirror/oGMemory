@@ -4,16 +4,16 @@
   "private": true,
   "description": "Install oGMemory integration directly into DeepSeek Harness from GitCode",
   "type": "module",
-  "main": "./deepseek-harness-plugin/index.js",
-  "exports": "./deepseek-harness-plugin/index.js",
+  "main": "./plugins/deepseek-harness/index.js",
+  "exports": "./plugins/deepseek-harness/index.js",
   "files": [
-    "deepseek-harness-plugin/index.js",
-    "deepseek-harness-plugin/lib",
-    "deepseek-harness-plugin/cordis.patch.yml"
+    "plugins/deepseek-harness/index.js",
+    "plugins/deepseek-harness/lib",
+    "plugins/deepseek-harness/cordis.patch.yml"
   ],
   "dsh": {
     "bundle": {
-      "patch": "./deepseek-harness-plugin/cordis.patch.yml"
+      "patch": "./plugins/deepseek-harness/cordis.patch.yml"
     }
   },
   "engines": {

@@ -22,6 +22,11 @@ INDEXABLE_METADATA_FIELDS = frozenset(
         "updated_at",
         "level",
         "uri",
+        "unit_key",
+        "agent_memory_unit_key",
+        "unit_revision",
+        "agent_memory_version",
+        "grounding",
     }
 )
 

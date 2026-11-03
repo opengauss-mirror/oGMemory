@@ -9,16 +9,20 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import replace
 from typing import Optional
 
+from commit import CandidatePipeline, ContextWriter, OutboxStore
+from commit.write_receipts import WriteDeadlineExceededError, WriteNotStartedError, receipt_plan
+from core.errors import ConcurrentModificationError, ExtractionIncompleteError
+from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
+from core.models import CandidateMemory, RequestContext, WritePlan
+from core.operation_deadline import check_deadline, remaining_seconds
+from extraction import Extractor
+from extraction.node_processing import NodeProcessor, serialized_topics
 
 logger = get_logger(__name__)
-from core.interfaces import ContextFS, LLM, CandidateExtractor
-from core.models import RequestContext, CandidateMemory, WritePlan
-from commit import ContextWriter, CandidatePipeline, OutboxStore
-from extraction import Extractor
 
 
 class MemoryWriteAPI:
@@ -45,6 +49,10 @@ class MemoryWriteAPI:
 internal_tool_usage_tracker=None,
         extraction_mode: str = "eager",
         directory_summary_enabled: bool = True,
+        source_occurrence_reconciliation_enabled: bool = False,
+        card_format_enabled: bool = False,
+        dual_pass_enabled: bool = True,
+        node_processing_enabled: bool = False,
     ):
         """Initialize the API with required dependencies.
 
@@ -68,6 +76,12 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._uri_resolver = uri_resolver
         self._internal_tool_usage_tracker = internal_tool_usage_tracker
         self._extraction_mode = extraction_mode
+        if type(source_occurrence_reconciliation_enabled) is not bool:
+            raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
+        self._source_occurrence_reconciliation_enabled = source_occurrence_reconciliation_enabled
+        self._card_format_enabled = card_format_enabled
+        self._dual_pass_enabled = dual_pass_enabled
+        self._node_processing_enabled = node_processing_enabled
 
         # Auto-create SchemaRegistry if not provided
         if schema_registry is None:
@@ -76,14 +90,24 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._schema_registry = schema_registry
 
         # Initialize write components
+        from commit.identity_resolver import MemoryIdentityResolver
         from commit.policy_router import PolicyRouter
-        policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
+        from core.uri_resolver import URIResolver
+        write_uris = uri_resolver or URIResolver(schema_registry)
+        policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=write_uris)
+        from commit.archive_builder import ArchiveBuilder
+
         self._writer = ContextWriter(
             fs,
             llm=self._llm,
             outbox_store=outbox_store,
             policy_router=policy_router,
+            archive_builder=ArchiveBuilder(self._llm, schema_registry=schema_registry,
+                                          card_format_enabled=card_format_enabled),
             directory_summary_enabled=directory_summary_enabled,
+            identity_resolver=MemoryIdentityResolver(
+                fs, write_uris, schema_registry=schema_registry, policy_router=policy_router,
+            ),
         )
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
@@ -103,26 +127,41 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 self._llm,
                 prompt_manager=pm,
                 mode=self._extraction_mode,
+                source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
+                dual_pass_enabled=self._dual_pass_enabled,
+                node_processing_enabled=self._node_processing_enabled,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
+                occurrence_update_eligible=lambda candidate: bool(
+                    self._writer._identity_resolver
+                    and self._writer._identity_resolver.handles(candidate)
+                ),
             )]
         except Exception:
             # Fall back to default prompt construction if the template system is unavailable.
             return [Extractor(
                 self._llm,
                 mode=self._extraction_mode,
+                source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
+                dual_pass_enabled=self._dual_pass_enabled,
+                node_processing_enabled=self._node_processing_enabled,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
+                occurrence_update_eligible=lambda candidate: bool(
+                    self._writer._identity_resolver
+                    and self._writer._identity_resolver.handles(candidate)
+                ),
             )]
 
+    @serialized_topics
     def commit_session(
         self,
         messages: list[dict],
@@ -133,6 +172,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         session_summary: str = "",
         tool_stats_text: str = "",
         archive_id: str | None = None,
+        candidate_checkpoint=None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -165,27 +205,84 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 "status": "processing" (only if wait=False)
             }
         """
-        # Step 0: Auto-generate archive_id for provenance if not provided
+        if candidate_checkpoint is not None:
+            from service.extraction_checkpoint import RecoveryNeedsConfirmationError
+
+            checkpoint_archive_id = candidate_checkpoint.journal.batch["archive_id"]
+            if archive_id is not None and archive_id != checkpoint_archive_id:
+                raise RecoveryNeedsConfirmationError("archive_id differs from the extraction checkpoint")
+            archive_id = checkpoint_archive_id
         if archive_id is None:
             from session.session_manager import generate_archive_id
             archive_id = generate_archive_id()
 
-        # Step 1: Extract candidates
-        candidates = self._pipeline.extract(
-            messages, ctx, session_time=session_time,
-            session_summary=session_summary,
-            tool_stats_text=tool_stats_text,
-            archive_id=archive_id,
-        )
+        def extract():
+            thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
+            execution_options = {"parallel": False} if (
+                remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
+            return self._pipeline.extract(
+                messages, ctx, session_time=session_time,
+                session_summary=session_summary,
+                tool_stats_text=tool_stats_text,
+                archive_id=archive_id,
+                **execution_options,
+            )
 
-        # Step 2: Filter by confidence
-        filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
+        def refresh_profile(candidate):
+            refreshed = [entry for entry in self._pipeline.filter_by_confidence(extract(), confidence_threshold)
+                         if entry.category == "profile" and entry.owner_scope == candidate.owner_scope
+                         and entry.target_uri in ("", candidate.target_uri)]
+            if len(refreshed) != 1:
+                raise ExtractionIncompleteError("profile refresh requires one complete source candidate")
+            return refreshed[0]
+
+        check_deadline()
+        accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
+        if accepted is None:
+            # Extraction must finish before the first accepted candidate is written.
+            candidates = (candidate_checkpoint.load_drafts() if self._node_processing_enabled
+                          and candidate_checkpoint is not None else None)
+            if candidates is None:
+                candidates = extract()
+                if self._node_processing_enabled and candidate_checkpoint is not None:
+                    candidates = [replace(c, node_draft_indices=[i]) if c.category in {"entity", "preference"}
+                                  else c for i, c in enumerate(candidates)]
+                    candidate_checkpoint.save_drafts(candidates, messages)
+            check_deadline()
+            filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
+            extracted_count, filtered_count = len(candidates), len(candidates) - len(filtered)
+            if self._node_processing_enabled:
+                filtered = self._node_processor().process(filtered, messages, ctx)
+            else:
+                from commit.topic_aliases import reconcile_topic_aliases
+                filtered = reconcile_topic_aliases(
+                    filtered, messages, ctx, self._writer._identity_resolver, self._llm)
+            # Read-bound snapshots must consume their observed versions before
+            # unbound source facts can merge into those nodes. Freeze this order
+            # with the new checkpoint; accepted batches retain their exact order.
+            filtered = sorted(filtered, key=lambda candidate: not bool(candidate.target_uri))
+            if self._card_format_enabled:
+                from extraction.card_format import validate_memory_card
+                for candidate in filtered:
+                    validate_memory_card(candidate)
+            if candidate_checkpoint is not None:
+                resolver = self._writer._identity_resolver
+                if resolver is not None:
+                    resolver.preflight_new_batch(
+                        [candidate for candidate in filtered
+                         if self._writer.prewrite_skip(candidate, ctx) is None], ctx)
+                check_deadline()
+                filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
+        else:
+            filtered, extracted_count, filtered_count = accepted
 
         # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
         deduplicated = filtered
 
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
-        plans = self._writer.write_candidates(deduplicated, ctx)
+        plans = (self._write_checkpointed_candidates(
+                     deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
+                 if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")
@@ -194,8 +291,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
         result = {
             "archive_id": archive_id,
-            "candidates_extracted": len(candidates),
-            "candidates_filtered": len(candidates) - len(filtered),
+            "candidates_extracted": extracted_count,
+            "candidates_filtered": filtered_count,
             "writes_completed": writes_completed,
             "writes_skipped": writes_skipped,
             "writes_failed": writes_failed,
@@ -219,6 +316,101 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
         return result
 
+    def _node_processor(self):
+        from extraction.prefetch import MemoryPrefetcher
+        resolver = self._writer._identity_resolver
+        prefetcher = (MemoryPrefetcher(self._fs, self._vector_index, self._embedder,
+                                     self._schema_registry, resolver.uris)
+                      if self._vector_index is not None and self._embedder is not None else None)
+        return NodeProcessor(resolver, self._llm, prefetcher)
+
+    def _write_checkpointed_candidates(self, candidates, ctx, checkpoint, *, refresh_profile=None,
+                                       source_only=False):
+        """Reuse durable drafts and receipts; never guess whether a write committed."""
+        from service.extraction_checkpoint import RecoveryNeedsConfirmationError
+        plans = []
+        for index, candidate in enumerate(candidates):
+            check_deadline()
+            completed = checkpoint.completed(index)
+            if completed is not None:
+                plans.append(WritePlan(**completed))
+                continue
+            # The frozen inputs prove these candidates cannot reach storage,
+            # including old checkpoints that marked them 'writing' before skip.
+            skipped = self._writer.prewrite_skip(candidate, ctx)
+            if skipped is not None:
+                checkpoint.complete(index, skipped)
+                plans.append(skipped)
+                continue
+            if checkpoint.outcome_uncertain(index):
+                resolver = self._writer._identity_resolver
+                normalized = resolver._normalize_subject(candidate, ctx)
+                committed = receipt_plan(self._fs, resolver.uris, normalized, ctx)
+                if committed is None:
+                    raise RecoveryNeedsConfirmationError(
+                        f"write outcome needs confirmation for operation {candidate.write_operation_id}")
+                checkpoint.complete(index, committed)
+                plans.append(committed)
+                continue
+            if source_only:
+                plan = WritePlan(action="skip", target_uri=candidate.target_uri,
+                                 merged_fields={"status": "source_preserved"})
+                checkpoint.complete(index, plan)
+                plans.append(plan)
+                continue
+            for attempt in range(3):
+                check_deadline()
+                checkpoint.begin(index)
+                try:
+                    plan = self._writer.write_candidate(candidate, ctx)
+                except WriteDeadlineExceededError as exc:
+                    checkpoint.reject(index, str(exc))
+                    raise
+                except WriteNotStartedError as exc:
+                    checkpoint.reject(index, str(exc))
+                    from core.errors import LLMTransientError, MemoryCardFormatError
+                    from fs.sql_adapter.session_mutation import SessionMutationBusyError
+                    if (refresh_profile is not None
+                            and candidate.category == "profile" and candidate.target_uri
+                            and isinstance(exc.__cause__, ConcurrentModificationError)):
+                        if attempt == 2:
+                            raise ExtractionIncompleteError("profile update remains concurrently modified") from exc
+                        check_deadline()
+                        candidate = checkpoint.revise_unwritten(index, refresh_profile(candidate))
+                        logger.info("Refreshed concurrently updated profile: %s", candidate.target_uri)
+                        continue
+                    if (self._node_processing_enabled and candidate.category in {"entity", "preference"}
+                            and isinstance(exc.__cause__, ConcurrentModificationError)):
+                        revised = self._node_processor().process(
+                            checkpoint.reprocessing_drafts(candidate),
+                            checkpoint.draft_source(), ctx)
+                        if (len(revised) != 1 or candidate.target_uri
+                                and revised[0].target_uri != candidate.target_uri):
+                            raise MemoryCardFormatError(
+                                "node revision must preserve one accepted target: " + candidate.target_uri)
+                        candidate = checkpoint.revise_unwritten(index, revised[0])
+                        checkpoint.begin(index)
+                        try:
+                            plan = self._writer.write_candidate(candidate, ctx)
+                        except WriteNotStartedError as retry_error:
+                            checkpoint.reject(index, str(retry_error))
+                            if isinstance(retry_error.__cause__,
+                                          (MemoryCardFormatError, LLMTransientError, SessionMutationBusyError)):
+                                raise retry_error.__cause__
+                            raise
+                        checkpoint.complete(index, plan)
+                        plans.append(plan)
+                        break
+                    if isinstance(exc.__cause__,
+                                  (MemoryCardFormatError, LLMTransientError, SessionMutationBusyError)):
+                        raise exc.__cause__
+                    logger.error("Accepted candidate rejected before writing: %s", exc)
+                    break
+                checkpoint.complete(index, plan)
+                plans.append(plan)
+                break
+        return plans
+
     def write_raw_chunk(
         self,
         messages: list[dict],
@@ -226,6 +418,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         chunk_index: int = 0,
         session_id: str = "",
         session_time=None,
+        candidate_checkpoint=None,
     ) -> dict:
         """Write raw chunk text as a session_archive node for retrieval.
 
@@ -242,6 +435,13 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         Returns:
             Dict with write result
         """
+        check_deadline()
+        accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
+        if accepted is not None:
+            plans = self._write_checkpointed_candidates(accepted[0], ctx, candidate_checkpoint)
+            if not plans:
+                raise RuntimeError("raw chunk rejected before writing")
+            return {"action": plans[0].action, "target_uri": plans[0].target_uri}
         if not messages:
             return {"action": "skip", "reason": "empty messages"}
 
@@ -302,7 +502,15 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             who=", ".join(participants) if participants else None,
         )
 
-        plan = self._writer.write_candidate(candidate, ctx)
+        if candidate_checkpoint is not None:
+            check_deadline()
+            accepted = candidate_checkpoint.accept([candidate], 1, 0)
+            plans = self._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
+            if not plans:
+                raise RuntimeError("raw chunk rejected before writing")
+            plan = plans[0]
+        else:
+            plan = self._writer.write_candidate(candidate, ctx)
         return {
             "action": plan.action,
             "target_uri": plan.target_uri,
@@ -326,6 +534,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         Returns:
             task_id string for tracking the background job.
         """
+        thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
+        if callable(thread_bound) and thread_bound(self._fs):
+            raise RuntimeError("an owning SQL session requires a separate service background handoff")
         task_id = str(uuid.uuid4())
         with self._tasks_lock:
             self._tasks[task_id] = {"status": "processing", "result": None}
@@ -435,6 +646,9 @@ def init_write_api(
     embedder=None,
     uri_resolver=None,
     internal_tool_usage_tracker=None,
+    source_occurrence_reconciliation_enabled: bool = False,
+    dual_pass_enabled: bool = True,
+    node_processing_enabled: bool = False,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
 
@@ -456,6 +670,9 @@ def init_write_api(
         fs, llm, outbox_store, schema_registry,
         vector_index, embedder, uri_resolver,
         internal_tool_usage_tracker,
+        source_occurrence_reconciliation_enabled=source_occurrence_reconciliation_enabled,
+        dual_pass_enabled=dual_pass_enabled,
+        node_processing_enabled=node_processing_enabled,
     )
     return _default_write_api
 
@@ -473,15 +690,16 @@ def get_write_api() -> Optional[MemoryWriteAPI]:
 # Read / Search API
 # ---------------------------------------------------------------------------
 
-from core.errors import AccessDeniedError, ValidationError as CoreValidationError
+from core.errors import AccessDeniedError
+from core.errors import ValidationError as CoreValidationError
 from core.models import (
     RetrievalConfig,
     RetrievedBlock,
     RetrieverMode,
     SearchMemoryResult,
 )
-from retrieval.pipeline import RetrievalPipeline
 from retrieval.context_reader import ContextReader
+from retrieval.pipeline import RetrievalPipeline
 
 
 class ReadAPI:
@@ -517,6 +735,8 @@ class ReadAPI:
         fill_content_for_top_k: int = 0,
         context_type: str | None = None,
         resource_type: str | None = None,
+        memory_directories: list[str] | None = None,
+        use_scene: bool | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -539,6 +759,8 @@ class ReadAPI:
             fill_content_for_top_k=fill_content_for_top_k,
             context_type=context_type,
             resource_type=resource_type,
+            memory_directories=memory_directories,
+            **({"use_scene": use_scene} if use_scene is not None else {}),
         )
 
         if not include_debug:
@@ -550,10 +772,12 @@ class ReadAPI:
         self,
         uri: str,
         ctx: RequestContext,
+        *,
+        unit_key: str | None = None,
     ) -> RetrievedBlock:
         """Read L2 md file content by URI.
 
         Since search_memory already returns abstract in results,
         read_memory only reads the actual md file content.
         """
-        return self._read_service.read(uri, ctx=ctx)
+        return self._read_service.read(uri, ctx=ctx, **({"unit_key": unit_key} if unit_key is not None else {}))

@@ -22,6 +22,7 @@ def _service(**overrides):
     values = {
         "storage_backend": "sql",
         "sql_connection_string": "postgresql://unused/test",
+        "index_workers": 0,
     }
     values.update(overrides)
     return MemoryService(
@@ -99,6 +100,8 @@ def test_finalize_session_trace_delegates_stop_boundary():
 def test_finalize_session_trace_creates_skill_candidate_only_when_enabled(monkeypatch):
     monkeypatch.setattr(MemoryService, "_start_skill_sedimentation_worker", lambda self: None)
     service = _service(skill_sedimentation_enabled=True)
+    service._get_context_fs = MagicMock()
+    service._get_outbox_store = MagicMock()
     store = MagicMock()
     store.finalize_session.return_value = {
         "ok": True,

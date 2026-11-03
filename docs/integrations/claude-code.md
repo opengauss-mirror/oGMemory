@@ -23,7 +23,7 @@ Marketplace：
 源码开发：
 
 ```bash
-claude --plugin-dir ./claude-plugin --debug
+claude --plugin-dir ./plugins/claude-code --debug
 ```
 
 ## 3. 配置
@@ -47,6 +47,8 @@ export OGMEM_TRACE_CAPTURE_CONTENT='1'
 | `OG_MEMORY_AGENT_ID` | `claude-code` | agentId；也兼容 `OG_AGENT_ID` |
 | `OG_AUTH_API_KEY` | 空 | oGMemory 租户 Key，不是模型 Key |
 | `OGMEM_TRACE_CAPTURE_CONTENT` | `1` | `0/false/no/off` 时 Trace 只保留结构和元数据 |
+| `OGMEM_AUTO_CAPTURE` | `true` | 关闭自动 transcript 写回和工具消息补录；Trace 继续上传 |
+| `OGMEM_AUTO_RECALL` | `true` | 关闭 prompt 提交时的自动 compose 和上下文注入 |
 
 连接设置优先使用显式 `OG_MEMORY_*` 环境变量（身份字段也兼容 `OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`）。
 未设置的字段才回退到可加载的 `OgMemConfig` 或默认值，避免仓库中的服务端身份覆盖客户端接入配置。
@@ -63,6 +65,22 @@ Content-Type: application/json
 
 ## 4. Hook 映射
 
+自动写入和自动召回可分别控制。例如只召回已有记忆：
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+```
+
+两个开关沿用插件布尔解析：`1/true/yes` 开启，忽略大小写及首尾空白；
+其他显式值关闭（推荐 `0/false/no/off`），未设置时开启。修改后重新启动 Claude Code。
+关闭捕获时，`Stop` / `PreCompact` 不同步 transcript，`PostToolUse` 不追加工具消息，
+不会创建或推进 `.ingest-offset`，也不会启动后台 after-turn 写入或重试。
+重新开启后会从旧偏移继续，可能补录关闭期间的对话。
+Trace 继续上传；如需仅保留 Trace 元数据，可同时设置 `OGMEM_TRACE_CAPTURE_CONTENT=0`。
+Read/Bash 输出过滤、手动 `/og-add-history` / `/og-compose` 和 MCP 工具保持各自行为。
+`OGMEM_CODE_MEMORY_ONLY=true` 仍优先禁用通用 Trace 和会话持久化。
+
 | Claude Code Hook | 脚本 | oGMemory 调用 | 超时 |
 | --- | --- | --- | --- |
 | `SessionStart` | `call_add_session_message.py` | Trace `session_start` | 5s |
@@ -77,7 +95,7 @@ Content-Type: application/json
 | `PreCompact` | 两个脚本 | Trace `pre_compact` + 同步 `/after_turn` | 5s + 600s |
 | `SessionEnd` | `call_add_session_message.py` | Trace `session_end` | 5s |
 
-Hook 定义：[`../../claude-plugin/hooks/hooks.json`](../../claude-plugin/hooks/hooks.json)。
+Hook 定义：[`../../plugins/claude-code/hooks/hooks.json`](../../plugins/claude-code/hooks/hooks.json)。
 
 ## 5. Prompt 前自动召回
 

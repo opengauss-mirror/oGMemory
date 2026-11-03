@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import json
 import threading
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
+from core.errors import NodeNotFoundError
 from core.models import ContextNode, RequestContext
 from features.tool_result_externalization.store_local import (
     LocalToolResultArtifactStore,
@@ -102,7 +103,7 @@ class _MemorySessionStateFS:
     def read_node(self, uri: str, _ctx: RequestContext) -> ContextNode:
         with self._lock:
             if uri not in self._nodes:
-                raise FileNotFoundError(uri)
+                raise NodeNotFoundError(uri)
             return deepcopy(self._nodes[uri])
 
     def delete_node(self, uri: str, _ctx: RequestContext) -> None:
@@ -130,7 +131,9 @@ def _service(tmp_path, **overrides) -> MemoryService:
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     )
     service._get_archive_store = lambda: None
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     return service
@@ -420,7 +423,9 @@ def test_externalization_disabled_creates_no_turn_ledger(tmp_path):
         tool_result_semantic_turn_mode="user_message",
         after_turn_threshold=999_999,
     ))
+    service._get_context_fs = lambda: None
     manager = service.get_session_manager()
+    manager._get_context_fs = lambda: None
     manager.load_session_state = lambda session_id, ctx: True
     manager.save_session_state = lambda session_id, ctx: True
     turn = _result_turn("D" * 25_000)

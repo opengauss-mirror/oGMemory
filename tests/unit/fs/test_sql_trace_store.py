@@ -111,16 +111,17 @@ def test_insert_persists_canonical_turn_end_type(store_and_db):
     assert insert_params[8] == {"event_type": "turn_end"}
 
 
+@pytest.mark.parametrize("write_batch_id", ["", "batch-A"])
 @pytest.mark.parametrize("boundary_type", ["turn_end", "Stop"])
 def test_finalize_aggregates_only_the_turn_end_bounded_turn(
-    store_and_db, boundary_type
+    store_and_db, boundary_type, write_batch_id
 ):
     store, conn, cursor = store_and_db
     started = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
     ended = datetime(2026, 7, 15, 8, 1, tzinfo=UTC)
     cursor.fetchone.side_effect = [
-        (ended,),
-        (9,),
+        (ended, write_batch_id),
+        *([(9,)] if not write_batch_id else []),
         (3, started, ended),
         ("ctx://acct/traces/sess/turns/t",),
     ]
@@ -140,21 +141,21 @@ def test_finalize_aggregates_only_the_turn_end_bounded_turn(
         )
 
     assert result["event_count"] == 3
-    assert result["prev_stop_event_index"] == 9
+    assert result["prev_stop_event_index"] == (None if write_batch_id else 9)
     boundary_query = cursor.execute.call_args_list[0].args[0]
-    previous_boundary_query = cursor.execute.call_args_list[1].args[0]
     assert "hook_type IN ('turn_end', 'Stop')" in boundary_query
-    assert "hook_type IN ('turn_end', 'Stop')" in previous_boundary_query
-    range_query = cursor.execute.call_args_list[3]
+    offset = 0 if write_batch_id else 1
+    range_query = cursor.execute.call_args_list[2 + offset]
     assert range_query.args[1][:-1] == (
         "acct",
         "sess",
         "user/alice",
         "agent",
-        9,
+        0 if write_batch_id else 9,
         12,
+        write_batch_id,
     )
-    upsert = cursor.execute.call_args_list[4]
+    upsert = cursor.execute.call_args_list[3 + offset]
     assert "INSERT INTO trace_sessions" in upsert.args[0]
     assert "ON CONFLICT (account_id, turn_id) DO UPDATE" in upsert.args[0]
     assert "hello" in upsert.args[1][9]
@@ -162,7 +163,7 @@ def test_finalize_aggregates_only_the_turn_end_bounded_turn(
     assert upsert.args[1][10] == upsert.args[1][9]
     executed_sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
     assert "INSERT INTO trace_session_events" in executed_sql
-    event_projection = cursor.execute.call_args_list[6]
+    event_projection = cursor.execute.call_args_list[5 + offset]
     assert "FROM trace_events" in event_projection.args[0]
     assert "ROW_NUMBER() OVER (ORDER BY event_index)" in event_projection.args[0]
     assert "jsonb_array_elements" not in event_projection.args[0]
@@ -174,8 +175,9 @@ def test_finalize_aggregates_only_the_turn_end_bounded_turn(
         "sess",
         "user/alice",
         "agent",
-        9,
+        0 if write_batch_id else 9,
         12,
+        write_batch_id,
     )
     assert "INSERT INTO skill_candidates" not in executed_sql
     assert "INSERT INTO skill_work_accounts" not in executed_sql
@@ -387,9 +389,10 @@ def test_read_skill_trace_event_page_rolls_back_before_reusing_connection(store_
     conn.rollback.assert_called_once()
 
 
-def test_read_skill_trace_event_page_backfills_legacy_content_once(store_and_db):
+@pytest.mark.parametrize("write_batch_id", ["", "batch-A"])
+def test_read_skill_trace_event_page_backfills_legacy_content_once(store_and_db, write_batch_id):
     store, conn, cursor = store_and_db
-    legacy_content = [{"event_type": "user_message", "prompt": "do it"}]
+    legacy_content = [{"event_type": "user_message", "prompt": "do it", "write_batch_id": write_batch_id}]
     cursor.fetchone.side_effect = [
         None,
         (legacy_content, "user/alice", "agent", "sess", 12, 9, 1),
@@ -412,7 +415,7 @@ def test_read_skill_trace_event_page_backfills_legacy_content_once(store_and_db)
     assert "FROM trace_events" in backfill.args[0]
     assert "ROW_NUMBER() OVER (ORDER BY event_index)" in backfill.args[0]
     assert backfill.args[1] == (
-        "acct", "trace:1", "acct", "sess", "user/alice", "agent", 9, 12,
+        "acct", "trace:1", "acct", "sess", "user/alice", "agent", 9, 12, write_batch_id,
     )
     conn.commit.assert_called_once()
     conn.rollback.assert_not_called()

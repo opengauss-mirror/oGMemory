@@ -1,19 +1,52 @@
-"""ContextReader — URI-based full-content read.
-
-Powers the read_memory tool interface.  Since search_memory already
-returns L2 results with abstract, read_memory only reads the actual
-md file content.  Enforces account-level ACL.
-"""
+"""ContextReader — ACL-checked URI reads with canonical L0, L1, L2 and metadata."""
 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
-from core.errors import AccessDeniedError, ValidationError
+from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError, ValidationError
 from core.interfaces import ContextFS
 from core.models import RequestContext, RetrievedBlock
+from retrieval.identity import canonical_uri
 
 logger = logging.getLogger(__name__)
+
+
+def canonical_agent_node(node):
+    """Read current and legacy Agent bodies through the canonical fields."""
+    if node.metadata.get("agent_memory_version") != 1:
+        return node
+    from extraction.agent_memory import memory_units, node_memory_fields, render_agent_memory
+
+    fields = node_memory_fields(node)
+    grounding = [source for unit in memory_units(node.category, fields)
+                 for source in unit.get("grounding", [])]
+    return replace(node, content=render_agent_memory(node.category, fields, grounding=grounding),
+                   metadata={**node.metadata, "structured_fields": fields, "grounding": grounding})
+
+
+def project_memory_unit(node, unit_key: str):
+    """Project a node already read with ACL into its current reusable unit."""
+    from extraction.agent_memory import memory_units, node_memory_fields, render_agent_memory
+
+    if node.metadata.get("agent_memory_version") != 1:
+        raise ValueError("unit_key requires an Agent memory unit")
+    fields = node_memory_fields(node)
+    unit = next((item for item in memory_units(node.category, fields)
+                 if item["key"] == unit_key), None)
+    if unit is None:
+        raise ValueError("Memory unit was not found")
+    selected = {**fields, "units": [unit]} if node.category == "tool" else unit
+    state = node.metadata.get("agent_memory", {}).get("units", {}).get(unit_key, {})
+    return replace(
+        node, abstract=unit["title"], overview="",
+        content=render_agent_memory(node.category, selected, grounding=unit.get("grounding")),
+        metadata={**node.metadata, "structured_fields": selected,
+                  "unit_key": unit_key, "agent_memory_unit_key": unit_key,
+                  "grounding": unit.get("grounding", []),
+                  "unit_revision": state.get("revision", 1)},
+    )
 
 
 class ContextReader:
@@ -21,10 +54,22 @@ class ContextReader:
         self._fs = fs
         self._storage_backend = storage_backend
 
+    def is_visible(self, uri: str, ctx: RequestContext) -> bool:
+        """Validate an index hit against the current node status and access scope."""
+        uri = canonical_uri(uri)
+        try:
+            self._check_acl(uri, ctx)
+            exists = getattr(self._fs, "exists", None)
+            return bool(exists(uri, ctx)) if callable(exists) else True
+        except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
+            return False
+
     def read(
         self,
         uri: str,
         ctx: RequestContext,
+        *,
+        unit_key: str | None = None,
     ) -> RetrievedBlock:
         self._check_acl(uri, ctx)
 
@@ -41,14 +86,25 @@ class ContextReader:
             if read_uri.endswith("/content.md"):
                 read_uri = read_uri[: -len("/content.md")]
             node = self._fs.read_node(read_uri, ctx)
+        except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
+            raise
         except Exception as exc:
             logger.warning("[ContextReader] read_node failed for %s: %s", uri, exc, exc_info=True)
             return block
 
+        if unit_key is not None:
+            node = project_memory_unit(node, unit_key)
+        else:
+            node = canonical_agent_node(node)
+
         block.category = node.category
         block.owner_space = node.owner_space
+        block.abstract = node.abstract
         block.overview = node.overview
         block.content_excerpt = node.content
+        block.metadata = dict(node.metadata)
+        block.has_overview = bool(node.overview)
+        block.has_content = bool(node.content)
 
         return block
 
@@ -64,6 +120,9 @@ class ContextReader:
         prefix = f"ctx://{ctx.account_id}/"
         if uri.startswith("ctx://") and not uri.startswith(prefix):
             raise AccessDeniedError(uri, ctx.account_id, "account mismatch")
+
+        if uri.startswith(f"{prefix}resources/"):
+            return
 
         # Owner space isolation: strategy depends on storage backend.
         #

@@ -1,5 +1,6 @@
 """Unit tests for commit package components."""
 
+import hashlib
 import json
 import re
 from unittest.mock import Mock, MagicMock
@@ -160,6 +161,31 @@ class TestAggregateTopicPolicy:
         plan = self.policy.plan(candidate, self.ctx)
 
         assert plan.action == "create"
+
+    @pytest.mark.parametrize("raw_key,stored_key", [
+        ("ProjectAtlas", "projectatlas"),
+        ("上下文图谱", "auto_" + hashlib.sha256("上下文图谱".encode()).hexdigest()[:16]),
+    ])
+    def test_existing_topic_reuses_legacy_uri(self, raw_key, stored_key):
+        from core.validation import validate_candidate
+
+        uri = f"ctx://test-account/users/user-123/memories/entities/{stored_key}"
+        self.mock_fs.exists.side_effect = lambda target, _ctx: target == uri
+        self.mock_fs.read_node.return_value = ContextNode(
+            uri=uri, context_type="MEMORY", category="entity", level=4,
+            owner_space="user_space:user-123", abstract=raw_key,
+            overview="Old overview", content="Old content", metadata={"version": 1},
+        )
+        candidate = validate_candidate(CandidateMemory(
+            category="entity", owner_scope="user", routing_key=raw_key,
+            abstract=raw_key, overview="New overview", content="New content",
+            confidence=0.9,
+        ))
+
+        plan = self.policy.plan(candidate, self.ctx)
+
+        assert plan.action == "merge"
+        assert plan.target_uri == uri
 
 
 class TestAppendOnlyPolicy:
@@ -478,7 +504,7 @@ class TestCandidatePipeline:
             CandidateMemory(
                 category="profile",
                 owner_scope="user",
-                routing_key="profile",
+                routing_key="user_profile",
                 abstract="",
                 overview="",
                 content="",
@@ -551,10 +577,26 @@ class TestCandidatePipeline:
             parallel=False,
         )
 
-        assert candidates == []
+        assert len(candidates) == 1
         args, kwargs = self.mock_extractor.extract.call_args
         assert len(args) == 6
         assert kwargs == {}
+
+    @pytest.mark.parametrize("parallel", [False, True])
+    def test_extract_retains_candidate_with_unresolved_name(self, parallel):
+        self.mock_extractor.extract.return_value = [CandidateMemory(
+            category="preference", owner_scope="user", routing_key="_md",
+            abstract="Keep diagrams in Markdown", overview="", content="",
+            confidence=0.9,
+        )]
+
+        candidates = self.pipeline.extract(
+            [{"role": "user", "content": "Keep diagrams in Markdown"}],
+            self.ctx, parallel=parallel,
+        )
+
+        assert len(candidates) == 1
+        assert candidates[0].routing_key == "_md"
 
     def test_filter_by_confidence(self):
         """Test confidence filtering."""

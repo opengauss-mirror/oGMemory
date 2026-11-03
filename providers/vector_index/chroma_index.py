@@ -5,6 +5,7 @@ come from the Embedder, not from ChromaDB's built-in models.
 """
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from core.interfaces import VectorIndex
+from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
 from core.resource_identity import CODE_INDEX_METADATA_FIELDS
 
@@ -153,6 +155,24 @@ class ChromaVectorIndex(VectorIndex):
     ) -> list[SeedHit]:
         chroma_where = self._build_where(filters)
         with self._locked():
+            if "memory_directory" in filters:
+                # Derive type constraints from persisted URIs before nearest-neighbor truncation.
+                uris = set()
+                offset = 0
+                while True:
+                    page = self._collection.get(
+                        where=chroma_where, include=["metadatas"], limit=1000, offset=offset,
+                    )
+                    for meta in page["metadatas"]:
+                        uri = (meta or {}).get("uri", "")
+                        if memory_directory(uri) in filters["memory_directory"]:
+                            uris.add(uri)
+                    if len(page["ids"]) < 1000:
+                        break
+                    offset += len(page["ids"])
+                if not uris:
+                    return []
+                chroma_where = self._build_where({**filters, "uri": sorted(uris)})
             count = self._collection.count()
             if count == 0:
                 return []
@@ -167,6 +187,9 @@ class ChromaVectorIndex(VectorIndex):
             return hits
         for i in range(len(results["ids"][0])):
             meta = results["metadatas"][0][i] if results["metadatas"] else {}
+            meta = dict(meta)
+            if "agent_memory_grounding_json" in meta:
+                meta["grounding"] = json.loads(meta.pop("agent_memory_grounding_json"))
             doc = results["documents"][0][i] if results["documents"] else ""
             dist = results["distances"][0][i] if results["distances"] else 1.0
             score = max(0.0, 1.0 - dist)
@@ -178,7 +201,7 @@ class ChromaVectorIndex(VectorIndex):
                 context_type=meta.get("context_type", ""),
                 category=meta.get("category", ""),
                 owner_space=meta.get("owner_space", ""),
-                abstract=doc[:200] if doc else "",
+                abstract=meta.get("abstract", doc[:200] if doc else ""),
                 has_overview=bool(meta.get("has_overview")),
                 has_content=bool(meta.get("has_content")),
                 active_count=int(meta.get("active_count", 0)),
@@ -192,6 +215,7 @@ class ChromaVectorIndex(VectorIndex):
         uris: list[str],
         filters: dict[str, Any],
         level: int = 0,
+        *, expected_texts: dict[str, str] | None = None,
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
@@ -199,7 +223,7 @@ class ChromaVectorIndex(VectorIndex):
         with self._locked():
             result = self._collection.get(
                 where=where if where else None,
-                include=["embeddings", "metadatas"],
+                include=["embeddings", "metadatas"] + (["documents"] if expected_texts is not None else []),
             )
         output: dict[str, list[float]] = {}
         embeddings = result.get("embeddings")
@@ -209,8 +233,12 @@ class ChromaVectorIndex(VectorIndex):
         if metadatas is None:
             metadatas = []
         wanted = set(uris)
-        for embedding, metadata in zip(embeddings, metadatas):
+        documents = result.get("documents")
+        for position, (embedding, metadata) in enumerate(zip(embeddings, metadatas)):
             uri = str((metadata or {}).get("uri", ""))
+            if expected_texts is not None and (documents is None or position >= len(documents)
+                                               or documents[position] != expected_texts.get(uri)):
+                continue
             if uri in wanted:
                 output[uri] = [float(value) for value in embedding]
         return output
@@ -266,6 +294,7 @@ class ChromaVectorIndex(VectorIndex):
             "owner_space": record.filters.get("owner_space", ""),
         }
         for key in (
+            "abstract",
             "context_type",
             "category",
             "parent_uri",
@@ -277,11 +306,16 @@ class ChromaVectorIndex(VectorIndex):
             "who",
             "where",
             "routing_key",
+            "unit_key",
+            "agent_memory_unit_key",
+            "unit_revision",
             *CODE_INDEX_METADATA_FIELDS,
         ):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
                 meta[key] = val
+        if isinstance((record.metadata or {}).get("grounding"), list):
+            meta["agent_memory_grounding_json"] = json.dumps(record.metadata["grounding"], ensure_ascii=False)
         sanitized: dict[str, str | int | float | bool] = {}
         for k, v in meta.items():
             if isinstance(v, bool):

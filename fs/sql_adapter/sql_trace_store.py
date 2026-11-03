@@ -42,6 +42,7 @@ def _insert_trace_session_events(
     session_id: str,
     after_event_index: int,
     stop_event_index: int,
+    write_batch_id: str = "",
 ) -> int:
     """Project one complete turn into its indexed event stream."""
     cur.execute(
@@ -55,6 +56,7 @@ def _insert_trace_session_events(
         WHERE account_id = %s AND session_id = %s
           AND owner_space = %s AND agent_id = %s
           AND event_index > %s AND event_index <= %s
+          AND COALESCE(content->>'write_batch_id', '') = %s
         ORDER BY event_index
         """,
         (
@@ -66,6 +68,7 @@ def _insert_trace_session_events(
             agent_id,
             after_event_index,
             stop_event_index,
+            write_batch_id,
         ),
     )
     return int(cur.rowcount)
@@ -240,7 +243,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT event_time
+                    SELECT event_time, COALESCE(content->>'write_batch_id', '')
                     FROM trace_events
                     WHERE account_id = %s AND session_id = %s
                       AND owner_space = %s AND agent_id = %s
@@ -259,24 +262,28 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 if stop_row is None:
                     raise ValueError("turn-end event not found")
 
-                cur.execute(
-                    """
-                    SELECT MAX(event_index)
-                    FROM trace_events
-                    WHERE account_id = %s AND session_id = %s
-                      AND owner_space = %s AND agent_id = %s
-                      AND hook_type IN ('turn_end', 'Stop') AND event_index < %s
-                    """,
-                    (
-                        account_id,
-                        session_id,
-                        owner_space,
-                        agent_id,
-                        stop_event_index,
-                    ),
-                )
-                previous_row = cur.fetchone()
-                prev_stop_index = previous_row[0] if previous_row else None
+                write_batch_id = stop_row[1]
+                prev_stop_index = None
+                if not write_batch_id:
+                    cur.execute(
+                        """
+                        SELECT MAX(event_index)
+                        FROM trace_events
+                        WHERE account_id = %s AND session_id = %s
+                          AND owner_space = %s AND agent_id = %s
+                          AND hook_type IN ('turn_end', 'Stop') AND event_index < %s
+                          AND COALESCE(content->>'write_batch_id', '') = ''
+                        """,
+                        (
+                            account_id,
+                            session_id,
+                            owner_space,
+                            agent_id,
+                            stop_event_index,
+                        ),
+                    )
+                    previous_row = cur.fetchone()
+                    prev_stop_index = previous_row[0] if previous_row else None
 
                 events, total_event_count, started_at, ended_at = self._fetch_turn_events(
                     cur,
@@ -286,6 +293,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     session_id,
                     int(prev_stop_index or 0),
                     stop_event_index,
+                    write_batch_id,
                 )
                 if not events:
                     raise RuntimeError("turn-end-bounded trace turn is empty")
@@ -337,6 +345,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     session_id=session_id,
                     after_event_index=int(prev_stop_index or 0),
                     stop_event_index=stop_event_index,
+                    write_batch_id=write_batch_id,
                 )
             conn.commit()
         except Exception:
@@ -531,6 +540,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                             session_id=content_row[3],
                             after_event_index=int(content_row[5]),
                             stop_event_index=int(content_row[4]),
+                            write_batch_id=content_row[0][-1].get("write_batch_id", "")
+                            if content_row[0] else "",
                         )
                         if projected_count != int(content_row[6]):
                             cur.execute(
@@ -1863,6 +1874,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         session_id: str,
         previous_stop_index: int,
         stop_event_index: int,
+        write_batch_id: str = "",
     ) -> tuple[list[dict], int, datetime | None, datetime | None]:
         cur.execute(
             """
@@ -1871,6 +1883,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
             WHERE account_id = %s AND session_id = %s
               AND owner_space = %s AND agent_id = %s
               AND event_index > %s AND event_index <= %s
+              AND COALESCE(content->>'write_batch_id', '') = %s
             """,
             (
                 account_id,
@@ -1879,6 +1892,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 agent_id,
                 previous_stop_index,
                 stop_event_index,
+                write_batch_id,
             ),
         )
         aggregate = cur.fetchone() or (0, None, None)
@@ -1893,6 +1907,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 WHERE account_id = %s AND session_id = %s
                   AND owner_space = %s AND agent_id = %s
                   AND event_index > %s AND event_index <= %s
+                  AND COALESCE(content->>'write_batch_id', '') = %s
                 ORDER BY event_index
                 LIMIT 1
                 """,
@@ -1903,6 +1918,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     agent_id,
                     previous_stop_index,
                     stop_event_index,
+                    write_batch_id,
                 ),
             )
             first_row = cur.fetchone()
@@ -1914,6 +1930,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
             WHERE account_id = %s AND session_id = %s
               AND owner_space = %s AND agent_id = %s
               AND event_index > %s AND event_index <= %s
+              AND COALESCE(content->>'write_batch_id', '') = %s
             ORDER BY event_index DESC
             LIMIT %s
             """,
@@ -1924,6 +1941,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 agent_id,
                 previous_stop_index,
                 stop_event_index,
+                write_batch_id,
                 suffix_limit,
             ),
         )

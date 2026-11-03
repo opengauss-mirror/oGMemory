@@ -20,6 +20,19 @@ Codex plugin integration over the oGMemory HTTP API.
 
 Every event is also sent to `/api/v1/trace/events` for turn reconstruction and reusable-skill extraction. Trace content is bounded and common credential fields are redacted.
 
+## Automatic memory controls
+
+`OGMEM_AUTO_CAPTURE` and `OGMEM_AUTO_RECALL` default to `true` and independently
+control automatic writes and recall. Set `OGMEM_AUTO_CAPTURE=false` to skip prompt
+caching, turn writes, bootstrap, compaction, subagent writes and disposal while
+keeping recall and lifecycle traces. Existing pending state is preserved and can
+be submitted after capture is re-enabled. Trace content remains enabled.
+
+The user configuration also accepts `auto_capture` and `auto_recall` booleans;
+environment variables take precedence. Values `1`, `true` and `yes` enable the
+feature (case and surrounding whitespace are ignored); other explicit values
+disable it. Restart Codex after changing its environment.
+
 ## Service connection
 
 The plugin can connect to an existing remote oGMemory service. Create `.ogmemory/codex-plugin.json` in the user home directory with the connection details supplied by the service administrator. Use an empty `api_key` when authentication is disabled:
@@ -35,6 +48,14 @@ The plugin can connect to an existing remote oGMemory service. Create `.ogmemory
 ```
 
 For local development, install and start oGMemory with `ogmem onboard --mode headless`. The default local service URL is `http://127.0.0.1:8090`; local default settings require no configuration file.
+
+Automatic Skill recall requires authenticated Skill HTTP access. The administrator
+must enable `auth.role_control_enabled` and configure privileged API keys in the
+server configuration. Set the issued `api_key`, `account_id`, `user_id`, and
+`agent_id` in `~/.ogmemory/codex-plugin.json` above, using credentials authorized
+for that agent. Empty-key configurations support ordinary memory hooks; Skill
+HTTP authentication failures produce a diagnostic on hook stderr. A 401 means
+authentication configuration needs attention; a 403 means access needs attention.
 
 ## Install from this repository
 
