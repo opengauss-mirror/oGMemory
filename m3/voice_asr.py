@@ -158,13 +158,21 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
         trace_id=f"m3-va-{uuid.uuid4().hex}",
     )
 
-    audio_nodes = (
-        graph.list_raw_nodes(RawDataType.AUDIO, ctx)
-        if hasattr(graph, "list_raw_nodes") else []
-    )
+    def _list_audio(raw_type):
+        # Bench-scale accounts hold >4096 AUDIO nodes; the default LIMIT
+        # silently drops late-created videos' nodes and voice_asr then
+        # aborts with "produced 0 segments without completed audio".
+        # ``limit=None`` -> LIMIT ALL on the SQL store; other backends may
+        # not accept the kwarg, so fall back to the plain call.
+        try:
+            return graph.list_raw_nodes(raw_type, ctx, limit=None)
+        except TypeError:
+            return graph.list_raw_nodes(raw_type, ctx)
+
+    audio_nodes = _list_audio(RawDataType.AUDIO) if hasattr(graph, "list_raw_nodes") else []
     if not audio_nodes and hasattr(graph, "list_raw_nodes"):
         # Fallback: list every RawNode and filter.
-        all_nodes = graph.list_raw_nodes(None, ctx) if hasattr(graph, "list_raw_nodes") else []
+        all_nodes = _list_audio(None)
         audio_nodes = [
             n for n in all_nodes
             if str(getattr(n, "raw_type", "")) == "audio"
