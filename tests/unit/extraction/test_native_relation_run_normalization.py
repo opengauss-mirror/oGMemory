@@ -15,7 +15,6 @@ from extraction.schemas.registry import SchemaRegistry
 from service.api import MemoryWriteAPI
 from tests.unit.commit.test_memory_identity import MemoryFS
 
-
 CTX = RequestContext("relation-runs", "reader", "agent", "session", "trace")
 TIME = datetime(2026, 10, 1, tzinfo=UTC)
 MESSAGES = [{"id": "repair-source", "role": "user", "content":
@@ -32,6 +31,7 @@ class NativeRelationsLLM:
         self.category, self.proposals, self.bodies = category, proposals, bodies
         self.generation = generation
         self.native_calls, self.json_calls = [], []
+        self.assembly_calls = []
 
     def complete_with_tools(self, *, prompt, tools, tool_choice, temperature=None):
         self.native_calls.append(temperature)
@@ -43,15 +43,22 @@ class NativeRelationsLLM:
             title="Receiver repair", when="2026-10-01", who="reader",
             update_activation="The receiver was repaired by replacing its cable.",
         )} for body in self.bodies[run]]
-        calls.extend({"tool": "extract_relation", "input": dict(
-            from_routing_key="receiver_repair", from_category=self.category,
-            to_routing_key=target, to_category="entity", relation_type="refers_to",
-            reason="The repair concerns the " + target, weight=.9,
-        )} for target in self.proposals[run])
+        if any(tool["name"] == "extract_relation" for tool in tools):
+            calls.extend({"tool": "extract_relation", "input": dict(
+                from_routing_key="receiver_repair", from_category=self.category,
+                to_routing_key=target, to_category="entity", relation_type="refers_to",
+                reason="The repair concerns the " + target, weight=.9,
+            )} for target in self.proposals[run])
         return calls
 
     def complete_json(self, prompt, schema):
         properties = set(schema["properties"])
+        if properties == {"categories"}:
+            # Dev now selects schemas before graph-disabled extraction. Track
+            # assembly separately from the extraction/reconciliation calls
+            # pinned by this fixture's existing relation-provenance assertions.
+            self.assembly_calls.append(properties)
+            return {"categories": [self.category]}
         self.json_calls.append(properties)
         if properties == {"spans"}:
             return {"spans": [{"start": 0, "end": 0, "categories": [self.category]}]}
@@ -152,7 +159,11 @@ def test_second_run_native_edge_persists_when_later_generation_adds_nothing(gene
 
 
 def test_proposal_survives_later_cross_span_occurrence_reconciliation():
-    from tests.unit.extraction.test_source_occurrence_reconciliation import LATE, SourceLLM, messages
+    from tests.unit.extraction.test_source_occurrence_reconciliation import (
+        LATE,
+        SourceLLM,
+        messages,
+    )
 
     class CrossSpanRelationsLLM(SourceLLM):
         def complete_with_tools(self, **kwargs):

@@ -234,6 +234,28 @@ def test_tool_output_mutation_lock_bounds_extra_connection_slots(mock_sql_fs):
     cursor.execute.assert_not_called()
 
 
+@pytest.mark.parametrize("remaining, expected", [(None, 120.0), (3.0, 3.0)])
+def test_guarded_memory_identity_wait_uses_caller_deadline(mock_sql_fs, remaining, expected):
+    from contextlib import nullcontext
+
+    fs, _, _ = mock_sql_fs
+    guard = MagicMock()
+    guard.wait_for_identity_lock = True
+    guard.identity_lock.return_value = nullcontext()
+    directory = "ctx://acme/users/alice/memories/preferences"
+
+    with (
+        patch("fs.sql_adapter.session_mutation.active_session_guard", return_value=guard),
+        patch("core.operation_deadline.remaining_seconds", return_value=remaining),
+        fs.memory_identity_lock(directory, _ctx()),
+    ):
+        pass
+
+    guard.identity_lock.assert_called_once_with(
+        _resource_mutation_lock_key("acme", directory), _ctx(), expected,
+    )
+
+
 @pytest.fixture
 def mock_sql_fs():
     """Create SQLContextFS with mocked psycopg2."""
