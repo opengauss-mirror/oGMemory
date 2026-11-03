@@ -327,13 +327,28 @@ class _ScriptedAdapterLLM(MockLLM):
 
 
 class _ScriptedJudgeLLM(MockLLM):
-    """Mock judge that returns the next score from a queue on each call."""
+    """Mock judge returning scripted scores.
+
+    ``scores`` may be a list (legacy queue — only safe when judging is
+    serial) or a mapping of ``{question substring: score}`` — the mapping
+    form matches the question inside the judge prompt and is deterministic
+    under the parallel judge, whose call order is completion order rather
+    than question order.
+    """
     def __init__(self, scores):
         super().__init__()
-        self._queue = list(scores)
+        self._queue = [] if isinstance(scores, dict) else list(scores)
+        self._mapping = scores if isinstance(scores, dict) else {}
     def complete_json(self, prompt, schema):
         self._call_count += 1
-        score = self._queue.pop(0) if self._queue else 0.0
+        if self._mapping:
+            score = 0.0
+            for needle, value in self._mapping.items():
+                if needle in prompt:
+                    score = value
+                    break
+        else:
+            score = self._queue.pop(0) if self._queue else 0.0
         return {"score": score, "reasoning": f"scored {score}"}
 
 
@@ -381,7 +396,9 @@ def test_run_end_to_end_writes_results_and_summary(tmp_path: Path):
 
     def _judge_llm_factory(*a, **kw):
         # Score 1.0 for q1 (correct), 0.5 for q2 (partial), 0.0 for q3.
-        return _ScriptedJudgeLLM([1.0, 0.5, 0.0])
+        # Keyed by question text: the parallel judge calls in completion
+        # order, so a positional queue would be order-dependent.
+        return _ScriptedJudgeLLM({"mug": 1.0, "enter": 0.5, "dog": 0.0})
     monkey.setattr(eval_mod, "build_judge_llm", _judge_llm_factory)
 
     try:
@@ -775,7 +792,9 @@ def test_run_with_input_qa_results_judges_existing_predictions(
     )
     monkeypatch.setattr(
         eval_mod, "build_judge_llm",
-        lambda *a, **kw: _ScriptedJudgeLLM([1.0, 0.5, 0.0]),
+        # Keyed by question text — deterministic under the parallel judge.
+        lambda *a, **kw: _ScriptedJudgeLLM(
+            {"color?": 1.0, "How many?": 0.5, "Where?": 0.0}),
     )
 
     out_dir = tmp_path / "eval_out"

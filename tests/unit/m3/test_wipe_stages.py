@@ -204,7 +204,7 @@ def test_post_ops_wipe_vector_gated():
     vector_op = next(o for o in ops if o["name"] == "drop_vector_rows")
     assert "m3_episodic_vectors" in vector_op["sql"]
     assert "filters->>'account_id' = %(account_id)s" in vector_op["sql"]
-    assert "uri LIKE 'm3://%'" in vector_op["sql"]
+    assert "uri LIKE 'm3://%%'" in vector_op["sql"]  # %% = psycopg2-escaped %
 
 
 def test_post_ops_vector_table_overridable():

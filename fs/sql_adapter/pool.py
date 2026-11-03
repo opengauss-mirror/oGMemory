@@ -356,7 +356,6 @@ class PoolAdapterMixin:
             self._sql_dialect = self._dialect.name
             self._pool_size = pool_size
             self._pool: list = []
-            self._pool: list = []
             # Guards the idle-queue length check + append/pop, and bounds
             # total live connections (idle + active) so concurrent
             # borrowers queue for a slot instead of over-connecting.

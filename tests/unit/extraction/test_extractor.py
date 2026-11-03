@@ -337,10 +337,10 @@ class TestExtractorToolCallFallback:
             self._prepared(), self._ctx(), archive_id=None
         )
 
-        # The dual returns the resolved but UNMERGED candidates (one per
-        # pass); the single global _merge_dual_run happens in
-        # _structure_spans.
-        assert len(result) == 2
+        # Dev contract: the dual run merges its two passes inside
+        # _structure_prepared_span_dual (cross-span reconciliation still
+        # happens in _structure_spans / _merge_span_results).
+        assert len(result) == 1
         assert all(c.routing_key == "coffee" for c in result)
         assert llm.complete_with_tools.call_count == 2
         llm.complete_json.assert_not_called()
@@ -657,6 +657,7 @@ class TestExtractorToolCallFallback:
         llm.complete_json.side_effect = [
             RuntimeError("phase 1 down"),  # span identification fails
             {"operations": [self._preference("coffee")]},  # JSON fallback
+            {"operations": [self._preference("coffee")]},  # summary repair (dev flow)
         ]
         llm.complete_with_tools.side_effect = ToolCallProtocolError(
             "empty native result"

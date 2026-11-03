@@ -86,6 +86,16 @@ logger = logging.getLogger(__name__)
 _CONFIDENCE_THRESHOLD = 0.5
 
 
+class _SpanProgrammingError(RuntimeError):
+    """An unexpected error inside the parsing/validation code itself.
+
+    Deliberately NOT a ToolCallProtocolError subclass: LLM-output problems
+    (protocol failures, schema violations) flow through the retry / JSON
+    fallback / span-drop machinery, but a bug in our own parsing code must
+    crash loudly instead of being silently degraded to a dropped span.
+    """
+
+
 class _CandidateValidationError(ToolCallProtocolError):
     """A native batch containing a candidate that failed output validation."""
 
@@ -1031,6 +1041,15 @@ class Extractor:
                     break
                 except OperationDeadlineExceededError:
                     # Never burn the retry budget on an expired deadline.
+                    raise
+                except _SpanProgrammingError:
+                    # Bugs in our parsing code must crash loudly, not be
+                    # degraded to a dropped span (dev contract).
+                    logger.error(
+                        "Span %d-%d structuring hit a programming error — "
+                        "re-raising instead of degrading",
+                        prepared.span.start, prepared.span.end, exc_info=True,
+                    )
                     raise
                 except Exception as exc:
                     if attempt < attempts:
@@ -2015,6 +2034,19 @@ class Extractor:
                 c.provenance_ids.append(prov_id)
 
     def _parse_candidate_calls(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
+        try:
+            return self._parse_candidate_calls_checked(
+                calls, prefetch_result, ctx, output_label=output_label,
+            )
+        except (ToolCallProtocolError, ValidationError, ValueError, TypeError) as exc:
+            # LLM-output problems: keep the existing protocol / repair flow.
+            raise
+        except Exception as exc:
+            # A bug in parsing/validation code must not enter the retry or
+            # output-repair paths — surface it immediately.
+            raise _SpanProgrammingError(f"{type(exc).__name__}: {exc}") from exc
+
+    def _parse_candidate_calls_checked(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
         contents = {}
         entries = []
         for call in calls:

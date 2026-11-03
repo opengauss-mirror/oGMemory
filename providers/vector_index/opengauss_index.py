@@ -373,9 +373,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
     def _reset_connection(conn):
         """End the index transaction before the connection becomes idle."""
         if conn.closed != 0:
-            # Slot release is handled by the mixin; closed conns are
-            # simply never pooled again.
-            self._standalone_return_connection(conn)
             return
         try:
             if conn.info.transaction_status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:

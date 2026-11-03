@@ -269,9 +269,9 @@ class SeedRetriever:
             getattr(self.bm25_index, "supported_filters", filters)
         )
         if "memory_directory" in filters and "memory_directory" not in supported_filters:
-            raise RuntimeError("typed memory retrieval requires a lexical provider with a memory_directory filter")
+            raise RetrievalConfigError("typed memory retrieval requires a lexical provider with a memory_directory filter")
         if not self.config.expand_hierarchy and "level" not in supported_filters:
-            raise RuntimeError("direct L2 retrieval requires a lexical provider with a level filter")
+            raise RetrievalConfigError("direct L2 retrieval requires a lexical provider with a level filter")
         if self.config.hybrid_enabled and not {
             "account_id", "owner_space"
         }.issubset(supported_filters):

@@ -864,18 +864,10 @@ class OpenAILLM(LLM):
                             f"model={self._model}, prompt_sha={prompt_sha}",
                             tool_choice="required",
                         )
-                    # Accepted response (auto tool_choice legitimately
-                    # returned text): track usage only now, not on the
-                    # retried attempts above.
-                    self._track_usage(response)
                     return []
 
                 if effective_tool_choice == "required":
                     self._required_tool_choice_capability = "supported"
-                # Usage belongs to the accepted response only: tracking on
-                # every retry-loop attempt (and on the final raise) inflated
-                # the token counters.
-                usage = self._track_usage(response)
                 parsed_tool_calls = [
                     {
                         "tool": call.function.name,

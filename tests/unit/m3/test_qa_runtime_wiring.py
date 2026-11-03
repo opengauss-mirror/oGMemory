@@ -67,11 +67,17 @@ def test_partial_qa_failure_returns_nonzero_and_keeps_both_records(tmp_path, mon
         "--annotations", str(annotations), "--output-jsonl", str(output),
     ])
     adapter = Mock()
-    adapter.run.side_effect = [
-        SimpleNamespace(output=["Here"], completed=True, iterations=1, finish_reason="done"),
-        SimpleNamespace(output=[], completed=False, iterations=3,
-                        finish_reason="llm_error", llm_error=RuntimeError("GPU out of memory")),
-    ]
+
+    def _run(q_ctx, task_ctx):
+        # Keyed by question id (encoded in the per-question trace id):
+        # the parallel QA driver consumes side effects in completion
+        # order, so a positional list would be order-dependent.
+        if str(q_ctx.trace_id).endswith("-q1"):
+            return SimpleNamespace(output=["Here"], completed=True, iterations=1, finish_reason="done")
+        return SimpleNamespace(output=[], completed=False, iterations=3,
+                               finish_reason="llm_error", llm_error=RuntimeError("GPU out of memory"))
+
+    adapter.run.side_effect = _run
     monkeypatch.setattr("m3.control_adapter.OGMemoryControlAdapter", Mock(return_value=adapter))
     assert run_react_qa(args, graph=Mock(), embedder=Mock(), llm=Mock()) == 2
     rows = [json.loads(line) for line in output.read_text().splitlines()]
