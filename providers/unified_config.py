@@ -506,7 +506,7 @@ class OgMemConfig:
     chroma_persist_directory: str = ".chroma_data"
     chroma_collection_name: str = "contextengine"
 
-    milvus_uri: str = "http://localhost:19530"
+    milvus_uri: str = field(default="http://localhost:19530", repr=False)
     milvus_token: str = field(default="", repr=False)
     milvus_collection_name: str = "contextengine"
     milvus_db_name: str = "default"
@@ -2530,7 +2530,7 @@ class OgMemConfig:
         """Return a sanitised dict suitable for logging (keys masked)."""
         def sanitize(name: str, value: Any) -> Any:
             lowered = name.casefold()
-            credential_name = lowered.endswith("token") or any(
+            credential_name = lowered == "milvus_uri" or lowered.endswith("token") or any(
                 marker in lowered
                 for marker in ("key", "password", "secret", "connection_string")
             )

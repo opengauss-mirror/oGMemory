@@ -18,6 +18,15 @@ from core.models import IndexRecord
 from providers.vector_index.factory import create_vector_index
 
 
+class MilvusPreflightError(RuntimeError):
+    """Safe probe diagnostics without SDK exception or connection details."""
+
+    def __init__(self, stage: str, record: IndexRecord):
+        super().__init__(
+            f"stage={stage}; record_id={record.id}; account_id={record.filters['account_id']}"
+        )
+
+
 def check_milvus(config: Any) -> None:
     probe = uuid4().hex
     account = f"ogmemory-preflight-{probe}"
@@ -31,23 +40,34 @@ def check_milvus(config: Any) -> None:
     )
     index = create_vector_index(config)
     try:
-        index.upsert([record])
-        saved = index.get_record(record.id)
-        if saved is None or saved.text != record.text:
-            raise RuntimeError("Milvus preflight read did not match the written record")
-        hits = index.search_by_vector(vector, {"account_id": account}, 1)
-        if not hits or hits[0].uri != uri:
-            raise RuntimeError("Milvus preflight search did not return the written record")
-    finally:
+        # A real RPC for an absent UUID checks Delete permission before writing.
+        # delete([]) would return locally without checking server permissions.
         try:
-            # Even an unsuccessful write may have committed before timing out.
             index.delete([record.id])
-            if index.get_record(record.id) is not None:
-                raise RuntimeError("Milvus preflight record was not removed")
+        except Exception as exc:
+            raise MilvusPreflightError("delete-permission", record) from exc
+        try:
+            index.upsert([record])
+            saved = index.get_record(record.id)
+            if saved is None or saved.text != record.text:
+                raise RuntimeError("Milvus preflight read did not match the written record")
+            hits = index.search_by_vector(vector, {"account_id": account}, 1)
+            if not hits or hits[0].uri != uri:
+                raise RuntimeError("Milvus preflight search did not return the written record")
         finally:
-            close = getattr(index, "close", None)
-            if callable(close):
-                close()
+            try:
+                # Even an unsuccessful write may have committed before timing out.
+                index.delete([record.id])
+                if index.get_record(record.id) is not None:
+                    raise RuntimeError("Milvus preflight record was not removed")
+            except Exception as exc:
+                # Permission can be revoked after the first check. Identify any
+                # possible orphan without exposing URI/token or raw SDK errors.
+                raise MilvusPreflightError("cleanup", record) from exc
+    finally:
+        close = getattr(index, "close", None)
+        if callable(close):
+            close()
 
 
 def main() -> int:
@@ -68,7 +88,8 @@ def main() -> int:
             milvus_timeout=float(os.environ["MILVUS_TIMEOUT"]),
         ))
     except Exception as exc:
-        print(f"Milvus preflight failed ({type(exc).__name__})", file=sys.stderr)
+        detail = f": {exc}" if isinstance(exc, MilvusPreflightError) else ""
+        print(f"Milvus preflight failed ({type(exc).__name__}){detail}", file=sys.stderr)
         return 1
     print("Milvus schema/index and write/read/search/delete preflight passed")
     return 0

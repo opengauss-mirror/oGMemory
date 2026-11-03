@@ -67,7 +67,7 @@ class ProviderConfig:
     chroma_persist_directory: str = ".chroma_data"
     chroma_collection_name: str = "contextengine"
 
-    milvus_uri: str = "http://localhost:19530"
+    milvus_uri: str = field(default="http://localhost:19530", repr=False)
     milvus_token: str = field(default="", repr=False)
     milvus_collection_name: str = "contextengine"
     milvus_db_name: str = "default"

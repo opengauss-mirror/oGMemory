@@ -14,8 +14,15 @@ from server.memory_service import MemoryService
 def probe_config(monkeypatch):
     index = Mock()
     records = []
-    index.upsert.side_effect = lambda value: records.extend(value)
-    index.get_record.side_effect = lambda _: records[0] if index.delete.call_count == 0 else None
+    stored = {}
+
+    def upsert(value):
+        records.extend(value)
+        stored.update((record.id, record) for record in value)
+
+    index.upsert.side_effect = upsert
+    index.get_record.side_effect = stored.get
+    index.delete.side_effect = lambda ids: [stored.pop(key, None) for key in ids]
     index.search_by_vector.side_effect = lambda *a: [SimpleNamespace(uri=records[0].uri)]
     config = SimpleNamespace(embedding_dimension=3)
     monkeypatch.setattr(check_milvus, "create_vector_index", Mock(return_value=index))
@@ -33,7 +40,8 @@ def test_preflight_checks_read_search_delete_and_removes_only_its_own_record(mon
     index.search_by_vector.assert_called_once_with(
         [1., 0., 0.], {"account_id": record.filters["account_id"]}, 1,
     )
-    index.delete.assert_called_once_with([record.id])
+    assert index.delete.call_count == 2
+    assert all(call.args == ([record.id],) for call in index.delete.call_args_list)
     assert index.get_record.call_count == 2
     index.close.assert_called_once_with()
 
@@ -53,7 +61,28 @@ def test_preflight_fails_closed_and_closes_client(operation, monkeypatch):
         index.get_record.side_effect = lambda _: records[0]
     with pytest.raises((PermissionError, RuntimeError)):
         check_milvus.check_milvus(config)
-    index.delete.assert_called_once()
+    assert index.delete.call_count == (1 if operation == "delete" else 2)
+    if operation == "delete":
+        index.upsert.assert_not_called()
+    index.close.assert_called_once_with()
+
+
+def test_preflight_reports_orphan_if_delete_permission_is_revoked(monkeypatch, capsys):
+    config, index, records = probe_config(monkeypatch)
+    index.delete.side_effect = [None, PermissionError("private-token")]
+    monkeypatch.setattr(check_milvus.logging, "disable", lambda *a: None)
+    monkeypatch.setenv("VECTOR_DB_DIMENSION", "3")
+    monkeypatch.setenv("MILVUS_URI", "http://user:private-token@localhost:19530")
+    monkeypatch.setenv("MILVUS_COLLECTION", "test")
+    monkeypatch.setenv("MILVUS_DB_NAME", "default")
+    monkeypatch.setenv("MILVUS_TIMEOUT", "5")
+    assert check_milvus.main() == 1
+    error = capsys.readouterr().err
+    assert "stage=cleanup" in error
+    assert f"record_id={records[0].id}" in error
+    assert f"account_id={records[0].filters['account_id']}" in error
+    assert "private-token" not in error
+    assert "localhost" not in error
     index.close.assert_called_once_with()
 
 

@@ -150,6 +150,31 @@ def test_factory_routes_milvus(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("uri", [
+    "https://user:synthetic-password@milvus.example:19530",
+    "http://user:synthetic%40password@milvus.example:19530",
+    "http://synthetic-user@milvus.example:19530",
+    "http://milvus.example:19530",
+])
+def test_milvus_uri_is_private_but_preserved_for_connections(uri, monkeypatch, caplog):
+    import logging
+
+    from providers import unified_config
+
+    config = unified_config.OgMemConfig(milvus_uri=uri)
+    monkeypatch.setattr(unified_config, "_global_config", None)
+    monkeypatch.setattr(unified_config.OgMemConfig, "load", lambda _: config)
+    with caplog.at_level(logging.INFO):
+        assert unified_config.get_config() is config
+    assert config.dump_summary()["milvus_uri"] == "<configured>"
+    projected = config.to_provider_config()
+    assert config.milvus_uri == projected.milvus_uri == uri
+    assert projected.to_ogmem_config().milvus_uri == uri
+    assert uri not in caplog.text
+    assert uri not in repr(config)
+    assert uri not in repr(projected)
+
+
 def _schema():
     from pymilvus import DataType
 
