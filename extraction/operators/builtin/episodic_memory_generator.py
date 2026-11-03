@@ -312,6 +312,7 @@ class EpisodicMemoryGenerator:
                         source_path,
                         fps=self._video_fps,
                         width=self._video_width,
+                        include_audio=self._include_audio,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -666,6 +667,7 @@ def _prepare_llm_video(
     *,
     fps: int = 10,
     width: int = 512,
+    include_audio: bool = True,
     ffmpeg_bin: str = "ffmpeg",
     timeout_sec: float = 300.0,
 ) -> tuple[Path, str]:
@@ -674,11 +676,15 @@ def _prepare_llm_video(
     Source clips come out of the slicer as high-bitrate stream copies
     (~27 MB for 30 s) — far too large for a base64 ``video_url`` part.
     We re-encode to ``width`` px, ``fps`` frames/s, CRF 30 (~350 KB for
-    30 s at 512px/10fps) keeping a mono 16 kHz AAC track. The result is
-    cached as a sidecar next to the source so re-extraction (``--force``)
-    doesn't pay the ffmpeg cost again, and the encode knobs are baked
-    into the sidecar name so different settings never reuse a stale
-    encode.
+    30 s at 512px/10fps) keeping a mono 16 kHz AAC track — unless
+    ``include_audio`` is False, in which case the audio track is
+    stripped (``-an``): ``--use-video --no-audio`` must not silently
+    upload the raw audio inside the video while reporting
+    ``audio_attached=False`` (review item 11). The result is cached as a
+    sidecar next to the source so re-extraction (``--force``) doesn't
+    pay the ffmpeg cost again, and the encode knobs — including the
+    audio setting — are baked into the sidecar name so different
+    settings never reuse a stale encode.
     """
     import subprocess
 
@@ -686,15 +692,19 @@ def _prepare_llm_video(
     if not src.exists():
         raise FileNotFoundError(f"clip source not found: {src}")
     sidecar = src.with_name(
-        f"{src.stem}.llm-f{fps}-w{width}.mp4"
+        f"{src.stem}.llm-f{fps}-w{width}-{'a' if include_audio else 'na'}.mp4"
     )
     if not sidecar.exists():
+        audio_args = (
+            ["-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "32k"]
+            if include_audio else ["-an"]
+        )
         cmd = [
             ffmpeg_bin, "-y", "-loglevel", "error",
             "-i", str(src),
             "-vf", f"scale={width}:-2,fps={fps}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
-            "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "32k",
+            *audio_args,
             str(sidecar),
         ]
         proc = subprocess.run(
@@ -766,9 +776,12 @@ def _video_part_from_source(
     *,
     fps: int = 10,
     width: int = 512,
+    include_audio: bool = True,
 ) -> dict:
     """Build a ``video_url`` content part from a clip's source path."""
-    _, b64 = _prepare_llm_video(source_path, fps=fps, width=width)
+    _, b64 = _prepare_llm_video(
+        source_path, fps=fps, width=width, include_audio=include_audio
+    )
     return {
         "type": "video_url",
         "video_url": {"url": f"data:video/mp4;base64,{b64}"},

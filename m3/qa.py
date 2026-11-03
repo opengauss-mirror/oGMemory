@@ -31,7 +31,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from m3._parallel import ThreadLocalModels, UnitError, parallel_clips
+from m3._parallel import ThreadLocalModels, UnitError, iter_parallel_clips, parallel_clips
 from m3.config import M3BENCH_ACCOUNT_ID, video_id_from_path
 from m3.index_episodic import build_embedder
 from m3.search import EpisodicSearcher, Evidence, format_evidence_block
@@ -670,7 +670,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         }
 
     with output_path.open(mode, encoding="utf-8") as f:
-        for q, out in parallel_clips(pending, _run_one_question, label="question(s)"):
+        for q, out in iter_parallel_clips(pending, _run_one_question, label="question(s)"):
             if isinstance(out, UnitError):
                 # _run_one_question never raises; this is a safety net
                 # for bugs in the row construction itself.

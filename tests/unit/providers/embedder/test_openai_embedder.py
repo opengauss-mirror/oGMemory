@@ -121,10 +121,12 @@ class TestOpenAIEmbedder:
         options = fake_client.with_options.call_args.kwargs
         assert 0 < options['timeout'] <= 4.5
         assert options['max_retries'] == 0
-        deadline_client.embeddings.create.assert_called_once_with(
-            input=["hello"],
-            model="custom-model",
-        )
+        create_kwargs = deadline_client.embeddings.create.call_args.kwargs
+        assert create_kwargs["input"] == ["hello"]
+        assert create_kwargs["model"] == "custom-model"
+        # Review item 6: the per-request timeout is recomputed per attempt
+        # and never exceeds the caller's remaining budget.
+        assert 0 < create_kwargs["timeout"] <= 4.5
 
     def test_deadline_aware_embedder_rejects_expired_budget_before_provider_call(
         self,
@@ -412,7 +414,7 @@ class TestEmbedRetryAndConcurrency:
 
         calls = []
 
-        def flaky():
+        def flaky(remaining):
             calls.append(1)
             if len(calls) < 2:
                 raise httpx.TimeoutException("transient")
@@ -427,7 +429,7 @@ class TestEmbedRetryAndConcurrency:
 
         calls = []
 
-        def denied():
+        def denied(remaining):
             calls.append(1)
             raise PermissionError("auth")
 
@@ -443,7 +445,7 @@ class TestEmbedRetryAndConcurrency:
 
         calls = []
 
-        def always_transient():
+        def always_transient(remaining):
             calls.append(1)
             raise httpx.TimeoutException("still down")
 
@@ -520,3 +522,53 @@ class TestEmbedRetryAndConcurrency:
             t.join()
 
         assert max(peak) <= 2
+
+
+class TestEmbedDeadlineBudget:
+    """Review item 6: concurrency waits and retry backoff must respect the
+    caller's absolute deadline; no API call may start after expiry."""
+
+    def test_contended_slot_with_tiny_budget_fails_fast_without_api_call(
+        self, fake_client, monkeypatch
+    ):
+        import time as _time
+        # Occupy every concurrency slot so the caller must queue.
+        slots = openai_embedder_module._embed_max_concurrency()
+        held = [openai_embedder_module._EMBED_SEMAPHORE.acquire()
+                for _ in range(slots)]
+        try:
+            embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
+            started = _time.monotonic()
+            with pytest.raises(TimeoutError, match="concurrency slot"):
+                embedder.embed_texts_with_timeout(["hello"], timeout_seconds=0.01)
+            # Failed fast instead of queueing unboundedly.
+            assert _time.monotonic() - started < 1.0
+        finally:
+            for ok in held:
+                if ok:
+                    openai_embedder_module._EMBED_SEMAPHORE.release()
+        # The API was never called — the budget died in the queue.
+        fake_client.with_options.assert_not_called()
+
+    def test_backoff_never_sleeps_past_the_deadline(
+        self, fake_client, monkeypatch
+    ):
+        import time as _time
+        from openai import APITimeoutError
+        import httpx
+        monkeypatch.setenv("OGMEM_EMBED_RETRIES", "2")
+        monkeypatch.setenv("OGMEM_EMBED_BASE_DELAY", "30")  # >> the budget
+        deadline_client = Mock()
+        request = httpx.Request("POST", "http://embed/embeddings")
+        deadline_client.embeddings.create.side_effect = APITimeoutError(request)
+        fake_client.with_options.return_value = deadline_client
+        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
+
+        started = _time.monotonic()
+        with pytest.raises(TimeoutError, match="deadline"):
+            embedder.embed_texts_with_timeout(["hello"], timeout_seconds=0.05)
+        # The 30s backoff was truncated to the remaining budget: the call
+        # ended within a second, not after a full sleep.
+        assert _time.monotonic() - started < 1.0
+        # Only the first attempt ran; the retry never started (no budget).
+        assert deadline_client.embeddings.create.call_count == 1

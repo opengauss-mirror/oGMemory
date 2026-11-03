@@ -63,3 +63,12 @@ RUN pip install --no-cache-dir -q "faster-whisper==1.2.1" && \
 # (an explicit -e HF_HOME=... overrides this default).
 ENV HF_HOME=/hf-cache
 RUN mkdir -p /hf-cache && chmod 1777 /hf-cache
+
+# The serving base declares ENTRYPOINT ["/opt/entrypoint.sh"], which boots
+# IndexService + MCP + gunicorn and IGNORES positional arguments — both the
+# compose `command: ["sleep", "infinity"]` and
+# `docker compose run --rm m3runner python3 -m m3...` would be silently
+# dropped and the runner would come up as a second (port-colliding, on
+# host networking) ogmem server instead. Reset the entrypoint so the
+# image runs exactly what the caller asks for (review item 3).
+ENTRYPOINT []

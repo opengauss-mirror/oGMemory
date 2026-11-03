@@ -352,3 +352,40 @@ def test_cli_requires_connection_string(monkeypatch):
     monkeypatch.delenv("OGMEM_GRAPH_CONNECTION_STRING", raising=False)
     rc = ws.main(["--account", "a", "--wipe-from", "m3.episodic_memory"])
     assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# Stage-scoped memory seeds (review item 2): two stages produce
+# node_type='memory' nodes and a bare seed predicate cannot tell them apart.
+# ---------------------------------------------------------------------------
+
+def test_seed_where_semantic_boundary_does_not_seed_episodic_memories():
+    """--wipe-from m3.semantic_memory_consolidator must only doom the
+    consolidator's own evolved memories, not the per-clip memories that
+    m3.memory.from_episodic produced (which the range promises to keep)."""
+    where, params = ws.seed_where(ws.stages_from("m3.semantic_memory_consolidator"))
+    assert "(node_type = 'memory' AND topic LIKE 'semantic:%%')" in where
+    assert "'episodic' = ANY(tags)" not in where
+    # Not the bare predicate — that would select every memory in the account.
+    assert where.count("node_type = 'memory'") == 1  # only inside the scoped clause
+
+
+def test_keep_until_index_episodic_preserves_per_clip_memories():
+    """Reviewer repro: --keep-until m3.index_episodic must not destroy the
+    m3.memory.from_episodic output it promises to retain."""
+    stages = ws.stages_after("m3.index_episodic")
+    assert [s.stage_id for s in stages] == [
+        "m3.semantic_memory_consolidator", "m3.qa", "m3.eval",
+    ]
+    where, _ = ws.seed_where(stages)
+    assert "(node_type = 'memory' AND topic LIKE 'semantic:%%')" in where
+    assert "'episodic' = ANY(tags)" not in where
+
+
+def test_seed_where_from_episodic_boundary_seeds_all_memories():
+    """--wipe-from m3.memory.from_episodic covers both memory producers
+    (from_episodic + the consolidator downstream of it) -> bare predicate."""
+    where, params = ws.seed_where(ws.stages_from("m3.memory.from_episodic"))
+    assert "node_type = 'memory'" in where
+    assert "topic LIKE" not in where
+    assert "'episodic' = ANY(tags)" not in where

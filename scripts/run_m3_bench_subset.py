@@ -798,6 +798,55 @@ def run_judge(
 # ---------------------------------------------------------------------------
 
 
+def _judge_input_digest(
+    jsonl: Path, annotations: Path, args: argparse.Namespace
+) -> str:
+    """Digest of everything a cached judgment depends on (review item 9).
+
+    Predictions, annotations, the effective judge configuration (provider /
+    model / base URL / type filter) and the ``--config`` YAML (it carries
+    ``m3.judge_llm``). The API key is deliberately excluded: rotating a key
+    must not invalidate judgments made by the same model+endpoint.
+    """
+    h = hashlib.sha256()
+    config = getattr(args, "config", None)
+    paths = [jsonl, annotations] + ([Path(config)] if config else [])
+    for path in paths:
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<missing:" + str(path).encode() + b">")
+    judge_identity = "|".join(str(x or "") for x in (
+        getattr(args, "judge_llm", None),
+        getattr(args, "judge_model", None),
+        getattr(args, "judge_base_url", None),
+        getattr(args, "type_filter", None),
+    ))
+    h.update(b"judge:" + judge_identity.encode())
+    return h.hexdigest()
+
+
+def _write_judge_digest(
+    work_dir: Path, digest: str, *, jsonl: Path, annotations: Path
+) -> None:
+    """Persist the digest a future resume must match to reuse the judgment."""
+    def _size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    sidecar = work_dir / "m3_eval_summary.digest.json"
+    try:
+        sidecar.write_text(json.dumps({
+            "digest": digest,
+            "qa_results_bytes": _size(jsonl),
+            "annotations_bytes": _size(annotations),
+        }, indent=2), encoding="utf-8")
+    except OSError:
+        logger.warning("could not write judge digest sidecar %s", sidecar)
+
+
 def live_judge_video(
     *,
     video_id: str,
@@ -809,8 +858,10 @@ def live_judge_video(
 
     Writes per-video ``m3_eval_summary.json`` / ``m3_eval_results.jsonl``
     under ``<work-dir-root>/<video_id>/``. When a per-video summary already
-    exists (resume) and ``--force`` is unset, it is reused as-is — the judge
-    never runs twice for the same predictions.
+    exists (resume) and ``--force`` is unset, it is reused **only when the
+    recorded input digest still matches** (predictions, annotations, judge
+    configuration) — repaired or partial predictions otherwise re-judge
+    instead of silently aggregating stale scores (review item 9).
     """
     if args.dry_run:
         return None
@@ -822,27 +873,46 @@ def live_judge_video(
     ):
         return None
     summary_path = work_dir / "m3_eval_summary.json"
+    digest = _judge_input_digest(jsonl, annotations_path, args)
     if summary_path.exists() and not args.force:
+        sidecar = work_dir / "m3_eval_summary.digest.json"
+        recorded = None
         try:
-            return {
-                "status": "reused",
-                "returncode": 0,
-                "summary_path": str(summary_path),
-                "summary": json.loads(summary_path.read_text(encoding="utf-8")),
-            }
-        except (OSError, json.JSONDecodeError):
+            recorded = json.loads(sidecar.read_text(encoding="utf-8")).get("digest")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        if recorded == digest:
+            try:
+                return {
+                    "status": "reused",
+                    "returncode": 0,
+                    "summary_path": str(summary_path),
+                    "summary": json.loads(summary_path.read_text(encoding="utf-8")),
+                }
+            except (OSError, json.JSONDecodeError):
+                logger.warning(
+                    "[%s] per-video judge summary unreadable — re-judging", video_id
+                )
+        else:
             logger.warning(
-                "[%s] per-video judge summary unreadable — re-judging", video_id
+                "[%s] cached judge summary is stale (predictions, annotations "
+                "or judge configuration changed since it was written) — "
+                "re-judging", video_id,
             )
     # Reuse the existing judge driver, scoped to this one video: the
     # ``--video`` filter keeps m3.eval from scoring other videos' questions.
-    return run_judge(
+    result = run_judge(
         annotations=annotations_path,
         merged_jsonl=jsonl,
         output_dir=work_dir,
         args=args,
         subset=[video_id],
     )
+    if result.get("returncode") == 0 and result.get("summary_path"):
+        _write_judge_digest(
+            work_dir, digest, jsonl=jsonl, annotations=annotations_path
+        )
+    return result
 
 
 def merge_per_video_judges(

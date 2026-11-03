@@ -94,8 +94,14 @@ class StageWipe:
     extractor_types: tuple[str, ...] = ()
     # RawNodes produced by the stage (graph_nodes.raw_type).
     raw_types: tuple[str, ...] = ()
-    # The stage creates MemoryNodes (node_type='memory').
-    memory_nodes: bool = False
+    # The stage creates MemoryNodes (node_type='memory'). The value is
+    # the producer selector, because two stages create memory nodes and a
+    # bare node_type='memory' seed cannot tell them apart (review item 2):
+    #   "episodic"  — m3.memory.from_episodic per-clip memories
+    #                 (tags contain 'episodic', topic 'm3:<video>')
+    #   "semantic"  — m3.semantic_memory_consolidator evolved memories
+    #                 (topic 'semantic:<video>')
+    memory_nodes: str = ""
     # Endpoint extractor types whose same_identity edges this stage owns;
     # empty = no clustering. (faces for face_clustering, speakers for
     # voice_clustering.)
@@ -154,7 +160,7 @@ STAGE_SPECS: dict[str, StageWipe] = {
     ),
     "m3.memory.from_episodic": StageWipe(
         stage_id="m3.memory.from_episodic",
-        memory_nodes=True,
+        memory_nodes="episodic",
     ),
     "m3.index_episodic": StageWipe(
         stage_id="m3.index_episodic",
@@ -163,7 +169,7 @@ STAGE_SPECS: dict[str, StageWipe] = {
     ),
     "m3.semantic_memory_consolidator": StageWipe(
         stage_id="m3.semantic_memory_consolidator",
-        memory_nodes=True,
+        memory_nodes="semantic",
         notes="evolved memories + evolves edges",
     ),
     "m3.qa": StageWipe(
@@ -237,8 +243,26 @@ def seed_where(stages: list[StageWipe]) -> tuple[str, dict[str, Any]]:
     if raws:
         clauses.append("raw_type = ANY(%(raw_types)s)")
         params["raw_types"] = raws
-    if any(s.memory_nodes for s in stages):
-        clauses.append("node_type = 'memory'")
+    memory_selectors = {s.memory_nodes for s in stages if s.memory_nodes}
+    if memory_selectors:
+        if len(memory_selectors) > 1:
+            # Wipe range covers every memory producer: a bare node_type
+            # predicate is correct and cheapest.
+            clauses.append("node_type = 'memory'")
+        elif "episodic" in memory_selectors:
+            # Only m3.memory.from_episodic is in range: seed its per-clip
+            # memories, NOT the semantic consolidator's evolved memories
+            # (and vice versa) — a bare node_type='memory' seed would doom
+            # memories produced by stages the range promises to keep.
+            clauses.append(
+                "(node_type = 'memory' AND 'episodic' = ANY(tags))"
+            )
+        else:  # "semantic"
+            # %% — escaped for psycopg2 (the seed SQL executes with named
+            # params), same as the vector-wipe uri LIKE 'm3://%%' below.
+            clauses.append(
+                "(node_type = 'memory' AND topic LIKE 'semantic:%%')"
+            )
     if not clauses:
         raise ValueError("wipe range owns no graph nodes")
     return " OR ".join(f"({c})" for c in clauses), params
@@ -554,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
             owns = " | ".join(filter(None, [
                 "ext:" + ",".join(spec.extractor_types) if spec.extractor_types else "",
                 "raw:" + ",".join(spec.raw_types) if spec.raw_types else "",
-                "memory_nodes" if spec.memory_nodes else "",
+                f"memory_nodes({spec.memory_nodes})" if spec.memory_nodes else "",
                 "same_identity_edges" if spec.same_identity_endpoints else "",
                 "vector_index" if spec.vector_index else "",
                 "qa_files" if spec.qa_files else "",

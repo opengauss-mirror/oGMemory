@@ -768,7 +768,15 @@ class Extractor:
                 prepared_spans[0], ctx, archive_id
             )
             if candidates is None:
-                return []
+                # Total failure must not look like "extraction completed,
+                # nothing found": an empty list is accepted as success by
+                # the write path, which then removes the source messages
+                # from the journal and marks the request complete. Raise
+                # the typed retryable signal instead (review item 1).
+                raise ExtractionIncompleteError(
+                    "extraction produced no successful span: the single "
+                    "span failed or was dropped after retries"
+                )
             if self._reconcile_source_occurrences_enabled():
                 return self._merge_span_results(
                     [(prepared_spans[0].span, candidates)], ctx, archive_id
@@ -794,6 +802,16 @@ class Extractor:
                     "failed or dropped — keeping partial candidates",
                     len(prepared_spans) - len(failed), len(prepared_spans),
                     len(failed),
+                )
+            if not span_results:
+                # Every span failed: raising (not returning []) keeps the
+                # source batch retryable — the journal is preserved and the
+                # request is re-extracted instead of being marked complete
+                # with zero memories (review item 1).
+                raise ExtractionIncompleteError(
+                    f"extraction produced no successful span: "
+                    f"{len(failed)}/{len(prepared_spans)} spans failed "
+                    "or were dropped after retries"
                 )
             return self._merge_span_results(span_results, ctx, archive_id)
 
@@ -859,6 +877,15 @@ class Extractor:
                 "failed or dropped — keeping partial candidates",
                 len(prepared_spans) - len(failed), len(prepared_spans),
                 len(failed),
+            )
+        if not span_results:
+            # Every span failed or was dropped: raise the typed retryable
+            # signal so the source batch is re-extracted rather than being
+            # marked complete with zero memories (review item 1).
+            raise ExtractionIncompleteError(
+                f"extraction produced no successful span: "
+                f"{len(failed)}/{len(prepared_spans)} spans failed "
+                "or were dropped after retries"
             )
         return self._merge_span_results(span_results, ctx, archive_id)
 

@@ -320,3 +320,82 @@ def test_dry_run_skips_live_judge(monkeypatch, tmp_path):
 
     assert judge_calls == []
     assert "judge" not in summaries[0]
+
+
+def _install_resume_runner(monkeypatch, tmp_path):
+    """A runner that leaves the existing JSONL untouched (resume semantics:
+    externally repaired QA rows must survive the re-run)."""
+
+    def fake_run_one_video(*, video_id, video_path, args, annotations,
+                           expected_qids):
+        return {
+            "video_id": video_id,
+            "status": "ok",
+            "duration_sec": 0.1,
+            "jsonl": str(Path(args.work_dir_root) / video_id / "m3_qa_results.jsonl"),
+            "returncode": 0,
+        }
+
+    monkeypatch.setattr(driver, "run_one_video", fake_run_one_video)
+
+    def fake_resolve_video_path(declared, *, project_root, videos_root):
+        return tmp_path / f"{declared}.mp4"
+
+    monkeypatch.setattr(driver, "resolve_video_path", fake_resolve_video_path)
+
+
+def test_live_judge_rejudges_when_predictions_change(monkeypatch, tmp_path):
+    """Review item 9: a cached judgment is bound to the digest of its
+    inputs — repaired predictions must re-judge, not reuse stale scores."""
+    videos = ["v1"]
+    _install_fake_runner(monkeypatch, tmp_path)
+    judge_calls = _install_fake_judge(monkeypatch)
+    annotations_path = tmp_path / "robot.json"
+
+    driver.run_videos(
+        subset=videos, args=_args(tmp_path, judge=True),
+        annotations=_annotations(videos), annotations_path=annotations_path,
+        project_root=tmp_path, videos_root=tmp_path,
+    )
+    assert judge_calls == ["v1"]
+
+    # Repair the predictions (as a normal resume does for failed/partial
+    # rows) — the recorded digest no longer matches.
+    jsonl = tmp_path / "v1" / "m3_qa_results.jsonl"
+    rows = [json.loads(l) for l in jsonl.read_text(encoding="utf-8").splitlines() if l]
+    rows[0]["predicted_answer"] = "repaired answer"
+    jsonl.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    _install_resume_runner(monkeypatch, tmp_path)  # resume: JSONL untouched
+    second = driver.run_videos(
+        subset=videos, args=_args(tmp_path, judge=True),  # force=False
+        annotations=_annotations(videos), annotations_path=annotations_path,
+        project_root=tmp_path, videos_root=tmp_path,
+    )
+    assert judge_calls == ["v1", "v1"]  # re-judged, not reused
+    assert second[0]["judge"].get("status") != "reused"
+
+
+def test_live_judge_rejudges_when_judge_model_changes(monkeypatch, tmp_path):
+    """Switching the judge model invalidates cached judgments."""
+    videos = ["v1"]
+    _install_fake_runner(monkeypatch, tmp_path)
+    judge_calls = _install_fake_judge(monkeypatch)
+    annotations_path = tmp_path / "robot.json"
+
+    driver.run_videos(
+        subset=videos, args=_args(tmp_path, judge=True),
+        annotations=_annotations(videos), annotations_path=annotations_path,
+        project_root=tmp_path, videos_root=tmp_path,
+    )
+    assert judge_calls == ["v1"]
+
+    _install_resume_runner(monkeypatch, tmp_path)
+    second = driver.run_videos(
+        subset=videos,
+        args=_args(tmp_path, judge=True, judge_model="other-model"),
+        annotations=_annotations(videos), annotations_path=annotations_path,
+        project_root=tmp_path, videos_root=tmp_path,
+    )
+    assert judge_calls == ["v1", "v1"]
+    assert second[0]["judge"].get("status") != "reused"

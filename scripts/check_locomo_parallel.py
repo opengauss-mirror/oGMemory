@@ -115,6 +115,7 @@ _DOCKER_WARNED = False
 
 
 def docker_exec_warn(container: str, *args: str):
+    global _DOCKER_WARNED  # assignment below must not shadow the module flag
     stdout, rc = docker_exec(container, *args)
     if stdout is None and not _DOCKER_WARNED:
         warn("docker access",

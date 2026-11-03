@@ -415,8 +415,8 @@ class TestVideoMode:
 
         calls = []
 
-        def fake_part(source_path, *, fps=10, width=512):
-            calls.append((source_path, fps, width))
+        def fake_part(source_path, *, fps=10, width=512, include_audio=True):
+            calls.append((source_path, fps, width, include_audio))
             if fail:
                 raise RuntimeError("ffmpeg exploded")
             return {
@@ -465,7 +465,7 @@ class TestVideoMode:
 
         gen.extract(video_node, ctx, frame_nodes=frame_nodes)
 
-        assert calls == [("/tmp/vid_a/0.mp4", 5, 256)]
+        assert calls == [("/tmp/vid_a/0.mp4", 5, 256, True)]
 
     def test_video_mode_error_falls_back_to_frames(
         self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
@@ -613,3 +613,97 @@ def test_wav_sample_count_not_container_size(
     assert any(p["type"] == "image_url" for p in parts)
     if samples:
         assert base64.b64decode(audio_parts[0]["input_audio"]["data"]) == payload
+
+
+class TestNoAudioVideoEncode:
+    """Review item 11: ``--use-video --no-audio`` must strip the audio
+    track from the re-encoded video (not silently upload it inside the
+    file while reporting audio_attached=False), and the audio setting
+    must be part of the sidecar cache key."""
+
+    @pytest.fixture
+    def clip_source(self, tmp_path):
+        src = tmp_path / "clip_0001.mp4"
+        src.write_bytes(b"fake-mp4-bytes")
+        return src
+
+    @staticmethod
+    def _fake_ffmpeg(monkeypatch, target_bytes=b"encoded"):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            out = cmd[-1]  # the output path is the final positional arg
+            if out.endswith(".mp4"):
+                from pathlib import Path
+                Path(out).write_bytes(target_bytes)
+            class _P:
+                returncode = 0
+                stderr = ""
+            return _P()
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(mod, "_ensure_video_stream", lambda *a, **k: None)
+        return commands
+
+    def test_include_audio_false_strips_track_and_keys_sidecar(
+        self, monkeypatch, clip_source,
+    ):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        commands = self._fake_ffmpeg(monkeypatch)
+
+        _, b64 = mod._prepare_llm_video(
+            str(clip_source), fps=10, width=512, include_audio=False,
+        )
+        assert b64
+        cmd = commands[0]
+        assert "-an" in cmd                      # audio track stripped
+        assert "-c:a" not in cmd and "-b:a" not in cmd
+        sidecar = clip_source.with_name("clip_0001.llm-f10-w512-na.mp4")
+        assert sidecar.exists()                  # audio setting in cache key
+
+    def test_include_audio_true_keeps_aac_track_and_keys_sidecar(
+        self, monkeypatch, clip_source,
+    ):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        commands = self._fake_ffmpeg(monkeypatch)
+
+        mod._prepare_llm_video(str(clip_source), fps=10, width=512,
+                               include_audio=True)
+        cmd = commands[0]
+        assert "-an" not in cmd
+        assert "-c:a" in cmd and "aac" in cmd
+        assert clip_source.with_name("clip_0001.llm-f10-w512-a.mp4").exists()
+
+    @pytest.fixture
+    def video_llm(self):
+        llm = MockLLM()
+        llm._mock_multimodal_response = {
+            "description": "A woman hangs her coat on the coat rack.",
+            "characters": [{"name": "Woman", "role": "subject"}],
+            "events": [{"type": "action", "summary": "hangs coat", "ts_sec": 2}],
+            "entities": [{"name": "Coat rack", "type": "furniture"}],
+        }
+        return llm
+
+    def test_operator_threads_include_audio_into_video_part(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        from core.graph_models import create_raw_node
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        calls = []
+
+        def fake_part(source_path, *, fps=10, width=512, include_audio=True):
+            calls.append(include_audio)
+            return {"type": "video_url",
+                    "video_url": {"url": "data:video/mp4;base64,x"}}
+
+        monkeypatch.setattr(mod, "_video_part_from_source", fake_part)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True, include_audio=False)
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes, audio_node=audio)
+        assert calls == [False]

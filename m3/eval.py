@@ -77,7 +77,7 @@ from pathlib import Path
 from typing import Any
 
 from core.models import RequestContext
-from m3._parallel import ThreadLocalModels, UnitError, parallel_clips
+from m3._parallel import ThreadLocalModels, UnitError, iter_parallel_clips, parallel_clips
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
 from m3.index_episodic import build_embedder
@@ -607,7 +607,7 @@ def run(args: argparse.Namespace) -> int:
         return qr
 
     with results_path.open(mode, encoding="utf-8") as f:
-        for q, qr in parallel_clips(pending, _answer_and_judge, label="question(s)"):
+        for q, qr in iter_parallel_clips(pending, _answer_and_judge, label="question(s)"):
             if isinstance(qr, UnitError):
                 # Safety net: _answer_and_judge catches its own
                 # exceptions; only a bug in the fallback itself lands here.
@@ -806,7 +806,7 @@ def _run_judge_only(
         return qr, was_missing
 
     with results_path.open(mode, encoding="utf-8") as f:
-        for q, judged in parallel_clips(pending, _judge_one, label="question(s)"):
+        for q, judged in iter_parallel_clips(pending, _judge_one, label="question(s)"):
             if isinstance(judged, UnitError):
                 # Safety net: _judge_one catches its own exceptions.
                 logger.error(

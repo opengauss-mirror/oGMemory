@@ -633,19 +633,24 @@ class TestExtractorToolCallFallback:
         ]
         extractor._prepare_unique_spans = Mock(return_value=prepared)
 
+        from core.errors import ExtractionIncompleteError
         started = _time.monotonic()
-        result = extractor._structure_spans(
-            spans=[item.span for item in prepared],
-            messages=[{"role": "user", "content": "memory"}],
-            language="en",
-            session_time=None,
-            session_summary="",
-            tool_stats_text="",
-            ctx=self._ctx(),
-            archive_id=None,
-        )
         try:
-            assert result == []
+            # All spans dropped as stragglers = nothing extracted: the
+            # chunk must fail retryably (review item 1), not report a
+            # successful empty extraction.
+            with pytest.raises(ExtractionIncompleteError,
+                               match="no successful span"):
+                extractor._structure_spans(
+                    spans=[item.span for item in prepared],
+                    messages=[{"role": "user", "content": "memory"}],
+                    language="en",
+                    session_time=None,
+                    session_summary="",
+                    tool_stats_text="",
+                    ctx=self._ctx(),
+                    archive_id=None,
+                )
             assert _time.monotonic() - started < 10
         finally:
             release.set()
@@ -1178,3 +1183,73 @@ class TestExtractorLanguageDetection:
         assert "zh-CN" in self.llm._last_prompt
         # The prompt instructs to output fields "in zh-CN" or similar
         assert "zh-cn" in self.llm._last_prompt.lower()
+
+
+class TestTotalSpanFailureIsRetryable:
+    """Review item 1: exhausted extraction must raise the typed retryable
+    signal, not return [] — an empty list is accepted as a *successful*
+    extraction by the write path, which then removes the source messages
+    from the journal and marks the request complete."""
+
+    @staticmethod
+    def _ctx() -> RequestContext:
+        return RequestContext(
+            account_id="test-account", user_id="user-123", agent_id="agent-456",
+            session_id="session-789", trace_id="trace-abc",
+        )
+
+    @staticmethod
+    def _prepared(i: int = 0) -> _PreparedSpan:
+        return _PreparedSpan(
+            span=_Span(start=i, end=i, message_ids=[f"msg-{i}"]),
+            prompt="Extract memory from this conversation",
+            prompt_sha="a" * 64,
+        )
+
+    def test_single_span_total_failure_raises(self):
+        from core.errors import ExtractionIncompleteError
+        extractor = Extractor(Mock())
+        prepared = [self._prepared()]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span_dual = Mock(return_value=None)
+
+        with pytest.raises(ExtractionIncompleteError, match="no successful span"):
+            extractor._structure_spans(
+                spans=[prepared[0].span],
+                messages=[{"role": "user", "content": "memory"}],
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )
+
+    def test_pool_path_total_failure_raises(self):
+        from core.errors import ExtractionIncompleteError
+        extractor = Extractor(Mock())
+        prepared = [self._prepared(0), self._prepared(1), self._prepared(2)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span_dual = Mock(return_value=None)
+
+        with pytest.raises(ExtractionIncompleteError, match="no successful span"):
+            extractor._structure_spans(
+                spans=[p.span for p in prepared],
+                messages=[{"role": "user", "content": "memory"}] * 3,
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )
+
+    def test_partial_failure_still_returns_successful_spans(self):
+        """Some spans succeed -> partial candidates, no raise (unchanged)."""
+        from unittest.mock import MagicMock
+        extractor = Extractor(Mock())
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        ok = MagicMock()
+        extractor._structure_prepared_span_dual = Mock(side_effect=[[ok], None])
+        extractor._merge_span_results = Mock(return_value=[ok])
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+        assert result == [ok]

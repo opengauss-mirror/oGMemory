@@ -153,7 +153,14 @@ class SeedRetriever:
                         global_results, bm25_results
                     )
 
-        if not self.config.expand_hierarchy:
+        if not self.config.expand_hierarchy or not query_vector:
+            # Hierarchy expansion is vector-driven: _merge_starting_points
+            # yields starting points that HierarchicalSearcher resolves via
+            # search_children, which builds cosine-distance SQL against the
+            # query vector — pgvector cannot execute a match against
+            # []::vector. Without a usable query vector (embedder degraded,
+            # or lexical-only mode) return the lexical L2 hits directly and
+            # skip the semantic traversal (review item 7).
             return SeedResult(
                 initial_candidates=[hit for hit in global_results if hit.level == 2],
                 query_vector=query_vector,

@@ -509,6 +509,14 @@ class RetrievalPipeline:
 
         has_dirs = any(v.level < 2 for v in sr.starting_points)
 
+        # Review item 7: hierarchical expansion ranks children by cosine
+        # similarity against sr.query_vector — with an empty vector (embed
+        # degradation, root-URI-only fallback seed) search_children would
+        # build SQL against []::vector, which pgvector cannot execute (and
+        # the expand error path re-raises, failing the whole turn). Skip
+        # the semantic traversal and keep whatever L2 hits the seed has.
+        has_dirs = has_dirs and bool(sr.query_vector)
+
         if has_dirs and self.hierarchical_searcher:
             with TraceTimer("hierarchical") as st:
                 st.input_count = len(sr.starting_points) + len(sr.initial_candidates)

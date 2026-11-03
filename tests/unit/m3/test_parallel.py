@@ -92,3 +92,94 @@ def test_thread_local_models_one_instance_per_thread():
     thread.join()
     assert other[0] is not main_obj
     assert len(built) == 2
+
+
+class TestIterParallelClips:
+    """Review item 8: iter_parallel_clips yields results as units COMPLETE,
+    so QA/eval writers can checkpoint finished answers while stragglers run."""
+
+    def test_yields_incrementally_in_input_order(self):
+        import threading
+        from m3._parallel import iter_parallel_clips
+        release = threading.Event()
+
+        def unit(x):
+            if x == 3:
+                release.wait(timeout=10)  # straggler at the TAIL
+            return x * 10
+
+        # Clips 0..2 complete while the tail straggler runs: each is
+        # yielded as soon as its prefix is complete — no waiting for the
+        # whole batch (review item 8).
+        it = iter_parallel_clips([0, 1, 2, 3], unit, 2)
+        assert next(it) == (0, 0)
+        assert next(it) == (1, 10)
+        assert next(it) == (2, 20)
+        release.set()
+        assert next(it) == (3, 30)
+        with pytest.raises(StopIteration):
+            next(it)
+
+    def test_head_of_queue_straggler_withholds_only_its_suffix(self):
+        import threading
+        from m3._parallel import iter_parallel_clips
+        release = threading.Event()
+
+        def unit(x):
+            if x == 0:
+                release.wait(timeout=10)  # head-of-queue straggler
+            return x * 10
+
+        it = iter_parallel_clips([0, 1, 2, 3], unit, 2)
+        release.set()
+        # In-order streaming: the head blocks its suffix (documented
+        # tradeoff; per-question timeouts bound it in practice), and the
+        # whole stream then flows in input order.
+        assert [next(it) for _ in range(4)] == [(0, 0), (1, 10), (2, 20), (3, 30)]
+        with pytest.raises(StopIteration):
+            next(it)
+
+    def test_abandoned_generator_cancels_queued_units(self):
+        import threading
+        from m3._parallel import iter_parallel_clips
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def unit(x):
+            calls.append(x)
+            if x == 0:
+                started.set()
+                release.wait(timeout=10)
+            return x
+
+        it = iter_parallel_clips(list(range(20)), unit, 2)
+        started.wait(timeout=10)     # first unit occupies a worker
+        it.close()                   # abandon: queued units must be cancelled
+        release.set()
+        # Only the in-flight units ran (at most 2), not the whole queue.
+        assert len(calls) <= 2
+
+    def test_unit_errors_are_yielded_not_raised(self):
+        from m3._parallel import iter_parallel_clips, UnitError
+        results = dict(iter_parallel_clips(
+            ["a", "b"], lambda x: (_ for _ in ()).throw(RuntimeError("boom")), 2))
+        assert isinstance(results["a"], UnitError)
+        assert isinstance(results["b"], UnitError)
+
+    def test_parallel_clips_wrapper_preserves_input_order(self):
+        import time
+        from m3._parallel import parallel_clips
+
+        def unit(x):
+            time.sleep((4 - x) * 0.01)  # reverse completion order
+            return x
+
+        assert parallel_clips([0, 1, 2, 3], unit, 4) == [(0, 0), (1, 1), (2, 2), (3, 3)]
+
+    def test_parallel_clips_wrapper_handles_duplicate_clips(self):
+        from m3._parallel import parallel_clips
+        shared = {"k": 1}
+        clips = [shared, shared, {"k": 2}]
+        results = parallel_clips(clips, lambda c: c["k"], 3)
+        assert results == [(shared, 1), (shared, 1), ({"k": 2}, 2)]
