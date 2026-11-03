@@ -36,6 +36,10 @@ ogmem onboard --mode docker --vector-db milvus \
 
 Docker quickstart 支持 openGauss 与外部 Milvus：openGauss 创建配套数据库，Milvus 连接外部服务。Milvus 默认通过现有 `docker/Dockerfile.standalone` 构建包含所选依赖的镜像；也可在部署环境文件中设置 `OGMEM_IMAGE` 使用已构建镜像。切换已有实例的后端或 Milvus 集合需使用新实例并重建索引。
 
+Docker quickstart 在替换已有容器前，使用正式运行网络与 Milvus 配置检查 schema/索引及写入、回读、检索和删除权限。探测记录使用 UUID 隔离账户，删除并确认不可读取后才报告成功；预检失败会保留现有容器。`/api/v1/health` 持续检查 Milvus 的有超时读取，断连或权限失效时返回 503，恢复后返回 200。
+
+共享镜像的基础依赖和 Milvus SDK 安装均启用正常 HTTPS 证书校验；使用私有包源时应配置受信任 CA，不跳过证书验证。
+
 手动配置容器时，使用包含 Milvus 可选依赖的运行镜像并挂载上述 YAML 配置；无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
 Milvus 服务由外部部署管理；配置其可达地址。容器中的 `127.0.0.1` 指向容器自身，跨容器连接应使用可解析的服务名或其他可达入口。
 现有运行镜像如果未包含 pymilvus，需要在该运行环境安装上述可选依赖。

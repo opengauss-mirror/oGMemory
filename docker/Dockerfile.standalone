@@ -10,7 +10,7 @@ RUN apt-get update && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     pydantic python-dotenv json-repair networkx "jsonschema>=4.20.0" rank-bm25 nltk \
@@ -21,7 +21,7 @@ ARG VECTOR_DB_EXTRA=opengauss
 RUN case "$VECTOR_DB_EXTRA" in \
       opengauss) ;; \
       milvus) pip install --no-cache-dir \
-        -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+        -i https://mirrors.aliyun.com/pypi/simple/ \
         --timeout 120 'pymilvus>=2.6.17,<2.7' ;; \
       *) echo "Unsupported VECTOR_DB_EXTRA: $VECTOR_DB_EXTRA" >&2; exit 1 ;; \
     esac
