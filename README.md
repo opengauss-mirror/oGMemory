@@ -731,6 +731,8 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **MCP:** [Protocol compatibility](docs/integrations/mcp-protocol-compatibility.md)
 
+**Optional ContextNode graph:** [Semantic graph ingestion and retrieval](docs/semantic-context-graph.md) (opt-in SQL storage; no retrieval-time LLM)
+
 **Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
 
 ---

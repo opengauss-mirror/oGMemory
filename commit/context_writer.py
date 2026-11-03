@@ -273,7 +273,17 @@ class ContextWriter:
                 persist_action = "merge" if receipt_only else plan.action
 
                 # Step 1.5: Idempotency check - prevent duplicate operations
-                content_hash = hashlib.sha256((candidate.content or "").encode()).hexdigest()[:16]
+                fingerprint_content = candidate.content or ""
+                from index.activation_projection import ACTIVATION_VERSION
+                descriptor = candidate.metadata.get("update_activation")
+                if (candidate.metadata.get("update_activation_version") == ACTIVATION_VERSION
+                        and isinstance(descriptor,str) and descriptor.strip()
+                        and "\n" not in descriptor.strip() and "\r" not in descriptor.strip()):
+                    # A changed connection key is a real graph projection
+                    # update, even when ordinary content stays identical.
+                    import json
+                    fingerprint_content = json.dumps([fingerprint_content,descriptor.strip(),ACTIVATION_VERSION])
+                content_hash = hashlib.sha256(fingerprint_content.encode()).hexdigest()[:16]
                 fp = self._operation_fingerprint(plan, ctx, content_hash)
                 cache_operation = (not candidate.write_operation_id and identity_plan is None
                                    and candidate.category != "profile")

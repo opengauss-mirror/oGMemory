@@ -217,6 +217,8 @@ class SeedRetriever:
         l2_only = lexical_only or not self.config.expand_hierarchy
         if l2_only:
             filters["level"] = 2
+        elif str(typed_query.context_type).upper() == "MEMORY":
+            filters["level"] = [0, 1, 2]
 
         supported_filters = frozenset(
             getattr(self.bm25_index, "supported_filters", filters)
@@ -251,7 +253,7 @@ class SeedRetriever:
         for h in bm25_hits:
             meta = h.metadata
             metadata = dict(meta or {})
-            if l2_only and int(metadata.get("level", 2)) != 2:
+            if int(metadata.get("level", 2)) not in (0, 1, 2) or (l2_only and int(metadata.get("level", 2)) != 2):
                 continue
             if self.config.hybrid_enabled:
                 if metadata.get("account_id") != ctx.account_id:

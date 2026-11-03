@@ -178,6 +178,14 @@ class ArchiveBuilder:
                         and "existing_overview" in plan.merged_fields):
                     abstract = " ".join(abstract.splitlines()).strip()
 
+        # Apply the validated incoming descriptor AFTER existing identity
+        # metadata; otherwise an update silently restores the old descriptor.
+        from index.activation_projection import ACTIVATION_VERSION, candidate_activation
+        descriptor = candidate_activation(candidate)
+        if descriptor is not None:
+            metadata["update_activation"] = descriptor
+            metadata["update_activation_version"] = ACTIVATION_VERSION
+
         if self._card_format_enabled:
             from extraction.card_format import validate_memory_card
             validate_memory_card(replace(candidate, abstract=abstract, overview=overview, content=content))
@@ -434,4 +442,3 @@ class ArchiveBuilder:
                 seen.add(key)
                 paragraphs.append(cleaned)
         return "\n\n".join(paragraphs)
-

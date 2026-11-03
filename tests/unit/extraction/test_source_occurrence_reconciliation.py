@@ -417,6 +417,7 @@ def test_bound_accepted_and_partitioned_drafts_never_enter_a_new_partition():
 def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints():
     candidate = event()
     old = asdict(candidate)
+    old.pop("metadata")  # absent from the pre-graph CandidateMemory contract
     old.pop("source_occurrence_id")
     old.pop("verified_routing_aliases")
     old.pop("verified_object_aliases")
@@ -428,6 +429,7 @@ def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints()
     assert occurrence_replay_id(candidate) == hashlib.sha256(
         json.dumps(old, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     old = asdict(candidate)
+    old.pop("metadata")
     old.pop("source_occurrence_id")
     old.pop("verified_routing_aliases")
     old.pop("verified_object_aliases")
@@ -453,6 +455,7 @@ def test_old_field_checkpoint_and_old_receipt_upgrade_retry_without_model_or_new
     accepted = replace(event(attributed_speaker=None, attribution_basis=None),
                        write_operation_id=hashlib.sha256(b"legacy-archive:structured:0").hexdigest())
     legacy_candidate = asdict(accepted)
+    legacy_candidate.pop("metadata")
     legacy_candidate.pop("source_occurrence_id")
     legacy_candidate.pop("verified_routing_aliases")
     legacy_candidate.pop("verified_object_aliases")

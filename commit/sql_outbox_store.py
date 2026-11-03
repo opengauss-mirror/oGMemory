@@ -428,6 +428,11 @@ class SQLOutboxStore(PoolAdapterMixin):
         exclude_event_types: list[str] | None = None,
     ) -> list[tuple[str, OutboxEvent]]:
         """Claim supported ready events before the batch limit, preserving per-URI order."""
+        excluded = exclude_event_types or []
+        # Graph wakeups represent an independent, revision-fenced projection.
+        # Pausing them must not hold up ordinary indexing for the same URI.
+        # Keep all other predecessor ordering, including agent-memory jobs.
+        paused_projections = ["PROJECT_GRAPH"] if "PROJECT_GRAPH" in excluded else []
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -458,6 +463,7 @@ class SQLOutboxStore(PoolAdapterMixin):
                                   AND earlier.uri = candidate.uri
                                   AND earlier.seq < candidate.seq
                                   AND earlier.status IN ('PENDING', 'PROCESSING')
+                                  AND earlier.event_type <> ALL(%s)
                               )
                         ORDER BY candidate.seq ASC NULLS LAST,
                                  candidate.created_at ASC
@@ -477,7 +483,7 @@ class SQLOutboxStore(PoolAdapterMixin):
                     )
                     SELECT * FROM claimed ORDER BY seq ASC NULLS LAST
                     """,
-                    (timeout_seconds, exclude_event_types or [], limit, worker_id),
+                    (timeout_seconds, excluded, paused_projections, limit, worker_id),
                 )
                 rows = cur.fetchall()
             conn.commit()
@@ -489,14 +495,22 @@ class SQLOutboxStore(PoolAdapterMixin):
 
         return [self._row_to_event(row) for row in rows]
 
-    def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
-        """Count pending/processing and dead-lettered events without claiming them."""
+    def count_unfinished(
+        self, account_id: str | None = None, *, exclude_event_types: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Count unfinished tasks, optionally excluding a paused feature for readiness.
+
+        The default still includes every event type for task/status reporting.
+        """
         conn = self._get_connection()
-        params: list[str] = []
+        params: list[object] = []
         where = "WHERE status IN ('PENDING', 'PROCESSING', 'FAILED')"
         if account_id:
             where += " AND account_id = %s"
             params.append(account_id)
+        if exclude_event_types:
+            where += " AND event_type <> ALL(%s)"
+            params.append(exclude_event_types)
         try:
             with conn.cursor() as cur:
                 cur.execute(

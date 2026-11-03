@@ -521,18 +521,38 @@ class MemoryIdentityResolver:
         directory = self._directory(candidate, ctx)
         replay = occurrence_replay_id(candidate)
         nodes = self._nodes(directory, ctx)
+        def replay_sources(node):
+            # Read pre-fix replay hashes using the descriptor stored on that
+            # node. New writes use descriptor-independent factual identity.
+            metadata = dict(candidate.metadata)
+            for key in ("update_activation", "update_activation_version"):
+                metadata.pop(key, None)
+                if key in node.metadata:
+                    metadata[key] = node.metadata[key]
+            legacy = occurrence_replay_fields(replace(candidate, metadata=metadata),
+                                              include_graph_annotations=True)
+            legacy_id = hashlib.sha256(json.dumps(legacy, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            sources = node.metadata.get("occurrence_replay_sources", {})
+            return set(sources.get(replay, [])) | set(sources.get(legacy_id, []))
         matches = [node for node in nodes if self._in_scope(node, candidate, ctx)
-                   and set(candidate.provenance_ids) <= set(
-                       node.metadata.get("occurrence_replay_sources", {}).get(replay, []))]
+                   and set(candidate.provenance_ids) <= replay_sources(node)]
         if len(matches) > 1:
             raise ValueError("occurrence replay has ambiguous targets; select a read target explicitly")
         if matches:
-            if candidate.write_operation_id:
+            if candidate.write_operation_id or self._descriptor_changed(candidate, matches[0]):
                 existing = self.fs.read_node(matches[0].uri, ctx)
-                commit(candidate, ctx, self._plan(candidate, existing, nodes, directory, ctx, duplicate=True))
+                return commit(candidate, ctx, self._plan(candidate, existing, nodes, directory, ctx, duplicate=True))
             return WritePlan(action="skip", target_uri=matches[0].uri,
                              merged_fields={"status": "duplicate"})
         return commit(candidate, ctx, self._plan(candidate, None, nodes, directory, ctx))
+
+    @staticmethod
+    def _descriptor_changed(candidate, existing):
+        from index.activation_projection import ACTIVATION_VERSION, candidate_activation
+        descriptor = candidate_activation(candidate)
+        return descriptor is not None and (
+            descriptor != existing.metadata.get("update_activation")
+            or existing.metadata.get("update_activation_version") != ACTIVATION_VERSION)
 
     def _write_once(self, candidate, ctx, commit):
         if candidate.category in OCCURRENCE_CATEGORIES and not candidate.target_uri:
@@ -543,6 +563,10 @@ class MemoryIdentityResolver:
         observation = observation_id(candidate)
         nodes = self._candidate_nodes(candidate, directory, ctx)
         matched = self._match(candidate, nodes, directory, ctx)
+        # Explicit updates must validate the extracted revision even when only
+        # graph annotations changed or the content is an exact replay.
+        if matched and candidate.target_uri and candidate.expected_version != matched.metadata.get("version", 0):
+            raise ValueError("memory changed since extraction; refresh and re-extract the update")
         if matched and not candidate.target_uri:
             matched = self.fs.read_node(matched.uri, ctx)
         repeats = [node for node in nodes if self._in_scope(node, candidate, ctx)
@@ -555,6 +579,11 @@ class MemoryIdentityResolver:
         if repeats:
             existing = repeats[0] if candidate.target_uri else self.fs.read_node(repeats[0].uri, ctx)
             plan = self._plan(candidate, existing, nodes, directory, ctx, duplicate=True)
+            # Content replay identity stays unchanged. A valid descriptor-only
+            # refresh still needs a real versioned write and index event, while
+            # preserving the existing content rather than appending it twice.
+            if self._descriptor_changed(candidate, existing):
+                return commit(candidate, ctx, plan)
             metadata = plan.merged_fields["identity_metadata"]
             changed = any(metadata.get(name) != existing.metadata.get(name) for name in
                           ("provenance_ids", "memory_observation_sources",
@@ -572,7 +601,5 @@ class MemoryIdentityResolver:
                 fields.update(existing_content=matched.content, content_append=candidate.content,
                               existing_overview=matched.overview, overview_append=candidate.overview)
                 return commit(candidate, ctx, plan)
-            if candidate.expected_version != matched.metadata.get("version", 0):
-                raise ValueError("memory changed since extraction; refresh and re-extract the update")
         plan = self._plan(candidate, matched, nodes, directory, ctx)
         return commit(candidate, ctx, plan)

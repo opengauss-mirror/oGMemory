@@ -57,9 +57,11 @@ class CompositeProjectionWriter:
         with self._projection_lock:
             lexical_records = [
                 lexical_record_from_index_record(record) for record in records
+                if record.level in (0, 1, 2)
             ]
             try:
-                self.lexical_index.upsert_many(lexical_records)
+                if lexical_records:
+                    self.lexical_index.upsert_many(lexical_records)
             except Exception:
                 self._best_effort_callback(self._on_records_failed, records)
                 raise

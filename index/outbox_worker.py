@@ -19,6 +19,7 @@ import logging
 import re
 import uuid
 from contextlib import ExitStack, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
@@ -98,6 +99,7 @@ class OutboxWorker:
         bm25_index: Bm25Index | None = None,
         agent_memory_handler=None,
         memory_projection_handler=None,
+        edge_projection_components=None,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -119,6 +121,35 @@ class OutboxWorker:
         self._bm25_index = bm25_index
         self._agent_memory_handler = agent_memory_handler
         self._memory_projection_handler = memory_projection_handler
+        self._edge_projection_store, self._edge_projection_profile = edge_projection_components or (None,None)
+        self._graph_poll_accounts = ContextVar("graph_projection_poll_accounts", default=None)
+
+    def _project_graph_account(self, account):
+        """Bound work to one due drain per account in this polling context.
+
+        Durable PROJECT_GRAPH events retain retry/restart discovery; there is
+        no lifetime cache of tenants. Standalone process_event calls also work.
+        """
+        polled = self._graph_poll_accounts.get()
+        if polled is not None:
+            if account in polled:
+                return 0
+            polled.add(account)
+        store = self._edge_projection_store
+        if self._has_real_method(store, "has_due_work") and not store.has_due_work(account):
+            return 0
+        return store.drain_sync(account, self._embedder, self._edge_projection_profile)
+
+    def _drain_graph(self, accounts, stats):
+        if self._edge_projection_store is None:
+            return
+        for account in sorted(set(accounts)):
+            try:
+                count = self._project_graph_account(account)
+                stats["edge_projections"] = stats.get("edge_projections",0) + count
+            except Exception:
+                stats["edge_projection_failures"] = stats.get("edge_projection_failures",0) + 1
+                logger.exception("Graph projection drain failed for account %s",account)
 
     def _upsert_code_bm25(self, records: list[IndexRecord]) -> None:
         if self._bm25_index is None:
@@ -193,6 +224,16 @@ class OutboxWorker:
                 return self._process_delete_context(event, ctx)
             elif event_type == "ARCHIVE_CONTEXT":
                 return self._process_archive_context(event)
+            elif event_type == "PROJECT_GRAPH":
+                if self._edge_projection_store is None:
+                    raise ValueError("Graph projection worker is not enabled")
+                resolved_ctx = ctx or self._build_request_context(event)
+                if resolved_ctx is None:
+                    raise ValueError("Missing graph projection account")
+                count = self._project_graph_account(resolved_ctx.account_id)
+                if self._edge_projection_store.unfinished(resolved_ctx.account_id,event.payload["edge_id"]):
+                    raise RuntimeError("Graph projection is pending; retain durable wakeup for retry")
+                return WorkerResult(event_id=event.event_id,success=True,records_upserted=count)
             else:
                 logger.warning("Unknown event type: %s", event_type)
                 return WorkerResult(
@@ -466,6 +507,10 @@ class OutboxWorker:
                 build_record_id(l2_uri, 2),
             ]
 
+        ids_to_delete = list(ids_to_delete)
+        activation_id = IndexRecord.generate_id(event.uri,3)
+        if activation_id not in ids_to_delete:
+            ids_to_delete.append(activation_id)
         self._vector_index.delete(ids_to_delete)
         self._delete_bm25(ids_to_delete)
         self._cleanup_tombstoned_payload(event, ctx)
@@ -505,6 +550,10 @@ class OutboxWorker:
                 build_record_id(l2_uri, 2),
             ]
 
+        ids_to_delete = list(ids_to_delete)
+        activation_id = IndexRecord.generate_id(event.uri,3)
+        if activation_id not in ids_to_delete:
+            ids_to_delete.append(activation_id)
         self._vector_index.delete(ids_to_delete)
         self._delete_bm25(ids_to_delete)
 
@@ -659,6 +708,12 @@ class OutboxWorker:
             # Create a copy with embedding in metadata
             new_metadata = dict(record.metadata)
             new_metadata["_embedding"] = embedding
+            # Persist identity for ordinary vectors too: equal dimensions do
+            # not make embeddings from different models comparable.
+            model = getattr(self._embedder, "model", None)
+            if isinstance(model, str) and model:
+                new_metadata["embedding_model"] = model
+            new_metadata["embedding_dimension"] = len(embedding)
 
             # Create new IndexRecord with augmented metadata
             # Note: IndexRecord is a dataclass, we can create a new instance
@@ -937,6 +992,12 @@ class OutboxWorker:
     ) -> None:
         """Process already-claimed events and update acknowledgement state."""
         for node_uri, event in claimed_events:
+            # Old/custom claim implementations may not honor exclusions. A
+            # disabled feature is not a processing failure or a completed job.
+            if event.event_type == "PROJECT_GRAPH" and self._edge_projection_store is None:
+                outbox_store.release(event, node_uri)
+                stats["skipped"] += 1
+                continue
             if (event.event_type == "EXTRACT_AGENT_MEMORY"
                     and self._has_real_method(outbox_store, "claim_agent_event")):
                 self._process_agent_claim(event, outbox_store, stats, worker_id)
@@ -1150,6 +1211,20 @@ class OutboxWorker:
 
     def run_once(
         self,
+        outbox_store,
+        account_ids: list[str],
+        worker_id: str = "default",
+    ) -> dict:
+        # Context-local state is reset even on errors and cannot suppress a
+        # future retry, another worker, or a concurrent polling context.
+        token = self._graph_poll_accounts.set(set())
+        try:
+            return self._run_once(outbox_store, account_ids, worker_id)
+        finally:
+            self._graph_poll_accounts.reset(token)
+
+    def _run_once(
+        self,
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
         account_ids: list[str],
         worker_id: str = "default",
@@ -1168,6 +1243,10 @@ class OutboxWorker:
         """
         stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
         excluded_types = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
+        if self._edge_projection_store is None:
+            # The durable wakeup is needed when graph is enabled again. Leave
+            # its status, retry budget and projection job untouched while off.
+            excluded_types.append("PROJECT_GRAPH")
 
         # Fast path: SQL outbox with batch-claim support
         if self._supports_batch_claim(outbox_store):
@@ -1180,9 +1259,16 @@ class OutboxWorker:
                 return stats
 
             self._process_claimed_events(claimed_events, outbox_store, stats, worker_id)
+            accounts = set(account_ids)
+            for node_uri, event in claimed_events:
+                ctx = self._build_request_context(event)
+                if ctx is not None:
+                    accounts.add(ctx.account_id)
+            self._drain_graph(accounts,stats)
             return stats
 
         # Collect all pending events across accounts, grouped by type.
+        self._drain_graph(account_ids,stats)
         # UPSERT_CONTEXT events are batch-embedded for efficiency.
         all_pending: list[tuple[str, OutboxEvent]] = []
         for account_id in account_ids:

@@ -109,7 +109,7 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     assert "earlier.status IN ('PENDING', 'PROCESSING')" in sql
     assert "FOR UPDATE OF candidate SKIP LOCKED" in sql
     assert "LIMIT %s" in sql
-    assert params == (42, [], 50, "worker-1")
+    assert params == (42, [], [], 50, "worker-1")
     conn.commit.assert_called_once()
 
 
