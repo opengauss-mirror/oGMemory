@@ -255,8 +255,10 @@ def test_selected_backend_and_milvus_parameters_reach_environment(tmp_path, back
 
 
 @pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
-@pytest.mark.parametrize("backend", ["opengauss", "milvus"])
-def test_real_quickstart_renders_selected_backend(tmp_path, backend):
+@pytest.mark.parametrize("backend,probe_failure", [
+    ("opengauss", False), ("milvus", False), ("milvus", True),
+])
+def test_real_quickstart_renders_selected_backend(tmp_path, backend, probe_failure):
     from string import Template
 
     import yaml
@@ -284,6 +286,9 @@ case "$1" in
   info) [ "${2-}" = --format ] && echo /tmp; exit 0 ;;
   container) exit 1 ;;
   ps) exit 0 ;;
+  run) case "$*" in *scripts.check_milvus*)
+    if [ "$PREFLIGHT_FAIL" = 1 ]; then echo PREFLIGHT_DENIED >&2; exit 97; fi ;;
+    esac ;;
   exec) case "$*" in *'python -c'*) echo VALIDATION_STOP >&2; exit 98 ;; esac ;;
 esac
 exit 0
@@ -297,10 +302,27 @@ exit 0
         ["bash", str(ROOT / "deploy/user-quickstart/deploy.sh")],
         env={"PATH": f"{shims}:/usr/bin:/bin", "HOME": str(tmp_path),
              "OGMEMORY_ENV_FILE": str(envfile), "OGMEMORY_STACK_ROOT": str(tmp_path),
-             "OGMEM_IMAGE": "test-current-image", "CAPTURE": str(capture), "LANG": "C.UTF-8"},
+             "OGMEM_IMAGE": "test-current-image", "CAPTURE": str(capture), "LANG": "C.UTF-8",
+             "PREFLIGHT_FAIL": "1" if probe_failure else "0"},
         capture_output=True, text=True, timeout=10,
     )
+    commands = capture.read_text()
+    if backend == "milvus":
+        probe = next(line for line in commands.splitlines() if "scripts.check_milvus" in line)
+        assert "--network ogmem_ogmemory_net" in probe
+        assert "--add-host host.docker.internal:host-gateway" in probe
+        assert "MILVUS_URI=http://milvus.example:19530" in probe
+        assert "VECTOR_DB_DIMENSION=1024" in probe
+        assert "-e MILVUS_TOKEN" in probe
+    if probe_failure:
+        assert completed.returncode == 1
+        assert "未替换现有容器" in completed.stderr
+        assert "rm -f" not in commands
+        assert "run -d" not in commands
+        return
     assert "VALIDATION_STOP" in completed.stderr, completed.stderr
+    if backend == "milvus":
+        assert commands.index("scripts.check_milvus") < commands.index("rm -f")
     text = (tmp_path / "ogmemory-ogmem/ogmemory.yaml").read_text()
     config = yaml.safe_load(Template(text).safe_substitute({
         "VECTOR_DB_TYPE": backend, "MILVUS_URI": "http://milvus.example:19530",

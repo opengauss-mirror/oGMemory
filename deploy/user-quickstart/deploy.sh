@@ -480,9 +480,16 @@ elif [[ -z "${OGMEM_IMAGE:-}" ]]; then
 fi
 ensure_image "$OGMEM_IMAGE"
 if [[ "$VECTOR_DB_TYPE" == milvus ]]; then
-  docker run --rm --entrypoint python "$OGMEM_IMAGE" -c \
-    "import pymilvus; from providers.vector_index.milvus_index import MilvusVectorIndex" \
-    || fail "镜像缺少所选向量后端实现或依赖"
+  # Probe on the final runtime network before removing any existing service.
+  docker network inspect "$OGMEM_NETWORK" >/dev/null 2>&1 || \
+    docker network create "$OGMEM_NETWORK" >/dev/null
+  MILVUS_TOKEN="${MILVUS_TOKEN:-}" docker run --rm \
+    --network "$OGMEM_NETWORK" --add-host host.docker.internal:host-gateway \
+    -e "MILVUS_URI=$MILVUS_URI" -e MILVUS_TOKEN \
+    -e "MILVUS_COLLECTION=$MILVUS_COLLECTION" -e "MILVUS_DB_NAME=$MILVUS_DB_NAME" \
+    -e "MILVUS_TIMEOUT=$MILVUS_TIMEOUT" -e "VECTOR_DB_DIMENSION=$EMBEDDING_DIMENSION" \
+    --entrypoint python "$OGMEM_IMAGE" -m scripts.check_milvus \
+    || fail "Milvus 预检失败，未替换现有容器；请检查网络、认证、数据库、集合 schema/索引及读写权限"
 fi
 ensure_image "$OPENCLAW_IMAGE"
 
