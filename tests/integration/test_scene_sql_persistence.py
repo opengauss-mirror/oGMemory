@@ -41,7 +41,8 @@ def scene_sql():
     control.autocommit = True
     with control.cursor() as cursor:
         cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(namespace)))
-    pool = SharedConnectionPool(make_dsn(dsn, options=f"-c search_path={namespace}"), pool_size=6, dialect=dialect)
+    # Keep tables isolated while resolving pgvector's extension type in public.
+    pool = SharedConnectionPool(make_dsn(dsn, options=f"-c search_path={namespace},public"), pool_size=6, dialect=dialect)
     try:
         fs = SQLContextFS(pool=pool)
         repository = SQLSceneRepository(pool)

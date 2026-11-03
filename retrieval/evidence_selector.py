@@ -66,6 +66,12 @@ def hydrate_evidence(items, read_memory, ctx, limits=LIMITS):
         if all(getattr(block, field, None) is None for field in ("abstract", "overview", "content_excerpt")):
             entry["reason"] = "read_failed"
             continue
+        # compose performs another canonical read after search. A graph score
+        # must never be attached to new content or a changed source/path here.
+        from retrieval.edge_retrieval_contract import graph_snapshot_matches
+        if not graph_snapshot_matches(block, item.get("metadata") or {}, ctx, read_memory):
+            entry["reason"] = "graph_snapshot_changed"
+            continue
         hydrated_item = {**item, "uri": uri}
         for key, field in (("abstract", "abstract"), ("overview", "overview"),
                            ("content", "content_excerpt"), ("category", "category")):

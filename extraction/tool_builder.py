@@ -107,7 +107,7 @@ def build_update_instruction(registry: SchemaRegistry) -> str:
     return "\n\n".join(parts)
 
 
-def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
+def build_extraction_tools(registry: SchemaRegistry, *, activation_enabled: bool = False) -> list[dict]:
     """Generate OpenAI function calling tool definitions from enabled schemas.
 
     Each schema generates one tool definition with:
@@ -125,6 +125,9 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
 
     for schema in registry.list_enabled():
         if schema.memory_type in _INTERNAL_MEMORY_TYPES:
+            continue
+        # Relation proposals belong to graph-on ingestion, not memory storage.
+        if schema.memory_type == "relation" and not activation_enabled:
             continue
 
         if not is_schema_version_compatible(schema):
@@ -198,6 +201,12 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
             description += "\n" + _UPDATE_INSTRUCTION
             if schema.memory_type == "profile" and schema.is_single_file:
                 description = _PROFILE_SNAPSHOT_INSTRUCTION + "\n\n" + description
+        if activation_enabled and schema.memory_type != "relation":
+            properties["update_activation"] = {
+                "type": "string", "minLength": 1,
+                "description": "One compact source-grounded declarative sentence describing this memory's explicit subject, concrete fact, and stated distinguishing context. Preserve uncertainty and negation. Generate alongside this candidate; do not invent scope, future queries, or links.",
+            }
+            required.append("update_activation")
 
         tools.append({
             "name": schema.tool_name,
@@ -218,7 +227,14 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
 
     if any(is_schema_version_compatible(schema) and _supports_read_target(schema)
            for schema in registry.list_enabled()):
-        tools.extend(build_incremental_tools())
+        incremental_tools = build_incremental_tools()
+        if activation_enabled:
+            descriptor = next(tool["input_schema"]["properties"]["update_activation"]
+                              for tool in tools if "update_activation" in tool["input_schema"]["properties"])
+            for tool in incremental_tools:
+                tool["input_schema"]["properties"]["update_activation"] = dict(descriptor)
+                tool["input_schema"]["required"].append("update_activation")
+        tools.extend(incremental_tools)
     return tools
 
 
@@ -234,7 +250,7 @@ def build_tool_to_category(registry: SchemaRegistry) -> dict[str, tuple[str, str
     return {
         schema.tool_name: (schema.memory_type, schema.owner_scope)
         for schema in registry.list_compatible_enabled()
-        if schema.memory_type not in _INTERNAL_MEMORY_TYPES
+        if schema.memory_type not in _INTERNAL_MEMORY_TYPES and schema.memory_type != "relation"
     }
 
 
@@ -246,6 +262,7 @@ def parse_tool_call(
     read_nodes: dict[str, ContextNode] | None = None,
     ctx: RequestContext | None = None,
     current_content: str | None = None,
+    activation_enabled: bool = False,
 ) -> tuple[str, str, CandidateMemory] | None:
     """Validate and parse a tool call using schema definitions.
 
@@ -259,10 +276,17 @@ def parse_tool_call(
         None if tool_name is unknown or validation fails
     """
     if tool_name in INCREMENTAL_TOOLS:
+        # Keep dev's strict edit validation unchanged: the graph-only descriptor
+        # is validated by the complete snapshot parser, not as an edit command.
+        incremental_input = dict(tool_input)
+        activation = incremental_input.pop("update_activation", None) if activation_enabled else None
         name, full_input = materialize_incremental_input(
-            tool_name, tool_input, registry, read_nodes, ctx, current_content,
+            tool_name, incremental_input, registry, read_nodes, ctx, current_content,
         )
-        parsed = parse_tool_call(name, full_input, registry)
+        if activation_enabled:
+            full_input["update_activation"] = activation
+        parsed = (parse_tool_call(name, full_input, registry, activation_enabled=True)
+                  if activation_enabled else parse_tool_call(name, full_input, registry))
         if parsed is None:
             raise ToolCallProtocolError("incremental update did not produce a schema-valid complete snapshot")
         category, owner, candidate = parsed
@@ -280,6 +304,8 @@ def parse_tool_call(
     for s in registry.list_compatible_enabled():
         if s.memory_type in _INTERNAL_MEMORY_TYPES:
             continue
+        if s.memory_type == "relation":
+            continue  # handled as a proposal, never a CandidateMemory
         if s.tool_name == tool_name:
             schema = s
             break
@@ -287,6 +313,14 @@ def parse_tool_call(
     if schema is None:
         logger.warning(f"Unknown tool name: {tool_name}")
         return None
+
+    activation = None
+    if activation_enabled:
+        value = tool_input.get("update_activation")
+        if not isinstance(value, str) or not value.strip() or "\n" in value.strip() or "\r" in value.strip():
+            logger.warning("Invalid or missing update_activation for %s", tool_name)
+            return None
+        activation = value.strip()
 
     # Pre-fill auto-generatable fields before validation so required checks pass
     tool_input = dict(tool_input)  # copy to avoid mutating caller's dict
@@ -459,6 +493,9 @@ def parse_tool_call(
             target_uri=target_uri,
             expected_version=expected_version,
             **identity_fields,
+            metadata={"update_activation": activation,
+                      "update_activation_version": "c1-integrated-activation-v1"}
+            if activation is not None else {},
         ),
     )
 

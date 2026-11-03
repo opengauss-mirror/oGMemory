@@ -198,6 +198,9 @@ def test_read_api_reuses_scene_runtime_and_returns_canonical_members(runtime, mo
         "revision": 0, "title": node.abstract, "description": node.overview, "member_uris": [node.uri],
     })
     read_api = runtime.service.get_read_api(start_outbox_worker=False)
+    assert runtime.service._cfg.graph_backend == "none"
+    assert read_api._pipeline._graph_retriever is None
+    assert read_api._pipeline._graph_supplement is None
     assert read_api is runtime.service.get_read_api(start_outbox_worker=False)
     assert read_api._pipeline._scene_stage.source is runtime.service._scene_source
     assert read_api._pipeline._scene_stage.ranker is runtime.service._scene_ranker

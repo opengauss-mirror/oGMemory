@@ -154,6 +154,7 @@ class LexicalBackfill:
                 lexical_record_from_index_record(record)
                 for node in nodes
                 for record in build_index_records(node)
+                if record.level in (0, 1, 2)
             )
             if not self._lexical.replace_scopes(
                 rebuild_id=rebuild_id,

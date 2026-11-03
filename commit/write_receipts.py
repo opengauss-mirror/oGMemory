@@ -12,6 +12,16 @@ from core.models import CandidateMemory, RequestContext, WritePlan
 RECEIPTS_KEY = "memory_write_receipts"
 
 
+def has_stored_target(plan: WritePlan) -> bool:
+    """A proven stored endpoint, not an unsuccessful or unverified skip.
+
+    Callers still authorize/hydrate target_uri before consuming its contents.
+    """
+    return bool(plan.target_uri) and (plan.action in {"create", "merge", "append"}
+        or (plan.action == "skip" and plan.merged_fields.get("status") in
+            {"operation_committed", "duplicate"}))
+
+
 class WriteNotStartedError(RuntimeError):
     """Planning, authorization or construction rejected before durable mutation."""
 
@@ -26,6 +36,13 @@ class WriteOutcomeUnknownError(RuntimeError):
 
 def operation_digest(candidate: CandidateMemory, ctx: RequestContext) -> str:
     payload = asdict(candidate)
+    from extraction.relation_proposals import KEY
+    metadata = dict(payload.get("metadata") or {})
+    metadata.pop(KEY, None)  # transient edge inputs are not a node-write payload
+    payload["metadata"] = metadata
+    # New opt-in annotations must not invalidate pre-graph durable receipts.
+    if not payload.get("metadata"):
+        payload.pop("metadata", None)
     payload.pop("write_operation_id")
     for name in ("verified_routing_aliases", "verified_object_aliases", "source_contexts", "node_draft_indices"):
         if not payload.get(name):

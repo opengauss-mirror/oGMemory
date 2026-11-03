@@ -14,6 +14,7 @@ class StageTrace:
     input_count: int = 0
     output_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -22,6 +23,7 @@ class StageTrace:
             "input_count": self.input_count,
             "output_count": self.output_count,
             "warnings": list(self.warnings),
+            **({"metrics": self.metrics} if self.metrics else {}),
         }
 
 
@@ -32,6 +34,7 @@ class RetrievalTrace:
     total_ms: float = 0.0
     warnings: list[str] = field(default_factory=list)
     level_histogram: dict[str, int] = field(default_factory=dict)
+    graph_expansion: dict = field(default_factory=dict)
 
     def add_stage(self, stage: StageTrace) -> None:
         self.stages.append(stage)
@@ -44,6 +47,7 @@ class RetrievalTrace:
             "total_ms": round(self.total_ms, 2),
             "warnings": list(self.warnings),
             "level_histogram": self.level_histogram,
+            **({"graph_expansion": self.graph_expansion} if self.graph_expansion else {}),
         }
 
 

@@ -309,6 +309,12 @@ class ChromaVectorIndex(VectorIndex):
             "unit_key",
             "agent_memory_unit_key",
             "unit_revision",
+            "record_kind",
+            "representation_version",
+            "memory_revision",
+            "canonical_revision",
+            "embedding_model",
+            "embedding_dimension",
             *CODE_INDEX_METADATA_FIELDS,
         ):
             val = record.metadata.get(key) if record.metadata else None
@@ -338,7 +344,8 @@ class ChromaVectorIndex(VectorIndex):
                     conditions.append({key: {"$in": expected}})
                 else:
                     conditions.append({key: expected})
-            elif key in ("context_type", "category"):
+            elif key in ("context_type", "category", "record_kind", "representation_version",
+                         "embedding_model", "embedding_dimension", "memory_revision", "canonical_revision"):
                 if isinstance(expected, list):
                     conditions.append({key: {"$in": expected}})
                 else:
@@ -401,7 +408,8 @@ class ChromaVectorIndex(VectorIndex):
             return None
         meta = ((result.get("metadatas") or [{}])[0]) or {}
         doc = ((result.get("documents") or [""])[0]) or ""
-        emb = ((result.get("embeddings") or [[]])[0]) or []
+        embeddings = result.get("embeddings")
+        emb = embeddings[0] if embeddings is not None and len(embeddings) else []
         # Mirror the OpenGauss path: surface a stable ``filters``
         # shape with account_id / owner_space so callers can re-derive
         # the scope without inspecting raw metadata.
@@ -410,7 +418,7 @@ class ChromaVectorIndex(VectorIndex):
             "owner_space": meta.get("owner_space", ""),
         }
         metadata = dict(meta)
-        if emb and "_embedding" not in metadata:
+        if len(emb) and "_embedding" not in metadata:
             metadata["_embedding"] = [float(x) for x in emb]
         return IndexRecord(
             id=str(ids[0]),

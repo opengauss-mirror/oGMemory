@@ -1,0 +1,51 @@
+memory_type: relation
+version: "1.0"
+description: |
+  Extract relationships between memory nodes.
+  Call when you identify a connection between entities, preferences, or other concepts.
+  Relation types:
+  - alias_of: Two expressions refer to the same entity (e.g., "Apple" and "苹果公司")
+  - supersedes: New information replaces old (e.g., new address supersedes old address)
+  - belongs_to: Hierarchical relationship (e.g., task belongs to project)
+  - supports: Evidence or support relationship (e.g., fact supports conclusion)
+  - refers_to: General reference (e.g., discussion refers to related topic)
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/relations"
+filename_template: "{{ from_routing_key }}_{{ relation_type }}_{{ to_routing_key }}.md"
+operation_mode: upsert
+owner_scope: user
+enabled: true
+fields:
+  - name: from_routing_key
+    type: string
+    required: true
+    description: "Routing key of the source node — the SAME routing_key you passed to extract_entity/extract_event/... when extracting that node. Do NOT assemble a full URI; the system builds the URI from routing key + category + context."
+  - name: to_routing_key
+    type: string
+    required: true
+    description: "Routing key of the target node (same convention as from_routing_key)."
+  - name: from_category
+    type: string
+    required: false
+    description: "Memory category of the source node (entity/event/profile/...). Defaults to 'entity' if omitted."
+  - name: to_category
+    type: string
+    required: false
+    description: "Memory category of the target node. Defaults to 'entity' if omitted."
+  - name: relation_type
+    type: string
+    required: true
+    description: "Type of relationship: alias_of, supersedes, belongs_to, supports, refers_to"
+    enum:
+      - alias_of
+      - supersedes
+      - belongs_to
+      - supports
+      - refers_to
+  - name: reason
+    type: string
+    required: true
+    description: "Explanation of why this relationship exists"
+  - name: weight
+    type: number
+    required: true
+    description: "Confidence/strength of relationship (0.0-1.0)"

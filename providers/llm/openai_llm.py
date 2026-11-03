@@ -868,6 +868,10 @@ class OpenAILLM(LLM):
 
                 if effective_tool_choice == "required":
                     self._required_tool_choice_capability = "supported"
+                # ``usage`` was already computed (and recorded) upfront
+                # right after _create_completion — dev contract: one record
+                # per LLM attempt, failed or not (see
+                # test_failed_normalization_and_retry_each_record_usage_once).
                 parsed_tool_calls = [
                     {
                         "tool": call.function.name,

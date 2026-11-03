@@ -144,8 +144,10 @@ class GraphService:
 
     def __init__(
         self,
-        graph_store: GraphStore,
+        graph_store: GraphStore | None,
         vector_index: "VectorIndex | None" = None,
+        *,
+        relation_reader=None,
     ):
         """Initialize the graph service.
 
@@ -164,6 +166,22 @@ class GraphService:
         # ``core.interfaces``. The VectorIndex Protocol is structural;
         # see ``core/interfaces.py:175``.
         self._vector_index = vector_index
+        self._relation_reader = relation_reader
+
+    @property
+    def supports_relation_reads(self) -> bool:
+        """ContextNode URI relations are separate from the UUID/M3 graph."""
+        return self._relation_reader is not None
+
+    def get_relation_neighbors(self, uri, ctx, *, limit=10, min_weight=0.0):
+        if self._relation_reader is None:
+            raise RuntimeError("semantic relation reader is not configured")
+        return self._relation_reader.get_relation_neighbors(uri, ctx, limit=limit, min_weight=min_weight)
+
+    def get_traversal_neighbors(self, uri, ctx, *, limit=128, embedding_profile=None):
+        if self._relation_reader is None:
+            raise RuntimeError("semantic relation reader is not configured")
+        return self._relation_reader.get_traversal_neighbors(uri, ctx, limit=limit, embedding_profile=embedding_profile)
 
     def _create_node_with_edges(self, node, edges, ctx):
         create = getattr(self._store, "create_node_with_edges", None)

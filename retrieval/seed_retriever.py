@@ -264,11 +264,17 @@ class SeedRetriever:
         l2_only = lexical_only or not self.config.expand_hierarchy
         if l2_only:
             filters["level"] = 2
+        elif str(typed_query.context_type).upper() == "MEMORY":
+            filters["level"] = [0, 1, 2]
 
         supported_filters = frozenset(
             getattr(self.bm25_index, "supported_filters", filters)
         )
         if "memory_directory" in filters and "memory_directory" not in supported_filters:
+            # Provider-capability mismatches are misconfiguration, not
+            # operational failures: raise RetrievalConfigError so the
+            # caller's degrade-to-BM25 catch re-raises them (dev contract:
+            # fail fast) instead of silently returning vector-only results.
             raise RetrievalConfigError("typed memory retrieval requires a lexical provider with a memory_directory filter")
         if not self.config.expand_hierarchy and "level" not in supported_filters:
             raise RetrievalConfigError("direct L2 retrieval requires a lexical provider with a level filter")
@@ -298,7 +304,7 @@ class SeedRetriever:
         for h in bm25_hits:
             meta = h.metadata
             metadata = dict(meta or {})
-            if l2_only and int(metadata.get("level", 2)) != 2:
+            if int(metadata.get("level", 2)) not in (0, 1, 2) or (l2_only and int(metadata.get("level", 2)) != 2):
                 continue
             if self.config.hybrid_enabled:
                 if metadata.get("account_id") != ctx.account_id:

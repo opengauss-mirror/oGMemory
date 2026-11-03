@@ -5,13 +5,14 @@ keeps the full existing extraction contract; transport and deadline errors propa
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from logging import getLogger
 import json
 import re
+from dataclasses import dataclass, field, replace
+from logging import getLogger
 from threading import Lock
 
-from jsonschema import ValidationError as JSONSchemaValidationError, validate
+from jsonschema import ValidationError as JSONSchemaValidationError
+from jsonschema import validate
 
 from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
 from core.operation_deadline import check_deadline
@@ -35,7 +36,8 @@ class AssemblyState:
 def category_catalog(registry, tools):
     offered = {tool["name"]: tool for tool in tools}
     return [{"category": schema.memory_type, "description": offered[schema.tool_name]["description"]}
-            for schema in registry.list_enabled() if schema.tool_name in offered]
+            for schema in registry.list_enabled()
+            if schema.tool_name in offered and schema.memory_type != "relation"]
 
 
 def select_categories(llm, registry, tools, source, user_id):
@@ -73,6 +75,10 @@ def select_categories(llm, registry, tools, source, user_id):
 
 def tools_for_categories(tools, registry, categories):
     names = {schema.tool_name for schema in registry.list_enabled() if schema.memory_type in categories}
+    # Relations connect extracted memories rather than representing a memory
+    # category. Retain this graph-only tool if the caller originally offered it;
+    # never introduce it to graph-disabled extraction.
+    names.update(tool["name"] for tool in tools if tool["name"] == "extract_relation")
     if any(schema.memory_type in categories and _supports_read_target(schema)
            for schema in registry.list_enabled()):
         names.update({"edit_memory", "append_memory"})
@@ -133,6 +139,13 @@ class PromptParts:
 
 def selection_for_prepared(extractor, prepared, ctx):
     check_deadline()
+    if getattr(extractor, "_activation_enabled", False):
+        # The reviewed graph extraction contract offers all memory categories
+        # together with relation proposals. Preserve that contract: narrowing
+        # graph extraction is a separate algorithm change, not a merge repair.
+        # Graph-off continues through Dev's native scoped assembly below.
+        return frozenset(item["category"] for item in category_catalog(
+            extractor._schema_registry, extractor._extraction_tools))
     with _INITIALIZE:
         if prepared.assembly_state is None:
             prepared.assembly_state = AssemblyState()

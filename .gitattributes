@@ -1,1 +1,4 @@
 *.sh text eol=lf
+
+# Preserve hash-pinned upstream BEAM source/prompt bytes, including whitespace.
+scripts/vendor/beam/** -whitespace

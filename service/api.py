@@ -53,6 +53,9 @@ internal_tool_usage_tracker=None,
         card_format_enabled: bool = False,
         dual_pass_enabled: bool = True,
         node_processing_enabled: bool = False,
+        graph_enabled: bool = False,
+        relation_store=None,
+        relation_candidate_service=None,
     ):
         """Initialize the API with required dependencies.
 
@@ -82,6 +85,11 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._card_format_enabled = card_format_enabled
         self._dual_pass_enabled = dual_pass_enabled
         self._node_processing_enabled = node_processing_enabled
+        self._graph_enabled = graph_enabled
+        self._relation_store = relation_store
+        self._relation_candidate_service = relation_candidate_service
+        if graph_enabled and relation_store is None:
+            raise ValueError("Graph ingestion requires canonical relation storage")
 
         # Auto-create SchemaRegistry if not provided
         if schema_registry is None:
@@ -140,6 +148,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     self._writer._identity_resolver
                     and self._writer._identity_resolver.handles(candidate)
                 ),
+                activation_enabled=self._graph_enabled,
             )]
         except Exception:
             # Fall back to default prompt construction if the template system is unavailable.
@@ -159,6 +168,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     self._writer._identity_resolver
                     and self._writer._identity_resolver.handles(candidate)
                 ),
+                activation_enabled=self._graph_enabled,
             )]
 
     @serialized_topics
@@ -279,10 +289,45 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
         deduplicated = filtered
 
+        # Proposals are transient ingestion inputs, never persisted as node metadata.
+        from extraction.relation_proposals import take
+        extraction_proposals = take(deduplicated)
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
         plans = (self._write_checkpointed_candidates(
                      deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
                  if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
+
+        graph_diagnostics = None
+        if self._graph_enabled:
+            from extraction.cross_prompt_relations import run_integrated_relations
+            from extraction.relation_proposals import resolve_edges, union_edges
+            native_edges, native_rejections = resolve_edges(
+                extraction_proposals, deduplicated, plans, ctx, fs=self._fs,
+                uri_resolver=self._uri_resolver)
+            historical, diagnostics = [], None
+            lookup_error = None
+            if len(deduplicated) == len(plans) and self._relation_candidate_service is not None:
+                try:
+                    historical, diagnostics = self._relation_candidate_service.recommend(deduplicated, plans, ctx)
+                except Exception as exc:
+                    lookup_error = type(exc).__name__
+            edges, graph_diagnostics = run_integrated_relations(
+                messages,deduplicated,plans,ctx,fs=self._fs,vector_index=self._vector_index,
+                embedder=self._embedder,llm=self._llm,historical_candidates=historical,
+                historical_diagnostics=diagnostics)
+            edges = union_edges(native_edges, edges)
+            graph_diagnostics.update(node_extraction_relation_proposals=len(extraction_proposals),
+                                     native_relation_accepted=len(native_edges),
+                                     native_relation_rejections=native_rejections)
+            if lookup_error:
+                graph_diagnostics["historical_recommendation_failure"] = lookup_error
+            try:
+                self._relation_store.upsert_edges(edges,ctx)
+                graph_diagnostics["relation_persisted"] = len(edges)
+            except Exception as exc:
+                graph_diagnostics.update(status="persistence_failed",relation_persisted=0,
+                                         persistence_error=type(exc).__name__)
+                logger.exception("Graph relation persistence failed")
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")
@@ -305,6 +350,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 for p in plans
             ],
         }
+
+        if graph_diagnostics is not None:
+            result["graph"] = graph_diagnostics
 
         # For async mode, return task_id
         if not wait:
@@ -720,6 +768,18 @@ class ReadAPI:
         self._read_service = read_service
         self._cfg = config or RetrievalConfig()
 
+    def append_graph_supplement(self, items, query, stats, ctx, budget, formatter):
+        supplement = getattr(self._pipeline,"_graph_supplement",None)
+        if not (self._cfg.enable_graph_expansion and self._cfg.graph_supplement_enabled and supplement):
+            return items
+        try:
+            return supplement.deliver(items,query,stats,ctx,budget,formatter)
+        except Exception as exc:
+            logger.warning("Graph delivery failed; preserving baseline: %s",exc)
+            stats["graph_supplement_delivery"] = dict(error=type(exc).__name__,added_uris=[],
+                                                      baseline_prefix_unchanged=True)
+            return items
+
     def search_memory(
         self,
         query: str,
@@ -736,6 +796,7 @@ class ReadAPI:
         context_type: str | None = None,
         resource_type: str | None = None,
         memory_directories: list[str] | None = None,
+        collect_graph_supplement: bool = False,
         use_scene: bool | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
@@ -760,6 +821,7 @@ class ReadAPI:
             context_type=context_type,
             resource_type=resource_type,
             memory_directories=memory_directories,
+            **({"collect_graph_supplement": True} if collect_graph_supplement else {}),
             **({"use_scene": use_scene} if use_scene is not None else {}),
         )
 
