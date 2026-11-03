@@ -1110,18 +1110,37 @@ def query_memory(
         type_filters["memory_directories"] = sorted({MEMORY_TYPES[t].directory for t in requested_types})
 
     try:
-        with request_usage_scope(ctx):
-            result = service.get_read_api().search_memory(
-                query.strip(),
-                ctx,
-                top_k=search_top_k,
-                categories=categories,
-                score_threshold=score_threshold,
-                include_debug=False,
-                fill_content_for_top_k=min(top_k, 3),
-                **type_filters,
-                **({"use_scene": use_scene} if use_scene is not None else {}),
-            )
+        from fs.sql_adapter.pool import psycopg2
+        from fs.sql_adapter.session_mutation import active_session_guard
+        for attempt in range(2):
+            try:
+                with request_usage_scope(ctx):
+                    result = service.get_read_api().search_memory(
+                        query.strip(),
+                        ctx,
+                        top_k=search_top_k,
+                        categories=categories,
+                        score_threshold=score_threshold,
+                        include_debug=False,
+                        fill_content_for_top_k=min(top_k, 3),
+                        **type_filters,
+                        **({"use_scene": use_scene} if use_scene is not None else {}),
+                    )
+                break
+            except Exception as exc:
+                connection_error = psycopg2 is not None and isinstance(
+                    exc, (psycopg2.InterfaceError, psycopg2.OperationalError)
+                ) and (not getattr(exc, "pgcode", None) or exc.pgcode.startswith("08")
+                       or exc.pgcode in {"57P01", "57P02", "57P03"})
+                if not connection_error or active_session_guard() is not None:
+                    raise
+                if attempt:
+                    raise RuntimeError(
+                        "Memory query failed: database connection unavailable after one retry; "
+                        "this does not mean the memory is absent."
+                    ) from exc
+                logger.warning("MCP memory query lost its database connection; retrying once")
+
     except Exception as exc:
         recorder = getattr(service, "record_retrieval_metric", None)
         if callable(recorder):

@@ -401,7 +401,8 @@ def create_mcp_server(
         memories. Each hit includes a relevance score, summary fields, and an
         exact ogmemory:// URI. Call ogm_read_memory only when the hit lacks the
         detail needed to answer. Treat no hits as no memory evidence; do not
-        invent missing context.
+        invent missing context. A tool error means retrieval failed, not that
+        the memory is absent; report the failure rather than claiming no memory.
         """
 
         return query_memory_tool(
