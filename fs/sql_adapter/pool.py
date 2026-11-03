@@ -36,6 +36,37 @@ logger = logging.getLogger(__name__)
 _dns_slots = threading.BoundedSemaphore(4)
 
 
+def sql_connection_identity(dsn):
+    """Conservative identity for sharing an authenticated SQL session.
+
+    Ignore only transport/diagnostic settings. Credentials, options (including
+    search_path), endpoints and all unknown settings must still match.
+    """
+    values = psycopg2.extensions.parse_dsn(dsn)
+    for key in ("connect_timeout", "application_name", "fallback_application_name"):
+        values.pop(key, None)
+    return tuple(sorted(values.items()))
+
+
+def is_connection_alive(conn):
+    """Validate an idle session without leaving a transaction open."""
+    if conn.closed != 0:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        conn.rollback()
+        return True
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
+
+
 def remaining_seconds(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -210,20 +241,7 @@ class SharedConnectionPool:
 
     def _is_connection_alive(self, conn) -> bool:
         """Check that an idle connection is still usable."""
-        if conn.closed != 0:
-            return False
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-            conn.rollback()
-            return True
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return False
+        return is_connection_alive(conn)
 
     def get_connection(
         self,

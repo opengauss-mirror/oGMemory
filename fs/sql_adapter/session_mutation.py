@@ -9,7 +9,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from fs.sql_adapter.pool import psycopg2
+from fs.sql_adapter.pool import psycopg2, sql_connection_identity
 
 _ACTIVE = ContextVar("sql_session_mutation", default=None)
 
@@ -27,7 +27,7 @@ def active_session_guard():
 
 
 def _dsn_identity(dsn):
-    return tuple(sorted(psycopg2.extensions.parse_dsn(dsn).items()))
+    return sql_connection_identity(dsn)
 
 
 class _Cursor:

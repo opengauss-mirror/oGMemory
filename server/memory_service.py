@@ -2601,13 +2601,15 @@ class MemoryService:
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            # Do not share across distinct DSNs or a non-PostgreSQL dialect.
+            # Use the same conservative identity as the session mutation guard.
+            from fs.sql_adapter.pool import sql_connection_identity
             pool = None
             vector_dsn = getattr(self._provider_cfg, "opengauss_connection_string", None)
             if (self._use_sql
                     and str(self._provider_cfg.vector_db_type).strip().casefold() == "opengauss"
                     and self._cfg.sql_dialect in {"postgresql", "opengauss"}
-                    and vector_dsn and vector_dsn == self._cfg.sql_connection_string):
+                    and vector_dsn
+                    and sql_connection_identity(vector_dsn) == sql_connection_identity(self._cfg.sql_connection_string)):
                 pool = self._get_shared_sql_pool()
             vector_index = (self._provider_cfg.create_vector_index(pool=pool) if pool is not None
                             else self._provider_cfg.create_vector_index())

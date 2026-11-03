@@ -12,7 +12,7 @@ from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
 from core.temporal import contains_time, seconds
 from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
-from fs.sql_adapter.pool import PoolAdapterMixin, resolve_connection_dialect
+from fs.sql_adapter.pool import PoolAdapterMixin, resolve_connection_dialect, is_connection_alive
 from fs.sql_adapter.dialect import normalize_sql_dialect
 
 try:
@@ -362,12 +362,12 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
     def _get_connection(self):
         """Get a connection from the pool or create a new one."""
-        if self._pool:
+        while self._pool:
             conn = self._pool.pop()
-            if conn.closed == 0:
+            if is_connection_alive(conn):
                 return conn
 
-        return psycopg2.connect(self._connection_string)
+        return psycopg2.connect(self._connection_string, connect_timeout=10)
 
     @staticmethod
     def _reset_connection(conn):

@@ -186,3 +186,28 @@ def test_legacy_vector_backfill_completes_with_canonical_schema(vector_pool, sch
     if schema_kind == "legacy_node_id":
         assert index.search_by_vector([1, 0, 0], {"account_id": "acct"}, 1)[0].metadata["node_id"] == node_id
     assert index.migrate_legacy_rows() is False
+
+
+@pytest.mark.parametrize('shared', [True, False])
+def test_first_vector_query_recovers_after_idle_backend_termination(vector_pool, shared):
+    pool, index, control, _, uri = vector_pool
+    if not shared:
+        index = OpenGaussVectorIndex(connection_string=pool.connection_string,
+                                    dialect=pool.dialect, dimension=3, table_name='vectors')
+    filters = {'account_id': 'acct', 'owner_space': 'user:alice'}
+    try:
+        assert index.search_by_vector([1, 0, 0], filters, 2)
+        idle = pool._pool[-1] if shared else index._pool[-1]
+        with idle.cursor() as cursor:
+            cursor.execute('SELECT pg_backend_pid()')
+            backend_pid = cursor.fetchone()[0]
+        idle.rollback()
+        with control.cursor() as cursor:
+            cursor.execute('SELECT pg_terminate_backend(%s)', (backend_pid,))
+            assert cursor.fetchone()[0]
+        assert [hit.uri for hit in index.search_by_vector([1, 0, 0], filters, 2)] == [uri]
+        assert idle.closed
+    finally:
+        if not shared:
+            for conn in index._pool:
+                conn.close()
