@@ -506,6 +506,12 @@ class OgMemConfig:
     chroma_persist_directory: str = ".chroma_data"
     chroma_collection_name: str = "contextengine"
 
+    milvus_uri: str = field(default="http://localhost:19530", repr=False)
+    milvus_token: str = field(default="", repr=False)
+    milvus_collection_name: str = "contextengine"
+    milvus_db_name: str = "default"
+    milvus_timeout: float = 30.0
+
     # -- Service ---------------------------------------------------------------
     http_port: int = 8090
     workers: int = 2
@@ -1310,6 +1316,11 @@ class OgMemConfig:
                 "CHROMA_COLLECTION",
                 "contextengine",
             ),
+            milvus_uri=_resolve(vdb.get("milvus_uri"), "MILVUS_URI", "http://localhost:19530"),
+            milvus_token=_resolve(vdb.get("milvus_token"), "MILVUS_TOKEN", ""),
+            milvus_collection_name=_resolve(vdb.get("milvus_collection"), "MILVUS_COLLECTION", "contextengine"),
+            milvus_db_name=_resolve(vdb.get("milvus_db_name"), "MILVUS_DB_NAME", "default"),
+            milvus_timeout=_resolve(vdb.get("milvus_timeout"), "MILVUS_TIMEOUT", 30.0, float),
             # Service
             http_port=_resolve(svc.get("http_port"), "OGMEM_HTTP_PORT", 8090, int),
             workers=_resolve(svc.get("workers"), "OGMEM_WORKERS", 2, int),
@@ -2556,7 +2567,7 @@ class OgMemConfig:
         """Return a sanitised dict suitable for logging (keys masked)."""
         def sanitize(name: str, value: Any) -> Any:
             lowered = name.casefold()
-            credential_name = lowered.endswith("token") or any(
+            credential_name = lowered == "milvus_uri" or lowered.endswith("token") or any(
                 marker in lowered
                 for marker in ("key", "password", "secret", "connection_string")
             )

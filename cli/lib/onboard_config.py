@@ -1,7 +1,8 @@
 """Preserve settings outside the wizard and save configuration atomically."""
+import time
 from copy import deepcopy
 from pathlib import Path
-import time
+
 import yaml
 
 from cli.lib.local_runtime import private_write
@@ -26,7 +27,8 @@ def merge_config(existing: dict, generated: dict) -> dict:
     result = deepcopy(existing)
     owned = {"llm": {"provider", "api_key", "base_url", "model"},
              "embedding": {"provider", "api_key", "base_url", "model"},
-             "vector_db": {"type", "dimension", "connection_string"},
+             "vector_db": {"type", "dimension", "connection_string", "milvus_uri",
+                           "milvus_collection", "milvus_db_name", "milvus_timeout"},
              "storage": {"backend", "dialect", "connection_string"},
              "service": {"http_port"}, "plugin": {"type", "openclaw_config"}}
     for section, values in generated.items():
@@ -66,6 +68,10 @@ def existing_defaults(args, raw: dict) -> None:
               "embedding_api_key": ("embedding", "api_key"), "embedding_base_url": ("embedding", "base_url"),
               "embedding_dimension": ("vector_db", "dimension"), "vector_db": ("vector_db", "type"),
               "vector_db_connection": ("vector_db", "connection_string"),
+              "milvus_uri": ("vector_db", "milvus_uri"),
+              "milvus_collection": ("vector_db", "milvus_collection"),
+              "milvus_db_name": ("vector_db", "milvus_db_name"),
+              "milvus_timeout": ("vector_db", "milvus_timeout"),
               "db_connection": ("storage", "connection_string"), "sql_dialect": ("storage", "dialect"),
               "storage_backend": ("storage", "backend"), "port": ("service", "http_port")}
     old_embedding = raw.get("embedding", {})

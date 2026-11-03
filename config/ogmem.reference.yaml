@@ -56,11 +56,20 @@ embedding:
 
 # ---- Vector Database [all] ----
 vector_db:
-  type: chroma                   # [local] memory (quickstart) / chroma / opengauss
-                                  # [docker] opengauss (recommended for production)
+  type: chroma                   # [local] memory (quickstart) / chroma / opengauss / milvus
+                                  # [docker] opengauss / milvus (opengauss recommended for production)
   # --- Chroma (local) ---
   chroma_persist_dir: ".ogmem_data/chroma"  # [local]
   # chroma_collection: "contextengine"
+  # --- Milvus (external service; install .[milvus]) ---
+  # Local/headless/Docker: connect to an external Milvus 2.6 service.
+  # Selected by vector_db.type: milvus, through the same provider factory.
+  # See docs/integrations/milvus.md. Embedding dimension must match.
+  # milvus_uri: "http://localhost:19530"    # MILVUS_URI
+  # milvus_collection: "contextengine"     # MILVUS_COLLECTION
+  # milvus_db_name: "default"              # MILVUS_DB_NAME
+  # milvus_timeout: 30                     # MILVUS_TIMEOUT (seconds)
+  # Supply credentials via MILVUS_TOKEN instead of committing them to YAML.
   # --- OpenGauss (docker / production) ---
   # connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"
   dimension: 1024                # [all]

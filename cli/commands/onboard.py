@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import shutil
 import subprocess
 import sys
@@ -126,19 +128,48 @@ def _step3_embedding(args, llm_config: dict) -> dict:
     }
 
 
+def _vector_db_choices(args) -> list[str]:
+    if getattr(args, "mode", None) == "docker":
+        return ["opengauss", "milvus"]
+    return ["opengauss", "chroma", "milvus"]
+
+
 def _step4_database(args) -> tuple[dict, dict]:
     """Vector DB + SQL storage configuration and schema init."""
     _print_header(5, "Database Configuration")
 
-    # Vector DB type
+    # All supported providers use the same configuration path.
+    vector_types = _vector_db_choices(args)
+    requested = getattr(args, "vector_db", None) or "opengauss"
+    if getattr(args, "mode", None) == "docker" and requested == "chroma":
+        raise ValueError(
+            "Docker supports openGauss or external Milvus; Chroma requires local/headless mode"
+        )
     if getattr(args, "non_interactive", False):
         vdb_type = getattr(args, "vector_db", None) or "opengauss"
     else:
-        vdb_type = ["opengauss", "chroma"][
-            select("Vector database:", ["openGauss", "Chroma"], default=1 if getattr(args, "vector_db", None) == "chroma" else 0)
+        requested = getattr(args, "vector_db", None) or "opengauss"
+        labels = {"opengauss": "openGauss", "chroma": "Chroma", "milvus": "Milvus"}
+        vdb_type = vector_types[
+            select("Vector database:", [labels[name] for name in vector_types],
+                   default=vector_types.index(requested) if requested in vector_types else 0)
         ]
 
     vdb = {"type": vdb_type}
+    if vdb_type == "milvus":
+        default_uri = getattr(args, "milvus_uri", None) or os.environ.get("MILVUS_URI") or (
+            "http://host.docker.internal:19530" if getattr(args, "mode", None) == "docker"
+            else "http://localhost:19530"
+        )
+        vdb["milvus_uri"] = (default_uri if getattr(args, "non_interactive", False)
+                             else input_validated("Milvus URI", default_uri))
+        vdb["milvus_collection"] = getattr(args, "milvus_collection", None) or os.environ.get("MILVUS_COLLECTION", "contextengine")
+        vdb["milvus_db_name"] = getattr(args, "milvus_db_name", None) or os.environ.get("MILVUS_DB_NAME", "default")
+        timeout = getattr(args, "milvus_timeout", None)
+        timeout = float(timeout if timeout is not None else os.environ.get("MILVUS_TIMEOUT", "30"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Milvus timeout must be finite and positive")
+        vdb["milvus_timeout"] = timeout
     storage_backend = getattr(args, "storage_backend", None) or "sql"
 
     database_required = storage_backend == "sql" or vdb_type == "opengauss"
@@ -200,7 +231,7 @@ def _step4_database(args) -> tuple[dict, dict]:
     # OpenGauss vector and SQL storage both require a reachable database.
     # Docker quickstart creates and checks its own OpenGauss container.
     if (storage_backend == "sql" or vdb_type == "opengauss") and getattr(args, "mode", None) != "docker":
-        from cli.lib.db_setup import check_postgresql, check_opengauss_compatibility, init_schema
+        from cli.lib.db_setup import check_opengauss_compatibility, check_postgresql, init_schema
 
         # Probe each distinct database; never silently replace a separate vector DSN.
         if vdb_type == "opengauss" and (storage_backend != "sql" or vector_conn != conn_str):
@@ -265,8 +296,8 @@ def _step_install_deps(args, embedding: dict, vdb: dict) -> bool:
     extras = []
     if embedding.get("provider") == "st":
         extras.append("sentence-transformers")
-    if vdb.get("type") == "chroma":
-        extras.append("chroma")
+    if vdb.get("type") in {"chroma", "milvus"}:
+        extras.append(vdb["type"])
 
     if shutil.which("uv"):
         cmd = ["uv", "sync"]
@@ -300,22 +331,23 @@ def _step_docker_setup(args, llm: dict, embedding: dict, vdb: dict) -> dict:
 
     root = find_project_root()
     result = {}
-    if vdb.get("type", "opengauss") != "opengauss":
-        print(fail("Docker quickstart requires OpenGauss; Chroma is only supported by local mode"))
-        result["deploy_failed"] = True
-        return result
     state_root = root / ".ogmem_data" / "onboard-docker"
     env_path = state_root / "ogmemory.env"
     runtime_env_path = state_root / "ogmemory-runtime.env"
     instance_name = getattr(args, "instance_name", None) or "ogmem"
 
     _print_header(6, "Generate deploy.env")
-    from cli.lib.deploy_helpers import deploy_quickstart, generate_quickstart_env, quickstart_shell_command
+    from cli.lib.deploy_helpers import (
+        deploy_quickstart,
+        generate_quickstart_env,
+        quickstart_shell_command,
+    )
 
     try:
         generate_quickstart_env(
             llm,
             embedding,
+            vector_config=vdb,
             instance_name=instance_name,
             opengauss_port=args.opengauss_port,
             ogmem_http_port=args.port,
@@ -430,7 +462,14 @@ plugin:
             cfg += f"  openclaw_config: {quote(openclaw_config)}\n"
 
     import yaml
-    return yaml.safe_load(cfg)
+    value = yaml.safe_load(cfg)
+    if vdb["type"] == "milvus":
+        value["vector_db"].update({
+            key: vdb[key] for key in (
+                "milvus_uri", "milvus_collection", "milvus_db_name", "milvus_timeout"
+            ) if key in vdb
+        })
+    return value
 
 
 
@@ -449,7 +488,7 @@ def run(args) -> int:
         from cli.commands.plugin_config import run as export_plugin_config
         return export_plugin_config(args)
 
-    from cli.lib.onboard_config import read_config, existing_defaults
+    from cli.lib.onboard_config import existing_defaults, read_config
     from cli.lib.process import find_project_root
     root = find_project_root()
     from cli.lib.local_config import resolve_local_config_path
@@ -491,7 +530,11 @@ def run(args) -> int:
         return 1
 
     # Database (Vector DB + SQL storage)
-    vdb_config, db_config = _step4_database(args)
+    try:
+        vdb_config, db_config = _step4_database(args)
+    except ValueError as exc:
+        print(fail(str(exc)))
+        return 1
 
     if deployment == "docker":
         docker_setup = _step_docker_setup(args, llm_config, embedding_config, vdb_config)
@@ -515,11 +558,13 @@ def run(args) -> int:
         if db_config.get("backend") == "sql" and not db_config.get("reachable", False):
             print(fail("Database is not reachable; local OpenGauss mode cannot continue"))
             return 1
-        from cli.lib.onboard_config import merge_config, save_config, changed_fields
-        from cli.lib.local_runtime import require_stopped, runtime_lock
-        from cli.lib.local_config import load_local_config
         import tempfile
+
         import yaml
+
+        from cli.lib.local_config import load_local_config
+        from cli.lib.local_runtime import require_stopped, runtime_lock
+        from cli.lib.onboard_config import changed_fields, merge_config, save_config
         value = merge_config(existing, _build_config(llm_config, embedding_config, vdb_config, db_config, port=args.port))
         changes = changed_fields(existing, value)
         print(info("Changed fields (values hidden): " + (", ".join(changes) or "none")))

@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
 import stat
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -236,3 +236,125 @@ def test_documented_docker_command_consumes_all_explicit_model_settings(monkeypa
                    "base_url": values["LLM_BASE_URL"], "model": values["LLM_MODEL"]}
     assert embedding == {"provider": "openai", "api_key": values["EMBEDDING_API_KEY"],
                          "base_url": values["EMBEDDING_BASE_URL"], "model": values["EMBEDDING_MODEL"], "dimension": 1024}
+
+
+@pytest.mark.parametrize("backend", ["opengauss", "milvus"])
+def test_selected_backend_and_milvus_parameters_reach_environment(tmp_path, backend, monkeypatch):
+    monkeypatch.setenv("MILVUS_TOKEN", "dummy-token")
+    envfile = deploy_helpers.generate_quickstart_env(
+        model_config(), model_config(), output_path=tmp_path / "backend.env",
+        vector_config={"type": backend, "milvus_uri": "http://milvus.example:19530",
+                       "milvus_collection": "selected", "milvus_db_name": "testdb"},
+    )
+    env = subprocess.check_output([
+        "bash", "-c", 'source "$1"; printf "%s\\n" "$VECTOR_DB_TYPE" "$MILVUS_URI" '
+        '"$MILVUS_COLLECTION" "$MILVUS_DB_NAME" "$MILVUS_TOKEN"', "verify", str(envfile),
+    ], text=True).splitlines()
+    assert env == [backend, "http://milvus.example:19530", "selected", "testdb", "dummy-token"]
+    assert stat.S_IMODE(envfile.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
+@pytest.mark.parametrize("backend,probe_failure", [
+    ("opengauss", False), ("milvus", False), ("milvus", True),
+])
+@pytest.mark.parametrize("grpc_override", [None, "", "custom-bypass.example"])
+def test_real_quickstart_renders_selected_backend(tmp_path, backend, probe_failure, grpc_override):
+    from string import Template
+
+    import yaml
+
+    envfile = deploy_helpers.generate_quickstart_env(
+        model_config(), model_config(), output_path=tmp_path / "runtime.env",
+        vector_config={"type": backend, "milvus_uri": "http://milvus.example:19530"},
+    )
+    capture = tmp_path / "docker.log"
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    scripts = {
+        "uname": "echo aarch64\n", "ss": "exit 0\n",
+        "curl": '''
+out=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+done
+if [ -n "$out" ]; then printf '%s' '{"choices":[],"data":[{"embedding":[0]}]}' > "$out"; fi
+printf 200
+''',
+        "docker": '''
+printf '%s\\n' "$*" >> "$CAPTURE"
+case "$1" in
+  info) [ "${2-}" = --format ] && echo /tmp; exit 0 ;;
+  container) exit 1 ;;
+  ps) exit 0 ;;
+  run) case "$*" in *scripts.check_milvus*)
+    if [ "$PREFLIGHT_FAIL" = 1 ]; then echo PREFLIGHT_DENIED >&2; exit 97; fi ;;
+    esac ;;
+  exec) case "$*" in *'python -c'*) echo VALIDATION_STOP >&2; exit 98 ;; esac ;;
+esac
+exit 0
+''',
+    }
+    for name, body in scripts.items():
+        p = shims / name
+        p.write_text("#!/bin/sh\n" + body)
+        p.chmod(0o700)
+    completed = subprocess.run(
+        ["bash", str(ROOT / "deploy/user-quickstart/deploy.sh")],
+        env={"PATH": f"{shims}:/usr/bin:/bin", "HOME": str(tmp_path),
+             "OGMEMORY_ENV_FILE": str(envfile), "OGMEMORY_STACK_ROOT": str(tmp_path),
+             "OGMEM_IMAGE": "test-current-image", "CAPTURE": str(capture), "LANG": "C.UTF-8",
+             "PREFLIGHT_FAIL": "1" if probe_failure else "0",
+             **({"MILVUS_NO_GRPC_PROXY": grpc_override} if grpc_override is not None else {})},
+        capture_output=True, text=True, timeout=10,
+    )
+    commands = capture.read_text()
+    if backend == "milvus":
+        probe = next(line for line in commands.splitlines() if "scripts.check_milvus" in line)
+        assert "--network ogmem_ogmemory_net" in probe
+        assert "--add-host host.docker.internal:host-gateway" in probe
+        assert "MILVUS_URI=http://milvus.example:19530" in probe
+        assert "VECTOR_DB_DIMENSION=1024" in probe
+        assert "-e MILVUS_TOKEN" in probe
+        bypass = "milvus.example" if grpc_override is None else grpc_override
+        assert f"no_grpc_proxy={bypass}" in shlex.split(probe)
+    if probe_failure:
+        assert completed.returncode == 1
+        assert "未替换现有容器" in completed.stderr
+        assert "rm -f" not in commands
+        assert "run -d" not in commands
+        return
+    assert "VALIDATION_STOP" in completed.stderr, completed.stderr
+    if backend == "milvus":
+        assert commands.index("scripts.check_milvus") < commands.index("rm -f")
+        assert commands.count(f"-e no_grpc_proxy={bypass} ") == 2
+    text = (tmp_path / "ogmemory-ogmem/ogmemory.yaml").read_text()
+    config = yaml.safe_load(Template(text).safe_substitute({
+        "VECTOR_DB_TYPE": backend, "MILVUS_URI": "http://milvus.example:19530",
+        "MILVUS_COLLECTION": "contextengine", "MILVUS_DB_NAME": "default", "MILVUS_TIMEOUT": "30",
+    }))
+    assert config["vector_db"]["type"] == backend
+    assert config["vector_db"]["milvus_uri"] == "http://milvus.example:19530"
+    commands = capture.read_text()
+    assert f"VECTOR_DB_TYPE={backend}" in commands
+    assert "/vector:/data/vector" not in commands
+    assert ("--name ogmem_opengauss" in commands) == (backend == "opengauss")
+    if backend != "opengauss":
+        assert "--entrypoint python test-current-image" in commands
+
+
+@pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
+@pytest.mark.parametrize("budget", ["0", "86401", "1.5"])
+def test_invalid_readiness_budget_fails_before_deployment(tmp_path, budget):
+    envfile = deploy_helpers.generate_quickstart_env(
+        model_config(), model_config(), output_path=tmp_path / "runtime.env",
+    )
+    result = subprocess.run(
+        ["bash", str(ROOT / "deploy/user-quickstart/deploy.sh")],
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+             "OGMEMORY_ENV_FILE": str(envfile), "OGMEM_DEPLOY_WAIT_SECONDS": budget},
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 1
+    assert "OGMEM_DEPLOY_WAIT_SECONDS 必须是 1-86400" in result.stderr
+    assert not (tmp_path / "ogmemory-ogmem").exists()

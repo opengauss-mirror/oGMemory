@@ -96,7 +96,7 @@ class _ResourceMutationLease:
 
 def _is_not_found_error(exc: AGFSClientError) -> bool:
     message = str(exc).lower()
-    return "no such file" in message or "not found" in message
+    return any(text in message for text in ("no such file", "no such directory", "not found"))
 
 
 # URI patterns for different memory types
@@ -1179,7 +1179,7 @@ class AGFSContextFS:
     @staticmethod
     def _is_not_found_error(exc: Exception) -> bool:
         message = str(exc).lower()
-        return "no such file" in message or "not found" in message
+        return any(text in message for text in ("no such file", "no such directory", "not found"))
 
     def _resource_mutation_lock_path(self, node_path: str) -> str:
         final_path = PurePosixPath(node_path.rstrip("/"))

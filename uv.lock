@@ -502,6 +502,15 @@ wheels = [
 ]
 
 [[package]]
+name = "cachetools"
+version = "7.2.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/40/3a/bce69b9ecf4658dcd3599abe5122a9031386f8f94bd85c6525fca9109db7/cachetools-7.2.7.tar.gz", hash = "sha256:e2154c809ce9e1247120258c36821467597b5663d44c3255a9790785f23c2b1e", size = 47240, upload-time = "2026-10-28T22:15:17.189Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dc/68/211287b89b122a6842b3f078ffecc5a2abd3c0e4362748586f765e2fb3c5/cachetools-7.2.7-py3-none-any.whl", hash = "sha256:88e6b53373a96786d20894fed9ce623ae5b73cbc07421b7a73098db088be69ae", size = 19654, upload-time = "2026-10-28T22:15:15.555Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.2.25"
 source = { registry = "https://pypi.org/simple" }
@@ -776,6 +785,7 @@ all = [
     { name = "insightface" },
     { name = "onnxruntime" },
     { name = "pyannote-audio" },
+    { name = "pymilvus" },
     { name = "sentence-transformers" },
     { name = "speechbrain" },
     { name = "torch" },
@@ -817,6 +827,9 @@ e2e = [
 m3-budget = [
     { name = "tokenizers" },
 ]
+milvus = [
+    { name = "pymilvus" },
+]
 sentence-transformers = [
     { name = "sentence-transformers" },
 ]
@@ -825,7 +838,7 @@ sentence-transformers = [
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10.0" },
     { name = "chromadb", marker = "extra == 'chroma'", specifier = ">=0.4.0" },
-    { name = "context-engine", extras = ["opengauss", "chroma", "sentence-transformers", "cv", "asr"], marker = "extra == 'all'" },
+    { name = "context-engine", extras = ["opengauss", "chroma", "milvus", "sentence-transformers", "cv", "asr"], marker = "extra == 'all'" },
     { name = "deepagents", marker = "extra == 'deepagents'", specifier = ">=0.7.23,<0.8" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.110" },
     { name = "faster-whisper", marker = "extra == 'asr'", specifier = ">=1.0.0" },
@@ -850,6 +863,7 @@ requires-dist = [
     { name = "pyagfs", specifier = ">=1.4.0" },
     { name = "pyannote-audio", marker = "extra == 'asr'", specifier = ">=3.1.0" },
     { name = "pydantic", specifier = ">=2.0" },
+    { name = "pymilvus", marker = "extra == 'milvus'", specifier = ">=2.6.17,<2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
@@ -866,7 +880,7 @@ requires-dist = [
     { name = "torchaudio", marker = "extra == 'asr'", specifier = ">=2.0.0" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.27" },
 ]
-provides-extras = ["dev", "opengauss", "m3-budget", "chroma", "deepagents", "sentence-transformers", "cv", "asr", "e2e", "all"]
+provides-extras = ["dev", "opengauss", "m3-budget", "chroma", "milvus", "deepagents", "sentence-transformers", "cv", "asr", "e2e", "all"]
 
 [[package]]
 name = "contourpy"
@@ -4577,6 +4591,24 @@ wheels = [
 [package.optional-dependencies]
 crypto = [
     { name = "cryptography" },
+]
+
+[[package]]
+name = "pymilvus"
+version = "2.6.17"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cachetools" },
+    { name = "grpcio" },
+    { name = "orjson" },
+    { name = "pandas" },
+    { name = "protobuf" },
+    { name = "python-dotenv" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/61/22/7dad24082f7efa4bf5ff29f0d9241cec6a8c8ebeb08ad126ca7ca4793da7/pymilvus-2.6.17.tar.gz", hash = "sha256:d9f849ef177f242febc4c02ece88feea46a1a9a1d0c67688b600e7cce3b76f43", size = 306908, upload-time = "2026-07-17T06:23:32.592Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/a6/9e2824138ffe1b2932c24f836638dabff5c6fbb5a9afcc1ba5ac5cdc39d8/pymilvus-2.6.17-py3-none-any.whl", hash = "sha256:583c680bea60b5944762ae81dd577169efe3b895b579d78e60bab05c087c4f89", size = 342148, upload-time = "2026-07-17T06:23:31.188Z" },
 ]
 
 [[package]]

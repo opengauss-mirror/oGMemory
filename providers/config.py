@@ -67,6 +67,12 @@ class ProviderConfig:
     chroma_persist_directory: str = ".chroma_data"
     chroma_collection_name: str = "contextengine"
 
+    milvus_uri: str = field(default="http://localhost:19530", repr=False)
+    milvus_token: str = field(default="", repr=False)
+    milvus_collection_name: str = "contextengine"
+    milvus_db_name: str = "default"
+    milvus_timeout: float = 30.0
+
     # Separate embedding provider (overrides main provider for embedding only)
     embedding_provider: str | None = None
 
@@ -137,6 +143,11 @@ class ProviderConfig:
             opengauss_pool_size=cfg.opengauss_pool_size,
             chroma_persist_directory=cfg.chroma_persist_directory,
             chroma_collection_name=cfg.chroma_collection_name,
+            milvus_uri=cfg.milvus_uri,
+            milvus_token=cfg.milvus_token,
+            milvus_collection_name=cfg.milvus_collection_name,
+            milvus_db_name=cfg.milvus_db_name,
+            milvus_timeout=cfg.milvus_timeout,
             openai_embedding_base_url=cfg.openai_embedding_base_url,
             openai_embedding_api_key=cfg.openai_embedding_api_key,
             openai_embedding_api_key_command=cfg.openai_embedding_api_key_command,
@@ -203,9 +214,9 @@ class ProviderConfig:
         if ep in ("openai", "openai-cached"):
             emb_url = self.openai_embedding_base_url or self.openai_base_url
             emb_key = self.effective_embedding_api_key()
-            OpenAIEmbedder, CachedOpenAIEmbedder = get_openai_embedder()
+            openai_embedder_cls, cached_openai_embedder_cls = get_openai_embedder()
             if ep == "openai-cached" and self.enable_cache:
-                return CachedOpenAIEmbedder(
+                return cached_openai_embedder_cls(
                     api_key=emb_key,
                     base_url=emb_url,
                     model=self.openai_embedding_model,
@@ -215,7 +226,7 @@ class ProviderConfig:
                     max_input_chars=self.embedding_max_input_chars,
                     batch_size=self.embedding_batch_size,
                 )
-            return OpenAIEmbedder(
+            return openai_embedder_cls(
                 api_key=emb_key,
                 base_url=emb_url,
                 model=self.openai_embedding_model,
@@ -257,9 +268,9 @@ class ProviderConfig:
             return MockLLM()
 
         if self.provider in ("openai", "openai-cached"):
-            OpenAILLM, CachedOpenAILLM = get_openai_llm()
+            openai_llm_cls, cached_openai_llm_cls = get_openai_llm()
             if self.provider == "openai-cached" and self.enable_cache:
-                return CachedOpenAILLM(
+                return cached_openai_llm_cls(
                     api_key=self.effective_openai_api_key(),
                     base_url=self.openai_base_url,
                     model=self.openai_llm_model,
@@ -272,7 +283,7 @@ class ProviderConfig:
                     extra_body=self.llm_extra_body,
                     cache_max_size=self.cache_max_size,
                 )
-            return OpenAILLM(
+            return openai_llm_cls(
                 api_key=self.effective_openai_api_key(),
                 base_url=self.openai_base_url,
                 model=self.openai_llm_model,
@@ -317,6 +328,11 @@ class ProviderConfig:
             opengauss_dimension=self.opengauss_dimension,
             opengauss_table_name=self.opengauss_table_name,
             opengauss_pool_size=self.opengauss_pool_size,
+            milvus_uri=self.milvus_uri,
+            milvus_token=self.milvus_token,
+            milvus_collection_name=self.milvus_collection_name,
+            milvus_db_name=self.milvus_db_name,
+            milvus_timeout=self.milvus_timeout,
             enable_cache=self.enable_cache,
             cache_max_size=self.cache_max_size,
         )

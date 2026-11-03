@@ -7778,6 +7778,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     ):
                         info["status"] = "degraded"
                         info["error"] = "lexical historical projection is not ready"
+            if self._cfg.vector_db_type.strip().casefold() == "milvus":
+                info["vector_db"] = {"type": "milvus", "available": False}
+                # A cached client can outlive a failed server or revoked grant.
+                # count uses the adapter's configured RPC timeout on every probe.
+                try:
+                    self._get_shared_vector_index().count({"account_id": self._cfg.account_id})
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Milvus vector backend unavailable ({type(exc).__name__})"
+                    ) from None
+                info["vector_db"]["available"] = True
             llm = self.get_llm()
             info["llm"] = getattr(llm, "model", "unknown")
             if self._cfg.skill_sedimentation_enabled:

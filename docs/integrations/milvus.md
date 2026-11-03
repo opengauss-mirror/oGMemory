@@ -1,0 +1,79 @@
+# Milvus 向量索引
+
+Milvus 与 Chroma、openGauss 一样，通过现有 `VectorIndex` Provider 工厂接入。
+统一配置 `vector_db.type` 决定使用哪个向量后端；正文、会话和 outbox 继续由现有存储与索引流程管理。
+
+## 配置
+
+在 oGMemory 的现有运行环境中安装可选依赖：
+
+```bash
+uv sync --extra milvus
+# 或 python -m pip install -e '.[milvus]'
+```
+
+使用现有配置文件（参见 `config/ogmem.reference.yaml`），修改向量库段落：
+
+```yaml
+vector_db:
+  type: milvus
+  dimension: 1024  # 必须匹配实际 embedding 输出
+  milvus_uri: http://127.0.0.1:19530
+  milvus_collection: contextengine
+  milvus_db_name: default
+  milvus_timeout: 30
+```
+
+凭据通过 `MILVUS_TOKEN` 注入，不提交到配置文件。数据库须预先存在；集合和缺失的索引会在启动时创建。
+当前使用 HNSW/COSINE，已有集合的字段类型、维度和 VARCHAR 字节容量必须兼容。
+
+CLI 的 local、headless 和 Docker 向导均支持 `--vector-db milvus`。例如：
+
+```bash
+ogmem onboard --mode docker --vector-db milvus \
+  --milvus-uri http://host.docker.internal:19530 --milvus-collection contextengine
+```
+
+Docker quickstart 支持 openGauss 与外部 Milvus：openGauss 创建配套数据库，Milvus 连接外部服务。Milvus 默认通过现有 `docker/Dockerfile.standalone` 构建包含所选依赖的镜像；也可在部署环境文件中设置 `OGMEM_IMAGE` 使用已构建镜像。切换已有实例的后端或 Milvus 集合需使用新实例并重建索引。
+
+Docker quickstart 在替换已有容器前，使用正式运行网络与 Milvus 配置检查 schema/索引及写入、回读、检索和删除权限。探测记录使用 UUID 隔离账户，删除并确认不可读取后才报告成功；预检失败会保留现有容器。`/api/v1/health` 持续检查 Milvus 的有超时读取，断连或权限失效时返回 503，恢复后返回 200。
+
+预检仅使用显式传入的 Milvus 参数，不读取需要由入口展开的默认应用模板。有 Docker HTTP 代理时，预检与正式容器默认将 Milvus URI 的主机加入 `no_grpc_proxy`，避免依赖 gRPC 不支持的 `no_proxy=*` 通配规则；可通过部署环境变量 `MILVUS_NO_GRPC_PROXY` 指定其他主机列表，显式设为空字符串可继续使用代理。
+
+每项 HTTP 服务的就绪等待默认最多 360 秒，单次连接最多 3 秒、单次请求最多 10 秒，并在接近总截止时间时缩短请求预算。可通过 `OGMEM_DEPLOY_WAIT_SECONDS` 设置 1-86400 秒的等待上限。
+
+共享镜像的基础依赖和 Milvus SDK 安装均启用正常 HTTPS 证书校验；使用私有包源时应配置受信任 CA，不跳过证书验证。
+
+手动配置容器时，使用包含 Milvus 可选依赖的运行镜像并挂载上述 YAML 配置；无需单独的 Milvus 版 oGMemory Dockerfile 或 Compose。
+Milvus 服务由外部部署管理；配置其可达地址。容器中的 `127.0.0.1` 指向容器自身，跨容器连接应使用可解析的服务名或其他可达入口。
+现有运行镜像如果未包含 pymilvus，需要在该运行环境安装上述可选依赖。
+
+| YAML 字段 | 环境变量 | 默认值 |
+|---|---|---|
+| `vector_db.type` | `VECTOR_DB_TYPE` | `chroma` |
+| `vector_db.dimension` | `VECTOR_DB_DIMENSION` | `1024` |
+| `vector_db.milvus_uri` | `MILVUS_URI` | `http://localhost:19530` |
+| `vector_db.milvus_collection` | `MILVUS_COLLECTION` | `contextengine` |
+| `vector_db.milvus_db_name` | `MILVUS_DB_NAME` | `default` |
+| `vector_db.milvus_timeout` | `MILVUS_TIMEOUT` | `30` 秒 |
+| `vector_db.milvus_token` | `MILVUS_TOKEN` | 空 |
+
+YAML 中显式配置的字段优先于环境变量。向量后端切换不会自动迁移历史 Chroma 索引，已有记忆应按现有索引重建流程重新索引。
+
+## 行为与兼容性
+
+- 支持幂等 upsert、向量检索、子节点检索、embedding 复用、记录读取和账户/owner 范围删除。
+- 租户、owner、URI、层级、目录和资源类型在 Milvus 内过滤后再执行 top-k。
+- 读取采用 Strong consistency；直接使用带超时的 query 和主键游标分页，避开 SDK QueryIterator 的无超时初始化 RPC，不依赖 offset 上限。启动支持索引缺失恢复及并发创建。
+- 为 account_id、owner_space、level、parent_uri、uri 补建标量 AUTOINDEX；已有标量索引保留。性能收益需按部署数据量与过滤选择率压测。
+- embedding 转换为实际存储的 FLOAT32 后校验有限且非零，并拒绝平方范数溢出或进入非正规数范围的向量，写入前检查 UTF-8 字节上限；正文按 UTF-8 边界拆入 5 个 VARCHAR 字段，覆盖现有 256 KiB Skill 容量，读取和 embedding 原文校验会完整拼回。超出总容量明确报错，不静默截断。范围删除不将全部 ID 拉回应用内存。
+- `get_record` 通过 `filters` 恢复已持久化的范围字段，写回时以这些字段为准；metadata 保留原始 JSON，不重复补入范围列，避免读取后重写突破容量上限。
+- 保留 JSON 元数据和 grounding。AGFS/SQL 存储配置由现有 `storage` 段独立决定，Milvus 只负责向量索引。
+
+当前实现要求 Milvus 2.6 系列及 pymilvus >=2.6.17,<2.7，实测组合为 Milvus 2.6.13 + pymilvus 2.6.17、ARM64 Standalone。升级时应先停止旧版写入进程：启动会向旧集合补建 4 个 nullable 正文字段及缺失的标量索引，需要相应 schema/index 权限；旧数据不重写。旧版适配器无法读回新写入的大正文。
+可选依赖的 SDK 版本范围不代表服务端兼容矩阵；其他版本、Lite、Distributed/Kubernetes 和托管服务需分别验证。
+
+## 自动化测试
+
+单元测试位于 `tests/unit/providers/test_milvus_adapter.py`，真实服务测试位于 `tests/integration/test_milvus_vector_index.py`。
+设置 `OGMEM_TEST_MILVUS_URI` 后可运行真实服务测试；测试仅清理自行创建的 UUID 集合，覆盖隔离、分页读取、范围删除、索引恢复和并发启动。

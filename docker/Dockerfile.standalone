@@ -10,11 +10,21 @@ RUN apt-get update && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     pydantic python-dotenv json-repair networkx "jsonschema>=4.20.0" rank-bm25 nltk \
     "mcp[cli]==2.0.0" "volcengine-python-sdk[ark]"
+
+# The shared image can include the selected optional vector SDK at build time.
+ARG VECTOR_DB_EXTRA=opengauss
+RUN case "$VECTOR_DB_EXTRA" in \
+      opengauss) ;; \
+      milvus) pip install --no-cache-dir \
+        -i https://mirrors.aliyun.com/pypi/simple/ \
+        --timeout 120 'pymilvus>=2.6.17,<2.7' ;; \
+      *) echo "Unsupported VECTOR_DB_EXTRA: $VECTOR_DB_EXTRA" >&2; exit 1 ;; \
+    esac
 
 # Copy oGMemory source
 COPY core/       /opt/ogmem/core/
@@ -35,8 +45,9 @@ COPY perf/       /opt/ogmem/perf/
 COPY features/   /opt/ogmem/features/
 COPY scene/      /opt/ogmem/scene/
 
-# Copy entrypoint (chmod at COPY time keeps the image one layer lighter).
-COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh
+# Set executable permissions in the existing RUN below so both legacy
+# Docker builders and BuildKit can build the shared image.
+COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh
 
 # Copy default config (user can override via volume mount)
 COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
@@ -45,7 +56,7 @@ COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
 RUN mkdir -p /data/ogmem /etc/ogmem && \
     useradd -m ogmem && \
     chown -R ogmem:ogmem /data/ogmem /opt/ogmem /etc/ogmem
-RUN chmod -R 755 /opt/ogmem
+RUN chmod -R 755 /opt/ogmem && chmod 755 /opt/entrypoint.sh
 
 # Environment defaults (kept for backward compat; YAML config takes priority)
 ENV PYTHONPATH=/opt/ogmem
@@ -95,6 +106,7 @@ ENTRYPOINT ["/opt/entrypoint.sh"]
 
 # Opt-in compatibility stages; BuildKit skips these for the default target.
 FROM golang:1.25-bookworm AS agfs-builder
+ARG GOPROXY=https://proxy.golang.org,direct
 WORKDIR /src/agfs
 COPY agfs/ ./
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /agfs-server ./cmd/server
