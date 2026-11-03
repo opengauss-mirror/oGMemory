@@ -233,20 +233,20 @@ def test_real_large_unicode_body_and_same_uri_multiple_records(index):
 
     item = make_record("long-skill", level=2)
     item.text = "中🙂" * 37449
-    siblings = [replace(item, id=f"unit-{n:03}", text=f"unit-{n:03}") for n in range(69)]
+    siblings = [replace(item, id=f"unit-{n:03}", text=f"unit-{n:03}") for n in range(169)]
     index.upsert([item, *siblings])
-    assert index.count() == 70
+    assert index.count() == 170
     assert index.get_record(item.id).text == item.text
     assert index.get_embeddings([item.uri], {"account_id": "a"}, level=2,
                                 expected_texts={item.uri: item.text})
-    # The last sibling is beyond the first two keyset pages for this URI.
+    # The last sibling is beyond the first bounded text page for this URI.
     assert index.get_embeddings([item.uri], {"account_id": "a"}, level=2,
                                 expected_texts={item.uri: siblings[-1].text})
     saved = index.get_record(item.id)
     index.upsert([saved])
     assert index.get_record(item.id).text == item.text
     index.delete([item.id])
-    assert index.get_record(item.id) is None and index.count() == 69
+    assert index.get_record(item.id) is None and index.count() == 169
 
 
 def test_real_scalar_index_repair_and_legacy_text_migration(index):
@@ -286,7 +286,8 @@ def test_real_scalar_index_repair_and_legacy_text_migration(index):
         client.drop_collection(collection_name=name)
 
 
-def test_real_bulk_embedding_reads_need_one_bounded_rpc(index, monkeypatch):
+@pytest.mark.parametrize("check_text", [False, True])
+def test_real_bulk_embedding_reads_need_one_bounded_rpc(index, monkeypatch, check_text):
     records = [make_record(f"bulk-{number}") for number in range(128)]
     index.upsert(records)
     query = index._client.query
@@ -297,8 +298,27 @@ def test_real_bulk_embedding_reads_need_one_bounded_rpc(index, monkeypatch):
         return query(**kwargs)
 
     monkeypatch.setattr(index._client, "query", tracked_query)
-    vectors = index.get_embeddings([record.uri for record in records], {"account_id": "a"})
+    vectors = index.get_embeddings(
+        [record.uri for record in records], {"account_id": "a"},
+        expected_texts={record.uri: record.text for record in records} if check_text else None,
+    )
     assert len(vectors) == 128
     assert len(calls) == 1
     assert calls[0]["timeout"] == index._timeout
-    assert calls[0]["output_fields"] == ["id", "uri", "embedding"]
+    assert ("text" in calls[0]["output_fields"]) == check_text
+
+
+def test_real_cosine_scores_remain_correct_for_safe_vector_magnitudes(index):
+    import math
+
+    records = [make_record(f"norm-{i}", vector=[magnitude, 0., 0.])
+               for i, magnitude in enumerate([1e-10, 1., 1e10])]
+    index.upsert(records)
+    for magnitude in (1e-10, 1., 1e10):
+        hits = index.search_by_vector([magnitude, 0., 0.], {"account_id": "a"}, 3)
+        assert len(hits) == 3
+        assert all(math.isclose(hit.score, 1., abs_tol=1e-5) for hit in hits)
+    for magnitude in (1e38, 1e-30):
+        with pytest.raises(ValueError, match="norm.*FLOAT32"):
+            index.upsert([make_record("unsafe", vector=[magnitude, 0., 0.])])
+    assert index.count() == 3

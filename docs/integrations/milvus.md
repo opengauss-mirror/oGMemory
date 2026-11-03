@@ -58,7 +58,7 @@ YAML 中显式配置的字段优先于环境变量。向量后端切换不会自
 - 租户、owner、URI、层级、目录和资源类型在 Milvus 内过滤后再执行 top-k。
 - 读取采用 Strong consistency；直接使用带超时的 query 和主键游标分页，避开 SDK QueryIterator 的无超时初始化 RPC，不依赖 offset 上限。启动支持索引缺失恢复及并发创建。
 - 为 account_id、owner_space、level、parent_uri、uri 补建标量 AUTOINDEX；已有标量索引保留。性能收益需按部署数据量与过滤选择率压测。
-- embedding 转换为实际存储的 FLOAT32 后校验有限且非零，写入前检查 UTF-8 字节上限；正文按 UTF-8 边界拆入 5 个 VARCHAR 字段，覆盖现有 256 KiB Skill 容量，读取和 embedding 原文校验会完整拼回。超出总容量明确报错，不静默截断。范围删除不将全部 ID 拉回应用内存。
+- embedding 转换为实际存储的 FLOAT32 后校验有限且非零，并拒绝平方范数溢出或进入非正规数范围的向量，写入前检查 UTF-8 字节上限；正文按 UTF-8 边界拆入 5 个 VARCHAR 字段，覆盖现有 256 KiB Skill 容量，读取和 embedding 原文校验会完整拼回。超出总容量明确报错，不静默截断。范围删除不将全部 ID 拉回应用内存。
 - `get_record` 通过 `filters` 恢复已持久化的范围字段，写回时以这些字段为准；metadata 保留原始 JSON，不重复补入范围列，避免读取后重写突破容量上限。
 - 保留 JSON 元数据和 grounding。AGFS/SQL 存储配置由现有 `storage` 段独立决定，Milvus 只负责向量索引。
 

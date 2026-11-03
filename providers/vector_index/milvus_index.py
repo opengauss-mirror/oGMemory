@@ -33,6 +33,7 @@ _JSON_FILTERS = {"node_status", "extracted_node_id", "clip_id"}
 _BATCH_SIZE = 32
 _URI_BATCH_SIZE = 128
 _QUERY_PAGE_SIZE = 256
+_QUERY_RESPONSE_BUDGET = 48 * 1024 * 1024
 _TEXT_FIELDS = ("text", "text_1", "text_2", "text_3", "text_4")
 _VARCHAR_LIMITS = {"id": 512, "text": 65535, **dict.fromkeys(_SCOPE_FIELDS, 8192)}
 
@@ -217,6 +218,11 @@ class MilvusVectorIndex(VectorIndex):
             raise ValueError("Milvus COSINE embeddings must be finite and non-zero") from exc
         if not all(math.isfinite(value) for value in vector) or not any(vector):
             raise ValueError("Milvus COSINE embeddings must be finite and non-zero")
+        # Milvus calculates norms in FLOAT32. Finite components alone do not
+        # prevent squared-norm overflow or underflow (including flushed subnormals).
+        squared_norm = math.fsum(value * value for value in vector)
+        if not 2.0**-126 <= squared_norm <= (2.0 - 2.0**-23) * 2.0**127:
+            raise ValueError("Milvus COSINE embedding norm is outside the stable FLOAT32 range")
         return vector.tolist()
 
     @staticmethod
@@ -391,9 +397,12 @@ class MilvusVectorIndex(VectorIndex):
         fields = ["uri", "embedding"]
         if expected_texts is not None:
             fields.extend(_TEXT_FIELDS)
-        # Keep long-text response pages bounded, but avoid fetching any text
-        # when callers only need vectors. URI and write batch sizes are independent.
-        page_size = _BATCH_SIZE if expected_texts is not None else _QUERY_PAGE_SIZE
+        # Budget the worst-case row, including all text suffixes and vectors.
+        # Scene checks expected_texts too; it should not inherit 32-row write batches.
+        row_bytes = self._dimension * 4 + _VARCHAR_LIMITS["id"] + _VARCHAR_LIMITS["uri"] + 1024
+        if expected_texts is not None:
+            row_bytes += len(_TEXT_FIELDS) * _VARCHAR_LIMITS["text"]
+        page_size = min(_QUERY_PAGE_SIZE, max(1, _QUERY_RESPONSE_BUDGET // row_bytes))
         for start in range(0, len(wanted), _URI_BATCH_SIZE):
             for row in self._query_rows(
                 {**filters, "uri": wanted[start:start + _URI_BATCH_SIZE], "level": level},

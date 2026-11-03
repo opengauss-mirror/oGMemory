@@ -430,5 +430,28 @@ def test_expected_texts_use_bounded_long_document_pages(index):
     index._client.query.return_value = []
     index.get_embeddings(["same"], {}, expected_texts={"same": "body"})
     call = index._client.query.call_args.kwargs
-    assert call["limit"] == 32
+    worst_row_bytes = 5 * 65535 + 3 * 4 + 512 + 8192 + 1024
+    assert 128 < call["limit"] <= 256
+    assert call["limit"] * worst_row_bytes <= 48 * 1024 * 1024
     assert all(name in call["output_fields"] for name in ("text", "text_1", "text_4"))
+
+
+@pytest.mark.parametrize("magnitude", [1e38, 1e20, 1e-20, 1e-30])
+def test_float32_squared_norm_must_be_safe_before_any_batch_is_written(index, magnitude):
+    with pytest.raises(ValueError, match="norm.*FLOAT32"):
+        index.upsert([record(), record(_embedding=[magnitude, 0., 0.])])
+    index._client.upsert.assert_not_called()
+    with pytest.raises(ValueError, match="norm.*FLOAT32"):
+        index.search_by_vector([magnitude, 0., 0.], {}, 1)
+    index._client.search.assert_not_called()
+
+
+@pytest.mark.parametrize("dimension", [1024, 32768])
+def test_expected_text_query_budget_includes_dimension_and_all_text_fields(index, dimension):
+    index._dimension = dimension
+    index._client.query.return_value = []
+    index.get_embeddings(["uri"], {}, expected_texts={"uri": "short"})
+    call = index._client.query.call_args.kwargs
+    worst_row = dimension * 4 + 512 + 8192 + 1024 + 5 * 65535
+    assert call["limit"] * worst_row <= 48 * 1024 * 1024
+    assert call["limit"] > 32
