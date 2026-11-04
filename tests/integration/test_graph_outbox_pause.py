@@ -28,7 +28,7 @@ def test_disabled_graph_preserves_jobs_and_unblocks_indexing_then_resumes(graph_
     disabled = OutboxWorker(index, enabled._embedder, fs=fs, directory_summary_enabled=False)
     for _ in range(disabled._config.max_retry + 2):
         disabled.run_once(outbox, [], worker_id="graph-off")
-    assert outbox.get_event(ctx.account_id, ordinary.event_id) is None
+    assert outbox.get_event(ctx.account_id, ordinary.event_id).status == "DONE"
     assert index.get_record(source_record_id) is not None
     assert _graph_sql(fs, ctx,
         "SELECT event_id,status,retry_count,payload FROM outbox_events "
@@ -58,7 +58,7 @@ def test_disabled_graph_preserves_jobs_and_unblocks_indexing_then_resumes(graph_
     fs.write_node(changed, ctx)
     target_write = outbox.register_write(changed, ctx)
     disabled.run_once(outbox, [], worker_id="graph-off")
-    assert outbox.get_event(ctx.account_id, target_write.event_id) is None
+    assert outbox.get_event(ctx.account_id, target_write.event_id).status == "DONE"
     assert index.get_record(IndexRecord.generate_id(target.uri + "/content.md", 2)).text == changed.content
     # Simulate expiry of a prior enabled worker's processing lease; the off
     # worker never changes that claim or spends its remaining retry budget.
@@ -68,8 +68,10 @@ def test_disabled_graph_preserves_jobs_and_unblocks_indexing_then_resumes(graph_
     for _ in range(4):
         enabled.run_once(outbox, [], worker_id="graph-on-again")
     assert _graph_sql(fs, ctx,
-        "SELECT count(*) FROM outbox_events WHERE account_id=%s AND event_type='PROJECT_GRAPH'",
+        "SELECT count(*) FROM outbox_events WHERE account_id=%s AND event_type='PROJECT_GRAPH' "
+        "AND status <> 'DONE'",
         (ctx.account_id,)) == [(0,)]
+    assert outbox.get_event(ctx.account_id, before[0][0]).status == "DONE"
     assert _graph_sql(fs, ctx,
         "SELECT status FROM edge_projection_jobs WHERE account_id=%s", (ctx.account_id,)) == [("COMPLETE",)]
     assert store.get_relation_neighbors(source.uri, ctx)[0].edge_projection["target_revision"] == 2

@@ -16,6 +16,9 @@ def index():
     obj._dimension = 3
     obj._collection_name = "test"
     obj._client = MagicMock()
+    obj._client._get_connection.return_value.alloc_timestamp.return_value = 1001
+    obj._client.query.return_value = []
+    obj._client.reset_mock()
     return obj
 
 
@@ -67,9 +70,11 @@ def test_filter_escaping_empty_lists_and_unknown_scope():
 
 
 def test_search_filters_before_top_k_and_preserves_hit(index):
+    index._client.query.side_effect = [[{"id": "one", "account_id": "a", "owner_space": "user:u", "level": 0}], []]
     index._client.search.return_value = [
         [
             {
+                "id": "one",
                 "distance": 0.9,
                 "entity": {
                     "uri": "ctx://a/test",
@@ -94,10 +99,10 @@ def test_search_filters_before_top_k_and_preserves_hit(index):
 
 
 def test_get_embeddings_text_guard_and_bounded_query(index):
-    index._client.query.side_effect = [[
-        {"id": "a", "uri": "x", "text": "old", "embedding": [1.0, 0.0, 0.0]},
-        {"id": "b", "uri": "y", "text": "same", "embedding": [0.0, 1.0, 0.0]},
-    ], []]
+    index._client.query.side_effect = [sorted([
+        {"id": IndexRecord.generate_id("x", 0), "level": 0, "account_id": "a", "owner_space": "user:u", "uri": "x", "text": "old", "embedding": [1.0, 0.0, 0.0]},
+        {"id": IndexRecord.generate_id("y", 0), "level": 0, "account_id": "a", "owner_space": "user:u", "uri": "y", "text": "same", "embedding": [0.0, 1.0, 0.0]},
+    ], key=lambda row: row["id"])]
     assert index.get_embeddings(
         ["x", "y"], {"account_id": "a"}, expected_texts={"x": "new", "y": "same"}
     ) == {"y": [0.0, 1.0, 0.0]}
@@ -216,7 +221,7 @@ def test_startup_repairs_schema_left_without_index(monkeypatch):
     client.list_indexes.side_effect = [[], ["embedding"], ["embedding"]]
     MilvusVectorIndex(dimension=3, timeout=7)
     client.create_collection.assert_not_called()
-    assert client.create_index.call_count == 6
+    assert client.create_index.call_count == 7
     assert client.create_index.call_args.kwargs["timeout"] == 7
     client.load_collection.assert_called_once_with(collection_name="contextengine", timeout=7)
 
@@ -261,13 +266,15 @@ def test_schema_dimension_mismatch_fails_before_index_creation(monkeypatch):
 def test_timeout_propagates_through_runtime_operations(index):
     index._client.search.return_value = [[]]
     index._client.get.return_value = []
-    index._client.query.side_effect = [[{"count(*)": 0}], []]
+    index._client.query.side_effect = [[], [], [{"id": "one", "level": 0, "account_id": "a", "owner_space": "user:u"}], [], [], [], [], []]
     index.upsert([record()])
     index.delete(["one"])
     index.search_by_vector([1.0, 0.0, 0.0], {"account_id": "a"}, 1)
     index.get_record("one")
     index.count()
     index.get_embeddings(["uri"], {"account_id": "a"})
+    index._client.query.side_effect = [[], [{"id": "one", "logical_id": None}]]
+    index.delete_account_data("a")
     for method in ["upsert", "delete", "search", "get", "query"]:
         assert getattr(index._client, method).call_args.kwargs["timeout"] == 7.0
     assert "text" not in index._client.search.call_args.kwargs["output_fields"]
@@ -287,13 +294,15 @@ def test_reject_oversized_utf8_before_any_batch(index, field, value):
     index._client.upsert.assert_not_called()
 
 
-def test_delete_scope_uses_server_filter_without_materializing_ids(index):
-    index._client.query.return_value = [{"count(*)": 100_000}]
-    assert index.delete_by_owner_space("a", "user:u") == 100_000
+def test_delete_scope_uses_bounded_pages_and_server_filter(index):
+    index.count = MagicMock(return_value=1)
+    index._client.query.return_value = [{"id": "legacy", "logical_id": None}]
+    assert index.delete_by_owner_space("a", "user:u") == 1
+    query = index._client.query.call_args.kwargs
+    assert '(account_id == "a") and (owner_space == "user:u")' in query["filter"]
+    assert query["limit"] == 1024
     assert index._client.delete.call_args.kwargs == {
-        "collection_name": "test",
-        "filter": '(account_id == "a") and (owner_space == "user:u")',
-        "timeout": 7.0,
+        "collection_name": "test", "ids": ["legacy"], "timeout": 7.0,
     }
     index._client.query_iterator.assert_not_called()
 
@@ -310,6 +319,7 @@ def test_get_record_preserves_scope_when_reindexed(index):
     )
     index.upsert([item])
     original = dict(index._client.upsert.call_args.kwargs["data"][0])
+    index._client.query.side_effect = [[original], [], []]
     index._client.get.return_value = [original]
     saved = index.get_record(item.id)
     assert saved.filters["video_id"] == "video-1"
@@ -368,6 +378,7 @@ def test_metadata_at_capacity_does_not_grow_after_read_and_rewrite(index, capaci
     original = dict(index._client.upsert.call_args.kwargs["data"][0])
     assert len(json.dumps(original["metadata"], ensure_ascii=False).encode("utf-8")) == capacity
     for _ in range(3):
+        index._client.query.side_effect = [[original], [], []]
         index._client.get.return_value = [original]
         saved = index.get_record(item.id)
         assert {k: v for k, v in saved.metadata.items() if k != "_embedding"} == original[
@@ -387,12 +398,13 @@ def test_large_text_survives_read_rewrite_and_shrinking(index, text):
     index.upsert([item])
     row = dict(index._client.upsert.call_args.kwargs["data"][0])
     assert len(row["text"].encode()) <= 65535
+    index._client.query.side_effect = [[row], [], []]
     index._client.get.return_value = [row]
     saved = index.get_record(item.id)
     assert saved.text == text
     index.upsert([saved])
     assert index._client.upsert.call_args.kwargs["data"][0] == row
-    index._client.query.side_effect = [[row], []]
+    index._client.query.side_effect = [[row], [row], [], []]
     assert index.get_embeddings([item.uri], {}, expected_texts={item.uri: text})
     item.text = "short"
     index.upsert([item])
@@ -423,29 +435,38 @@ def test_scalar_indexes_preserve_existing_and_fill_missing(index):
     index._client.describe_index.return_value = {"field_name": "account_id"}
     index._ensure_scalar_indexes()
     fields = [c.kwargs["field_name"] for c in index._client.prepare_index_params.return_value.add_index.call_args_list]
-    assert set(fields) == {"owner_space", "level", "parent_uri", "uri"}
-    assert index._client.create_index.call_count == 4
+    assert set(fields) == {"owner_space", "level", "parent_uri", "uri", "logical_id"}
+    assert index._client.create_index.call_count == len(fields)
     assert all(c.kwargs["timeout"] == 7 for c in index._client.create_index.call_args_list)
 
 
 def test_bulk_embeddings_use_one_rpc_and_do_not_fetch_documents(index):
-    rows = [{"id": f"id-{number:03}", "uri": f"uri-{number}",
+    rows = [{"id": IndexRecord.generate_id(f"uri-{number}", 0), "level": 0, "account_id": "a", "owner_space": "user:u", "uri": f"uri-{number}",
              "embedding": [1., 0., 0.]} for number in range(128)]
-    index._client.query.return_value = rows
+    index._client.query.return_value = sorted(rows, key=lambda row: row["id"])
     assert len(index.get_embeddings([r["uri"] for r in rows], {"account_id": "a"})) == 128
     index._client.query.assert_called_once()
     call = index._client.query.call_args.kwargs
-    assert call["output_fields"] == ["id", "uri", "embedding"]
+    assert call["output_fields"] == ["id", "logical_id", "account_id", "owner_space", "uri", "level", "embedding"]
     assert call["limit"] == 256 and call["timeout"] == 7
     assert call["consistency_level"] == "Strong"
 
 
 def test_keyset_pagination_stops_on_short_page_and_keeps_same_uri_records(index):
-    rows = [{"id": f"id-{number:03}", "uri": "same", "embedding": [1., 0., 0.]}
+    rows = [{"id": f"id-{number:03}", "level": 0, "account_id": "a", "owner_space": "user:u", "uri": "same", "embedding": [1., 0., 0.]}
             for number in range(529)]
-    index._client.query.side_effect = [rows[:256], rows[256:512], rows[512:]]
+    page = iter([rows[:256], rows[256:512], rows[512:]])
+    def query(**kwargs):
+        if kwargs["filter"].startswith("logical_id in"):
+            keys = json.loads(kwargs["filter"].split(" in ", 1)[1].split(" or ", 1)[0])
+            return [row for row in rows if row["id"] in keys]
+        if kwargs["filter"].startswith("level == -2"):
+            return []
+        return next(page)
+    index._client.query.side_effect = query
     assert index.get_embeddings(["same"], {}) == {"same": [1., 0., 0.]}
     calls = index._client.query.call_args_list
+    calls = [c for c in calls if "embedding" in c.kwargs["output_fields"]]
     assert len(calls) == 3
     assert 'id > "id-255"' in calls[1].kwargs["filter"]
     assert 'id > "id-511"' in calls[2].kwargs["filter"]

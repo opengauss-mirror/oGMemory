@@ -29,6 +29,8 @@ CTX = RequestContext("acct", "alice", "codex", "session", "request")
 
 
 class _MemoryAGFS(_AtomicMemoryAGFSClient):
+    api_base = "memory://agent-memory"
+
     def read(self, path, offset=0, size=-1, stream=False):
         data = super().read(path)
         return data[offset:] if size < 0 else data[offset:offset + size]

@@ -3,7 +3,9 @@
 Persists OutboxEvents to AGFS for processing by OutboxWorker.
 """
 
+import hashlib
 import json
+import re
 import uuid
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
@@ -22,6 +24,7 @@ from core.models import ContextNode, OutboxEvent, RequestContext
 
 logger = get_logger(__name__)
 _AGENT_PROCESSING_LEASE = ContextVar("agent_processing_lease", default=None)
+_PROCESSING_LEASES = ContextVar("outbox_processing_leases", default=None)
 
 
 class OutboxPublishOutcomeUnknownError(RuntimeError):
@@ -87,6 +90,105 @@ class OutboxStore:
         self._client = client
         self._fs = fs
         self._mount_prefix = mount_prefix.rstrip("/")
+
+    def _processing_key(self, node_uri: str):
+        return (self._client.api_base, self._uri_to_agfs_path(node_uri).rstrip("/"))
+
+    @contextmanager
+    def processing_lock(self, node_uri: str, *, timeout_seconds: float = 0):
+        """Hold a renewable cross-process lease for one URI's projection."""
+        from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, parse_uri
+
+        key = self._processing_key(node_uri)
+        leases = _PROCESSING_LEASES.get() or {}
+        if key in leases:
+            lease = leases[key]
+            lease.ensure_owned()
+            yield lease
+            lease.ensure_owned()
+            return
+        account_id = parse_uri(node_uri)["account"]
+        lock_id = hashlib.sha256(key[1].encode("utf-8")).hexdigest()
+        lock_uri = f"ctx://{account_id}/resources/outbox-processing-{lock_id}"
+        ctx = RequestContext(account_id=account_id, user_id="outbox-worker",
+                             agent_id="outbox-worker", session_id=lock_id, trace_id=lock_id)
+        fs = AGFSContextFS(self._client, mount_prefix=self._mount_prefix)
+        with fs.resource_mutation_lock(lock_uri, ctx, timeout_seconds=timeout_seconds) as lease:
+            lease.outbox_directory = f"{lease.lock_path}/outbox-{lease.owner_token}"
+            self._client.mkdir(lease.outbox_directory)
+            lease.ensure_owned()
+            token = _PROCESSING_LEASES.set({**leases, key: lease})
+            try:
+                yield lease
+            finally:
+                _PROCESSING_LEASES.reset(token)
+
+    def ensure_processing_owned(self, event: OutboxEvent, node_uri: str) -> None:
+        self._check_agent_lease(event)
+        lease = getattr(event, "_outbox_processing_lease", None)
+        if lease is not None:
+            lease.ensure_owned()
+            if (_PROCESSING_LEASES.get() or {}).get(self._processing_key(node_uri)) is not lease:
+                raise RuntimeError("Outbox processing lease scope changed")
+
+    @contextmanager
+    def claim_processing_event(self, event: OutboxEvent, node_uri: str, worker_id: str):
+        """Reload and claim a live event, retaining its lease through acknowledgement."""
+        with self.processing_lock(node_uri) as lease:
+            path = self._uri_to_agfs_path(node_uri) + ".outbox/" + event.event_id + ".json"
+            try:
+                data = self._load_event_json(self._client.read(path))
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    yield False
+                    return
+                raise
+            if data.get("event_id") != event.event_id or data.get("uri") != node_uri:
+                raise ValueError("Outbox event identity changed during claim")
+            if data.get("status", "PENDING") not in {"PENDING", "PROCESSING"}:
+                yield False
+                return
+            next_retry_at = data.get("next_retry_at", "")
+            if next_retry_at and datetime.now(UTC) < datetime.fromisoformat(next_retry_at):
+                yield False
+                return
+            event.event_type = data["event_type"]
+            event.payload, event.retry_count = data.get("payload", {}), data.get("retry_count", 0)
+            event.status, event.next_retry_at = data.get("status", "PENDING"), next_retry_at
+            event._outbox_processing_lease = lease
+            yield self.try_acquire(event, node_uri, worker_id)
+
+    def _write_processing_file(self, path: str, data: bytes, event: OutboxEvent, node_uri: str) -> None:
+        self.ensure_processing_owned(event, node_uri)
+        lease = getattr(event, "_outbox_processing_lease", None)
+        if lease is None:
+            self._client.write(path, data)
+            return
+        temporary = f"{lease.outbox_directory}/.outbox-{uuid.uuid4().hex}.json"
+        try:
+            self._client.write(temporary, data)
+            self.ensure_processing_owned(event, node_uri)
+            self._client.mv(temporary, path)
+            self.ensure_processing_owned(event, node_uri)
+        finally:
+            self._rm_if_present(temporary)
+
+    def _remove_processing_file(self, path: str, event: OutboxEvent, node_uri: str) -> bool:
+        """Acknowledge by moving a file into the current owner's private directory."""
+        self.ensure_processing_owned(event, node_uri)
+        lease = getattr(event, "_outbox_processing_lease", None)
+        if lease is None:
+            return self._rm_if_present(path)
+        completed = f"{lease.outbox_directory}/.completed-{uuid.uuid4().hex}"
+        try:
+            self._client.mv(path, completed)
+        except Exception as exc:
+            self.ensure_processing_owned(event, node_uri)
+            if self._is_not_found_error(exc):
+                return False
+            raise
+        self._rm_if_present(completed)
+        return True
 
     def register_write(
         self,
@@ -525,7 +627,7 @@ class OutboxStore:
     @staticmethod
     def _is_not_found_error(exc: Exception) -> bool:
         message = str(exc).lower()
-        return "no such file" in message or "not found" in message
+        return any(marker in message for marker in ("no such file", "no such directory", "not found"))
 
     def _rm_if_present(self, path: str, *, recursive: bool = False) -> bool:
         try:
@@ -649,12 +751,13 @@ class OutboxStore:
         self._client.write(event_path, event_json.encode('utf-8'))
 
     def mark_done(self, event: OutboxEvent, node_uri: str) -> None:
-        """Mark an event as completed and delete it.
+        """Acknowledge the completed event under its processing lease.
 
         Args:
             event: OutboxEvent to complete
             node_uri: URI of the associated node
         """
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
         processing_path = node_path + ".outbox/" + event.event_id + ".processing"
@@ -668,7 +771,12 @@ class OutboxStore:
             return
 
         if event.event_type != EventType.DELETE_CONTEXT.value:
+            if getattr(event, "_outbox_processing_lease", None) is not None:
+                self._remove_processing_file(event_path, event, node_uri)
+                self._remove_processing_file(processing_path, event, node_uri)
+                return
             for path in (event_path, processing_path):
+                self.ensure_processing_owned(event, node_uri)
                 try:
                     self._rm_if_present(path)
                 except Exception:
@@ -687,12 +795,13 @@ class OutboxStore:
         if not has_tombstone:
             # Generic DELETE events predate the durable resource tombstone
             # protocol.  Preserve their existing strict lock cleanup.
-            self._rm_if_present(event_path)
-            self._rm_if_present(processing_path)
+            self._remove_processing_file(event_path, event, node_uri)
+            self._remove_processing_file(processing_path, event, node_uri)
+            self.ensure_processing_owned(event, node_uri)
             self._cleanup_empty_outbox_directory(node_uri)
             return
 
-        if not self._remove_acknowledged_delete_event(event_path, node_uri):
+        if not self._remove_acknowledged_delete_event(event_path, node_uri, event):
             return
 
         # Once event removal succeeds, do not raise back into the worker: its
@@ -700,7 +809,7 @@ class OutboxStore:
         # ACKNOWLEDGING recovery.  The marker remains a durable recovery token
         # if any best-effort cleanup below is interrupted or fails.
         try:
-            self._rm_if_present(processing_path)
+            self._remove_processing_file(processing_path, event, node_uri)
         except Exception as exc:
             logger.warning(
                 "Failed to remove DELETE processing lock for %s: %s",
@@ -709,6 +818,7 @@ class OutboxStore:
             )
             return
         try:
+            self.ensure_processing_owned(event, node_uri)
             self._cleanup_empty_outbox_directory(node_uri)
         except Exception as exc:
             logger.warning(
@@ -718,7 +828,7 @@ class OutboxStore:
             )
             return
         try:
-            self._rm_if_present(node_path + self._DELETE_TOMBSTONE_NAME)
+            self._remove_processing_file(node_path + self._DELETE_TOMBSTONE_NAME, event, node_uri)
         except Exception as exc:
             logger.warning(
                 "Failed to remove acknowledged DELETE tombstone for %s: %s",
@@ -730,11 +840,12 @@ class OutboxStore:
         self,
         event_path: str,
         node_uri: str,
+        event: OutboxEvent,
     ) -> bool:
         """Remove the live DELETE event without replaying an ambiguous delete."""
 
         try:
-            self._client.rm(event_path)
+            self._remove_processing_file(event_path, event, node_uri)
             return True
         except Exception as exc:
             if self._is_not_found_error(exc):
@@ -820,6 +931,9 @@ class OutboxStore:
             ensure_ascii=False,
             indent=2,
         ).encode("utf-8")
+        if getattr(event, "_outbox_processing_lease", None) is not None:
+            self._write_processing_file(tombstone_path, encoded, event, node_uri)
+            return True
         self._client.write(temp_path, encoded)
         try:
             self._client.mv(temp_path, tombstone_path)
@@ -862,7 +976,7 @@ class OutboxStore:
             self._scan_outbox_recursive(prefix, results)
         except Exception:
             pass
-        return results
+        return sorted(results, key=lambda item: (item[1].created_at, item[1].event_id))
 
     def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
         """Count every live account Outbox event without claiming it.
@@ -930,6 +1044,8 @@ class OutboxStore:
     def _is_atomic_resource_staging_directory(name: str) -> bool:
         """Return whether ``name`` is a hidden atomic code publish tree."""
 
+        if re.fullmatch(r"\.outbox-processing-[0-9a-f]{64}\.resource-mutation-lock(?:-[0-9a-f]{32})?", name):
+            return True
         prefix, separator, token = name.rpartition(".resource-create-")
         return bool(
             separator
@@ -1092,6 +1208,7 @@ class OutboxStore:
     def move_to_dlq(self, event: "OutboxEvent", node_uri: str) -> None:
         """Move a failed event to the dead letter queue."""
         self._check_agent_lease(event)
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         src_path = node_path + ".outbox/" + event.event_id + ".json"
         dlq_dir = node_path + ".outbox/dlq/"
@@ -1111,9 +1228,10 @@ class OutboxStore:
             "created_at": event.created_at,
             "next_retry_at": event.next_retry_at,
         }, ensure_ascii=False, indent=2)
-        self._client.write(dlq_path, data.encode("utf-8"))
+        self._write_processing_file(dlq_path, data.encode("utf-8"), event, node_uri)
+        self.ensure_processing_owned(event, node_uri)
         try:
-            self._client.rm(src_path)
+            self._remove_processing_file(src_path, event, node_uri)
         except Exception:
             pass
 
@@ -1131,6 +1249,7 @@ class OutboxStore:
             next_retry_at: Optional datetime for scheduled retry (exponential backoff)
         """
         self._check_agent_lease(event)
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
         event.retry_count += 1
@@ -1147,7 +1266,7 @@ class OutboxStore:
             "created_at": event.created_at,
             "next_retry_at": event.next_retry_at,
         }, ensure_ascii=False, indent=2)
-        self._client.write(event_path, data.encode("utf-8"))
+        self._write_processing_file(event_path, data.encode("utf-8"), event, node_uri)
 
     def try_acquire(
         self,
@@ -1156,6 +1275,7 @@ class OutboxStore:
         worker_id: str,
         timeout_seconds: int = 300,
     ) -> bool:
+        self.ensure_processing_owned(event, node_uri)
         if event.event_type == EventType.EXTRACT_AGENT_MEMORY.value:
             with self._agent_event_lock(event):
                 if self._cleanup_completed_agent_event(event) or not self.is_event_current(event.event_id, node_uri):
@@ -1222,9 +1342,11 @@ class OutboxStore:
             "worker_id": worker_id,
             "acquired_at": datetime.now(UTC).isoformat(),
         }
-        self._client.write(
+        self._write_processing_file(
             processing_path,
-            json.dumps(lock_data, ensure_ascii=False).encode("utf-8")
+            json.dumps(lock_data, ensure_ascii=False).encode("utf-8"),
+            event,
+            node_uri,
         )
         return True
 
@@ -1238,11 +1360,12 @@ class OutboxStore:
             node_uri: URI of the associated node
         """
         self._check_agent_lease(event)
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         processing_path = node_path + ".outbox/" + event.event_id + ".processing"
 
         try:
-            self._client.rm(processing_path)
+            self._remove_processing_file(processing_path, event, node_uri)
         except Exception:
             # Lock file may have been removed already, silently ignore
             pass

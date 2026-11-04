@@ -10,12 +10,14 @@ import json
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 
 from core.enums import EventType
 from core.interfaces import ContextFS
 from core.logging_config import get_logger
 from core.models import ContextNode, OutboxEvent, RequestContext
+from fs.sql_adapter.outbox_receipt import PROJECTION_RECEIPT_SQL
 from fs.sql_adapter.pool import PoolAdapterMixin
 
 try:
@@ -31,6 +33,7 @@ logger = get_logger(__name__)
 _PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS = 5
 _PROCESSING_LOCK_TIMEOUT_SECONDS = 5.0
 _PROCESSING_LOCK_POLL_SECONDS = 0.05
+_PROCESSING_CONNECTIONS = ContextVar("sql_outbox_processing_connections", default=None)
 
 
 def _uri_processing_lock_key(uri: str) -> int:
@@ -177,8 +180,7 @@ class SQLOutboxStore(PoolAdapterMixin):
             self._return_connection(conn)
 
     def _row_to_event(self, row) -> tuple[str, OutboxEvent]:
-        # Rows from claim_batch include a trailing seq column;
-        # rows from list_pending do not.  Slice uniformly.
+        # Claim rows append sequence and ownership fields after the event data.
         (
             event_id,
             event_type,
@@ -200,7 +202,39 @@ class SQLOutboxStore(PoolAdapterMixin):
             created_at=str(created_at) if created_at else "",
             next_retry_at=str(next_retry_at) if next_retry_at else "",
         )
+        if len(row) >= 11:
+            event._outbox_claim = (row[9], row[10])
         return uri, event
+
+    @staticmethod
+    def _claim_filter(event):
+        claim = getattr(event, "_outbox_claim", None)
+        if claim is None:
+            return "", ()
+        return " AND status = 'PROCESSING' AND worker_id = %s AND locked_at = %s", claim
+
+    def ensure_processing_owned(self, event: OutboxEvent, node_uri: str) -> None:
+        """Validate the claim within the URI lock that protects its side effects."""
+        claim = getattr(event, "_outbox_claim", None)
+        if claim is None:
+            return
+        conn = (_PROCESSING_CONNECTIONS.get() or {}).get((self._connection_string, node_uri))
+        if conn is None or conn.closed:
+            raise RuntimeError("Outbox URI processing lock is required")
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, worker_id, locked_at FROM outbox_events "
+                        "WHERE event_id = %s AND uri = %s", (event.event_id, node_uri))
+            row = cur.fetchone()
+        # Source relocation can remove a row after this lock validated its claim.
+        if row is None and getattr(event, "_outbox_verified_connection", None) is conn:
+            return
+        if row != ("PROCESSING", *claim):
+            raise RuntimeError("Outbox processing claim changed")
+        event._outbox_verified_connection = conn
+
+    def _check_claim_update(self, cur, event, node_uri):
+        if getattr(event, "_outbox_claim", None) is not None and cur.rowcount == 0:
+            self.ensure_processing_owned(event, node_uri)
 
     # ------------------------------------------------------------------
     # OutboxStore Protocol
@@ -215,11 +249,13 @@ class SQLOutboxStore(PoolAdapterMixin):
                 self._insert_event(event, ctx.account_id)
 
     def save_payload(self, event: OutboxEvent) -> None:
+        ownership, claim = self._claim_filter(event)
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE outbox_events SET payload = %s WHERE event_id = %s",
-                            (Json(event.payload), event.event_id))
+                cur.execute("UPDATE outbox_events SET payload = %s WHERE event_id = %s" + ownership,
+                            (Json(event.payload), event.event_id, *claim))
+                self._check_claim_update(cur, event, event.uri)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -338,6 +374,7 @@ class SQLOutboxStore(PoolAdapterMixin):
 
         return [self._row_to_event(row) for row in rows]
 
+
     def list_recent(self, account_id: str, limit: int = 200) -> list[tuple[str, OutboxEvent]]:
         """Return recent live and failed index tasks for the task center."""
         conn = self._get_connection()
@@ -381,6 +418,7 @@ class SQLOutboxStore(PoolAdapterMixin):
             conn.rollback()
             self._return_connection(conn)
         return self._row_to_event(row)[1] if row else None
+
 
     def retry_failed(self, account_id: str, event: OutboxEvent) -> OutboxEvent | None:
         """Atomically requeue a failed task with a fresh retry budget."""
@@ -436,56 +474,67 @@ class SQLOutboxStore(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    WITH ready AS (
-                        SELECT candidate.event_id
-                        FROM outbox_events AS candidate
-                        WHERE (
-                                (
-                                    candidate.status = 'PENDING'
-                                    AND (
-                                        candidate.next_retry_at IS NULL
-                                        OR candidate.next_retry_at <= NOW()
+                busy = []
+                rows = []
+                while (remaining := limit - len(rows)) > 0:
+                    cur.execute(
+                        """
+                            SELECT candidate.event_id, candidate.uri
+                            FROM outbox_events AS candidate
+                            WHERE (
+                                    (
+                                        candidate.status = 'PENDING'
+                                        AND (
+                                            candidate.next_retry_at IS NULL
+                                            OR candidate.next_retry_at <= NOW()
+                                        )
                                     )
-                                )
-                                OR (
-                                    candidate.status = 'PROCESSING'
-                                    AND candidate.locked_at
-                                        < NOW() - %s * interval '1 second'
-                                )
-                              )
-                          AND candidate.event_type <> ALL(%s)
-                          AND NOT EXISTS (
-                                SELECT 1
-                                FROM outbox_events AS earlier
-                                WHERE earlier.account_id = candidate.account_id
-                                  AND earlier.uri = candidate.uri
-                                  AND earlier.seq < candidate.seq
-                                  AND earlier.status IN ('PENDING', 'PROCESSING')
-                                  AND earlier.event_type <> ALL(%s)
-                              )
-                        ORDER BY candidate.seq ASC NULLS LAST,
-                                 candidate.created_at ASC
-                        FOR UPDATE OF candidate SKIP LOCKED
-                        LIMIT %s
-                    ),
-                    claimed AS (
-                        UPDATE outbox_events oe
-                        SET status = 'PROCESSING',
-                            worker_id = %s,
-                            locked_at = NOW()
-                        FROM ready
-                        WHERE oe.event_id = ready.event_id
-                        RETURNING oe.event_id, oe.event_type, oe.uri, oe.payload,
-                                  oe.status, oe.retry_count, oe.created_at, oe.next_retry_at,
-                                  oe.seq
+                                    OR (
+                                        candidate.status = 'PROCESSING'
+                                        AND candidate.locked_at
+                                            < NOW() - %s * interval '1 second'
+                                    )
+                                  )
+                              AND candidate.event_id <> ALL(%s)
+                              AND candidate.event_type <> ALL(%s)
+                              AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM outbox_events AS earlier
+                                    WHERE earlier.account_id = candidate.account_id
+                                      AND earlier.uri = candidate.uri
+                                      AND earlier.seq < candidate.seq
+                                      AND earlier.status IN ('PENDING', 'PROCESSING')
+                                      AND earlier.event_type <> ALL(%s)
+                                  )
+                            ORDER BY candidate.seq ASC NULLS LAST,
+                                     candidate.created_at ASC
+                            FOR UPDATE OF candidate SKIP LOCKED
+                            LIMIT %s
+                        """,
+                        (timeout_seconds, busy, excluded, paused_projections, remaining),
                     )
-                    SELECT * FROM claimed ORDER BY seq ASC NULLS LAST
-                    """,
-                    (timeout_seconds, excluded, paused_projections, limit, worker_id),
-                )
-                rows = cur.fetchall()
+                    ready = cur.fetchall()
+                    # Use the processing lock key before replacing an expired claim.
+                    # The transaction lock is released when the claim commits.
+                    for event_id, uri in ready:
+                        cur.execute("SELECT pg_try_advisory_xact_lock(%s)",
+                                    (_uri_processing_lock_key(uri),))
+                        if not cur.fetchone()[0]:
+                            busy.append(event_id)
+                            continue
+                        cur.execute(
+                            """
+                            UPDATE outbox_events SET status = 'PROCESSING',
+                                worker_id = %s, locked_at = NOW()
+                            WHERE event_id = %s
+                            RETURNING event_id, event_type, uri, payload, status,
+                                      retry_count, created_at, next_retry_at,
+                                      seq, worker_id, locked_at
+                            """, (worker_id, event_id),
+                        )
+                        rows.append(cur.fetchone())
+                    if len(ready) < remaining:
+                        break
             conn.commit()
         except Exception:
             conn.rollback()
@@ -549,6 +598,13 @@ class SQLOutboxStore(PoolAdapterMixin):
     @contextmanager
     def processing_lock(self, node_uri: str, *, timeout_seconds: float = _PROCESSING_LOCK_TIMEOUT_SECONDS):
         """Serialize all side effects for one URI across worker processes."""
+        connections = _PROCESSING_CONNECTIONS.get() or {}
+        current = connections.get((self._connection_string, node_uri))
+        if current is not None:
+            with current.cursor() as cur:
+                cur.execute("SELECT 1")
+            yield
+            return
         lock_key = _uri_processing_lock_key(node_uri)
         conn = psycopg2.connect(
             self._connection_string,
@@ -568,7 +624,11 @@ class SQLOutboxStore(PoolAdapterMixin):
                     if remaining <= 0:
                         raise TimeoutError("timed out acquiring URI processing lock")
                     time.sleep(min(_PROCESSING_LOCK_POLL_SECONDS, remaining))
-            yield
+            token = _PROCESSING_CONNECTIONS.set({**connections, (self._connection_string, node_uri): conn})
+            try:
+                yield
+            finally:
+                _PROCESSING_CONNECTIONS.reset(token)
         finally:
             if acquired and conn.closed == 0:
                 try:
@@ -580,6 +640,11 @@ class SQLOutboxStore(PoolAdapterMixin):
                 conn.close()
 
     @contextmanager
+    def claim_processing_event(self, event: OutboxEvent, node_uri: str, worker_id: str):
+        with self.processing_lock(node_uri):
+            yield self.try_acquire(event, node_uri, worker_id)
+
+    @contextmanager
     def claim_agent_event(self, event: OutboxEvent, worker_id: str):
         """Reload checkpoints under the URI lock and hold it through acknowledgement."""
         with ExitStack() as stack:
@@ -588,6 +653,12 @@ class SQLOutboxStore(PoolAdapterMixin):
             except TimeoutError:
                 yield False
                 return
+            if getattr(event, "_outbox_claim", None) is not None:
+                try:
+                    self.ensure_processing_owned(event, event.uri)
+                except RuntimeError:
+                    yield False
+                    return
             ctx = RequestContext(**event.payload["context"])
             fresh = self.get_event(ctx.account_id, event.event_id)
             if fresh is None or fresh.status not in {"PENDING", "PROCESSING"}:
@@ -598,19 +669,21 @@ class SQLOutboxStore(PoolAdapterMixin):
             if event.next_retry_at and datetime.fromisoformat(event.next_retry_at) > datetime.now(UTC):
                 yield False
                 return
-            if event.status == "PENDING" and not self.try_acquire(event, event.uri, worker_id):
+            if getattr(event, "_outbox_claim", None) is None and not self.try_acquire(event, event.uri, worker_id):
                 yield False
                 return
             yield True
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
+        ownership, claim = self._claim_filter(event)
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE outbox_events SET status = 'PROCESSING' WHERE event_id = %s",
-                    (event.event_id,),
+                    "UPDATE outbox_events SET status = 'PROCESSING' WHERE event_id = %s" + ownership,
+                    (event.event_id, *claim),
                 )
+                self._check_claim_update(cur, event, node_uri)
             conn.commit()
             event.status = "PROCESSING"
         except Exception:
@@ -653,18 +726,22 @@ class SQLOutboxStore(PoolAdapterMixin):
             self._return_connection(conn)
 
     def mark_done(self, event: OutboxEvent, node_uri: str) -> None:
+        ownership, claim = self._claim_filter(event)
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 if event.event_type == EventType.EXTRACT_AGENT_MEMORY.value:
                     audit = {key: event.payload[key] for key in ("trace_uri", "value_reviews") if key in event.payload}
-                    cur.execute("UPDATE outbox_events SET status = 'DONE', payload = %s WHERE event_id = %s",
-                                (Json(audit), event.event_id))
+                    cur.execute("UPDATE outbox_events SET status = 'DONE', payload = %s WHERE event_id = %s" + ownership,
+                                (Json(audit), event.event_id, *claim))
                 else:
                     cur.execute(
-                        "DELETE FROM outbox_events WHERE event_id = %s",
-                        (event.event_id,),
+                        f"UPDATE outbox_events SET status = 'DONE', payload = {PROJECTION_RECEIPT_SQL}, "
+                        "worker_id = NULL, locked_at = NULL "
+                        "WHERE event_id = %s AND uri = %s" + ownership,
+                        (event.event_id, node_uri, *claim),
                     )
+                self._check_claim_update(cur, event, node_uri)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -673,6 +750,7 @@ class SQLOutboxStore(PoolAdapterMixin):
             self._return_connection(conn)
 
     def move_to_dlq(self, event: OutboxEvent, node_uri: str) -> None:
+        ownership, claim = self._claim_filter(event)
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -681,9 +759,10 @@ class SQLOutboxStore(PoolAdapterMixin):
                     UPDATE outbox_events
                     SET status = 'FAILED', payload = %s
                     WHERE event_id = %s
-                    """,
-                    (Json(event.payload), event.event_id),
+                    """ + ownership,
+                    (Json(event.payload), event.event_id, *claim),
                 )
+                self._check_claim_update(cur, event, node_uri)
             conn.commit()
             event.status = "FAILED"
         except Exception:
@@ -698,6 +777,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         node_uri: str,
         next_retry_at: datetime | None = None,
     ) -> None:
+        ownership, claim = self._claim_filter(event)
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -711,9 +791,10 @@ class SQLOutboxStore(PoolAdapterMixin):
                         worker_id = NULL,
                         locked_at = NULL
                     WHERE event_id = %s
-                    """,
-                    (Json(event.payload), next_retry_at, event.event_id),
+                    """ + ownership,
+                    (Json(event.payload), next_retry_at, event.event_id, *claim),
                 )
+                self._check_claim_update(cur, event, node_uri)
             conn.commit()
             event.retry_count += 1
             event.status = "PENDING"
@@ -742,19 +823,21 @@ class SQLOutboxStore(PoolAdapterMixin):
                     SET status = 'PROCESSING',
                         worker_id = %s,
                         locked_at = NOW()
-                    WHERE event_id = %s
+                    WHERE event_id = %s AND uri = %s
                       AND (
-                          status = 'PENDING'
+                          (status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
                           OR (status = 'PROCESSING' AND locked_at < NOW() - %s * interval '1 second')
                       )
-                    RETURNING event_id
+                    RETURNING worker_id, locked_at
                     """,
-                    (worker_id, event.event_id, timeout_seconds),
+                    (worker_id, event.event_id, node_uri, timeout_seconds),
                 )
-                acquired = cur.fetchone() is not None
+                claim = cur.fetchone()
+                acquired = claim is not None
             conn.commit()
             if acquired:
                 event.status = "PROCESSING"
+                event._outbox_claim = tuple(claim)
             return acquired
         except Exception:
             conn.rollback()
@@ -763,6 +846,9 @@ class SQLOutboxStore(PoolAdapterMixin):
             self._return_connection(conn)
 
     def release(self, event: OutboxEvent, node_uri: str) -> None:
+        if getattr(event, "_outbox_claim", None) is not None and event.status == "PENDING":
+            return
+        ownership, claim = self._claim_filter(event)
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -771,9 +857,10 @@ class SQLOutboxStore(PoolAdapterMixin):
                     UPDATE outbox_events
                     SET status = 'PENDING', worker_id = NULL, locked_at = NULL
                     WHERE event_id = %s AND status = 'PROCESSING'
-                    """,
-                    (event.event_id,),
+                    """ + ownership,
+                    (event.event_id, *claim),
                 )
+                self._check_claim_update(cur, event, node_uri)
             conn.commit()
             event.status = "PENDING"
         except Exception:

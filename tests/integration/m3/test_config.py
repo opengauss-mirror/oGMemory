@@ -23,6 +23,8 @@ embedding:
   model: top-embedding
 vector_db:
   dimension: 12
+  connection_string: host=localhost dbname=vectors
+storage:
   connection_string: host=localhost dbname=test
 m3:
   episodic_llm:
@@ -90,6 +92,8 @@ def test_vector_index_connection_string_inherits_vector_db(monkeypatch, tmp_path
         """
 vector_db:
   connection_string: host=primary dbname=graph
+storage:
+  connection_string: host=primary dbname=storage
 m3:
   vector_index:
     backend: pgvector
@@ -102,7 +106,7 @@ m3:
     cfg = load_m3_runtime_config(str(cfg_path))
     # DSN inherited from vector_db, not the stale m3.vector_index key.
     assert cfg.vector_index_connection_string == "host=primary dbname=graph"
-    assert cfg.graph_connection_string == "host=primary dbname=graph"
+    assert cfg.graph_connection_string == "host=primary dbname=storage"
     # The M3-specific knobs are still honoured.
     assert cfg.vector_index_backend == "pgvector"
     assert cfg.vector_index_table_name == "custom_m3_table"

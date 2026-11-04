@@ -82,7 +82,7 @@ def test_agent_memory_checkpoint_and_completion_receipt(mock_sql_outbox_store):
 def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
     created_at = datetime(2026, 4, 17, 10, 0, tzinfo=UTC)
-    cursor.fetchall.return_value = [
+    cursor.fetchone.side_effect = [(True,),
         (
             "evt-2",
             "UPSERT_CONTEXT",
@@ -92,8 +92,11 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
             1,
             created_at,
             None,
+            1, "worker-1", created_at,
         )
     ]
+
+    cursor.fetchall.return_value = [("evt-2", "ctx://acme/users/alice/memories/profile")]
 
     claimed = store.claim_batch(worker_id="worker-1", limit=50, timeout_seconds=42)
 
@@ -102,14 +105,14 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     assert node_uri == "ctx://acme/users/alice/memories/profile"
     assert event.event_id == "evt-2"
     assert event.status == "PROCESSING"
-    sql, params = cursor.execute.call_args.args
+    sql, params = cursor.execute.call_args_list[0].args
     assert "earlier.account_id = candidate.account_id" in sql
     assert "earlier.uri = candidate.uri" in sql
     assert "earlier.seq < candidate.seq" in sql
     assert "earlier.status IN ('PENDING', 'PROCESSING')" in sql
     assert "FOR UPDATE OF candidate SKIP LOCKED" in sql
     assert "LIMIT %s" in sql
-    assert params == (42, [], [], 50, "worker-1")
+    assert params == (42, [], [], [], 50)
     conn.commit.assert_called_once()
 
 

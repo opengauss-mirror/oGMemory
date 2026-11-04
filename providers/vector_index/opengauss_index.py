@@ -10,10 +10,11 @@ from typing import Any
 from core.clip_lookup import validate_clip_lookup
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
+from core.projection_ownership import current_projection_owner
 from core.temporal import contains_time, seconds
 from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
-from fs.sql_adapter.pool import PoolAdapterMixin, resolve_connection_dialect, is_connection_alive
 from fs.sql_adapter.dialect import normalize_sql_dialect
+from fs.sql_adapter.pool import PoolAdapterMixin, is_connection_alive, resolve_connection_dialect
 
 try:
     import psycopg2
@@ -396,6 +397,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         else:
             conn.close()
 
+    def _lock_projection(self, cur, ids):
+        check = current_projection_owner()
+        if check is not None:
+            for record_id in sorted(set(ids)):
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+                            (self._table_name, record_id))
+            check()
+
     def upsert(self, records: list[IndexRecord]) -> None:
         """Add or update records in the index.
 
@@ -438,6 +447,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 try:
                     with conn.cursor() as cur:
+                        self._lock_projection(cur, [record.id])
                         # IDs should already be account-scoped. Fail closed on
                         # a legacy/global ID collision: it must hit the unique
                         # constraint, never overwrite another tenant's row.
@@ -489,6 +499,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                         record.id, record.uri, exc,
                     )
                     conn.rollback()
+                    if current_projection_owner() is not None:
+                        raise
         finally:
             self._return_connection(conn)
 
@@ -648,6 +660,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
+                self._lock_projection(cur, ids)
                 cur.execute(
                     f"DELETE FROM {self._table_name} WHERE id = ANY(%s)",
                     (ids,)

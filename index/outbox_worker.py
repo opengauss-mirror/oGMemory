@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 
+from core.projection_ownership import projection_owner
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
 from core.models import IndexRecord, OutboxEvent, RequestContext
@@ -73,6 +74,7 @@ class WorkerConfig:
     max_retry: int = DEFAULT_MAX_RETRY
     base_delay_ms: int = DEFAULT_BASE_DELAY_MS
     max_delay_ms: int = DEFAULT_MAX_DELAY_MS
+    processing_batch_size: int = 16
 
 
 class OutboxWorker:
@@ -767,6 +769,12 @@ class OutboxWorker:
             result: Processing result
             stats: Statistics dict to update
         """
+        try:
+            self._ensure_processing_owned(outbox_store, event, node_uri)
+        except Exception:
+            logger.warning("Event %s awaits its processing lease owner", event.event_id, exc_info=True)
+            stats["skipped"] += 1
+            return
         if result.success:
             self._notify_memory_projection(event, result)
             outbox_store.mark_done(event, node_uri)
@@ -883,6 +891,15 @@ class OutboxWorker:
         return nullcontext()
 
     @staticmethod
+    def _ensure_processing_owned(outbox_store, event, node_uri):
+        if callable(getattr(type(outbox_store), "ensure_processing_owned", None)):
+            outbox_store.ensure_processing_owned(event, node_uri)
+
+    def _projection_owner(self, store, event, uri):
+        check = getattr(type(store), "ensure_processing_owned", None)
+        return projection_owner(lambda: check(store, event, uri)) if callable(check) else nullcontext()
+
+    @staticmethod
     def _is_upsert_event(event: OutboxEvent) -> bool:
         return event.event_type in {"UPSERT_CONTEXT", "UPSERT_DIRECTORY"}
 
@@ -925,9 +942,12 @@ class OutboxWorker:
         records_data = event.payload.get("records", [])
         ids = [r["id"] for r in records_data if "id" in r]
 
+        self._ensure_processing_owned(outbox_store, event, event.uri)
         if ids:
-            self._vector_index.delete(ids)
-            self._delete_bm25(ids)
+            with self._projection_owner(outbox_store, event, event.uri):
+                self._vector_index.delete(ids)
+                self._ensure_processing_owned(outbox_store, event, event.uri)
+                self._delete_bm25(ids)
             logger.info(
                 "Rolled back %d stale records for tombstoned event %s",
                 len(ids), event.event_id,
@@ -1046,6 +1066,13 @@ class OutboxWorker:
     ) -> None:
         """Process and acknowledge one event while its URI lock is held."""
 
+        try:
+            self._ensure_processing_owned(outbox_store, event, node_uri)
+        except Exception:
+            logger.info("Event %s awaits its current claim owner", event.event_id, exc_info=True)
+            stats["skipped"] += 1
+            return
+
         # Tombstone check: if move_node deleted this event between
         # claim_batch and here, skip processing to avoid writing stale
         # vectors at the old URI.  DB errors propagate so we don't
@@ -1075,7 +1102,8 @@ class OutboxWorker:
 
         try:
             ctx = self._build_request_context(event)
-            result = self.process_event(event, ctx)
+            with self._projection_owner(outbox_store, event, node_uri):
+                result = self.process_event(event, ctx)
 
             # Post-upsert tombstone check: close the race where
             # move_node deleted this event *after* the pre-check
@@ -1159,8 +1187,11 @@ class OutboxWorker:
                 embeddings = all_embeddings[start : start + len(records)]
                 augmented = self._augment_with_embeddings(records, embeddings)
                 try:
-                    self._vector_index.upsert(augmented)
-                    self._upsert_code_bm25(records)
+                    self._ensure_processing_owned(outbox_store, event, node_uri)
+                    with self._projection_owner(outbox_store, event, node_uri):
+                        self._vector_index.upsert(augmented)
+                        self._ensure_processing_owned(outbox_store, event, node_uri)
+                        self._upsert_code_bm25(records)
                     result = WorkerResult(
                         event_id=event.event_id,
                         success=True,
@@ -1279,6 +1310,16 @@ class OutboxWorker:
                 continue
             all_pending.extend(pending)
 
+        batch_size = max(1, self._config.processing_batch_size)
+        for start in range(0, len(all_pending), batch_size):
+            with ExitStack() as processing_stack:
+                self._process_pending_events(
+                    all_pending[start:start + batch_size], outbox_store, stats,
+                    worker_id, excluded_types, processing_stack,
+                )
+        return stats
+
+    def _process_pending_events(self, all_pending, outbox_store, stats, worker_id, excluded_types, processing_stack):
         # Phase 1: Batch-embed all UPSERT_CONTEXT events
         upsert_batch: list[tuple[OutboxEvent, str, list[IndexRecord]]] = []
         other_events: list[tuple[OutboxEvent, str]] = []
@@ -1291,7 +1332,28 @@ class OutboxWorker:
                     and self._has_real_method(outbox_store, "claim_agent_event")):
                 self._process_agent_claim(event, outbox_store, stats, worker_id)
                 continue
-            if not outbox_store.try_acquire(event, node_uri, worker_id):
+            if self._has_real_method(outbox_store, "claim_processing_event"):
+                event_stack = ExitStack()
+                try:
+                    acquired = event_stack.enter_context(
+                        outbox_store.claim_processing_event(event, node_uri, worker_id)
+                    )
+                except TimeoutError:
+                    event_stack.close()
+                    stats["skipped"] += 1
+                    continue
+                except Exception:
+                    event_stack.close()
+                    logger.exception("Failed to claim event %s under its URI lease", event.event_id)
+                    stats["failed"] += 1
+                    continue
+                if acquired:
+                    processing_stack.enter_context(event_stack)
+                else:
+                    event_stack.close()
+            else:
+                acquired = outbox_store.try_acquire(event, node_uri, worker_id)
+            if not acquired:
                 stats["skipped"] += 1
                 continue
 
@@ -1358,8 +1420,11 @@ class OutboxWorker:
         for event, node_uri in other_events:
             stats["processed"] += 1
             try:
+                self._ensure_processing_owned(outbox_store, event, node_uri)
                 ctx = self._build_request_context(event)
-                result = self.process_event(event, ctx)
+                with self._projection_owner(outbox_store, event, node_uri):
+                    result = self.process_event(event, ctx)
+                self._ensure_processing_owned(outbox_store, event, node_uri)
                 if (
                     result.success
                     and self._is_upsert_event(event)

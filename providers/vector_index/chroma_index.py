@@ -5,6 +5,7 @@ come from the Embedder, not from ChromaDB's built-in models.
 """
 
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -14,10 +15,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from core.projection_ownership import check_projection_owner
 from core.interfaces import VectorIndex
 from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
 from core.resource_identity import CODE_INDEX_METADATA_FIELDS
+from core.vector_math import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +133,7 @@ class ChromaVectorIndex(VectorIndex):
                 embeddings.append(self._stable_vector(r.text))
         batch_size = self._provider_batch_size()
         with self._locked():
+            check_projection_owner()
             for start in range(0, len(ids), batch_size):
                 end = start + batch_size
                 self._collection.upsert(
@@ -144,6 +148,7 @@ class ChromaVectorIndex(VectorIndex):
             return
         batch_size = self._provider_batch_size()
         with self._locked():
+            check_projection_owner()
             for start in range(0, len(ids), batch_size):
                 self._collection.delete(ids=ids[start : start + batch_size])
 
@@ -182,6 +187,8 @@ class ChromaVectorIndex(VectorIndex):
                 where=chroma_where if chroma_where else None,
                 include=["documents", "metadatas", "distances"],
             )
+            if chroma_where and not results["ids"][0]:
+                results = self._exact_filtered_query(query_vector, chroma_where, top_k)
         hits: list[SeedHit] = []
         if not results or not results["ids"] or not results["ids"][0]:
             return hits
@@ -209,6 +216,32 @@ class ChromaVectorIndex(VectorIndex):
                 metadata=dict(meta),
             ))
         return hits
+
+    def _exact_filtered_query(self, query_vector, where, top_k):
+        # Filtered HNSW can omit candidates that metadata reads still return.
+        best = []
+        offset = 0
+        while True:
+            page = self._collection.get(
+                where=where, include=["embeddings", "documents", "metadatas"],
+                limit=1000, offset=offset,
+            )
+            rows = [
+                (cosine_similarity(query_vector, list(vector)), record_id, document, metadata)
+                for record_id, vector, document, metadata in zip(
+                    page["ids"], page["embeddings"], page["documents"], page["metadatas"],
+                )
+            ]
+            best = heapq.nlargest(top_k, best + rows, key=lambda row: row[0])
+            if len(page["ids"]) < 1000:
+                break
+            offset += len(page["ids"])
+        return {
+            "ids": [[row[1] for row in best]],
+            "documents": [[row[2] for row in best]],
+            "metadatas": [[row[3] for row in best]],
+            "distances": [[1.0 - row[0] for row in best]],
+        }
 
     def get_embeddings(
         self,

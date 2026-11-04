@@ -19,7 +19,7 @@ def test_only_explicitly_paused_graph_jobs_are_nonblocking(mock_sql_outbox_store
     assert "earlier.account_id = candidate.account_id" in sql
     assert "earlier.uri = candidate.uri" in sql
     assert "earlier.seq < candidate.seq" in sql
-    assert params == (300, excluded or [], paused, 7, "worker")
+    assert params == (300, [], excluded or [], paused, 7)
 
 
 def test_counter_exclusion_is_explicit_and_does_not_change_default(mock_sql_outbox_store):

@@ -227,12 +227,12 @@ class EpisodicSearcher:
         from core.models import IndexRecord
         from providers.vector_index import InMemoryVectorIndex
 
-        dim = 384
-        for rec in records:
-            emb = rec.get("embedding")
-            if isinstance(emb, list) and emb:
-                dim = len(emb)
-                break
+        dim = next((len(rec["embedding"]) for rec in records
+                    if isinstance(rec.get("embedding"), list) and rec["embedding"]), None)
+        if dim is None:
+            dim = getattr(embedder, "dimension", None)
+            if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
+                dim = len(embedder.embed_texts(["embedding dimension"])[0])
         idx = InMemoryVectorIndex(dimension=dim)
         payload: list[IndexRecord] = []
         for rec in records:

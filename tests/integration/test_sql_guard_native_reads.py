@@ -40,6 +40,8 @@ class NativeProtocolLLM:
         self.lock = threading.Lock()
 
     def complete_json(self, prompt, schema):
+        if 'categories' in schema['properties']:
+            return {'categories': ['entity']}
         assert 'spans' in schema['properties'], 'unexpected JSON fallback/model call'
         return {'spans': [
             {'start': 0, 'end': 0, 'categories': ['entity'], 'reason': 'alpha calibration'},
@@ -215,7 +217,7 @@ class GuardedSourceProtocolLLM(SourceLLM):
     def complete_json(self, prompt, schema):
         phase = next(iter(schema['properties']))
         self.record_owner(phase)
-        if phase != 'spans':
+        if phase not in {'spans', 'categories'}:
             payload = json.loads(prompt.split('\n\n', 1)[1])
             drafts = payload['member_drafts'] if phase == 'valid' else payload['drafts']
             assert all(not draft['draft'].get('source_occurrence_id')
@@ -258,7 +260,7 @@ def test_guarded_eager_source_multispan_keeps_stable_archive_namespace(native_sq
         guard.ensure_owned()
     assert_source_protocol_owner(llm, ctx)
     assert Counter(phase for phase, *_ in llm.owner_rounds) == Counter(
-        {'spans': 3, 'native': 12, 'groups': 3, 'valid': 3})
+        {'spans': 3, 'categories': 6, 'native': 12, 'groups': 3, 'valid': 3})
     assert Counter(temperature for _, temperature in llm.native_calls) == Counter({None: 6, 0: 6})
 
 

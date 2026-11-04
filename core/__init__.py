@@ -58,13 +58,6 @@ from core.models import (
     TypedQuery,
     WritePlan,
 )
-from core.react_loop import (
-    ReactIterationTrace,
-    ReactLoop,
-    ReactLoopResult,
-    ReactTaskContext,
-    ReactTrace,
-)
 from core.resource_identity import (
     CODE_INDEX_METADATA_FIELDS,
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
@@ -172,3 +165,13 @@ __all__ = [
     "ReactTaskContext",
     "ReactTrace",
 ]
+
+
+def __getattr__(name):
+    if name in {"ReactLoop", "ReactLoopResult", "ReactIterationTrace", "ReactTaskContext", "ReactTrace"}:
+        from importlib import import_module
+
+        value = getattr(import_module("core.react_loop"), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -36,6 +36,7 @@ from core.resource_identity import (
     validate_resource_uri_slug,
 )
 from fs.access_control import check_uri_access
+from fs.sql_adapter.outbox_receipt import PROJECTION_RECEIPT_SQL
 from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 
 # ---------------------------------------------------------------------------
@@ -1286,6 +1287,13 @@ class SQLContextFS(PoolAdapterMixin):
                         EventType.UPSERT_CONTEXT.value,
                         EventType.UPSERT_DIRECTORY.value,
                     ),
+                )
+
+                cur.execute(
+                    f"UPDATE outbox_events SET payload = {PROJECTION_RECEIPT_SQL} "
+                    "WHERE account_id = %s AND uri = ANY(%s) AND status = 'DONE' "
+                    f"AND event_type IN (%s, %s) AND payload <> {PROJECTION_RECEIPT_SQL}",
+                    (ctx.account_id, targets, EventType.UPSERT_CONTEXT.value, EventType.UPSERT_DIRECTORY.value),
                 )
 
                 for uri in targets:

@@ -14,6 +14,7 @@ import time
 from core.interfaces import VectorIndex
 from core.lexical import LexicalIndex, lexical_record_from_index_record
 from core.models import IndexRecord
+from core.projection_ownership import check_projection_owner
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,13 @@ class CompositeProjectionWriter:
                 if lexical_records:
                     self.lexical_index.upsert_many(lexical_records)
             except Exception:
+                check_projection_owner()
                 self._best_effort_callback(self._on_records_failed, records)
                 raise
             try:
                 self.vector_index.upsert(records)
             except Exception:
+                check_projection_owner()
                 self._best_effort_callback(self._on_records_failed, records)
                 self._best_effort_lexical_delete([record.id for record in records])
                 raise
