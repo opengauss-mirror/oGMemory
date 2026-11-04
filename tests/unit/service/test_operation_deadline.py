@@ -17,6 +17,16 @@ def clock(monkeypatch):
     return value
 
 
+def test_write_confirmation_budget_restores_caller_budget(clock):
+    with deadline.operation_deadline(5):
+        with deadline.write_outcome_confirmation():
+            assert deadline.remaining_seconds() == 10
+            clock[0] += 2
+            assert deadline.remaining_seconds() == 8
+        assert deadline.remaining_seconds() == 3
+    assert deadline.remaining_seconds() is None
+
+
 @pytest.mark.parametrize("value", [0, -1, True, "1", float("nan"), float("inf"), 10 ** 1000])
 def test_invalid_budget_rejected(value):
     with pytest.raises(ValueError):
