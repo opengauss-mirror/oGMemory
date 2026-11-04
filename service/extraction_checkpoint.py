@@ -89,7 +89,7 @@ class ExtractionBatchJournal:
     def _replace(self, batch):
         with self.buffer.session_state_save_lock:
             with self.buffer.extraction_lock:
-                prior = deepcopy(self.buffer.runtime_extensions.get(EXTENSION_KEY))
+                prior = self.buffer.runtime_extensions.get(EXTENSION_KEY)
                 if batch is None:
                     self.buffer.runtime_extensions.pop(EXTENSION_KEY, None)
                 else:

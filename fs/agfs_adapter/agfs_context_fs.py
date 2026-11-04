@@ -10,6 +10,7 @@ Phase 1 implementation:
 - P1-W4: read_node/exists/list_children/delete_node
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -542,6 +543,7 @@ class AGFSContextFS:
         "created_at",
         "updated_at",
         "version",
+        "session_state_layout",
     }
 
     def __init__(self, client: AGFSClient, mount_prefix: str = "/local"):
@@ -2500,29 +2502,55 @@ class AGFSContextFS:
         overview_path = node_path + self.FILE_OVERVIEW
         meta_path = meta_path or node_path + self.FILE_META
 
+        relations = node.metadata.get('_relations', [])
+        relations_json = json.dumps(
+            [self._relation_edge_to_dict(r) for r in relations], ensure_ascii=False, indent=2,
+        )
+        layout = self._session_state_layout(node, relations_json)
+        reuse_static = False
+        if layout is not None and mutation_lease is not None:
+            try:
+                stored_meta = json.loads(self._read_file(node_path + self.FILE_META))
+            except (NodeNotFoundError, json.JSONDecodeError):
+                stored_meta = {}
+            reuse_static = (isinstance(stored_meta, dict)
+                            and stored_meta.get("status") == NodeStatus.ACTIVE.value
+                            and stored_meta.get("uri") == node.uri
+                            and stored_meta.get("session_state_layout") == layout)
+
         # Step ①: Write content.md (largest file, do first)
         # If this fails, no .meta.json exists, node doesn't exist → skip in repair
         write_file(content_path, node.content)
 
-        # Step ②: Write .relations.json
-        # Get relations from node metadata if available
-        relations = node.metadata.get('_relations', [])
-        relations_json = json.dumps(
-            [self._relation_edge_to_dict(r) for r in relations],
-            ensure_ascii=False,
-            indent=2
-        )
-        write_file(relations_path, relations_json)
-
-        # Step ③: Write .abstract.md and .overview.md (parallel safe)
-        write_file(abstract_path, node.abstract)
-        write_file(overview_path, node.overview)
+        if not reuse_static:
+            write_file(relations_path, relations_json)
+            write_file(abstract_path, node.abstract)
+            write_file(overview_path, node.overview)
 
         # Step ④: Write status=ACTIVE metadata. Versioned updates pass a
         # temporary path and publish it with one atomic file rename.
         meta = self._build_node_metadata(node, expected_version)
+        if layout is not None:
+            meta["session_state_layout"] = layout
         meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
         write_file(meta_path, meta_json)
+
+    @staticmethod
+    def _session_state_layout(node: ContextNode, relations_json: str) -> dict | None:
+        """Bind reusable session files to their canonical identity and contents."""
+        match = _SESSION_STATE_PATTERN.fullmatch(node.uri)
+        if (match is None or node.context_type != "RESOURCE" or node.category != "state"
+                or node.owner_space != "session:" + match["session_id"]
+                or node.metadata.get("session_id") != match["session_id"]
+                or any(not isinstance(node.metadata.get(key), str)
+                       for key in ("owner_user_id", "owner_agent_id"))):
+            return None
+        static = [node.uri, node.context_type, node.category, node.level, node.owner_space,
+                  node.metadata["owner_user_id"], node.metadata["owner_agent_id"],
+                  node.abstract, node.overview, relations_json]
+        encoded = json.dumps(static, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return {"version": 1, "sha256": hashlib.sha256(encoded).hexdigest()}
+
 
     def _build_node_metadata(
         self,
