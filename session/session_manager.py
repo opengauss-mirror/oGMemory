@@ -796,6 +796,8 @@ class SessionManager:
         return True
 
     def save_session_state(self, session_id: str, ctx: RequestContext) -> bool:
+        from service.extraction_recovery_discovery import DISCOVERY_KEY, recovery_discovery_hint
+
         if self._get_context_fs is None:
             return False
         pinned_buffer = None
@@ -855,10 +857,9 @@ class SessionManager:
                             "created_at": buf.compaction_prepare_token_created_at,
                         }
                         if buf.runtime_extensions:
-                            payload["runtime_extensions"] = deepcopy(
-                                buf.runtime_extensions
-                            )
-                from service.extraction_recovery_discovery import DISCOVERY_KEY, recovery_discovery_hint
+                            payload["runtime_extensions"] = buf.runtime_extensions
+                        content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                        discovery_hint = recovery_discovery_hint(payload)
                 now = datetime.now(timezone.utc).isoformat()
                 node = ContextNode(
                     uri=self._session_state.state_uri(ctx.account_id, session_id),
@@ -868,12 +869,12 @@ class SessionManager:
                     owner_space=f"session:{session_id}",
                     abstract="Session task state and commitments",
                     overview="Session task state and commitments",
-                    content=json.dumps(payload, ensure_ascii=False, indent=2),
+                    content=content,
                     metadata={
                         "session_id": session_id,
                         "owner_user_id": ctx.user_id,
                         "owner_agent_id": ctx.agent_id,
-                        DISCOVERY_KEY: recovery_discovery_hint(payload),
+                        DISCOVERY_KEY: discovery_hint,
                         "updated_at": now,
                     },
                 )
