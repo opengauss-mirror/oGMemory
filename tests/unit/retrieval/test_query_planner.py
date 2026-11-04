@@ -60,6 +60,11 @@ class TestQueryPlanner:
         "What particles did John study?",
         "Which newspapers does John read?",
         "When did John add hyperlinks?",
+        "请找一下suspected的含义",
+        "请找一下spec_v2",
+        "请找一下spec2",
+        "请找一下2spec",
+        "请找一下specsx",
     ])
     def test_resource_keyword_inside_word_does_not_change_memory_routing(self, planner, ctx, query):
         queries = planner.plan(query, ctx)
@@ -90,6 +95,23 @@ class TestQueryPlanner:
         queries = planner.plan(query, ctx)
         assert len(queries) == 1
         assert queries[0].context_type == "RESOURCE"
+
+    @pytest.mark.parametrize("keyword", [
+        "document", "spec", "reference", "link", "paper", "article",
+        "documents", "specs", "references", "links", "papers", "articles",
+        "SPEC", "PAPERS",
+    ])
+    @pytest.mark.parametrize("template", [
+        "请找一下{}",
+        "{}在哪里",
+        "这篇{}在哪里",
+    ])
+    def test_resource_keywords_adjacent_to_chinese(self, planner, ctx, keyword, template):
+        query = template.format(keyword)
+        queries = planner.plan(query, ctx)
+        assert len(queries) == 1
+        assert queries[0].context_type == "RESOURCE"
+        assert queries[0].text == query
 
     def test_ambiguous_falls_back_to_triple(self, planner, ctx):
         queries = planner.plan("hello world", ctx)
