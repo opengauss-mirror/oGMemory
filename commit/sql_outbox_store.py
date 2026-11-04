@@ -173,6 +173,8 @@ class SQLOutboxStore(PoolAdapterMixin):
                     ),
                 )
             conn.commit()
+            from commit.outbox_scope import record_persisted_event
+            record_persisted_event(event.uri, event.event_id)
         except Exception:
             conn.rollback()
             raise
@@ -374,6 +376,35 @@ class SQLOutboxStore(PoolAdapterMixin):
 
         return [self._row_to_event(row) for row in rows]
 
+    def list_pending_events(self, references) -> list[tuple[str, OutboxEvent]]:
+        """Load requested events and their unfinished per-URI predecessors."""
+        references = tuple(references)
+        if not references:
+            return []
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT candidate.event_id, candidate.event_type,
+                               candidate.uri, candidate.payload, candidate.status,
+                               candidate.retry_count, candidate.created_at, candidate.next_retry_at
+                            FROM outbox_events AS candidate
+                            WHERE candidate.status IN ('PENDING', 'PROCESSING')
+                              AND EXISTS (
+                                SELECT 1 FROM outbox_events AS requested
+                                WHERE (requested.uri, requested.event_id) IN %s
+                                  AND requested.account_id = candidate.account_id
+                                  AND requested.uri = candidate.uri
+                                  AND (candidate.event_id = requested.event_id
+                                       OR candidate.seq < requested.seq))
+                            ORDER BY candidate.seq ASC NULLS LAST""", (references,))
+                rows = cur.fetchall()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return [self._row_to_event(row) for row in rows]
 
     def list_recent(self, account_id: str, limit: int = 200) -> list[tuple[str, OutboxEvent]]:
         """Return recent live and failed index tasks for the task center."""
@@ -464,6 +495,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         timeout_seconds: int = 300,
         *,
         exclude_event_types: list[str] | None = None,
+        event_ids: list[str] | None = None,
     ) -> list[tuple[str, OutboxEvent]]:
         """Claim supported ready events before the batch limit, preserving per-URI order."""
         excluded = exclude_event_types or []
@@ -471,14 +503,19 @@ class SQLOutboxStore(PoolAdapterMixin):
         # Pausing them must not hold up ordinary indexing for the same URI.
         # Keep all other predecessor ordering, including agent-memory jobs.
         paused_projections = ["PROJECT_GRAPH"] if "PROJECT_GRAPH" in excluded else []
+        scope = " AND candidate.event_id = ANY(%s)" if event_ids is not None else ""
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 busy = []
                 rows = []
                 while (remaining := limit - len(rows)) > 0:
+                    params = (timeout_seconds, busy, excluded)
+                    if event_ids is not None:
+                        params += (event_ids,)
+                    params += (paused_projections, remaining)
                     cur.execute(
-                        """
+                        f"""
                             SELECT candidate.event_id, candidate.uri
                             FROM outbox_events AS candidate
                             WHERE (
@@ -497,6 +534,7 @@ class SQLOutboxStore(PoolAdapterMixin):
                                   )
                               AND candidate.event_id <> ALL(%s)
                               AND candidate.event_type <> ALL(%s)
+                              {scope}
                               AND NOT EXISTS (
                                     SELECT 1
                                     FROM outbox_events AS earlier
@@ -511,7 +549,7 @@ class SQLOutboxStore(PoolAdapterMixin):
                             FOR UPDATE OF candidate SKIP LOCKED
                             LIMIT %s
                         """,
-                        (timeout_seconds, busy, excluded, paused_projections, remaining),
+                        params,
                     )
                     ready = cur.fetchall()
                     # Use the processing lock key before replacing an expired claim.

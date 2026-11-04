@@ -7,6 +7,7 @@ import json
 from copy import deepcopy
 from dataclasses import asdict, replace
 
+from commit.outbox_scope import current_outbox_events, restore_outbox_events
 from commit.write_receipts import operation_digest
 from core.models import CandidateMemory
 
@@ -42,6 +43,7 @@ class ExtractionBatchJournal:
         journal = cls.__new__(cls)
         journal.manager, journal.buffer, journal.ctx = manager, buffer, ctx
         journal._archive_id = batch["archive_id"]
+        restore_outbox_events(batch, ctx.account_id)
         return journal
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
@@ -72,11 +74,13 @@ class ExtractionBatchJournal:
                      "messages": deepcopy(messages),
                      "session_time": session_time.isoformat() if hasattr(session_time, "isoformat") else session_time,
                      "session_summary": session_summary, "tool_stats_text": tool_stats_text,
-                     "chunks": None, "slots": {}}
+                     "chunks": None, "slots": {}, "outbox_tracking_version": 1,
+                     "outbox_events": []}
             if lifecycle is not None:
                 batch["lifecycle"] = deepcopy(lifecycle)
             self._replace(batch)
         self._archive_id = batch["archive_id"]
+        restore_outbox_events(batch, ctx.account_id)
 
     @property
     def batch(self):
@@ -88,6 +92,14 @@ class ExtractionBatchJournal:
 
     def _replace(self, batch):
         with self.buffer.session_state_save_lock:
+            if batch is not None:
+                batch = dict(batch)
+                references = [tuple(item) for item in batch.get("outbox_events", [])]
+                current = current_outbox_events(self.ctx.account_id)
+                if current is None:
+                    batch.pop("outbox_tracking_version", None)
+                references.extend(current or [])
+                batch["outbox_events"] = [list(item) for item in dict.fromkeys(references)]
             with self.buffer.extraction_lock:
                 prior = self.buffer.runtime_extensions.get(EXTENSION_KEY)
                 if batch is None:

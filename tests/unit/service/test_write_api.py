@@ -377,12 +377,14 @@ class TestWriteMemory:
 
         class AtomicEventBuilder:
             def build_write_event(self, node):
+                from commit.code_resource_events import build_code_resource_write_event
                 self.built_nodes.append(node)
+                self.event = build_code_resource_write_event(node)
                 return self.event
 
         class AtomicOutbox(AtomicEventBuilder):
             def __init__(self):
-                self.event = object()
+                self.event = None
                 self.built_nodes = []
                 self.registered_writes = []
 

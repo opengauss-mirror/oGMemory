@@ -327,7 +327,10 @@ class OutboxWorker:
                     and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT", "DELETE_CONTEXT"})
 
     def _current_projection_records(self, event: OutboxEvent, records: list[IndexRecord]) -> list[IndexRecord]:
-        if not self._is_memory_projection_event(event):
+        if not (self._is_memory_projection_event(event) or (
+                self._fs is not None and _MEMORY_OWNER_PATTERN.match(event.uri)
+                and "/memories/" in event.uri
+                and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT"})):
             return records
         if self._fs is None:
             raise RuntimeError("memory projection requires canonical node storage")
@@ -1245,12 +1248,13 @@ class OutboxWorker:
         outbox_store,
         account_ids: list[str],
         worker_id: str = "default",
+        pending_events: list[tuple[str, OutboxEvent]] | None = None,
     ) -> dict:
         # Context-local state is reset even on errors and cannot suppress a
         # future retry, another worker, or a concurrent polling context.
         token = self._graph_poll_accounts.set(set())
         try:
-            return self._run_once(outbox_store, account_ids, worker_id)
+            return self._run_once(outbox_store, account_ids, worker_id, pending_events)
         finally:
             self._graph_poll_accounts.reset(token)
 
@@ -1259,6 +1263,7 @@ class OutboxWorker:
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
         account_ids: list[str],
         worker_id: str = "default",
+        pending_events: list[tuple[str, OutboxEvent]] | None = None,
     ) -> dict:
         """Single polling cycle: scan → process → ack/retry/dlq.
 
@@ -1281,28 +1286,47 @@ class OutboxWorker:
 
         # Fast path: SQL outbox with batch-claim support
         if self._supports_batch_claim(outbox_store):
-            try:
-                claimed_events = outbox_store.claim_batch(
-                    worker_id=worker_id, exclude_event_types=excluded_types,
-                )
-            except Exception as e:
-                logger.error("Failed to claim pending events: %s", e)
-                return stats
-
-            self._process_claimed_events(claimed_events, outbox_store, stats, worker_id)
+            remaining = ({event.event_id for _, event in pending_events}
+                         if pending_events is not None else None)
             accounts = set(account_ids)
-            for node_uri, event in claimed_events:
-                ctx = self._build_request_context(event)
-                if ctx is not None:
-                    accounts.add(ctx.account_id)
+            while remaining is None or remaining:
+                try:
+                    scoped = {"event_ids": list(remaining)} if remaining is not None else {}
+                    claimed_events = outbox_store.claim_batch(
+                        worker_id=worker_id, exclude_event_types=excluded_types, **scoped,
+                    )
+                except Exception as e:
+                    logger.error("Failed to claim pending events: %s", e)
+                    return stats
+                if not claimed_events:
+                    break
+                self._process_claimed_events(claimed_events, outbox_store, stats, worker_id)
+                for node_uri, event in claimed_events:
+                    ctx = self._build_request_context(event)
+                    if ctx is not None:
+                        accounts.add(ctx.account_id)
+                if remaining is None:
+                    break
+                completed = {event.event_id for _, event in claimed_events}
+                if not remaining.intersection(completed):
+                    break
+                remaining.difference_update(completed)
+            if pending_events is not None:
+                outstanding = outbox_store.list_pending_events(
+                    [(uri, event.event_id) for uri, event in pending_events
+                     if event.event_type not in excluded_types])
+                pending_count = sum(event.event_type not in excluded_types for _, event in outstanding)
+                if pending_count:
+                    stats["pending"] = pending_count
+                    stats["deferred"] = True
             self._drain_graph(accounts,stats)
             return stats
 
         # Collect all pending events across accounts, grouped by type.
         self._drain_graph(account_ids,stats)
         # UPSERT_CONTEXT events are batch-embedded for efficiency.
-        all_pending: list[tuple[str, OutboxEvent]] = []
-        for account_id in account_ids:
+        all_pending: list[tuple[str, OutboxEvent]] = list(pending_events or [])
+        for account_id in account_ids if pending_events is None else []:
             try:
                 pending = outbox_store.list_pending(account_id)
             except Exception as e:

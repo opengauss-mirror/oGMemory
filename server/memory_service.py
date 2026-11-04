@@ -12,6 +12,7 @@ import logging
 import os
 import re as _re
 import threading
+from commit.outbox_scope import capture_outbox_events, current_outbox_events, restore_outbox_events
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
@@ -2887,9 +2888,14 @@ class MemoryService:
                 effective_account_id = account_id or self._default_account_id
                 account_ids = [effective_account_id]
 
+            targeted = {}
+            references = current_outbox_events(account_id)
+            if references is not None and callable(getattr(type(outbox_store), "list_pending_events", None)):
+                targeted["pending_events"] = outbox_store.list_pending_events(references)
             stats = worker.run_once(
                 outbox_store=outbox_store,
                 account_ids=account_ids,
+                **targeted,
             )
             logger.info("drain_outbox_sync: %s", stats)
             return stats
@@ -5246,6 +5252,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return {"ok": True, "status": "queued", "reason": "memory_card_format",
                 "recovery_task": task, "last_error": str(error)}
 
+    @capture_outbox_events
     @retry_failed_source
     @_after_turn_deadline
     @_attribute_request_usage
@@ -5780,7 +5787,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     )
 
                 try:
-                    self._async_drain()
+                    self._async_drain(account_id=ctx.account_id)
                 except Exception as exc:
                     logger.warning("outbox_drain failed after background extract: %s", exc)
 
@@ -5839,6 +5846,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 buf.end_extraction()
 
+        @capture_outbox_events
         def _background_owned():
             """The child acquires its own connection after the HTTP handoff."""
             ran = False
@@ -5851,6 +5859,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                                 raise RecoveryNeedsConfirmationError("the scheduled source batch changed")
                             # Another fenced worker durably finished the original source.
                             return
+                    if extraction_journal is not None:
+                        restore_outbox_events(extraction_journal.batch, ctx.account_id)
                     ran = True
                     _background_extract_write()
                 if guard is not None and guard.post_commit_drain:
@@ -6122,6 +6132,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         """Batch ingest through the standard externalization path."""
         return self.ingest(params)
 
+    @capture_outbox_events
     @_guard_session_mutation
     def compact(self, params: dict) -> dict:
         """Run the complete compaction flow under the shared session operation guard."""
@@ -6250,7 +6261,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return
 
         try:
-            drain_stats = self.drain_outbox_sync()
+            ctx = params.get("_ctx") or self.build_context(params)
+            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
             logger.info(
                 "compact short-term index sync processed=%d succeeded=%d failed=%d",
                 drain_stats.get("processed", 0),
@@ -6424,6 +6436,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if self._write_result_updates_profile(write_result):
             self.get_session_manager().invalidate_topic_slot(session_id, "identity")
 
+    @capture_outbox_events
     @_guard_session_mutation
     def prepare_compaction(self, params: dict) -> dict:
         """Prepare extraction while preventing lifecycle cleanup from interleaving."""
@@ -6587,6 +6600,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 buf.rewind_watermark_to_ids(snapshot_ids)
                 raise
 
+    @capture_outbox_events
     def _run_dispose_background(self, mgr, session_id: str, params: dict, ctx, buf, source_snapshot=None, operation=None) -> None:
         try:
             from service.api import MemoryWriteAPI
@@ -6664,6 +6678,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     self._dispose_journal(mgr, buf, ctx, snapshot)
             return {"source_snapshot": snapshot}
 
+    @capture_outbox_events
     def _run_dispose_background_impl(self, mgr, session_id: str, params: dict, ctx, buf, source_snapshot=None) -> None:
         snapshot_ids: set[str] = set()
         extraction_started = False
