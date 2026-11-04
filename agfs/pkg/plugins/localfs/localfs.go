@@ -110,7 +110,7 @@ func (fs *LocalFS) Mkdir(path string, perm uint32) error {
 
 	// Check if directory already exists
 	if _, err := os.Stat(localPath); err == nil {
-		return fmt.Errorf("directory already exists: %s", path)
+		return fmt.Errorf("%w: directory already exists: %s", filesystem.ErrAlreadyExists, path)
 	}
 
 	// Check if parent directory exists
@@ -320,7 +320,7 @@ func (fs *LocalFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
 	info, err := os.Stat(localPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("no such directory: %s", path)
+			return nil, fmt.Errorf("%w: no such directory: %s", filesystem.ErrNotFound, path)
 		}
 		return nil, fmt.Errorf("failed to stat: %w", err)
 	}

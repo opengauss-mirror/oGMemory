@@ -24,7 +24,7 @@ from core.errors import ConcurrentModificationError, OperationDeadlineExceededEr
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
-from core.operation_deadline import check_deadline, remaining_seconds
+from core.operation_deadline import check_deadline, remaining_seconds, write_outcome_confirmation
 
 logger = get_logger(__name__)
 
@@ -198,7 +198,9 @@ class ContextWriter:
                     committed = recover_receipt()
                     return committed or commit(candidate, ctx)
             return commit(candidate, ctx)
-        except OperationDeadlineExceededError:
+        except OperationDeadlineExceededError as exc:
+            if not persistence_started:
+                raise WriteDeadlineExceededError(str(exc)) from exc
             raise
         except Exception as exc:
             if not candidate.write_operation_id:
@@ -207,7 +209,11 @@ class ContextWriter:
                           or isinstance(exc, WriteOutcomeUnknownError) else WriteNotStartedError)
             if resolver is not None:
                 try:
-                    committed = recover_receipt()
+                    if persistence_started:
+                        with write_outcome_confirmation():
+                            committed = recover_receipt()
+                    else:
+                        committed = recover_receipt()
                 except Exception as read_exc:
                     raise error_type(str(exc)) from read_exc
                 if committed is not None:

@@ -16,7 +16,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
@@ -37,6 +37,7 @@ from core.errors import (
 )
 from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.operation_deadline import check_deadline
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
     RootBindingError,
@@ -1180,8 +1181,7 @@ class AGFSContextFS:
 
     @staticmethod
     def _is_not_found_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return any(text in message for text in ("no such file", "no such directory", "not found"))
+        return _is_not_found_error(exc)
 
     def _resource_mutation_lock_path(self, node_path: str) -> str:
         final_path = PurePosixPath(node_path.rstrip("/"))
@@ -2601,7 +2601,37 @@ class AGFSContextFS:
         meta.update(extra_meta)
         return meta
 
+    def _read_node_snapshot(
+        self, uri: str, ctx: RequestContext, read: Callable[[], tuple[ContextNode, str]],
+    ) -> ContextNode:
+        """Read payload fields from one completed node publication."""
+        self._ensure_accessible(uri, ctx)
+        node_path = self._uri_to_agfs_path(uri)
+        final_path = PurePosixPath(node_path.rstrip("/"))
+        lock_path = str(final_path.parent) + f"/.{final_path.name}.update-lock"
+        marker_path = lock_path + "/transaction.json"
+        deadline = time.monotonic() + _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS
+        observed_version = 0
+        while True:
+            check_deadline()
+            marker = self._read_update_marker(marker_path)
+            expected = marker.get("expected_version") if marker is not None else None
+            if (marker is None or type(expected) is int
+                    and self._read_node_version(node_path) > expected):
+                node, metadata = read()
+                observed_version = node.metadata.get("version", 0)
+                if (self._read_update_marker(marker_path) == marker
+                        and self._read_file(node_path + self.FILE_META) == metadata):
+                    return node
+            if time.monotonic() >= deadline:
+                raise ConcurrentModificationError(uri, observed_version, self._read_node_version(node_path))
+            time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
+
+
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
+        return self._read_node_snapshot(uri, ctx, lambda: self._read_node_once(uri, ctx))
+
+    def _read_node_once(self, uri: str, ctx: RequestContext) -> tuple[ContextNode, str]:
         """Read a node from AGFS.
 
         Args:
@@ -2678,13 +2708,17 @@ class AGFSContextFS:
             overview=overview,
             content=content,
             metadata=metadata,
-        )
+        ), meta_content
+
 
     def read_node_fields(self, uri: str, ctx: RequestContext, level: str) -> ContextNode:
         """Read only the MCP-requested detail fields for a node."""
 
         if level not in {"abstract", "overview", "content", "all"}:
             raise ValueError("level must be one of: abstract, overview, content, all")
+        return self._read_node_snapshot(uri, ctx, lambda: self._read_node_fields_once(uri, ctx, level))
+
+    def _read_node_fields_once(self, uri: str, ctx: RequestContext, level: str) -> tuple[ContextNode, str]:
         self._ensure_accessible(uri, ctx)
         if self.is_tombstoned(uri, ctx):
             raise NodeNotFoundError(uri)
@@ -2692,7 +2726,8 @@ class AGFSContextFS:
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
         try:
-            meta = json.loads(self._read_file(meta_path))
+            meta_content = self._read_file(meta_path)
+            meta = json.loads(meta_content)
         except NodeNotFoundError:
             raise NodeNotFoundError(uri)
 
@@ -2728,7 +2763,8 @@ class AGFSContextFS:
             overview=overview,
             content=content,
             metadata=metadata,
-        )
+        ), meta_content
+
 
     def exists(self, uri: str, ctx: RequestContext) -> bool:
         """Check if node exists and is ACTIVE.
