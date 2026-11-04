@@ -2508,12 +2508,14 @@ class AGFSContextFS:
         )
         layout = self._session_state_layout(node, relations_json)
         reuse_static = False
-        if layout is not None and mutation_lease is not None:
+        stored_meta = {}
+        if _SESSION_STATE_PATTERN.fullmatch(node.uri):
             try:
                 stored_meta = json.loads(self._read_file(node_path + self.FILE_META))
             except (NodeNotFoundError, json.JSONDecodeError):
                 stored_meta = {}
-            reuse_static = (isinstance(stored_meta, dict)
+            reuse_static = (layout is not None and mutation_lease is not None
+                            and isinstance(stored_meta, dict)
                             and stored_meta.get("status") == NodeStatus.ACTIVE.value
                             and stored_meta.get("uri") == node.uri
                             and stored_meta.get("session_state_layout") == layout)
@@ -2523,6 +2525,11 @@ class AGFSContextFS:
         write_file(content_path, node.content)
 
         if not reuse_static:
+            if isinstance(stored_meta, dict) and "session_state_layout" in stored_meta:
+                # Retire the committed fingerprint before replacing its static files.
+                stored_meta.pop("session_state_layout")
+                write_file(node_path + self.FILE_META,
+                           json.dumps(stored_meta, ensure_ascii=False, indent=2))
             write_file(relations_path, relations_json)
             write_file(abstract_path, node.abstract)
             write_file(overview_path, node.overview)

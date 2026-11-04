@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from core.models import RequestContext
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from session.session_manager import SessionManager
@@ -24,6 +26,42 @@ def state_stack():
 def published(operations):
     return [entry[2].rsplit("/", 1)[-1] for entry in operations
             if entry[0] == "mv" and "/.publish-" in entry[1]]
+
+
+@pytest.mark.parametrize("publication", [".overview.md", ".meta.json"])
+def test_original_layout_restored_after_interrupted_static_update(monkeypatch, publication):
+    client, fs, ctx, manager, buffer, uri = state_stack()
+    assert manager.save_session_state(ctx.session_id, ctx)
+    original = fs.read_node(uri, ctx)
+    changed = fs.read_node(uri, ctx)
+    changed.abstract = "Updated task summary"
+    changed.overview = "Updated task overview"
+    move = client.mv
+    path = fs._uri_to_agfs_path(uri)
+
+    def interrupt_publication(source, destination, *args, **kwargs):
+        if (destination == path + publication
+                and fs._read_file(path + fs.FILE_ABSTRACT) == changed.abstract):
+            raise OSError("metadata publication interrupted")
+        return move(source, destination, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(client, "mv", interrupt_publication)
+        with fs.session_recovery_lock(uri, ctx):
+            with pytest.raises(OSError, match="metadata publication interrupted"):
+                fs.write_node(changed, ctx)
+    recovered_fs = AGFSContextFS(client)
+    recovered_manager = SessionManager(get_context_fs=lambda: recovered_fs)
+    recovered_manager.get_or_create(ctx.session_id, ctx)
+    assert recovered_manager.load_session_state(ctx.session_id, ctx)
+    with recovered_fs.session_recovery_lock(uri, ctx):
+        assert recovered_manager.save_session_state(ctx.session_id, ctx)
+    restored = recovered_fs.read_node(uri, ctx)
+    assert (restored.abstract, restored.overview) == (original.abstract, original.overview)
+    start = len(client.operations)
+    with recovered_fs.session_recovery_lock(uri, ctx):
+        assert recovered_manager.save_session_state(ctx.session_id, ctx)
+    assert published(client.operations[start:]) == ["content.md", ".meta.json"]
 
 
 def test_twenty_two_saves_publish_forty_seven_state_files():
@@ -80,7 +118,7 @@ def test_updated_static_layout_is_published_then_reused():
         node.overview = "Current session tasks, commitments and extraction progress."
         start = len(client.operations)
         fs.write_node(node, ctx)
-        assert published(client.operations[start:]) == ["content.md", ".relations.json", ".abstract.md", ".overview.md", ".meta.json"]
+        assert published(client.operations[start:]) == ["content.md", ".meta.json", ".relations.json", ".abstract.md", ".overview.md", ".meta.json"]
         start = len(client.operations)
         fs.write_node(node, ctx)
         assert published(client.operations[start:]) == ["content.md", ".meta.json"]
