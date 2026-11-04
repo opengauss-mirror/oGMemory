@@ -60,7 +60,7 @@
         </div>
         <section class="model-usage-section" aria-labelledby="model-usage-title">
           <div class="dashboard-section-head">
-            <div><h2 id="model-usage-title">模型用量</h2><p id="metrics-scope">当前账户的 LLM 与 Embedding Token 使用情况。</p></div>
+            <div><h2 id="model-usage-title">模型用量</h2><p id="metrics-scope">当前账户的 LLM、Embedding 与 Decision Token 使用情况。</p></div>
             <span id="metrics-updated">最近 14 天</span>
           </div>
           <div id="metrics-status" class="metrics-status" hidden></div>
@@ -68,7 +68,7 @@
             <article>
               <span>今日 Token</span>
               <strong id="metrics-today-total">—</strong>
-              <small><b id="metrics-today-llm">—</b> LLM · <b id="metrics-today-embedding">—</b> Embedding</small>
+              <small><b id="metrics-today-llm">—</b> LLM · <b id="metrics-today-embedding">—</b> Embedding · <b id="metrics-today-decision">—</b> Decision</small>
             </article>
             <article>
               <span>LLM</span>
@@ -82,11 +82,18 @@
               <small><b id="metrics-embedding-calls">—</b> 次归因调用 · 平均 <b id="metrics-embedding-average">—</b> Token</small>
               <code id="metrics-embedding-model">—</code>
             </article>
+            <article>
+              <span>Decision</span>
+              <strong id="metrics-decision-total_tokens">—</strong>
+              <small><b id="metrics-decision-input_tokens">—</b> 输入 · <b id="metrics-decision-output_tokens">—</b> 输出 · <b id="metrics-decision-calls">—</b> 次调用</small>
+              <small><b id="metrics-decision-failed_calls">—</b> 次失败 · <b id="metrics-decision-missing_usage_calls">—</b> 次用量缺失</small>
+              <code id="metrics-decision-model">—</code>
+            </article>
           </div>
           <article class="token-trend-panel">
             <div class="token-trend-head">
               <div><h3>Token 趋势</h3><p>按 UTC 日期统计；Token 以模型返回的用量为准。</p></div>
-              <div class="token-legend"><span data-series="llm-input">LLM 输入</span><span data-series="llm-output">LLM 输出</span><span data-series="embedding">Embedding</span></div>
+              <div class="token-legend"><span data-series="llm-input">LLM 输入</span><span data-series="llm-output">LLM 输出</span><span data-series="embedding">Embedding</span><span data-series="decision-input">Decision 输入</span><span data-series="decision-output">Decision 输出</span></div>
             </div>
             <div id="token-trend-chart" class="token-trend-chart" role="img" aria-label="最近 14 天 Token 使用趋势">
               <div class="metrics-empty">正在加载模型用量…</div>

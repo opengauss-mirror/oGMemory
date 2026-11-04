@@ -11,6 +11,7 @@ from core.errors import OperationDeadlineExceededError
 from core.operation_deadline import check_deadline, remaining_seconds
 
 from .config import DecisionConfig
+from .usage import DecisionTokenTracker
 
 
 class DecisionError(ValueError):
@@ -107,6 +108,7 @@ def _parse_response(raw, questions, kind):
 class JevDecisionClient:
     def __init__(self, config: DecisionConfig, *, transport=None):
         self.config = config
+        self.token_tracker = DecisionTokenTracker(config.model)
         self._transport = transport if transport is not None else self._post
         base = config.base_url.rstrip("/")
         self.endpoint = (
@@ -134,12 +136,18 @@ class JevDecisionClient:
         with _open_once(request, timeout=timeout) as response:
             return json.load(response)
 
-    def _request(self, payload):
+    def _request(self, payload, questions, kind):
         check_deadline()
         started = time.perf_counter()
+        raw, failed = None, True
         try:
             raw = self._transport(payload)
+            answers, choices = _parse_response(raw, questions, kind)
+            failed = False
         except OperationDeadlineExceededError:
+            raise
+        except DecisionError:
+            check_deadline()
             raise
         except Exception as exc:
             check_deadline()
@@ -151,8 +159,10 @@ class JevDecisionClient:
             )
             error.status_code = exc.code if isinstance(exc, HTTPError) else None
             raise error from None
+        finally:
+            self.token_tracker.record_response(raw, failed=failed)
         check_deadline()
-        return raw, time.perf_counter() - started
+        return raw, time.perf_counter() - started, answers, choices
 
     def evaluate(self, state, questions):
         return self._evaluate(state, questions, "noul")
@@ -174,6 +184,5 @@ class JevDecisionClient:
             raise DecisionError("Decision input must be finite JSON") from None
         if not questions:
             return DecisionBatch({}, {}, {}, 0.0)
-        raw, seconds = self._request(payload)
-        answers, choices = _parse_response(raw, questions, kind)
+        raw, seconds, answers, choices = self._request(payload, questions, kind)
         return DecisionBatch(answers, choices, raw, seconds)
