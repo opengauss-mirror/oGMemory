@@ -34,7 +34,7 @@ _SKILL_PATTERNS: list[re.Pattern[str]] = [
 _RESOURCE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"文档|资料|规范|链接|document|spec|reference|link|paper|article",
+        r"文档|资料|规范|链接|\b(?:document|spec|reference|link|paper|article)\b",
     ]
 ]
 

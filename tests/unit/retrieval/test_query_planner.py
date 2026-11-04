@@ -50,6 +50,35 @@ class TestQueryPlanner:
         assert len(queries) == 1
         assert queries[0].context_type == "RESOURCE"
 
+    @pytest.mark.parametrize("query", [
+        "What are John's suspected health problems?",
+        "Who is the most respected person in John's family?",
+        "When did John add a hyperlink?",
+        "Which newspaper does John read?",
+    ])
+    def test_resource_keyword_inside_word_does_not_change_memory_routing(self, planner, ctx, query):
+        queries = planner.plan(query, ctx)
+        assert len(queries) == 1
+        assert queries[0].context_type == "MEMORY"
+        assert queries[0].text == query
+
+    @pytest.mark.parametrize("query", [
+        "SPEC",
+        "Find the (document).",
+        "Find a reference.",
+        "Find the link.",
+        "Find the paper.",
+        "Find the article.",
+        "请提供相关文档",
+        "请提供相关资料",
+        "请提供相关规范",
+        "请提供相关链接",
+    ])
+    def test_standalone_resource_keywords(self, planner, ctx, query):
+        queries = planner.plan(query, ctx)
+        assert len(queries) == 1
+        assert queries[0].context_type == "RESOURCE"
+
     def test_ambiguous_falls_back_to_triple(self, planner, ctx):
         queries = planner.plan("hello world", ctx)
         # Ambiguous queries now default to MEMORY only (not triple-query)
