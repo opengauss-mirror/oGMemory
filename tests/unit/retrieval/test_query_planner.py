@@ -55,6 +55,11 @@ class TestQueryPlanner:
         "Who is the most respected person in John's family?",
         "When did John add a hyperlink?",
         "Which newspaper does John read?",
+        "Which documentary did John watch?",
+        "Which value did John dereference?",
+        "What particles did John study?",
+        "Which newspapers does John read?",
+        "When did John add hyperlinks?",
     ])
     def test_resource_keyword_inside_word_does_not_change_memory_routing(self, planner, ctx, query):
         queries = planner.plan(query, ctx)
@@ -69,6 +74,13 @@ class TestQueryPlanner:
         "Find the link.",
         "Find the paper.",
         "Find the article.",
+        "Find documents",
+        "Find specs",
+        "Find references",
+        "Find links",
+        "Find papers",
+        "Find articles",
+        "Find the (DOCUMENTS).",
         "请提供相关文档",
         "请提供相关资料",
         "请提供相关规范",
