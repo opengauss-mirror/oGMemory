@@ -109,6 +109,13 @@ def tq():
     )
 
 
+class _VecIdx:
+    """Minimal vector index stub for fail-fast config tests."""
+
+    def search_by_vector(self, query_vector, filters, top_k):
+        return []
+
+
 class TestSeedRetriever:
     def test_returns_seed_result(self, retriever, tq, ctx):
         result = retriever.search(tq, ctx)
@@ -541,6 +548,66 @@ class TestSeedRetriever:
         assert lexical.filters["account_id"] == "acct-1"
         assert "user_u1" in lexical.filters["owner_space"]
 
+    def test_hybrid_without_backfill_coordinator_fails_fast(self, embedder, ctx):
+        """P1-2 regression: missing lexical backfill coordinator is a
+        MISCONFIGURATION — it must raise, not silently degrade to
+        vector-only results."""
+
+        class LexicalIndex:
+            supported_filters = frozenset({"account_id", "owner_space"})
+
+            def search(self, *a, **k):
+                return []
+
+        cfg = RetrievalConfig(hybrid_enabled=True, lexical_weight=0.5)
+        query = TypedQuery(
+            text="hybrid", context_type="MEMORY", categories=[], top_k=2,
+            account_id="acct-1", owner_space="user_u1",
+        )
+        r = SeedRetriever(_VecIdx(), embedder, cfg, LexicalIndex())
+        with pytest.raises(RuntimeError, match="lexical backfill coordinator"):
+            r.search(query, ctx)
+
+    def test_hybrid_backfill_not_ready_fails_fast(self, embedder, ctx):
+        """P1-2 regression: backfill refusing ready-state is a
+        misconfiguration signal — raise, don't degrade."""
+
+        class LexicalIndex:
+            supported_filters = frozenset({"account_id", "owner_space"})
+
+            def search(self, *a, **k):
+                return []
+
+        cfg = RetrievalConfig(hybrid_enabled=True, lexical_weight=0.5)
+        query = TypedQuery(
+            text="hybrid", context_type="MEMORY", categories=[], top_k=2,
+            account_id="acct-1", owner_space="user_u1",
+        )
+        backfill = SimpleNamespace(ensure_ready=lambda _ctx, _scopes: False)
+        r = SeedRetriever(_VecIdx(), embedder, cfg, LexicalIndex(), backfill)
+        with pytest.raises(RuntimeError, match="backfill is not ready"):
+            r.search(query, ctx)
+
+    def test_hybrid_provider_missing_security_filters_fails_fast(self, embedder, ctx):
+        """P1-2 regression: a lexical provider without account/owner-space
+        security filters is a misconfiguration — raise, don't degrade."""
+
+        class UnsafeLexicalIndex:
+            supported_filters = frozenset({"account_id"})
+
+            def search(self, *a, **k):
+                return []
+
+        cfg = RetrievalConfig(hybrid_enabled=True, lexical_weight=0.5)
+        query = TypedQuery(
+            text="hybrid", context_type="MEMORY", categories=[], top_k=2,
+            account_id="acct-1", owner_space="user_u1",
+        )
+        backfill = SimpleNamespace(ensure_ready=lambda _ctx, _scopes: True)
+        r = SeedRetriever(_VecIdx(), embedder, cfg, UnsafeLexicalIndex(), backfill)
+        with pytest.raises(RuntimeError, match="security filters"):
+            r.search(query, ctx)
+
     def test_zero_lexical_weight_skips_backfill_and_bm25(self, embedder, ctx):
         class VectorIndex:
             def search_by_vector(self, query_vector, filters, top_k):
@@ -696,3 +763,119 @@ class TestSeedRetriever:
         assert "ctx://other/users/u1/memories/leak" not in uris
         assert "ctx://acct-1/users/u2/memories/leak" not in uris
         assert "ctx://acct-1/users/u1/memories/good" in uris
+
+
+class TestDegradeOnEmbedFailure:
+    """WS 3.4: embed failures degrade to BM25-only retrieval, never raise."""
+
+    def _bm25_index(self):
+        """A minimal BM25 index stub matching the .search() interface."""
+
+        def _hit(uri, level, parent, score):
+            return SimpleNamespace(
+                score=score,
+                metadata={
+                    "uri": uri,
+                    "level": level,
+                    "parent_uri": parent,
+                    "context_type": "MEMORY",
+                    "category": "profile",
+                    "owner_space": "user_u1",
+                    "account_id": "acct-1",
+                },
+            )
+
+        class _Idx:
+            doc_count = 3
+            supported_filters = {"account_id", "owner_space"}
+
+            def search(self, query, top_k, filters):
+                return [
+                    _hit(
+                        "ctx://acct-1/users/u1/memories/profile", 1,
+                        "ctx://acct-1/users/u1/memories", 1.5,
+                    ),
+                    _hit(
+                        "ctx://acct-1/users/u1/memories/profile/detail", 2,
+                        "ctx://acct-1/users/u1/memories/profile", 1.2,
+                    ),
+                ]
+
+        return _Idx()
+
+    def test_embed_failure_degrades_to_bm25_only(self, cfg, ctx, tq):
+        from unittest.mock import Mock
+
+        class ExplodingEmbedder:
+            dimension = 8
+
+            def embed_texts(self, texts, **kwargs):
+                raise RuntimeError("embedder down")
+
+        r = SeedRetriever(
+            Mock(), ExplodingEmbedder(), cfg, bm25_index=self._bm25_index()
+        )
+        result = r.search(tq, ctx)
+
+        # No raise; BM25 level-2 hits survive as candidates.
+        assert result.query_vector == []
+        assert result.initial_candidates
+        uris = {h.uri for h in result.initial_candidates}
+        assert "ctx://acct-1/users/u1/memories/profile/detail" in uris
+        # Review item 7: with no query vector there must be NO hierarchy
+        # expansion — starting points would drive search_children into
+        # cosine SQL against []::vector, which pgvector cannot execute.
+        # Lexical L2 hits only, no semantic traversal.
+        assert result.starting_points == []
+        assert result.root_uris == []
+
+    def test_embed_and_bm25_failure_returns_empty_not_raise(self, cfg, ctx, tq):
+        from unittest.mock import Mock
+
+        class ExplodingEmbedder:
+            dimension = 8
+
+            def embed_texts(self, texts, **kwargs):
+                raise RuntimeError("embedder down")
+
+        class ExplodingBM25:
+            doc_count = 3
+
+            def search(self, *args, **kwargs):
+                raise RuntimeError("bm25 down")
+
+        r = SeedRetriever(
+            Mock(), ExplodingEmbedder(), cfg, bm25_index=ExplodingBM25()
+        )
+        result = r.search(tq, ctx)
+        assert result.initial_candidates == []
+        # Total outage: empty result, no raise — and no starting points
+        # (review item 7: score-0 root starting points are unusable
+        # without a query vector; they would only push []::vector into
+        # the SQL hierarchy search).
+        assert result.starting_points == []
+        assert result.root_uris == []
+
+    def test_pipeline_run_seed_falls_back_to_root_uris(self, cfg, ctx, tq):
+        """RetrievalPipeline._run_seed must not re-raise when search fails."""
+        from unittest.mock import Mock
+
+        from retrieval.pipeline import RetrievalPipeline
+
+        class ExplodingRetriever:
+            def search(self, tq, ctx, mode="quick"):
+                raise RuntimeError("total outage")
+
+        pipeline = RetrievalPipeline.__new__(RetrievalPipeline)
+        trace = Mock()
+
+        result = pipeline._run_seed(tq, ctx, trace, mode="quick")
+
+        assert result.query_vector == []
+        assert result.initial_candidates == []
+        assert result.root_uris  # rooted at the typed query's roots
+        for hit in result.starting_points:
+            assert hit.score == 0.0
+        assert all(
+            hit.uri in result.root_uris for hit in result.starting_points
+        )

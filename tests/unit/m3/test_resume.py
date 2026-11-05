@@ -407,7 +407,8 @@ def test_build_graph_service_sql_with_connection_string(monkeypatch):
 
     sentinel = MagicMock()
     monkeypatch.setattr(
-        "providers.graph_store.SQLGraphStore", lambda connection_string: sentinel
+        "providers.graph_store.SQLGraphStore",
+        lambda connection_string, **kwargs: sentinel,
     )
 
     graph, kind = resume.build_graph_service(
@@ -416,6 +417,25 @@ def test_build_graph_service_sql_with_connection_string(monkeypatch):
     assert kind == "sql"
     assert isinstance(graph, GraphService)
     assert graph._store is sentinel  # type: ignore[attr-defined]
+
+
+def test_build_graph_service_sql_pool_size_env(monkeypatch):
+    """OGMEM_GRAPH_POOL_SIZE sizes the SQLGraphStore connection pool.
+
+    The pool must be >= the parallel-clip worker count or worker
+    threads serialize on pool checkout.
+    """
+    store_cls = MagicMock()
+    monkeypatch.setattr("providers.graph_store.SQLGraphStore", store_cls)
+    dsn = "postgresql://user:pw@host:5432/db"
+
+    monkeypatch.setenv("OGMEM_GRAPH_POOL_SIZE", "17")
+    resume.build_graph_service("sql", dsn)
+    assert store_cls.call_args.kwargs["pool_size"] == 17
+
+    monkeypatch.delenv("OGMEM_GRAPH_POOL_SIZE")
+    resume.build_graph_service("sql", dsn)
+    assert store_cls.call_args.kwargs["pool_size"] == 32
 
 
 def test_build_graph_service_unknown_kind_raises():

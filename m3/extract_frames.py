@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import logging
@@ -36,6 +37,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
+from m3._parallel import UnitError, parallel_clips
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.resume_status import is_completed_extraction
 
@@ -281,6 +283,11 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
 
     only_videos = set(args.video.split(",")) if args.video else None
 
+    # Flatten the (video, clip) pairs into per-clip descriptors; each
+    # worker opens its own cv2.VideoCapture, so decode concurrency is
+    # limited only by cores. The main thread serialises output writes
+    # in input order.
+    clips: list[dict] = []
     for video_record in manifest_records:
         video_id = video_record["id"]
         if only_videos and video_id not in only_videos:
@@ -294,39 +301,57 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                     raw_record["raw_node_id"], video_id, clip_id,
                 )
                 continue
-            try:
-                result = extract_frames_for_clip(
-                    op_service=op_service, graph=graph, ctx=ctx,
-                    video_raw_node=video_node,
-                    video_id=video_id,
-                    clip_id=clip_id,
-                    frames_root=frames_root,
-                    fps=args.fps,
-                    max_frames=args.max_frames,
-                    keyframe_threshold=args.keyframe_threshold,
-                    resize=args.resize,
-                    jpeg_quality=args.jpeg_quality,
-                    keyframes_only=args.keyframes_only,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Frame extraction failed for %s clip %d", video_id, clip_id,
-                )
-                failed.append({"video_id": video_id, "clip_id": clip_id, "error": str(exc)})
-                continue
+            clips.append({
+                "video_id": video_id,
+                "clip_id": clip_id,
+                "video_node": video_node,
+            })
 
-            output_lines.append(json.dumps({
-                "video_id": result["video_id"],
-                "clip_id": result["clip_id"],
-                "video_raw_node_id": result["video_raw_node_id"],
-                "extracted_node_id": result["extracted_node_id"],
-                "child_node_ids": result["child_node_ids"],
-                "child_count": result["child_count"],
-                "resumed": result["resumed"],
-            }, ensure_ascii=False))
-            total_children += result["child_count"]
-            if not result["resumed"]:
-                total_extractions += 1
+    def _unit(clip: dict) -> dict:
+        video_id = clip["video_id"]
+        clip_id = clip["clip_id"]
+        clip_ctx = dataclasses.replace(
+            ctx, trace_id=f"{ctx.trace_id}-{video_id}-{clip_id}"
+        )
+        return extract_frames_for_clip(
+            op_service=op_service, graph=graph, ctx=clip_ctx,
+            video_raw_node=clip["video_node"],
+            video_id=video_id,
+            clip_id=clip_id,
+            frames_root=frames_root,
+            fps=args.fps,
+            max_frames=args.max_frames,
+            keyframe_threshold=args.keyframe_threshold,
+            resize=args.resize,
+            jpeg_quality=args.jpeg_quality,
+            keyframes_only=args.keyframes_only,
+        )
+
+    for clip, result in parallel_clips(clips, _unit):
+        if isinstance(result, UnitError):
+            logger.error(
+                "Frame extraction failed for %s clip %s: %s",
+                clip["video_id"], clip["clip_id"], result,
+                exc_info=result.exception,
+            )
+            failed.append({
+                "video_id": clip["video_id"],
+                "clip_id": clip["clip_id"],
+                "error": str(result),
+            })
+            continue
+        output_lines.append(json.dumps({
+            "video_id": result["video_id"],
+            "clip_id": result["clip_id"],
+            "video_raw_node_id": result["video_raw_node_id"],
+            "extracted_node_id": result["extracted_node_id"],
+            "child_node_ids": result["child_node_ids"],
+            "child_count": result["child_count"],
+            "resumed": result["resumed"],
+        }, ensure_ascii=False))
+        total_children += result["child_count"]
+        if not result["resumed"]:
+            total_extractions += 1
 
     with output_jsonl.open("w", encoding="utf-8") as f:
         for line in output_lines:

@@ -64,21 +64,13 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         self._ensure_table()
 
     # ------------------------------------------------------------------
-    # Connection pool (standalone fallback — used when pool=None)
+    # Connection pool: PoolAdapterMixin provides the bounded standalone
+    # pool; _create_connection uses this module's psycopg2 so unit tests
+    # that patch it keep working.
     # ------------------------------------------------------------------
 
-    def _get_connection(self):
-        if self._pool:
-            conn = self._pool.pop()
-            if conn.closed == 0:
-                return conn
+    def _create_connection(self):
         return psycopg2.connect(self._connection_string)
-
-    def _return_connection(self, conn):
-        if len(self._pool) < self._pool_size and conn.closed == 0:
-            self._pool.append(conn)
-        else:
-            conn.close()
 
     # ------------------------------------------------------------------
     # Schema
