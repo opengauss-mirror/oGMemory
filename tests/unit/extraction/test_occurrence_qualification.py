@@ -54,8 +54,8 @@ class QualificationProvider:
 
     def complete_json(self, prompt, schema):
         # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-        if set(schema.get("properties", {})) == {"categories"}:
-            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
+        if set(schema.get("properties", {})) == {"categories", "shared_tools"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
         self.calls.append(prompt)
         if "operations" in schema.get("properties", {}):
             return {"operations": [{"tool": self.operation["name"],
@@ -341,8 +341,8 @@ def test_single_span_native_case_aliases_reconcile_one_complete_target_before_wr
 
     def complete_json(prompt, schema):
         # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-        if set(schema.get("properties", {})) == {"categories"}:
-            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
+        if set(schema.get("properties", {})) == {"categories", "shared_tools"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
         llm.calls.append(prompt)
         if "valid" in schema["properties"]:
             return {"valid": True}
@@ -425,8 +425,8 @@ def test_existing_facts_in_native_event_revision_use_stored_evidence_before_sour
 
     def complete_json(prompt, schema):
         # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-        if set(schema.get("properties", {})) == {"categories"}:
-            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
+        if set(schema.get("properties", {})) == {"categories", "shared_tools"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
         llm.calls.append(prompt)
         if "groups" in schema["properties"]:
             # These correct prior facts cannot be established by the new correction alone.

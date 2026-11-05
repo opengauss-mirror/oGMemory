@@ -9,7 +9,7 @@ import pytest
 from core.errors import LLMCallError, LLMOutputTruncatedError, ToolCallProtocolError
 from core.models import RequestContext
 from extraction.prefetch import PrefetchResult
-from extraction.prompt_assembly import assemble_prepared, tools_for_categories
+from extraction.prompt_assembly import assemble_prepared
 from extraction.tools import Extractor, _PreparedSpan, _Span
 from providers.llm.mock_llm import MockLLM
 
@@ -17,7 +17,7 @@ from providers.llm.mock_llm import MockLLM
 @pytest.fixture
 def task():
     extractor = Extractor(MockLLM())
-    extractor._llm.complete_json = Mock(return_value={"categories": ["entity"]})
+    extractor._llm.complete_json = Mock(return_value={"categories": ["entity"], "shared_tools": []})
     ctx = RequestContext("acct", "user", "agent", "session", "trace")
     source = "user: Project Beacon uses PostgreSQL."
     reads = PrefetchResult(messages=["EXISTING MEMORY SNAPSHOT"], read_versions={"old-uri": 4})
@@ -27,12 +27,13 @@ def task():
     return extractor, _PreparedSpan(span, prompt, "sha", source), ctx
 
 
-def test_selection_contract_only_contains_categories(task):
+def test_selection_contract_contains_categories_and_optional_shared_tools(task):
     extractor, prepared, ctx = task
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     request = extractor._llm.complete_json.call_args
     schema = request.kwargs["schema"]
-    assert set(schema["properties"]) == {"categories"}
+    assert set(schema["properties"]) == {"categories", "shared_tools"}
     assert schema["additionalProperties"] is False
     assert "Project Beacon uses PostgreSQL" in request.args[0]
     assert "EXISTING MEMORY SNAPSHOT" not in request.args[0]
@@ -45,7 +46,8 @@ def test_selection_contract_only_contains_categories(task):
 def test_assembly_preserves_source_and_all_existing_read_authority(task):
     extractor, prepared, ctx = task
     original_reads = prepared.span.prefetch_result
-    prompt, _ = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, _ = request.prompt, request.tools
     assert prepared.source_context in prompt
     assert "EXISTING MEMORY SNAPSHOT" in prompt
     assert prepared.span.prefetch_result is original_reads
@@ -64,13 +66,14 @@ def test_shared_selection_survives_recovery_copies_and_concurrent_passes(task):
     extractor._llm.complete_json.assert_called_once()
 
 
-@pytest.mark.parametrize("result", [{"categories": []}, {"categories": ["missing"]},
+@pytest.mark.parametrize("result", [{"categories": []}, {"categories": ["missing"], "shared_tools": []},
                                      {"categories": ["entity"], "target_uri": "invented"},
                                      {"operations": []}])
 def test_invalid_selection_keeps_all_available_tools_instead_of_skipping(task, result):
     extractor, prepared, ctx = task
     extractor._llm.complete_json.return_value = result
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     assert prompt == prepared.prompt
     assert tools == extractor._extraction_tools
 
@@ -78,7 +81,8 @@ def test_invalid_selection_keeps_all_available_tools_instead_of_skipping(task, r
 def test_truncated_selection_falls_back_without_losing_facts(task):
     extractor, prepared, ctx = task
     extractor._llm.complete_json.side_effect = LLMOutputTruncatedError("length")
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     assert prepared.source_context in prompt
     assert tools == extractor._extraction_tools
 
@@ -94,20 +98,24 @@ def test_provider_error_is_shared_and_propagates(task):
     extractor._llm.complete_json.assert_called_once()
 
 
-def test_add_only_selection_does_not_offer_incremental_tools(task):
-    extractor, _, _ = task
-    tools = tools_for_categories(extractor._extraction_tools, extractor._schema_registry, {"event"})
-    assert [t["name"] for t in tools] == ["extract_event"]
+def test_add_only_selection_retains_fixed_incremental_tools(task):
+    extractor, prepared, ctx = task
+    extractor._llm.complete_json.return_value = {"categories": ["event"], "shared_tools": []}
+    request = assemble_prepared(extractor, prepared, ctx)
+    assert {t["name"] for t in request.tools} == {"extract_event", "edit_memory", "append_memory"}
+    assert "── event (" in request.prompt and "── profile (" not in request.prompt
+    assert "FACT" in request.prompt
 
 
 def test_lazy_run_uses_the_same_selected_rules_and_preserves_read_tools(task):
+    from core.uri_resolver import URIResolver
     from extraction.extraction_react_loop import ExtractionReActLoop
     from extraction.prompts import PromptManager
     from extraction.schemas.registry import SchemaRegistry
-    from core.uri_resolver import URIResolver
 
     extractor, prepared, ctx = task
     llm = extractor._llm
+    llm.complete_json.return_value = {"categories": ["entity"], "shared_tools": ["get_relations", "get_access_stats"]}
     llm.complete_with_tools_messages = Mock(return_value=([], "[]"))
     registry = SchemaRegistry()
     loop = ExtractionReActLoop(llm, Mock(), registry, URIResolver(registry), PromptManager())
@@ -120,15 +128,18 @@ def test_lazy_run_uses_the_same_selected_rules_and_preserves_read_tools(task):
     assert "── entity (" in messages[0]["content"]
     assert "── profile (" not in messages[0]["content"]
     assert "── event (" not in messages[0]["content"]
+    assert "If entity is actually about the user" in messages[0]["content"]
+    assert "PRESERVE all specific details" in messages[0]["content"]
     llm.complete_json.assert_called_once()
 
 
 def test_lazy_final_json_cannot_emit_an_unselected_category(task):
+    import json
+
+    from core.uri_resolver import URIResolver
     from extraction.extraction_react_loop import ExtractionReActLoop
     from extraction.prompts import PromptManager
     from extraction.schemas.registry import SchemaRegistry
-    from core.uri_resolver import URIResolver
-    import json
 
     extractor, prepared, ctx = task
     llm = extractor._llm
@@ -147,8 +158,9 @@ def test_public_extraction_selects_once_and_keeps_recovery_scoped(mode, recover)
     """Exercise the real entry point, parser, two native passes and JSON recovery."""
     import json
     from datetime import datetime
-    from extraction.schemas.registry import SchemaRegistry
+
     from core.uri_resolver import URIResolver
+    from extraction.schemas.registry import SchemaRegistry
 
     statement = "Project Beacon uses PostgreSQL."
     operation = {"tool": "extract_entity", "input": {
@@ -161,8 +173,8 @@ def test_public_extraction_selects_once_and_keeps_recovery_scoped(mode, recover)
         if properties == {"spans"}:
             # Phase 1 is advisory; shared selection independently reads the complete source.
             return {"spans": [{"start": 0, "end": 0, "categories": ["profile"]}]}
-        if properties == {"categories"}:
-            return {"categories": ["entity"]}
+        if properties == {"categories", "shared_tools"}:
+            return {"categories": ["entity"], "shared_tools": []}
         assert properties == {"operations"}
         return {"operations": [operation]}
     llm.complete_json.side_effect = respond
@@ -181,7 +193,7 @@ def test_public_extraction_selects_once_and_keeps_recovery_scoped(mode, recover)
     assert len(result) == 1 and result[0].content == statement
     assert result[0].provenance_ids
     selections = [call for call in llm.complete_json.call_args_list
-                  if set(call.kwargs["schema"]["properties"]) == {"categories"}]
+                  if set(call.kwargs["schema"]["properties"]) == {"categories", "shared_tools"}]
     assert len(selections) == 1
     if mode == "eager":
         assert llm.complete_with_tools.call_count == 2
@@ -196,13 +208,13 @@ def test_public_extraction_selects_once_and_keeps_recovery_scoped(mode, recover)
 
 
 def test_lazy_reusing_a_loop_does_not_leak_previous_selection(task):
+    from core.uri_resolver import URIResolver
     from extraction.extraction_react_loop import ExtractionReActLoop
     from extraction.prompts import PromptManager
-    from core.uri_resolver import URIResolver
 
     extractor, _, ctx = task
     llm = extractor._llm
-    llm.complete_json.side_effect = [{"categories": ["entity"]}, {"categories": ["event"]}]
+    llm.complete_json.side_effect = [{"categories": ["entity"], "shared_tools": []}, {"categories": ["event"], "shared_tools": []}]
     llm.complete_with_tools_messages = Mock(return_value=([], "[]"))
     registry = extractor._schema_registry
     loop = ExtractionReActLoop(llm, Mock(), registry, URIResolver(registry), PromptManager())
@@ -224,31 +236,39 @@ def test_separate_spans_do_not_mutate_shared_tools(task):
     import json
     extractor._llm.complete_json.side_effect = lambda prompt, schema: {
         "categories": ["entity" if "Beacon" in json.loads(prompt.split("\n\n", 1)[1])["source"]
-                       else "event"]}
+                       else "event"], "shared_tools": []}
     full_tools = list(extractor._extraction_tools)
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda span: assemble_prepared(extractor, span, ctx), [prepared, other]))
-    assert "extract_entity" in {t["name"] for t in results[0][1]}
-    assert "extract_entity" not in {t["name"] for t in results[1][1]}
+    assert "extract_entity" in {t["name"] for t in results[0].tools}
+    assert "extract_entity" not in {t["name"] for t in results[1].tools}
     assert extractor._extraction_tools == full_tools
 
 
 def test_custom_prompt_shape_keeps_full_assembly_and_source(task):
     extractor, prepared, ctx = task
     prepared.prompt = "CUSTOM RULES\n" + prepared.source_context
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
-    assert prompt == prepared.prompt
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
+    prefix = extractor._prefetch_prompt("", prepared.span.prefetch_result)
+    assert prompt == prefix + prepared.prompt
+    assert prepared.source_context in prompt
+    assert "EXISTING MEMORY SNAPSHOT" in prefix
     assert tools is extractor._extraction_tools
 
 
 def test_model_can_choose_an_update_after_selection_without_a_preplanned_target(task):
-    from tests.unit.extraction.test_memory_update_flow import setup_flow, ExtractionProvider, operation
     from tests.unit.commit.test_memory_identity import memory
+    from tests.unit.extraction.test_memory_update_flow import (
+        ExtractionProvider,
+        operation,
+        setup_flow,
+    )
 
     original = memory("beverage", category="preference", content="Prefers tea.", who="user")
     ctx, fs, registry, uri, embedder, index, _ = setup_flow("preference", original)
     llm = ExtractionProvider(operation("preference", "beverage", "Prefers green tea.", uri))
-    llm.complete_json = Mock(return_value={"categories": ["preference"]})
+    llm.complete_json = Mock(return_value={"categories": ["preference"], "shared_tools": []})
     from core.uri_resolver import URIResolver
     extractor = Extractor(llm, fs=fs, vector_index=index, embedder=embedder,
                           schema_registry=registry, uri_resolver=URIResolver(registry))
@@ -262,13 +282,13 @@ def test_model_can_choose_an_update_after_selection_without_a_preplanned_target(
 
 
 def test_generic_edit_tool_cannot_write_a_category_outside_the_selection():
+    from core.uri_resolver import URIResolver
     from extraction.extraction_react_loop import ExtractionReActLoop
     from extraction.prompts import PromptManager
     from tests.unit.extraction.test_incremental_edit_flow import eager_flow, edit
-    from core.uri_resolver import URIResolver
 
     ctx, fs, registry, uri, llm, extractor, _ = eager_flow()
-    llm.complete_json = Mock(return_value={"categories": ["entity"]})
+    llm.complete_json = Mock(return_value={"categories": ["entity"], "shared_tools": []})
     llm.complete_with_tools_messages = Mock(return_value=([], "[]"))
     loop = ExtractionReActLoop(llm, fs, registry, URIResolver(registry), PromptManager())
     loop.run("The project uses PostgreSQL.", ctx)
@@ -283,11 +303,12 @@ def test_time_anchored_source_with_tool_stats_is_preserved_and_can_be_scoped(tas
     prepared = extractor._prepare_span(_Span(0, 0, categories=["entity"]),
         [{"role": "user", "content": "Project Beacon uses PostgreSQL."}],
         "English", datetime(2026, 10, 28), "", "Some unrelated tool statistics", ctx)
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     assert "Project Beacon uses PostgreSQL." in prompt
     assert "2026-10-28" in prompt
     assert "── profile (" not in prompt
-    assert {t["name"] for t in tools} == {"extract_entity", "extract_tool", "edit_memory", "append_memory"}
+    assert {t["name"] for t in tools} == {"extract_entity", "edit_memory", "append_memory"}
 
 
 def test_custom_template_without_a_common_rule_boundary_keeps_full_text(task):
@@ -300,7 +321,8 @@ def test_custom_template_without_a_common_rule_boundary_keeps_full_text(task):
     prepared = extractor._prepare_span(_Span(0, 0, categories=["entity"]),
         [{"role": "user", "content": "Project Beacon uses PostgreSQL."}],
         "English", None, "", "", ctx)
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     assert prompt == prepared.prompt
     assert tools is extractor._extraction_tools
 

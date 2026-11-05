@@ -53,12 +53,12 @@ class NativeRelationsLLM:
 
     def complete_json(self, prompt, schema):
         properties = set(schema["properties"])
-        if properties == {"categories"}:
+        if properties == {"categories", "shared_tools"}:
             # Dev now selects schemas before graph-disabled extraction. Track
             # assembly separately from the extraction/reconciliation calls
             # pinned by this fixture's existing relation-provenance assertions.
             self.assembly_calls.append(properties)
-            return {"categories": [self.category]}
+            return {"categories": [self.category], "shared_tools": []}
         self.json_calls.append(properties)
         if properties == {"spans"}:
             return {"spans": [{"start": 0, "end": 0, "categories": [self.category]}]}

@@ -712,3 +712,40 @@ def test_spawn_failure_completes_claimed_source_synchronously(ctx, monkeypatch):
     assert not buf.messages
     assert not buf.pending_extraction_ids()
     assert buf.extraction_active_count == 0
+
+
+@pytest.mark.parametrize("node_processing", [False, True])
+def test_empty_extraction_survives_finish_failure_without_second_batch_state(ctx, node_processing):
+    """An accepted empty batch is a result, including after a process restart."""
+    fs = MemoryFS()
+    service, writer, manager = setup_service(fs, ctx, extract=lambda **kwargs: [])
+    writer._node_processing_enabled = node_processing
+    save = manager.save_session_state
+    failed = []
+
+    def fail_finish_once(session_id, request):
+        buffer = manager.get_or_create(session_id)
+        if writer._pipeline.extract.called and EXTENSION_KEY not in buffer.runtime_extensions and not failed:
+            failed.append(True)
+            return False
+        return save(session_id, request)
+
+    manager.save_session_state = fail_finish_once
+    assert service.after_turn(params(ctx))["status"] == "failed"
+    assert failed
+    assert not nodes(fs, 'event')
+    restarted, next_writer, next_manager = setup_service(
+        fs, ctx, extract=lambda **kwargs: pytest.fail('accepted empty result was extracted again'))
+    next_writer._node_processing_enabled = node_processing
+    assert restarted.after_turn(params(ctx))["status"] == "completed"
+    next_writer._pipeline.extract.assert_not_called()
+    assert next_manager.get_or_create(ctx.session_id).request_completed('original')
+    assert not nodes(fs, 'event')
+
+
+def test_empty_postprocessing_does_not_emit_a_fake_model_request(ctx):
+    from providers.llm_observation import capture_llm_events
+    service, _, _ = setup_service(MemoryFS(), ctx, extract=lambda **kwargs: [])
+    with capture_llm_events() as events:
+        assert service.after_turn(params(ctx))['status'] == 'completed'
+    assert not [e for e in events if e['event'] == 'request']

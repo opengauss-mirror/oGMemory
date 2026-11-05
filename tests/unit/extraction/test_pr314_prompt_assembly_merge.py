@@ -60,8 +60,8 @@ def _provider(graph_enabled, *, recover=False):
         properties = set(schema["properties"])
         if properties == {"spans"}:
             return {"spans": [{"start": 0, "end": 0, "categories": ["profile"]}]}
-        if properties == {"categories"}:
-            return {"categories": ["entity"]}
+        if properties == {"categories", "shared_tools"}:
+            return {"categories": ["entity"], "shared_tools": []}
         assert properties == {"operations"}
         return {"operations": operations}
 
@@ -125,7 +125,7 @@ def test_public_extraction_graph_contract_survives_scoping_and_recovery(
         assert proposals[0]["from_routing_key"] == PROPOSAL["from_routing_key"]
 
     selections = [call for call in llm.complete_json.call_args_list
-                  if set(call.kwargs["schema"]["properties"]) == {"categories"}]
+                  if set(call.kwargs["schema"]["properties"]) == {"categories", "shared_tools"}]
     # Native Dev selection remains shared across its two passes and recovery;
     # graph-on keeps the measured full-category contract without a new gate.
     assert len(selections) == (0 if graph_enabled else 1)
@@ -146,7 +146,10 @@ def test_public_extraction_graph_contract_survives_scoping_and_recovery(
             assert "── entity (" in prompt.split("Conversation:\n", 1)[0]
             assert ("── profile (" in prompt.split("Conversation:\n", 1)[0]) is graph_enabled
             assert (graph_guidance in prompt) is graph_enabled
-            assert extractor._update_instruction in prompt
+            from extraction.tool_builder import build_update_instruction
+            expected_runtime = (extractor._update_instruction if graph_enabled else
+                                build_update_instruction(extractor._schema_registry, {"entity"}))
+            assert expected_runtime in prompt
             _assert_graph_tools(request.kwargs["tools"], graph_enabled)
     if mode == "lazy":
         assert llm.complete_with_tools_messages.call_count == 2
@@ -159,7 +162,11 @@ def test_public_extraction_graph_contract_survives_scoping_and_recovery(
             assert any(message["role"] == "user" and SOURCE in message["content"]
                        for message in messages)
             assert (graph_guidance in first_system) is graph_enabled
-            assert extractor._prompt_manager.render(template, "lazy_tools_instruction") in first_system
+            if graph_enabled:
+                assert extractor._prompt_manager.render(template, "lazy_tools_instruction") in first_system
+            else:
+                assert "PRESERVE all specific details" in first_system
+                assert "If entity is actually about the user" in first_system
             _assert_graph_tools(request.kwargs["tools"], graph_enabled)
     json_recoveries = [call for call in llm.complete_json.call_args_list
                        if set(call.kwargs["schema"]["properties"]) == {"operations"}]
@@ -184,7 +191,7 @@ def test_graph_relations_are_not_category_choices_but_remain_offered(graph_enabl
         names = {tool["name"] for tool in scoped}
         assert ("extract_relation" in names) is graph_enabled
         assert "extract_" + next(iter(selected)) in names
-        assert ("edit_memory" in names) is (selected == {"entity"})
+        assert {"edit_memory", "append_memory"} <= names
 
 
 @pytest.mark.parametrize("graph_enabled", [False, True])
@@ -194,12 +201,16 @@ def test_prepared_prompt_crops_only_trusted_sections_and_renders_system_once(gra
     parts = extractor._build_prompt_parts("English", SOURCE, ctx=CTX)
     span = _Span(0, 0, source_context=SOURCE, prompt_parts=parts)
     prepared = _PreparedSpan(span, parts.render(), "hash", SOURCE)
-    prompt, tools = assemble_prepared(extractor, prepared, CTX)
+    request = assemble_prepared(extractor, prepared, CTX)
+    prompt, tools = request.prompt, request.tools
     assert prompt.count(INTRO) == 1
     assert prompt.endswith(SOURCE)
     assert ("── profile (" in prompt.split("Conversation:\n", 1)[0]) is graph_enabled
     assert "── profile (" in prompt.split("Conversation:\n", 1)[1]
-    assert extractor._update_instruction in prompt
+    from extraction.tool_builder import build_update_instruction
+    expected_runtime = (extractor._update_instruction if graph_enabled else
+                        build_update_instruction(extractor._schema_registry, {"entity"}))
+    assert expected_runtime in prompt
     _assert_graph_tools(tools, graph_enabled)
 
 
@@ -207,7 +218,7 @@ def test_prepared_prompt_crops_only_trusted_sections_and_renders_system_once(gra
 def test_lazy_loop_reuse_restores_full_tools_before_new_category_selection(graph_enabled):
     llm = Mock()
     llm.complete_json.side_effect = [
-        {"categories": ["entity"]}, {"categories": ["event"]},
+        {"categories": ["entity"], "shared_tools": []}, {"categories": ["event"], "shared_tools": []},
     ]
     llm.complete_with_tools_messages.return_value = ([], "[]")
     extractor = Extractor(llm, activation_enabled=graph_enabled)
@@ -231,4 +242,5 @@ def test_lazy_loop_reuse_restores_full_tools_before_new_category_selection(graph
         assert llm.complete_json.call_count == 2
     assert ("extract_relation" in first_names) is graph_enabled
     assert ("extract_relation" in second_names) is graph_enabled
-    assert {"read", "list", "get_relations", "get_access_stats"} <= first_names & second_names
+    assert {"read", "list"} <= first_names & second_names
+    assert ({"get_relations", "get_access_stats"} <= first_names & second_names) is graph_enabled

@@ -12,6 +12,7 @@ from core.memory_names import canonical_scope
 from core.operation_deadline import check_deadline, operation_deadline, remaining_seconds
 from core.validation import validate_candidate
 from extraction.occurrence_qualification import prompt_fits
+from providers.llm_observation import observe_call
 
 logger = get_logger(__name__)
 _MAX_ITEMS = 32
@@ -177,14 +178,14 @@ def _reconcile(candidates, messages, ctx, resolver, llm):
     if not prompt_fits(prompt, _GROUPS) or not prompt_fits(verification, _VERDICT):
         logger.info("Topic alias reconciliation deferred: complete input exceeds budget")
         return candidates
-    groups = _partition(llm.complete_json(prompt, schema=_GROUPS), items, stored)
+    groups = _partition(observe_call("postprocess", llm.complete_json, prompt, schema=_GROUPS), items, stored)
     if all(len(group) == 1 for group in groups):
         return candidates
     verification = verify_prefix + _RULES + " Return valid=true only if every group is justified.\n" + json.dumps(
         {**payload, "groups": groups}, ensure_ascii=False)
     if not prompt_fits(verification, _VERDICT):
         return candidates
-    verdict = llm.complete_json(verification, schema=_VERDICT)
+    verdict = observe_call("postprocess", llm.complete_json, verification, schema=_VERDICT)
     if (not isinstance(verdict, dict) or set(verdict) != {"valid"}
             or verdict["valid"] is not True):
         return candidates

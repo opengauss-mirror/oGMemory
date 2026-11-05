@@ -60,7 +60,6 @@ def test_fallback_summary_repair_preserves_read_snapshot_and_details(field, valu
     body = extraction["input"]["content"]
     extraction["input"][field] = value
     llm.complete_json.side_effect = [
-        {"categories": ["profile"]},
         {"operations": [extraction]},
         {"repairs": [{"operation_index": 0, field: "Reader works as an engineer."}]},
     ]

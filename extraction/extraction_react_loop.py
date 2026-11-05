@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from logging import getLogger
 from typing import Any
 
@@ -30,6 +30,7 @@ from core.react_loop import (
 )
 from core.uri_resolver import URIResolver
 from core.validation import validate_candidate
+from extraction.assembly_contract import AssemblyContract, UnsupportedAssemblyTemplateError
 from extraction.incremental_edit import (
     INCREMENTAL_TOOLS,
     coalesce_incremental_edits,
@@ -111,6 +112,7 @@ class ExtractionTaskContext(ReactTaskContext):
     """Task context for extraction ReAct loop."""
     conversation_text: str
     prefetch_result: PrefetchResult | None = None
+    selected_sections: tuple[str, str, str] | None = None
 
 
 @dataclass
@@ -159,6 +161,8 @@ class ExtractionReActLoop(ReactLoop):
     - Single safety re-read: prevent infinite loops
     """
 
+    _llm_observation_stage = "extraction"
+
     def __init__(
         self,
         llm: LLM,
@@ -187,6 +191,7 @@ class ExtractionReActLoop(ReactLoop):
         self._extraction_tools = (build_extraction_tools(registry, activation_enabled=True)
                                   if activation_enabled else build_extraction_tools(registry))
         self._base_extraction_tools = self._extraction_tools
+        self._prompt_parts = None
         self._assembly_categories: frozenset[str] | None = None
         self._offered_extraction_tools: list[dict] | None = None
         self._update_instruction = build_update_instruction(registry)
@@ -211,28 +216,62 @@ class ExtractionReActLoop(ReactLoop):
         prefetch_result: PrefetchResult | None = None,
         *,
         categories: frozenset[str] | None = None,
+        prompt_parts=None,
+        assembly_contract=None,
     ) -> ExtractionReActResult:
         check_deadline()
         from extraction.prompt_assembly import (
             category_catalog,
-            select_categories,
+            lazy_tools_for_contract,
+            select_assembly,
+            shared_tool_catalog,
+            supports_assembly,
             tools_for_categories,
         )
-        if self._activation_enabled:
-            # Keep the reviewed graph prompt and full memory/relation schemas.
-            # Dev's category selector remains unchanged for graph-off runs.
-            self._assembly_categories = None
-            self._extraction_tools = self._base_extraction_tools
-        else:
-            self._assembly_categories = (select_categories(
-                self._llm, self._registry, self._base_extraction_tools, conversation_text, ctx.user_id,
-            ) if categories is None else categories)
-            self._extraction_tools = tools_for_categories(
-                self._base_extraction_tools, self._registry, self._assembly_categories,
-            )
+        available = frozenset(item["category"] for item in category_catalog(
+            self._registry, self._base_extraction_tools))
+        shared = shared_tool_catalog(self._fs, "lazy")
+        selected_sections = None
+        if self._activation_enabled or not supports_assembly(self._prompt_manager):
+            assembly_contract = AssemblyContract(available, (), "lazy", "full", "unsupported_template")
+        elif assembly_contract is None:
+            if categories is None:
+                selection = select_assembly(
+                    self._llm, self._registry, self._base_extraction_tools, conversation_text,
+                    ctx.user_id, manager=self._prompt_manager, shared_tools=shared,
+                )
+                categories = selection.categories
+                scope, reason = selection.scope, selection.reason
+                shared = [tool for tool in shared if tool["name"] in selection.shared_tools]
+            else:
+                scope, reason, shared = "scoped" if categories else "no_task", None, []
+            selected = tools_for_categories(self._base_extraction_tools, self._registry, categories)
+            assembly_contract = AssemblyContract(categories,
+                tuple(t["name"] for t in [_READ_TOOL, _LIST_TOOL] + shared + selected),
+                "lazy", scope, reason)
+            if scope == "scoped":
+                variables = prompt_parts.template_variables if prompt_parts is not None else {}
+                try:
+                    selected_sections = self._render_selected_sections(
+                        "extraction", assembly_contract, variables)
+                except UnsupportedAssemblyTemplateError:
+                    assembly_contract = AssemblyContract(
+                        available, (), "lazy", "full", "unsupported_template")
+        self._assembly_categories = (None if assembly_contract.scope == "full"
+                                     else assembly_contract.categories)
+        self._extraction_tools = (self._base_extraction_tools if self._assembly_categories is None
+            else tools_for_categories(self._base_extraction_tools, self._registry, self._assembly_categories))
+        self._prompt_parts = prompt_parts
+        self._update_instruction = build_update_instruction(self._registry, self._assembly_categories)
         self._offered_extraction_tools = (self._extraction_tools if category_catalog(
             self._registry, self._base_extraction_tools) else None)
-        self._all_tools = [_READ_TOOL, _LIST_TOOL, _RELATIONS_TOOL, _ACCESS_STATS_TOOL] + self._extraction_tools
+        self._all_tools = lazy_tools_for_contract(self._extraction_tools, self._fs, assembly_contract)
+        if assembly_contract.scope == "full":
+            assembly_contract = replace(
+                assembly_contract, tool_names=tuple(tool["name"] for tool in self._all_tools))
+        self._assembly_contract = assembly_contract
+        if assembly_contract.scope == "no_task":
+            return ExtractionReActResult(finish_reason="no_task", completed=True)
         # Reset runtime state
         self._did_safety_reread = False
         self._read_versions = dict(prefetch_result.read_versions) if prefetch_result else {}
@@ -247,6 +286,7 @@ class ExtractionReActLoop(ReactLoop):
         task_ctx = ExtractionTaskContext(
             conversation_text=conversation_text,
             prefetch_result=prefetch_result,
+            selected_sections=selected_sections,
         )
 
         loop_result = super().run(ctx, task_ctx)
@@ -276,6 +316,14 @@ class ExtractionReActLoop(ReactLoop):
             content_length=content_length,
         )
 
+    def _render_selected_sections(self, template, contract, variables):
+        render = self._prompt_manager.render_selected
+        return (
+            render(template, "system_prompt", decision=contract, **variables),
+            render(template, "examples", decision=contract),
+            render(template, "lazy_tools_instruction", decision=contract),
+        )
+
     def _build_messages(
         self,
         ctx: RequestContext,
@@ -288,25 +336,25 @@ class ExtractionReActLoop(ReactLoop):
         messages = []
 
         template = "extraction_graph" if self._activation_enabled else "extraction"
-        system_prompt = self._prompt_manager.render(template, "system_prompt")
-        lazy_tools = self._prompt_manager.render(template, "lazy_tools_instruction")
+        variables = self._prompt_parts.template_variables if self._prompt_parts is not None else {}
         identity_block = self._prompt_manager.render(template, "identity_block", user_id=ctx.user_id)
-        examples = self._prompt_manager.render(template, "examples")
         output_instruction = self._prompt_manager.render(template, "output_instruction")
-
-        # Crop the two trusted template sections before joining any runtime data.
-        if self._assembly_categories is not None:
-            from extraction.prompt_assembly import crop_template_sections
-            try:
-                system_prompt, examples = crop_template_sections(
-                    str(system_prompt), str(examples), set(self._assembly_categories),
-                )
-            except (ValueError, IndexError):
-                # A custom template with unknown structure keeps its original contract.
-                self._extraction_tools = self._base_extraction_tools
-                self._offered_extraction_tools = (self._base_extraction_tools
-                                                 if self._offered_extraction_tools is not None else None)
-                self._all_tools = [_READ_TOOL, _LIST_TOOL, _RELATIONS_TOOL, _ACCESS_STATS_TOOL] + self._extraction_tools
+        if self._assembly_categories is None:
+            system_prompt = self._prompt_manager.render(template, "system_prompt", **variables)
+            examples = self._prompt_manager.render(template, "examples")
+            lazy_tools = self._prompt_manager.render(template, "lazy_tools_instruction")
+        else:
+            system_prompt, examples, lazy_tools = (
+                task_ctx.selected_sections or self._render_selected_sections(
+                    template, self._assembly_contract, variables)
+            )
+            if self._prompt_parts is not None:
+                system_prompt = self._prompt_parts.system_prompt
+                examples = self._prompt_parts.examples if self._prompt_parts.include_examples else ""
+        if self._prompt_parts is not None and not self._prompt_parts.include_examples:
+            examples = ""
+        if self._prompt_parts is not None and self._prompt_parts.output_instruction:
+            output_instruction = self._prompt_parts.output_instruction
         system_content = f"{system_prompt}\n\n{identity_block}\n\n{lazy_tools}\n\n{examples}\n\n{output_instruction}"
         system_content += "\n\n" + self._update_instruction
 
@@ -357,6 +405,8 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
     ) -> dict | str:
         check_deadline()
+        if getattr(self, "_offered_extraction_tools", None) is not None and name not in {tool["name"] for tool in self._all_tools}:
+            raise ToolCallProtocolError("Extraction returned a tool outside the assembled schemas")
         try:
             if name == "read":
                 uri = input.get("uri", "")

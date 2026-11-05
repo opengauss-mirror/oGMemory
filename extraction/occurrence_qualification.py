@@ -17,6 +17,7 @@ from core.validation import (
     validate_utf8,
 )
 from extraction.prefetch import _CONTEXT_CHARS, _OUTPUT_CHARS, _PREFETCH_NODES
+from providers.llm_observation import observe_call
 
 _LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
            "content": MAX_CONTENT_LEN, "title": MAX_ABSTRACT_LEN}
@@ -189,7 +190,7 @@ def qualify_occurrence_drafts(candidates, source, selected_user_evidence, read_v
                 or not prompt_fits(verification, _VALIDATION_SCHEMA)):
             results.append(candidate)
             continue
-        response = llm.complete_json(prompt, schema=_DECISION_SCHEMA)
+        response = observe_call("postprocess", llm.complete_json, prompt, schema=_DECISION_SCHEMA)
         if not isinstance(response, dict) or response.get("decision") not in {"same", "new", "uncertain"}:
             raise ExtractionIncompleteError("Occurrence qualification requires a valid decision")
         if response["decision"] != "same":
@@ -204,7 +205,7 @@ def qualify_occurrence_drafts(candidates, source, selected_user_evidence, read_v
         verification = _prompt(_VERIFY_PROMPT, {**payload, "proposal": response})
         if not prompt_fits(verification, _VALIDATION_SCHEMA):
             raise ExtractionIncompleteError("Occurrence verification exceeds the complete context budget")
-        validation = llm.complete_json(verification, schema=_VALIDATION_SCHEMA)
+        validation = observe_call("postprocess", llm.complete_json, verification, schema=_VALIDATION_SCHEMA)
         if not isinstance(validation, dict) or validation.get("valid") is not True:
             raise ExtractionIncompleteError("Occurrence identity and complete facts could not be verified")
         try:
@@ -258,13 +259,13 @@ def reconcile_occurrence_updates(entries, existing, ctx, uris, llm):
     prompt = _prompt(instruction, payload)
     if not prompt_fits(prompt, SNAPSHOT_SCHEMA):
         raise ExtractionIncompleteError("Occurrence span reconciliation exceeds the complete context budget")
-    snapshot = llm.complete_json(prompt, schema=SNAPSHOT_SCHEMA)
+    snapshot = observe_call("postprocess", llm.complete_json, prompt, schema=SNAPSHOT_SCHEMA)
     validate_snapshot(snapshot)
     verification = _prompt(_VERIFY_PROMPT + "Verify ALL ordered revisions jointly. ",
                            {**payload, "proposal": snapshot})
     if not prompt_fits(verification, _VALIDATION_SCHEMA):
         raise ExtractionIncompleteError("Occurrence span verification exceeds the complete context budget")
-    validation = llm.complete_json(verification, schema=_VALIDATION_SCHEMA)
+    validation = observe_call("postprocess", llm.complete_json, verification, schema=_VALIDATION_SCHEMA)
     if not isinstance(validation, dict) or validation.get("valid") is not True:
         raise ExtractionIncompleteError("Occurrence span identity and complete facts could not be verified")
     try:

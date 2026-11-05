@@ -1,12 +1,13 @@
 """Source-grounded node updates through the public write pipeline."""
 
-from dataclasses import replace
-from concurrent.futures import ThreadPoolExecutor
 import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+
 import pytest
 
-from core.models import RequestContext
 from core.errors import LLMOutputTruncatedError
+from core.models import RequestContext
 from extraction.node_processing import NodeProcessor
 from service.api import MemoryWriteAPI
 from tests.unit.commit.test_memory_identity import MemoryFS, memory
@@ -28,8 +29,8 @@ def operation(ids, *, target="", action="create", fact="Gift from Caroline's gra
 
 class NodeLLM:
     def complete_json(self, prompt, schema):
-        assert set(schema["properties"]) == {"categories"}
-        return {"categories": schema["properties"]["categories"]["items"]["enum"]}
+        assert set(schema["properties"]) == {"categories", "shared_tools"}
+        return {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
 
     def __init__(self, decide):
         self.decide, self.calls = decide, []
@@ -56,6 +57,7 @@ def setup(decide, mode="eager"):
 def test_fallback_locks_complete_concurrent_commits(monkeypatch, users, with_event):
     import threading
     from contextlib import contextmanager
+
     import commit.identity_resolver as identity
 
     rendezvous = threading.Barrier(2)
@@ -154,8 +156,8 @@ def test_equivalent_boundaries_commit_all_facts_once(category, holders):
 
 @pytest.mark.parametrize("entity_state", ["absent", "disabled", "incompatible"])
 def test_preference_only_registry_processes_its_configured_topic(tmp_path, entity_state):
-    from extraction.schemas.registry import SchemaRegistry
     from core.uri_resolver import URIResolver
+    from extraction.schemas.registry import SchemaRegistry
     ctx, fs, llm, _ = setup(lambda _: [operation([0])])
     defaults = SchemaRegistry()
     registry = SchemaRegistry(str(tmp_path))
@@ -444,9 +446,10 @@ def test_checkpoint_revision_commits_against_refreshed_snapshot(category):
 @pytest.mark.parametrize("failure", ["defer", "truncated"])
 def test_stage_b_resume_reuses_saved_stage_a(failure):
     from unittest.mock import Mock
-    from tests.unit.server.test_extraction_batch_recovery import setup_service, params
-    from tests.unit.server.test_memory_card_recovery import enable
+
+    from tests.unit.server.test_extraction_batch_recovery import params, setup_service
     from tests.unit.server.test_extraction_retry_task import ready
+    from tests.unit.server.test_memory_card_recovery import enable
     ctx, fs, _, _ = setup(lambda _: [])
     service, writer, manager = setup_service(fs, ctx, entries=[card()])
     enable(service, writer)
@@ -473,9 +476,9 @@ def test_stage_b_resume_reuses_saved_stage_a(failure):
 
 
 def test_split_stage_b_resume_commits_one_complete_new_node():
-    from tests.unit.server.test_extraction_batch_recovery import setup_service, params
-    from tests.unit.server.test_memory_card_recovery import enable
+    from tests.unit.server.test_extraction_batch_recovery import params, setup_service
     from tests.unit.server.test_extraction_retry_task import ready
+    from tests.unit.server.test_memory_card_recovery import enable
 
     ctx, fs, _, _ = setup(lambda _: [])
     drafts = [card(f"alias_{i}", content="# Item\n\n## Details\n- " + "Source detail. " * 2300

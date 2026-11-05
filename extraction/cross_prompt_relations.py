@@ -6,10 +6,12 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from commit.write_receipts import has_stored_target
 from core.interfaces import LLM
 from core.models import CandidateMemory, RelationEdge, RequestContext, WritePlan
-from commit.write_receipts import has_stored_target
 from index.activation_projection import build_activation_record
+from providers.llm_observation import observe_call
+
 
 def run_integrated_relations(messages, candidates, plans, ctx, *, fs,
                              vector_index, embedder, llm,
@@ -207,7 +209,7 @@ def generate_cross_prompt_relations(
 ) -> tuple[list[RelationEdge], tuple[str, ...], int]:
     """Generate and strictly validate mixed relations; malformed siblings abstain."""
     prompt = build_cross_prompt_relation_prompt(messages, candidates, plans, historical)
-    data = llm.complete_json(prompt, relation_response_schema())
+    data = observe_call("postprocess", llm.complete_json, prompt, relation_response_schema())
     items = data.get("relations", []) if isinstance(data, dict) else []
     if not isinstance(items, list):
         return [], ("relations_not_array",), 0
