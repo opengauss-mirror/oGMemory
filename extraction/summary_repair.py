@@ -83,7 +83,8 @@ def repair_candidate_summaries(llm, candidates, tool_names=None):
     if not prompt_fits(prompt, schema):
         raise ExtractionIncompleteError("native text repair exceeds the complete context budget")
     try:
-        response = llm.complete_json(prompt, schema=schema)
+        from providers.llm_observation import observe_call
+        response = observe_call("repair", llm.complete_json, prompt, schema=schema)
     except ValueError as exc:
         raise ToolCallProtocolError(f"summary repair returned invalid JSON output: {exc}") from exc
     values = response.get("repairs") if isinstance(response, dict) and set(response) == {"repairs"} else None

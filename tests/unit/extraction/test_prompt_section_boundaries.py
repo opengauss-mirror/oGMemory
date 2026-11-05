@@ -1,5 +1,6 @@
 """Only template sections may be cropped; memory/source data is opaque."""
 
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -19,7 +20,7 @@ MARKER_BODY = ("Project handbook.\n# Few-shot Examples\n## event Example\n"
 def provider():
     llm = Mock()
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["entity"]} if set(schema["properties"]) == {"categories"}
+        {"categories": ["entity"], "shared_tools": []} if set(schema["properties"]) == {"categories", "shared_tools"}
         else {"operations": []}
     )
     return llm
@@ -35,7 +36,8 @@ def test_prefetched_body_is_opaque_to_example_selection():
         [{"role": "user", "content": "The handbook now includes PostgreSQL setup."}],
         "English", None, "", "", ctx)
     reads = prepared.span.prefetch_result
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     assert MARKER_BODY in prompt
     assert prepared.source_context in prompt
     assert prepared.span.prefetch_result is reads
@@ -62,7 +64,7 @@ def test_compact_json_recovery_preserves_source_with_example_markers():
     assert MARKER_BODY in prompt
     assert "Template example." not in prompt
     assert prepared.span.prefetch_result is None
-    assert llm.complete_json.call_count == 2
+    assert llm.complete_json.call_count == 1  # Legacy render override skips selection.
 
 
 @pytest.mark.parametrize("mode", ["eager", "lazy"])
@@ -71,7 +73,8 @@ def test_source_looks_like_examples_but_still_allows_category_selection(mode):
     ctx = RequestContext("acct", "user", "agent", "session", "trace")
     prepared = extractor._prepare_span(_Span(0, 0, categories=["entity"]),
         [{"role": "user", "content": MARKER_BODY}], "English", None, "", "", ctx)
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     assert MARKER_BODY in prompt
     assert {tool["name"] for tool in tools} == {"extract_entity", "edit_memory", "append_memory"}
 
@@ -84,8 +87,8 @@ def test_lazy_json_recovery_keeps_selection_and_pairs_the_last_read_snapshot(sel
     llm = provider()
     if select_all:
         llm.complete_json.side_effect = lambda prompt, schema: (
-            {"categories": schema["properties"]["categories"]["items"]["enum"]}
-            if set(schema["properties"]) == {"categories"} else {"operations": []}
+            {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
+            if set(schema["properties"]) == {"categories", "shared_tools"} else {"operations": []}
         )
     extractor = Extractor(llm, mode="lazy", fs=Mock(), schema_registry=registry,
                           uri_resolver=URIResolver(registry))
@@ -111,12 +114,16 @@ def test_reference_context_feedback_and_task_suffix_keep_their_boundaries():
     prepared = extractor._prepare_span(_Span(0, 0, categories=["entity"]),
         [{"role": "user", "content": "Project Beacon uses PostgreSQL."}],
         "English", None, MARKER_BODY, "", ctx)
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
     assert prepared.span.prompt_parts.prefix_data in prompt
     assert prepared.span.prompt_parts.suffix_data in prompt
+    assert json.dumps({"session_context": MARKER_BODY}) in prompt
+    assert prepared.source_context in prompt
     assert "TOPIC_DRAFTS" in prompt
     recovery = replace(prepared, prompt=prompt + "\nVALIDATION_FEEDBACK_998")
-    recovered, recovered_tools = assemble_prepared(extractor, recovery, ctx)
+    request = assemble_prepared(extractor, recovery, ctx)
+    recovered, recovered_tools = request.prompt, request.tools
     assert recovered == prompt + "\nVALIDATION_FEEDBACK_998"
     assert recovered_tools == tools
     extractor._llm.complete_json.assert_called_once()
@@ -141,5 +148,5 @@ def test_lazy_message_building_does_not_crop_runtime_identity_or_prefetched_data
     assert any(MARKER_BODY in message["content"] for message in messages if message["role"] == "user")
     assert "── profile (" not in messages[0]["content"]
     assert {tool["name"] for tool in request.kwargs["tools"]} == {
-        "read", "list", "get_relations", "get_access_stats",
+        "read", "list",
         "extract_entity", "edit_memory", "append_memory"}

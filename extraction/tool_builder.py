@@ -97,10 +97,11 @@ def _source_identity_properties(schema: MemoryTypeSchema) -> dict:
     return properties
 
 
-def build_update_instruction(registry: SchemaRegistry) -> str:
+def build_update_instruction(registry: SchemaRegistry, categories=None) -> str:
     """Describe runtime write units independently of persisted schema fields."""
     schemas = [schema for schema in registry.list_enabled()
-               if is_schema_version_compatible(schema) and _supports_read_target(schema)]
+               if is_schema_version_compatible(schema) and _supports_read_target(schema)
+               and (categories is None or schema.memory_type in categories)]
     parts = [_UPDATE_INSTRUCTION] if schemas else []
     if any(schema.memory_type == "profile" and schema.is_single_file for schema in schemas):
         parts.append(_PROFILE_SNAPSHOT_INSTRUCTION)

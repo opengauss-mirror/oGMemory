@@ -10,14 +10,20 @@ from uuid import uuid4
 
 from jsonschema import Draft202012Validator
 
-from core.errors import (ExtractionIncompleteError, LLMOutputTruncatedError,
-                         MemoryCardFormatError, ToolCallProtocolError, ValidationError)
+from core.errors import (
+    ExtractionIncompleteError,
+    LLMOutputTruncatedError,
+    MemoryCardFormatError,
+    ToolCallProtocolError,
+    ValidationError,
+)
 from core.logging_config import get_logger
 from core.memory_names import canonical_scope
 from core.models import CandidateMemory, ContextNode
 from core.validation import validate_candidate
 from extraction.card_format import validate_memory_card
 from extraction.incremental_edit import materialize_incremental_input
+from providers.llm_observation import observe_call
 
 logger = get_logger(__name__)
 CATEGORIES = frozenset({"entity", "preference"})
@@ -246,7 +252,7 @@ class NodeProcessor:
                 raise ExtractionIncompleteError("node context exceeds processing budget")
             return self._split(drafts, messages, ctx, staged, pending)
         try:
-            calls = self.llm.complete_with_tools(prompt=prompt, tools=[_TOOL],
+            calls = observe_call("postprocess", self.llm.complete_with_tools, prompt=prompt, tools=[_TOOL],
                                                  tool_choice="required", temperature=0)
         except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
             if isinstance(exc, LLMOutputTruncatedError) and len(drafts) > 1:

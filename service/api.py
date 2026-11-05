@@ -10,6 +10,8 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 import threading
 import uuid
 from dataclasses import replace
+from providers.llm_observation import correlate_extraction_calls
+
 from typing import Optional
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
@@ -172,6 +174,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             )]
 
     @serialized_topics
+    @correlate_extraction_calls
     def commit_session(
         self,
         messages: list[dict],

@@ -4,8 +4,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.uri_resolver import URIResolver
 from core.errors import LLMOutputTruncatedError
+from core.uri_resolver import URIResolver
 from extraction.occurrence_qualification import prompt_fits
 from extraction.tools import Extractor, _Span
 from tests.unit.commit.test_profile_merge import profile
@@ -27,7 +27,7 @@ def prepare(*, old_chars=64000, bound=False, mode="eager", source=SOURCE, exampl
         fields.pop("expected_version")
     llm.complete_json.return_value = {"operations": [{"tool": "extract_profile", "input": fields}]}
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["profile"]} if set(schema["properties"]) == {"categories"}
+        {"categories": ["profile"], "shared_tools": []} if set(schema["properties"]) == {"categories", "shared_tools"}
         else llm.complete_json.return_value
     )
     extractor = Extractor(llm, mode=mode, schema_registry=registry, fs=fs,
@@ -78,7 +78,6 @@ def test_summary_repair_fallback_uses_its_final_read_snapshot():
         "tool": operation["tool"], "input": {**operation["input"], "abstract": "x" * 201},
     }]
     llm.complete_json.side_effect = [
-        {"categories": ["profile"]},
         {"repairs": [{"operation_index": 0, "abstract": "x" * 201}]},
         {"operations": [operation]},
     ]

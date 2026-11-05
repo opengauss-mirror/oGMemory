@@ -19,10 +19,10 @@ from unittest.mock import Mock
 import pytest
 
 from core.errors import LLMCallError, LLMOutputTruncatedError, ToolCallProtocolError
-from core.models import RequestContext, CandidateMemory
+from core.models import CandidateMemory, RequestContext
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import build_extraction_tools, build_tool_to_category
-from extraction.tools import Extractor, _PreparedSpan, _SPAN_SCHEMA, _Span
+from extraction.tools import _SPAN_SCHEMA, Extractor, _PreparedSpan, _Span
 from providers.llm.mock_llm import MockLLM
 
 
@@ -207,7 +207,6 @@ class TestExtractorPhase2PromptDedupe:
         extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
         extractor._mode = "lazy"
         extractor._fs = object()
-        extractor._schema_registry = object()
         extractor._uri_resolver = object()
         ctx = RequestContext(
             account_id="test-account",
@@ -475,7 +474,7 @@ class TestExtractorToolCallFallback:
                     {"start": 0, "end": 0, "reason": "preference", "categories": ["preference"]}
                 ]
             },
-            {"categories": ["preference"]},
+            {"categories": ["preference"], "shared_tools": []},
             {"operations": [self._preference("coffee", confidence=0.3)]},
         ]
         llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")

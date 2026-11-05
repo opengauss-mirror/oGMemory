@@ -23,6 +23,7 @@ from extraction.event_reconciliation import (
     _verify_occurrence_groups,
 )
 from extraction.occurrence_qualification import prompt_fits
+from providers.llm_observation import observe_call
 
 _EVIDENCE_SCHEMA = {
     "type": "object", "properties": {
@@ -165,7 +166,7 @@ def _repair_quote_contract(groups, drafts, sources, llm):
     )
     if not prompt_fits(prompt, _QUOTE_REPAIR_SCHEMA):
         raise ExtractionIncompleteError("Source evidence repair exceeds the complete context budget")
-    response = llm.complete_json(prompt, schema=_QUOTE_REPAIR_SCHEMA)
+    response = observe_call("postprocess", llm.complete_json, prompt, schema=_QUOTE_REPAIR_SCHEMA)
     repairs = response.get("repairs") if isinstance(response, dict) and set(response) == {"repairs"} else None
     if not isinstance(repairs, list) or len(repairs) != len(indices):
         return groups
@@ -230,7 +231,7 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
         prompt = _prompt(_PARTITION, payload)
         if not prompt_fits(prompt, _SCHEMA):
             raise ExtractionIncompleteError("Source occurrence partition exceeds the complete context budget")
-        response = llm.complete_json(prompt, schema=_SCHEMA)
+        response = observe_call("postprocess", llm.complete_json, prompt, schema=_SCHEMA)
         groups = response.get("groups") if isinstance(response, dict) and set(response) == {"groups"} else None
         groups, repaired = _normalize_empty_context(groups)
         if (isinstance(groups, list) and groups

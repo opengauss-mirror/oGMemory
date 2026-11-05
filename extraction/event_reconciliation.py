@@ -15,6 +15,7 @@ from core.validation import (
     validate_utf8,
 )
 from extraction.occurrence_qualification import prompt_fits
+from providers.llm_observation import observe_call
 
 _LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
            "content": MAX_CONTENT_LEN, "title": MAX_ABSTRACT_LEN}
@@ -65,7 +66,7 @@ def reconcile_event_drafts(
             raise ExtractionIncompleteError("Event occurrence reconciliation requires source evidence")
         drafts = [candidates[index] for index in indices]
         payload = {"source": source, "drafts": [candidate_draft_fields(draft) for draft in drafts]}
-        response = llm.complete_json(
+        response = observe_call("postprocess", llm.complete_json,
             "Partition these event drafts by actual occurrence using the source conversation. "
             "Different wording or titles may describe ONE occurrence. A shared routing key, "
             "date, actor or location does NOT prove identity; repeated occurrences must stay "
@@ -179,7 +180,7 @@ def _verify_occurrence_groups(payload, groups, llm, budget_check=None):
         prompt = instruction + "\n\n" + json.dumps(_verification_payload(payload, group), ensure_ascii=False)
         if not fits(prompt, schema):
             raise ExtractionIncompleteError("Occurrence verification exceeds the complete context budget")
-        return llm.complete_json(prompt, schema=schema)
+        return observe_call("postprocess", llm.complete_json, prompt, schema=schema)
 
     for group in groups:
         verdict = call(_VERIFY_ONE, group, _VERIFY_SCHEMA)
@@ -279,7 +280,7 @@ def _repair_group_summaries(groups, count, llm):
                   ensure_ascii=False))
     if not prompt_fits(prompt, schema):
         raise ExtractionIncompleteError('Event summary repair exceeds complete context budget')
-    response = llm.complete_json(prompt, schema=schema)
+    response = observe_call("postprocess", llm.complete_json, prompt, schema=schema)
     values = response.get('repairs') if isinstance(response, dict) and set(response) == {'repairs'} else None
     if not isinstance(values, list) or len(values) != len(repairs):
         raise ExtractionIncompleteError('Event summary repair requires all group indices exactly once')

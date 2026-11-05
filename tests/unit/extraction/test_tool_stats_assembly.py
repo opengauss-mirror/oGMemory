@@ -13,36 +13,39 @@ from extraction.tools import Extractor, _Span
 STATS = format_tool_stats_text({"web_search": {"call_count": 3, "success_count": 0, "fail_count": 3}})
 
 
-def provider():
+def provider(categories=("preference",)):
     llm = Mock()
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["preference"]} if set(schema["properties"]) == {"categories"}
+        {"categories": list(categories), "shared_tools": []} if set(schema["properties"]) == {"categories", "shared_tools"}
         else {"operations": []}
     )
     return llm
 
 
 @pytest.mark.parametrize("mode", ["eager", "lazy"])
-def test_attached_tool_statistics_keep_the_tool_schema_and_rules(mode):
+def test_attached_tool_statistics_reach_selector_without_forcing_tool(mode):
     extractor = Extractor(provider(), mode=mode)
     ctx = RequestContext("acct", "user", "agent", "session", "trace")
     prepared = extractor._prepare_span(_Span(0, 0, categories=["preference"]),
         [{"role": "user", "content": "I prefer tea."}], "English", None, "", STATS, ctx)
 
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
 
     assert STATS in prompt
     assert STATS not in prepared.source_context
-    assert "extract_tool" in {tool["name"] for tool in tools}
+    assert "extract_tool" not in {tool["name"] for tool in tools}
     assert "extract_preference" in {tool["name"] for tool in tools}
-    assert "── tool (" in prompt
+    assert "── tool (" not in prompt
+    import json
+    assert json.loads(extractor._llm.complete_json.call_args.args[0].split("\n\n", 1)[1])["tool_statistics"] == STATS
     assert "── entity (" not in prompt
     extractor._llm.complete_json.assert_called_once()
 
 
 @pytest.mark.parametrize("truncated", [False, True])
 def test_json_recovery_reuses_the_tool_category_for_attached_statistics(truncated):
-    extractor = Extractor(provider())
+    extractor = Extractor(provider(("preference", "tool")))
     ctx = RequestContext("acct", "user", "agent", "session", "trace")
     prepared = extractor._prepare_span(_Span(0, 0, categories=["preference"]),
         [{"role": "user", "content": "I prefer tea."}], "English", None, "", STATS, ctx)
@@ -67,7 +70,8 @@ def test_non_attached_statistics_do_not_expand_early_span_categories(stats):
     prepared = extractor._prepare_span(_Span(0, 0, categories=["preference"]),
         messages, "English", None, "", stats, ctx)
 
-    prompt, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    prompt, tools = request.prompt, request.tools
 
     assert STATS not in prompt
     assert "extract_tool" not in {tool["name"] for tool in tools}
@@ -75,6 +79,7 @@ def test_non_attached_statistics_do_not_expand_early_span_categories(stats):
 
 def test_disabled_tool_schema_is_not_reenabled_for_statistics():
     from dataclasses import replace
+
     from extraction.schemas.registry import SchemaRegistry
 
     registry = SchemaRegistry()
@@ -84,7 +89,8 @@ def test_disabled_tool_schema_is_not_reenabled_for_statistics():
     prepared = extractor._prepare_span(_Span(0, 0, categories=["preference"]),
         [{"role": "user", "content": "I prefer tea."}], "English", None, "", STATS, ctx)
 
-    _, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    _, tools = request.prompt, request.tools
 
     assert "extract_tool" not in {tool["name"] for tool in tools}
 
@@ -95,17 +101,19 @@ def test_empty_tail_statistics_do_not_expand_categories(stats):
     ctx = RequestContext("acct", "user", "agent", "session", "trace")
     prepared = extractor._prepare_span(_Span(0, 0, categories=["preference"]),
         [{"role": "user", "content": "I prefer tea."}], "English", None, "", stats, ctx)
-    _, tools = assemble_prepared(extractor, prepared, ctx)
+    request = assemble_prepared(extractor, prepared, ctx)
+    _, tools = request.prompt, request.tools
     assert "extract_tool" not in {tool["name"] for tool in tools}
 
 
 @pytest.mark.parametrize("mode", ["eager", "lazy"])
 def test_structured_extraction_can_emit_a_memory_from_statistics_alone(mode):
     import json
+
     from core.uri_resolver import URIResolver
     from extraction.schemas.registry import SchemaRegistry
 
-    llm = provider()
+    llm = provider(("tool",))
     operation = {"tool": "extract_tool", "input": {
         "routing_key": "web_search", "abstract": "web_search failed three times.",
         "overview": "web_search: 3 calls, all failed.",
