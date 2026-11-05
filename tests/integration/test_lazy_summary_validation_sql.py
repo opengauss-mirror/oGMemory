@@ -49,6 +49,8 @@ def replay_lazy_summary(make, ctx, operations, snapshots, source, *, recovery=Fa
 
         def complete_json(self, prompt, schema=None, **kwargs):
             properties = (schema or {}).get("properties", {})
+            if "categories" in properties:
+                return {"categories": ["entity", "event"]}
             if "spans" in properties:
                 self.calls.append("spans")
                 return {"spans": [{"start": 0, "end": 0, "categories": ["entity", "event"]}]}

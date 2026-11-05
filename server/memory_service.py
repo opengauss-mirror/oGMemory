@@ -719,6 +719,8 @@ class MemoryService:
         self._bm25_index: Bm25Index | None = None
         self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
+        self._outbox_stop = threading.Event()
+        self._shutdown_lock = threading.Lock()
         self._extraction_retry = ExtractionRetryWorker(self)
         self._extraction_discovery = None
         self._outbox_listener = None
@@ -2722,7 +2724,7 @@ class MemoryService:
     @_serialize_lazy_initialization("_outbox_thread")
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
-        if self._outbox_thread is not None:
+        if self._outbox_thread is not None or self._outbox_stop.is_set():
             return
         if int(getattr(self._cfg, "index_workers", 1)) <= 0:
             logger.info("OutboxWorker disabled by index.workers=%s", self._cfg.index_workers)
@@ -2794,9 +2796,8 @@ class MemoryService:
                 return [self._default_account_id]
 
             def _outbox_loop():
-                import time
                 logger.info("OutboxWorker thread started (polling every 5s)")
-                while True:
+                while not self._outbox_stop.is_set():
                     try:
                         account_ids = _get_account_ids_to_scan()
                         worker.run_once(
@@ -2805,7 +2806,7 @@ class MemoryService:
                         )
                     except Exception as exc:
                         logger.warning("OutboxWorker poll error: %s", exc)
-                    time.sleep(5)
+                    self._outbox_stop.wait(5)
 
             self._outbox_thread = threading.Thread(
                 target=_outbox_loop, daemon=True, name="outbox-worker"
@@ -2897,7 +2898,13 @@ class MemoryService:
             return {"processed": 0, "succeeded": 0, "failed": 1, "error": str(exc)}
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
-        """Best-effort shutdown for background SQL listener threads."""
+        """Stop the outbox worker before closing its shared projections."""
+        with self._shutdown_lock:
+            with self._init_lock:
+                self._outbox_stop.set()
+            self._shutdown_resources(join_timeout)
+
+    def _shutdown_resources(self, join_timeout: float) -> None:
         if self._scene_manager is not None and not self._scene_manager.stop(timeout=join_timeout):
             logger.warning("Scene worker is completing its current request")
             return
@@ -2933,8 +2940,6 @@ class MemoryService:
                 logger.warning("Outbox worker did not stop before shutdown deadline")
                 return
 
-        self._outbox_listener = None
-        self._outbox_thread = None
         if self._lexical_backfill is not None:
             if not self._lexical_backfill.close(timeout=join_timeout):
                 logger.warning("Lexical backfill did not stop before shutdown deadline")
@@ -2951,6 +2956,11 @@ class MemoryService:
             self._lexical_index = None
             self._lexical_backfill = None
             self._vector_index = None
+        with self._init_lock:
+            self._outbox_listener = None
+            self._outbox_thread = None
+            self._outbox_stop.clear()
+
 
     def get_decision_client(self):
         """One optional protocol client shared by retrieval and lazy extraction."""
@@ -7838,9 +7848,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if self._cfg.vector_db_type.strip().casefold() == "milvus":
                 info["vector_db"] = {"type": "milvus", "available": False}
                 # A cached client can outlive a failed server or revoked grant.
-                # count uses the adapter's configured RPC timeout on every probe.
                 try:
-                    self._get_shared_vector_index().count({"account_id": self._cfg.account_id})
+                    self._get_shared_vector_index().probe(self._cfg.account_id)
                 except Exception as exc:
                     raise RuntimeError(
                         f"Milvus vector backend unavailable ({type(exc).__name__})"

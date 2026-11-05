@@ -1,6 +1,7 @@
 """Run Agent extraction recovery and concurrent index publication against AGFS."""
 
 import multiprocessing
+import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
@@ -110,7 +111,15 @@ def _index_event(url, ctx, index, started, reached, resume, completed):
             return super().embed_texts(texts)
 
     started.set()
-    result = OutboxWorker(index, Embedding(), fs=fs).run_once(outbox, [ctx.account_id])
+    worker = OutboxWorker(index, Embedding(), fs=fs)
+    deadline = time.monotonic() + 15
+    while True:
+        result = worker.run_once(outbox, [ctx.account_id])
+        assert result["failed"] == 0, result
+        if result["succeeded"]:
+            break
+        assert time.monotonic() < deadline, result
+        time.sleep(0.05)
     assert result["succeeded"] == 1, result
     completed.set()
 

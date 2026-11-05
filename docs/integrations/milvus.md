@@ -70,7 +70,9 @@ YAML 中显式配置的字段优先于环境变量。向量后端切换不会自
 - `get_record` 通过 `filters` 恢复已持久化的范围字段，写回时以这些字段为准；metadata 保留原始 JSON，不重复补入范围列，避免读取后重写突破容量上限。
 - 保留 JSON 元数据和 grounding。AGFS/SQL 存储配置由现有 `storage` 段独立决定，Milvus 只负责向量索引。
 
-当前实现要求 Milvus 2.6 系列及 pymilvus >=2.6.17,<2.7，实测组合为 Milvus 2.6.13 + pymilvus 2.6.17、ARM64 Standalone。升级时应先停止旧版写入进程：启动会向旧集合补建 4 个 nullable 正文字段及缺失的标量索引，需要相应 schema/index 权限；旧数据不重写。旧版适配器无法读回新写入的大正文。
+当前实现要求 Milvus 2.6 系列及 pymilvus >=2.6.17,<2.7，实测组合为 Milvus 2.6.13 + pymilvus 2.6.17、ARM64 Standalone。升级时先停止访问同一集合的旧版服务和 worker，再统一启动新版。启动需要 schema/index 权限，写入需要服务端分配时间戳的权限。
+
+适配器将原记录 ID 保存在可空的 `logical_id` 列，每次写入使用带版本的物理主键。已有记录按初始版本读取。按 ID、向量和范围查询都以最新可见版本为准。删除标记用于拦截迟到的旧写入。升级后的业务读写应通过适配器使用逻辑 ID。回退旧版时，应从记忆原文重建独立的旧格式索引。
 可选依赖的 SDK 版本范围不代表服务端兼容矩阵；其他版本、Lite、Distributed/Kubernetes 和托管服务需分别验证。
 
 ## 自动化测试

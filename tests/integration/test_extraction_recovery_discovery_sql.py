@@ -16,7 +16,7 @@ from tests.unit.service.test_extraction_recovery_discovery import state
 
 @pytest.mark.parametrize("upgrade", [False, True])
 def test_normal_role_discovers_account_directory_after_restart(upgrade):
-    dsn = os.environ.get("OGMEM_IDENTITY_TEST_DSN")
+    dsn = os.environ.get("OGMEM_TEST_ADMIN_DSN") or os.environ.get("OGMEM_IDENTITY_TEST_DSN")
     if not dsn:
         pytest.skip("set OGMEM_IDENTITY_TEST_DSN to a disposable PostgreSQL database")
     from fs.sql_adapter.schema import _schema_ensured, ensure_schema

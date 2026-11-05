@@ -6,15 +6,19 @@ truncation. Strong reads make outbox acknowledgements observable across workers.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
+import time
 from array import array
+from itertools import islice
 from typing import Any
 
 from core.interfaces import VectorIndex
 from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
+from core.projection_ownership import check_projection_owner
 
 _SCOPE_FIELDS = (
     "uri",
@@ -33,6 +37,7 @@ _JSON_FILTERS = {"node_status", "extracted_node_id", "clip_id"}
 _BATCH_SIZE = 32
 _URI_BATCH_SIZE = 128
 _QUERY_PAGE_SIZE = 256
+_KEY_PAGE_SIZE = 1024
 _QUERY_RESPONSE_BUDGET = 48 * 1024 * 1024
 _TEXT_FIELDS = ("text", "text_1", "text_2", "text_3", "text_4")
 _VARCHAR_LIMITS = {"id": 512, "text": 65535, **dict.fromkeys(_SCOPE_FIELDS, 8192)}
@@ -66,6 +71,7 @@ class MilvusVectorIndex(VectorIndex):
                 )
                 schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=dimension)
                 schema.add_field("text", DataType.VARCHAR, max_length=_VARCHAR_LIMITS["text"])
+                schema.add_field("logical_id", DataType.VARCHAR, max_length=512, nullable=True)
                 for name in _TEXT_FIELDS[1:]:
                     schema.add_field(name, DataType.VARCHAR, max_length=65535, nullable=True)
                 schema.add_field("metadata", DataType.JSON)
@@ -132,15 +138,15 @@ class MilvusVectorIndex(VectorIndex):
         # support. Old rows read as empty suffixes; no data rewrite is required.
         schema = self._rpc("describe_collection", collection_name=self._collection_name)
         fields = {field["name"]: field for field in schema["fields"]}
-        for name in _TEXT_FIELDS[1:]:
+        for name, limit in [("logical_id", 512), *((key, 65535) for key in _TEXT_FIELDS[1:])]:
             if name not in fields:
                 self._create_if_absent(
                     "add_collection_field", collection_name=self._collection_name,
                     field_name=name, data_type=data_type.VARCHAR,
-                    max_length=65535, nullable=True,
+                    max_length=limit, nullable=True,
                 )
             elif (fields[name]["type"] != data_type.VARCHAR
-                  or int(fields[name].get("params", {}).get("max_length", 0)) < 65535):
+                  or int(fields[name].get("params", {}).get("max_length", 0)) < limit):
                 raise ValueError("Existing Milvus collection has incompatible text suffix fields")
 
     @staticmethod
@@ -197,9 +203,8 @@ class MilvusVectorIndex(VectorIndex):
         for name in self._rpc("list_indexes", collection_name=self._collection_name):
             info = self._rpc("describe_index", collection_name=self._collection_name, index_name=name)
             indexed.add(info.get("field_name"))
-        # Limit automatic indexes to the common tenant/hierarchy access paths.
         # Preserve existing scalar indexes regardless of their implementation.
-        for field in ("account_id", "owner_space", "level", "parent_uri", "uri"):
+        for field in ("account_id", "owner_space", "level", "parent_uri", "uri", "logical_id"):
             if field not in indexed:
                 params = self._client.prepare_index_params()
                 params.add_index(field_name=field, index_name=f"scope_{field}", index_type="AUTOINDEX")
@@ -257,7 +262,7 @@ class MilvusVectorIndex(VectorIndex):
         return " and ".join(f"({clause})" for clause in clauses)
 
     def upsert(self, records: list[IndexRecord]) -> None:
-        rows = []
+        rows = {}
         for record in records:
             if not record.filters.get("account_id") or not record.filters.get("owner_space"):
                 raise ValueError("Milvus records require account_id and owner_space")
@@ -288,21 +293,128 @@ class MilvusVectorIndex(VectorIndex):
             ):
                 raise ValueError("Milvus metadata exceeds 65536 UTF-8 bytes")
             json.dumps(row, allow_nan=False)
-            rows.append(row)
+            rows[record.id] = row
+        self._publish(list(rows.values()))
+
+    def _epoch(self):
+        epoch = self._client._get_connection().alloc_timestamp(timeout=self._timeout)
+        if not epoch:
+            raise RuntimeError("Milvus must support timestamp allocation for projection writes")
+        check_projection_owner()
+        return epoch
+
+    def _publish(self, rows: list[dict], *, deleted: bool = False) -> None:
+        if not rows:
+            return
+        epoch = self._epoch()
+        for row in rows:
+            logical_id = row["id"]
+            digest = hashlib.sha256(logical_id.encode()).hexdigest()
+            row["logical_id"] = logical_id
+            row["id"] = f"ogv_{epoch:020d}_{int(deleted)}_{digest}"
         for start in range(0, len(rows), _BATCH_SIZE):
             self._rpc(
                 "upsert",
                 collection_name=self._collection_name,
                 data=rows[start : start + _BATCH_SIZE],
             )
+        self._prune_versions(rows)
+
+    def _prune_versions(self, writes):
+        # Keep the maximum generation, including a deletion marker. A worker
+        # racing this cleanup can only remove immutable, superseded identities.
+        for start in range(0, len(writes), _URI_BATCH_SIZE):
+            batch = writes[start : start + _URI_BATCH_SIZE]
+            expr = self._version_filter([row["logical_id"] for row in batch])
+            accounts = {row["account_id"] for row in batch if row["account_id"]}
+            if accounts:
+                expr = f"({expr}) or ({self._marker_filter(accounts)})"
+            cutoffs = {}
+            latest = {}
+            obsolete = []
+            for row in self._key_rows(expr, ["logical_id", "level", "account_id", "owner_space"]):
+                if row["level"] == -2:
+                    self._add_marker(cutoffs, row)
+                    continue
+                key = row.get("logical_id") or row["id"]
+                rank = row["id"] if row.get("logical_id") else ""
+                current = rank, row["id"]
+                if key in latest:
+                    loser, current = sorted((latest[key], current))
+                    obsolete.append(loser[1])
+                latest[key] = current
+            retired = [row for row in batch if self._is_live(row) and not self._current_in_scope(row, cutoffs)]
+            for offset in range(0, len(retired), _BATCH_SIZE):
+                self._retire_payloads(retired[offset : offset + _BATCH_SIZE])
+            for offset in range(0, len(obsolete), _BATCH_SIZE):
+                self._rpc(
+                    "delete",
+                    collection_name=self._collection_name,
+                    ids=obsolete[offset : offset + _BATCH_SIZE],
+                )
+
+    @staticmethod
+    def _version_filter(keys):
+        literals = json.dumps(keys, ensure_ascii=False)
+        return f"logical_id in {literals} or (logical_id is null and id in {literals})"
+
+    @staticmethod
+    def _is_live(row):
+        return not row.get("logical_id") or row["id"].split("_", 3)[2] == "0"
+
+    @staticmethod
+    def _marker_filter(accounts):
+        expression = 'level == -2 and id like "ogscope_%"'
+        if accounts:
+            expression += " and account_id in " + json.dumps(sorted(set(accounts)))
+        return expression
+
+    @staticmethod
+    def _add_marker(cutoffs, row):
+        scope = row["account_id"], row["owner_space"]
+        epoch = row["id"].split("_", 2)[1]
+        cutoffs[scope] = max(epoch, cutoffs.get(scope, ""))
+
+    @staticmethod
+    def _current_in_scope(row, cutoffs):
+        account = row["account_id"]
+        bound = max(cutoffs.get((account, ""), ""), cutoffs.get((account, row["owner_space"]), ""))
+        return not bound or (row.get("logical_id") and row["id"].split("_", 2)[1] > bound)
+
+    def _heads(self, ids):
+        heads = {}
+        keys = list(dict.fromkeys(ids))
+        for start in range(0, len(keys), _URI_BATCH_SIZE):
+            expression = self._version_filter(keys[start : start + _URI_BATCH_SIZE])
+            for row in self._key_rows(
+                expression, ["logical_id", "account_id", "owner_space", "level"]
+            ):
+                key = row.get("logical_id") or row["id"]
+                rank = row["id"] if row.get("logical_id") else ""
+                if key not in heads or rank > heads[key][0]:
+                    heads[key] = (rank, row)
+        live = {
+            key: row for key, (_, row) in heads.items() if row["level"] != -2 and self._is_live(row)
+        }
+        cutoffs = {}
+        if live:
+            expression = self._marker_filter([row["account_id"] for row in live.values()])
+            for row in self._key_rows(expression, ["account_id", "owner_space"]):
+                self._add_marker(cutoffs, row)
+        return {key: row["id"] for key, row in live.items() if self._current_in_scope(row, cutoffs)}
+
+    def _marker(self, key, level):
+        return {
+            **dict.fromkeys(_SCOPE_FIELDS, ""),
+            **dict.fromkeys(_TEXT_FIELDS, ""),
+            "id": key,
+            "level": level,
+            "metadata": {},
+            "embedding": [1.0] + [0.0] * (self._dimension - 1),
+        }
 
     def delete(self, ids: list[str]) -> None:
-        for start in range(0, len(ids), _BATCH_SIZE):
-            self._rpc(
-                "delete",
-                collection_name=self._collection_name,
-                ids=ids[start : start + _BATCH_SIZE],
-            )
+        self._publish([self._marker(key, -1) for key in dict.fromkeys(ids)], deleted=True)
 
     def search_by_vector(
         self, query_vector: list[float], filters: dict[str, Any], top_k: int
@@ -311,19 +423,34 @@ class MilvusVectorIndex(VectorIndex):
             return []
         if top_k > 16384:
             raise ValueError("Milvus top_k must not exceed 16384")
-        result = self._rpc(
-            "search",
-            collection_name=self._collection_name,
-            data=[self._vector(query_vector)],
-            anns_field="embedding",
-            filter=self._build_filter(filters),
-            limit=top_k,
-            output_fields=["metadata", "level", *_SCOPE_FIELDS],
-            search_params={"metric_type": "COSINE", "params": {"ef": max(64, top_k)}},
-            consistency_level="Strong",
-        )
+        requested = self._build_filter(filters)
+        expression = f"({requested}) and level >= 0" if requested else "level >= 0"
+        excluded = set()
+        scope = expression
+        vector = self._vector(query_vector)
+        while True:
+            result = self._rpc(
+                "search",
+                collection_name=self._collection_name,
+                data=[vector],
+                anns_field="embedding",
+                filter=expression,
+                limit=top_k,
+                output_fields=["logical_id", "metadata", "level", *_SCOPE_FIELDS],
+                search_params={"metric_type": "COSINE", "params": {"ef": max(64, top_k)}},
+                consistency_level="Strong",
+            )
+            matches = result[0]
+            keys = [m["entity"].get("logical_id") or m["id"] for m in matches]
+            heads = self._heads(keys)
+            current = [m for key, m in zip(keys, matches) if heads.get(key) == m["id"]]
+            if len(current) == len(matches) or len(matches) < top_k:
+                break
+            excluded.update(m["id"] for key, m in zip(keys, matches) if heads.get(key) != m["id"])
+            omit = "id not in " + json.dumps(sorted(excluded))
+            expression = f"({scope}) and ({omit})" if scope else omit
         hits = []
-        for match in result[0]:
+        for match in current:
             row = match["entity"]
             meta = {
                 **row.get("metadata", {}),
@@ -360,8 +487,11 @@ class MilvusVectorIndex(VectorIndex):
         # The server iterator flag orders by primary key. Use bounded keyset
         # pages directly: pymilvus 2.6.17 QueryIterator performs an unbounded
         # describe_collection during construction, even with a timeout.
-        expression = self._build_filter(filters)
+        yield from self._pages(self._build_filter(filters), output_fields, page_size)
+
+    def _pages(self, expression, output_fields, page_size=_QUERY_PAGE_SIZE):
         cursor = None
+        snapshot = {}
         while True:
             page_filter = expression
             if cursor is not None:
@@ -371,6 +501,7 @@ class MilvusVectorIndex(VectorIndex):
                 "query", collection_name=self._collection_name, filter=page_filter,
                 output_fields=list(dict.fromkeys(["id", *output_fields])),
                 limit=page_size, iterator="True", consistency_level="Strong",
+                **snapshot,
             )
             if not batch:
                 break
@@ -378,9 +509,21 @@ class MilvusVectorIndex(VectorIndex):
             if ids != sorted(ids) or (cursor is not None and ids[0] <= cursor):
                 raise RuntimeError("Milvus returned an unordered iterator page")
             cursor = ids[-1]
+            timestamp = getattr(batch, "extra", {}).get("iterator_session_ts")
+            if timestamp:
+                snapshot["guarantee_timestamp"] = timestamp
             yield from batch
             if len(batch) < page_size:
                 break
+
+    def _key_rows(self, expression, fields):
+        output = list(dict.fromkeys(["id", *fields]))
+        batch = self._rpc("query", collection_name=self._collection_name, filter=expression,
+                          output_fields=output, limit=_KEY_PAGE_SIZE, consistency_level="Strong")
+        if len(batch) < _KEY_PAGE_SIZE:
+            yield from batch
+        else:
+            yield from self._pages(expression, fields, _KEY_PAGE_SIZE)
 
     def get_embeddings(
         self,
@@ -399,35 +542,98 @@ class MilvusVectorIndex(VectorIndex):
             fields.extend(_TEXT_FIELDS)
         # Budget the worst-case row, including all text suffixes and vectors.
         # Scene checks expected_texts too; it should not inherit 32-row write batches.
-        row_bytes = self._dimension * 4 + _VARCHAR_LIMITS["id"] + _VARCHAR_LIMITS["uri"] + 1024
+        row_bytes = (self._dimension * 4 + 2 * _VARCHAR_LIMITS["id"] + _VARCHAR_LIMITS["uri"]
+                     + _VARCHAR_LIMITS["account_id"] + _VARCHAR_LIMITS["owner_space"] + 1024)
         if expected_texts is not None:
             row_bytes += len(_TEXT_FIELDS) * _VARCHAR_LIMITS["text"]
         page_size = min(_QUERY_PAGE_SIZE, max(1, _QUERY_RESPONSE_BUDGET // row_bytes))
         for start in range(0, len(wanted), _URI_BATCH_SIZE):
-            for row in self._query_rows(
-                {**filters, "uri": wanted[start:start + _URI_BATCH_SIZE], "level": level},
-                fields, page_size=page_size,
-            ):
+            batch = wanted[start : start + _URI_BATCH_SIZE]
+            scope = {**filters, "uri": batch, "level": level}
+            if filters.keys() <= {"account_id", "owner_space"}:
+                rows = self._embedding_rows(batch, scope, fields, page_size)
+            else:
+                rows = self._visible_rows(scope, fields, page_size)
+            for row in rows:
                 if expected_texts is None or self._text(row) == expected_texts.get(row["uri"]):
                     output[row["uri"]] = [float(value) for value in row["embedding"]]
         return output
 
+    def _embedding_rows(self, uris, scope, fields, page_size):
+        # Include the complete history of canonical URI/level IDs in the same
+        # bounded query. Sibling records with custom IDs resolve independently.
+        expected_ids = {IndexRecord.generate_id(uri, scope["level"]) for uri in uris}
+        expression = (
+            f"({self._build_filter(scope)}) or ({self._version_filter(sorted(expected_ids))})"
+        )
+        account = scope.get("account_id", [])
+        markers = self._marker_filter(account if isinstance(account, list) else [account])
+        newest, cutoffs = {}, {}
+        rows = self._pages(
+            f"({expression}) or ({markers})",
+            ["logical_id", "account_id", "owner_space", *scope, *fields],
+            page_size,
+        )
+        while batch := list(islice(rows, page_size)):
+            siblings = []
+            for row in batch:
+                if row["level"] == -2:
+                    self._add_marker(cutoffs, row)
+                    continue
+                key = row.get("logical_id") or row["id"]
+                if key not in expected_ids:
+                    siblings.append(row)
+                    continue
+                rank = row["id"] if row.get("logical_id") else ""
+                if key not in newest or rank > newest[key][0]:
+                    newest[key] = rank, row
+            yield from self._visible_batch(siblings)
+        for _, row in newest.values():
+            if (
+                self._is_live(row)
+                and self._current_in_scope(row, cutoffs)
+                and all(
+                    row.get(field) in value if isinstance(value, list) else row.get(field) == value
+                    for field, value in scope.items()
+                )
+            ):
+                yield row
+
+    def _visible_rows(self, filters, fields, page_size=_QUERY_PAGE_SIZE):
+        rows = self._query_rows(filters, ["logical_id", *fields], page_size=page_size)
+        while batch := list(islice(rows, page_size)):
+            yield from self._visible_batch(batch)
+
+    def _visible_batch(self, batch):
+        keys = [row.get("logical_id") or row["id"] for row in batch]
+        heads = self._heads(keys)
+        for key, row in zip(keys, batch):
+            if heads.get(key) == row["id"]:
+                yield row
+
     def get_record(self, record_id: str) -> IndexRecord | None:
         if not record_id:
             return None
-        rows = self._rpc(
-            "get",
-            collection_name=self._collection_name,
-            ids=[record_id],
-            output_fields=["*"],
-            consistency_level="Strong",
-        )
-        if not rows:
-            return None
+        deadline = time.monotonic() + self._timeout
+        while True:
+            physical = self._heads([record_id]).get(record_id)
+            if physical is None:
+                return None
+            rows = self._rpc(
+                "get",
+                collection_name=self._collection_name,
+                ids=[physical],
+                output_fields=["*"],
+                consistency_level="Strong",
+            )
+            if rows:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Milvus record changed throughout the lookup")
         row = rows[0]
         scope = {key: row.get(key, "") for key in _SCOPE_FIELDS}
         return IndexRecord(
-            id=row["id"],
+            id=record_id,
             uri=row["uri"],
             level=row["level"],
             text=self._text(row),
@@ -445,25 +651,44 @@ class MilvusVectorIndex(VectorIndex):
             },
         )
 
+    def probe(self, account_id: str) -> None:
+        self._rpc("query", collection_name=self._collection_name,
+                  filter=self._build_filter({"account_id": account_id}),
+                  output_fields=["id"], limit=1, consistency_level="Strong")
+
     def count(self, filters: dict[str, Any] | None = None) -> int:
-        rows = self._rpc(
-            "query",
-            collection_name=self._collection_name,
-            filter=self._build_filter(filters or {}),
-            output_fields=["count(*)"],
-            consistency_level="Strong",
-        )
-        return int(rows[0]["count(*)"])
+        rows = self._key_rows(self._build_filter(filters or {}), ["logical_id"])
+        total = 0
+        while batch := list(islice(rows, _KEY_PAGE_SIZE)):
+            total += sum(1 for _ in self._visible_batch(batch))
+        return total
 
     def _delete_where(self, filters: dict[str, Any]) -> int:
-        # Count the visible snapshot for the protocol's return value. Some Milvus
-        # versions do not report an accurate logical-row count for expression deletes.
         count = self.count(filters)
-        if count:
-            self._rpc(
-                "delete", collection_name=self._collection_name, filter=self._build_filter(filters)
-            )
+        epoch = self._epoch()
+        digest = hashlib.sha256(json.dumps(filters, sort_keys=True).encode()).hexdigest()
+        marker = self._marker(f"ogscope_{epoch:020d}_{digest}", -2)
+        marker.update(filters)
+        self._rpc("upsert", collection_name=self._collection_name, data=[marker])
+        scope = self._build_filter(filters)
+        prefix = f"ogv_{epoch:020d}_"
+        retiring = f'({scope}) and level >= 0 and (logical_id is null or id < "{prefix}")'
+        rows = self._key_rows(retiring, ["logical_id"])
+        while batch := list(islice(rows, _BATCH_SIZE)):
+            self._retire_payloads(batch)
         return count
+
+    def _retire_payloads(self, batch):
+        tombstones = []
+        for row in batch:
+            key = row.get("logical_id") or row["id"]
+            version = row["id"].split("_", 2)[1] if row.get("logical_id") else "0" * 20
+            digest = hashlib.sha256(key.encode()).hexdigest()
+            tombstone = self._marker(f"ogv_{version}_1_{digest}", -1)
+            tombstone["logical_id"] = key
+            tombstones.append(tombstone)
+        self._rpc("upsert", collection_name=self._collection_name, data=tombstones)
+        self._rpc("delete", collection_name=self._collection_name, ids=[row["id"] for row in batch])
 
     def delete_account_data(self, account_id: str) -> int:
         return self._delete_where({"account_id": account_id})

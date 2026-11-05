@@ -89,6 +89,7 @@ def _code_node(
         content=content,
         metadata={
             "resource_type": "code",
+            "file_source": content,
             "resource_root_slug": root,
             "root_fingerprint": ("f" * 63) + account_id[-1],
             "file_key": uuid.uuid4().hex * 2,
@@ -97,7 +98,7 @@ def _code_node(
             "source_extension": ".py",
             "language": "python",
             "start_line": 1,
-            "end_line": max(1, content.count("\n") + 1),
+            "end_line": max(1, len(content.splitlines())),
             "symbol": symbol,
             "symbol_kind": "function",
             "signature": f"{symbol}(value)",
@@ -384,7 +385,7 @@ def test_active_retrieval_crosses_real_sql_outbox_bm25_and_provider(
     ]
     evidence = outcome.evidence[0]
     assert evidence.excerpt.startswith("def parse_config")
-    assert evidence.locator == "repo/src/target.py:1-3"
+    assert evidence.locator == "repo/src/target.py:1-2"
     assert "/home/" not in evidence.locator
     assert all("foreign" not in item.uri for item in outcome.evidence)
     assert outcome.diagnostics.scope_match_count == 1

@@ -69,18 +69,19 @@ def _wait_for_pgvector_rows(
 ) -> tuple[int, list[tuple]]:
     """Wait until async listener finishes vector upsert for the account."""
     deadline = time.time() + timeout_seconds
-    last_outbox_rows = 0
+    last_unfinished_rows = 0
     last_vector_rows: list[tuple] = []
 
     while time.time() < deadline:
         conn = psycopg2.connect(dsn)
         try:
             with conn.cursor() as cur:
+                cur.execute("SET LOCAL app.account_id = %s", (account_id,))
                 cur.execute(
-                    "SELECT count(*) FROM outbox_events WHERE account_id = %s",
+                    "SELECT count(*) FROM outbox_events WHERE account_id = %s AND status <> 'DONE'",
                     (account_id,),
                 )
-                last_outbox_rows = cur.fetchone()[0]
+                last_unfinished_rows = cur.fetchone()[0]
                 cur.execute(
                     """
                     SELECT id, uri, level, vector_dims(embedding), filters->>'account_id'
@@ -91,13 +92,13 @@ def _wait_for_pgvector_rows(
                     (account_id,),
                 )
                 last_vector_rows = cur.fetchall()
-                if len(last_vector_rows) == 2 and last_outbox_rows == 0:
-                    return last_outbox_rows, last_vector_rows
+                if len(last_vector_rows) == 2 and last_unfinished_rows == 0:
+                    return last_unfinished_rows, last_vector_rows
         finally:
             conn.close()
         time.sleep(0.1)
 
-    return last_outbox_rows, last_vector_rows
+    return last_unfinished_rows, last_vector_rows
 
 
 @pytest.fixture
@@ -352,12 +353,24 @@ def test_sql_pgvector_roundtrip_via_memory_service(
         # The listener may process the event before this synchronous sweep runs.
         service.drain_outbox_sync()
 
-        outbox_rows, vector_rows = _wait_for_pgvector_rows(
+        unfinished_rows, vector_rows = _wait_for_pgvector_rows(
             pgvector_dsn,
             sql_ctx.account_id,
         )
 
-        assert outbox_rows == 0
+        assert unfinished_rows == 0
+        conn = psycopg2.connect(sql_dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL app.account_id = %s", (sql_ctx.account_id,))
+                cur.execute(
+                    "SELECT status FROM outbox_events WHERE account_id = %s "
+                    "AND uri = %s AND event_type = 'UPSERT_CONTEXT'",
+                    (sql_ctx.account_id, result["target_uri"]),
+                )
+                assert cur.fetchall() == [("DONE",)]
+        finally:
+            conn.close()
         assert len(vector_rows) == 2
         assert {row[2] for row in vector_rows} == {0, 2}
         assert all(row[3] == 1536 for row in vector_rows)

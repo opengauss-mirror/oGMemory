@@ -268,14 +268,21 @@ class OperatorService:
             )
             content_to_write["materialization"] = materialization_report.to_dict()
 
-        extracted = self._graph.create_extracted_node(
-            source_raw_id=raw_node.node_id,
-            extractor_type=operator.extractor_type,
-            extraction_schema=extraction.schema_used,
-            ctx=ctx,
-            extracted_content=content_to_write,
-            node_id=desired_node_id,
-        )
+        try:
+            extracted = self._graph.create_extracted_node(
+                source_raw_id=raw_node.node_id,
+                extractor_type=operator.extractor_type,
+                extraction_schema=extraction.schema_used,
+                ctx=ctx,
+                extracted_content=content_to_write,
+                node_id=desired_node_id,
+            )
+        except FileExistsError:
+            extracted = self._graph.get_extracted_node(desired_node_id, ctx) if desired_node_id else None
+            if (extracted is None or extracted.source_raw_id != raw_node.node_id
+                    or extracted.extractor_type != operator.extractor_type
+                    or extracted.extraction_schema != extraction.schema_used):
+                raise
         # Mark the node as COMPLETED so M3 drivers and other callers can
         # distinguish a real persisted result from a leftover pending
         # row written by a previous failed run. ``create_extracted_node``

@@ -116,7 +116,7 @@ class TestIndexEpisodic:
         assert "put our photos in the album" in index_with_asr[0]["text"]
 
     def test_index_record_shape(self):
-        rec = index_record_from_episodic(_episodic_record(), [0.1, 0.2])
+        rec = index_record_from_episodic(_episodic_record(), [0.1, 0.2], include_embedding=True)
         assert rec["video_id"] == "living_room_06"
         assert rec["clip_id"] == 0
         assert rec["embedding"] == [0.1, 0.2]
@@ -146,7 +146,7 @@ class TestSearch:
         # up a real vector store. The records shape is unchanged
         # from the legacy JSONL output (same key names), so this
         # migration is one-line per call site.
-        searcher = EpisodicSearcher.from_records(records, embedder=embedder)
+        searcher = EpisodicSearcher.from_records(build_index(records, embedder=embedder), embedder=embedder)
         hits = searcher.search(
             "What drink is on the table?",
             video_id="living_room_06",
@@ -164,7 +164,7 @@ class TestSearch:
             _episodic_record("v", 0, "The robot enters the kitchen."),
             _episodic_record("v", 1, "The robot sees a red apple."),
         ]
-        searcher = EpisodicSearcher.from_records(records, embedder=embedder)
+        searcher = EpisodicSearcher.from_records(build_index(records, embedder=embedder), embedder=embedder)
         hits = searcher.search("red apple", video_id="v", top_k=2, include_neighbors=1)
         assert {h.clip_id for h in hits} == {0, 1}
 
@@ -196,7 +196,7 @@ class TestQAMVP:
         assert result["answer"] == "Coffee."
         assert result["confidence"] == 0.9
 
-    def test_run_qa_writes_jsonl(self, tmp_path: Path):
+    def test_run_qa_writes_jsonl(self, tmp_path: Path, monkeypatch):
         annotations = {
             "living_room_06": {
                 "video_path": "data/videos/robot/living_room_06.mp4",
@@ -214,13 +214,12 @@ class TestQAMVP:
 
         embedder = MockEmbedder(dimension=8)
         index = build_index([_episodic_record()], embedder=embedder)
-        index_path = tmp_path / "index.jsonl"
-        index_path.write_text("\n".join(json.dumps(r) for r in index) + "\n", encoding="utf-8")
+        searcher = EpisodicSearcher.from_records(index, embedder=embedder)
+        monkeypatch.setattr("m3.qa._build_qa_vector_index", lambda args: searcher._index)
 
         out = tmp_path / "qa.jsonl"
         args = parse_qa_args([
             "--annotations", str(ann_path),
-            "--index", str(index_path),
             "--output-jsonl", str(out),
             "--embedder", "mock",
             "--embedding-dimension", "8",

@@ -113,7 +113,7 @@ def test_http_readiness_rechecks_cached_milvus_and_recovers(monkeypatch, storage
     monkeypatch.setattr("server.memory_service.AGFSClient", Mock())
     monkeypatch.setattr(service, "_get_shared_sql_pool", Mock(return_value=MagicMock()))
     index = Mock()
-    index.count.side_effect = [0, ConnectionError("private-token"), 0]
+    index.probe.side_effect = [None, ConnectionError("private-token"), None]
     monkeypatch.setattr(service, "_get_shared_vector_index", Mock(return_value=index))
     app = import_module("server.app")
     monkeypatch.setattr(app, "_get_service", lambda: service)
@@ -123,9 +123,8 @@ def test_http_readiness_rechecks_cached_milvus_and_recovers(monkeypatch, storage
             assert response.status_code == status
             assert "private-token" not in response.get_data(as_text=True)
             assert response.json["vector_db"]["available"] == available
-    assert index.count.call_count == 3
-    assert all(call.args == ({"account_id": "selected-account"},)
-               for call in index.count.call_args_list)
+    assert index.probe.call_count == 3
+    assert all(call.args == ("selected-account",) for call in index.probe.call_args_list)
 
 
 def test_health_rejects_initial_milvus_connection_failure(monkeypatch):

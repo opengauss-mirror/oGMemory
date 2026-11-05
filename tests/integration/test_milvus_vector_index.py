@@ -3,6 +3,7 @@
 Only a UUID-named collection created by this test is removed during cleanup.
 """
 
+import json
 import os
 from uuid import uuid4
 
@@ -270,8 +271,10 @@ def test_real_scalar_index_repair_and_legacy_text_migration(index):
     client.create_collection(collection_name=name, schema=schema)
     reopened = None
     try:
-        row = client.get(collection_name=index._collection_name, ids=[item.id])[0]
-        row = {k: v for k, v in row.items() if not k.startswith("text_")}
+        row = client.query(collection_name=index._collection_name, filter='uri == ' + json.dumps(item.uri),
+                           output_fields=["*"], consistency_level="Strong")[0]
+        row = {k: v for k, v in row.items() if k != "logical_id" and not k.startswith("text_")}
+        row["id"] = item.id
         client.insert(collection_name=name, data=[row])
         reopened = MilvusVectorIndex(uri=os.environ["OGMEM_TEST_MILVUS_URI"],
                                      token=os.environ.get("MILVUS_TOKEN", ""),
@@ -279,7 +282,8 @@ def test_real_scalar_index_repair_and_legacy_text_migration(index):
         assert reopened.get_record(item.id).text == item.text
         names = client.list_indexes(collection_name=name)
         fields = {client.describe_index(collection_name=name, index_name=n)["field_name"] for n in names}
-        assert {"embedding", "account_id", "owner_space", "level", "parent_uri", "uri"} <= fields
+        print("RESPONSE describe_index", name, sorted(fields))
+        assert {"embedding", "logical_id", "account_id", "owner_space", "level", "parent_uri", "uri"} <= fields
     finally:
         if reopened:
             reopened.close()
@@ -322,3 +326,60 @@ def test_real_cosine_scores_remain_correct_for_safe_vector_magnitudes(index):
         with pytest.raises(ValueError, match="norm.*FLOAT32"):
             index.upsert([make_record("unsafe", vector=[magnitude, 0., 0.])])
     assert index.count() == 3
+
+@pytest.mark.parametrize("deletion", ["record", "owner", "account"])
+def test_milvus_late_projection_search_delete_and_recreate(index, monkeypatch, deletion):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    old = make_record("atlas", vector=[1., 0., 0.])
+    new = make_record("atlas", vector=[0., 1., 0.])
+    old.text = old.metadata["abstract"] = "Monday"
+    new.text = new.metadata["abstract"] = "Friday"
+    entered, release = Event(), Event()
+    send = index._client.upsert
+
+    def delayed(**request):
+        if request["data"][0]["text"] == "Monday":
+            entered.set()
+            assert release.wait(30)
+            send(**request)
+            raise TimeoutError("response lost after Milvus persisted the older generation")
+        return send(**request)
+
+    monkeypatch.setattr(index._client, "upsert", delayed)
+    with ThreadPoolExecutor(1) as pool:
+        late = pool.submit(index.upsert, [old])
+        try:
+            assert entered.wait(10)
+            index.upsert([new])
+        finally:
+            release.set()
+        with pytest.raises(TimeoutError, match="response lost"):
+            late.result()
+    scope = {"account_id": "a", "owner_space": "user:u"}
+    hits = index.search_by_vector([1., 0., 0.], scope, 1)
+    assert [hit.abstract for hit in hits] == ["Friday"]
+    assert index.count(scope) == 1
+    assert index.get_embeddings([new.uri], scope) == {new.uri: [0., 1., 0.]}
+    entered.clear()
+    release.clear()
+    with ThreadPoolExecutor(1) as pool:
+        late = pool.submit(index.upsert, [old])
+        try:
+            assert entered.wait(10)
+            if deletion == "record":
+                index.delete([old.id])
+            elif deletion == "owner":
+                assert index.delete_by_owner_space("a", "user:u") == 1
+            else:
+                assert index.delete_account_data("a") == 1
+        finally:
+            release.set()
+        with pytest.raises(TimeoutError, match="response lost"):
+            late.result()
+    assert index.count(scope) == 0
+    assert index.search_by_vector([1., 0., 0.], scope, 1) == []
+    assert index.get_record(old.id) is None
+    index.upsert([new])
+    assert index.get_record(new.id).text == "Friday"

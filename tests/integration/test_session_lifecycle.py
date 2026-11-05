@@ -267,6 +267,7 @@ class TestMemoryServiceSessionIntegration:
 
     def test_after_turn_returns_failure_when_archive_commit_fails(self, service):
         """after_turn surfaces archive commit failures instead of reporting success."""
+        service._cfg.after_turn_threshold = 100
         mgr = service.get_session_manager()
 
         with patch.object(

@@ -213,7 +213,7 @@ def check_assemble(common):
     """Step 6: Assemble (should return systemPromptAddition)."""
     print("\n=== Step 6: Assemble ===")
 
-    result = http_post("/assemble", {
+    result = http_post("/compose", {
         **common,
         "sessionId": SESSION_ID,
         "messages": [
@@ -222,8 +222,10 @@ def check_assemble(common):
         "prompt": "RAG方案",
         "tokenBudget": 128000,
     })
-    prompt_addition = result.get("systemPromptAddition", "")
-    tokens = result.get("estimatedTokens", 0)
+    assert isinstance(result["messages"], list), result
+    assert result["messages"][-1]["role"] == "user", result
+    prompt_addition = result["systemPromptAddition"]
+    tokens = result["estimatedTokens"]
     print(f"  systemPromptAddition length={len(prompt_addition)}, estimatedTokens={tokens}")
     assert tokens >= 0, f"Unexpected tokens: {tokens}"
     print("  PASSED")

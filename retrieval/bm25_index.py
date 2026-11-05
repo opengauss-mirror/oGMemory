@@ -18,6 +18,7 @@ from rank_bm25 import BM25Okapi
 
 from core.memory_names import memory_directory
 from core.models import IndexRecord
+from core.projection_ownership import check_projection_owner
 from retrieval.code_ordering import code_source_key
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,7 @@ class Bm25Index:
 
         tokenized = [_tokenize(document.text) for document in prepared]
         with self._lock:
+            check_projection_owner()
             for document, tokens in zip(prepared, tokenized):
                 position = self._positions.get(document.id)
                 if position is None:
@@ -338,6 +340,7 @@ class Bm25Index:
         """Remove documents by ID."""
         id_set = set(doc_ids)
         with self._lock:
+            check_projection_owner()
             if len(self._fields) != len(self._ids):
                 self._fields = [{} for _ in self._ids]
             if len(self._field_tokenized) != len(self._ids):
