@@ -280,12 +280,12 @@ class SQLRelationStore(PoolAdapterMixin):
             projection_gate = """
                            AND re.weight >= 0 AND re.weight < 'Infinity'::double precision
                            AND re.edge_projection @> %s::jsonb
-                           AND re.edge_projection->'source_revision' = to_jsonb(s.version)
-                           AND re.edge_projection->'target_revision' = to_jsonb(t.version)
+                           AND re.edge_projection->'source_revision' = s.version::text::jsonb
+                           AND re.edge_projection->'target_revision' = t.version::text::jsonb
                            AND jsonb_typeof(re.edge_projection->'vector') = 'array'
-                           AND re.edge_projection->'dimension' = to_jsonb(
+                           AND re.edge_projection->'dimension' = (
                                CASE WHEN jsonb_typeof(re.edge_projection->'vector') = 'array'
-                                    THEN jsonb_array_length(re.edge_projection->'vector') ELSE -1 END)
+                                    THEN jsonb_array_length(re.edge_projection->'vector') ELSE -1 END)::text::jsonb
             """
             params += (json.dumps(identity, sort_keys=True),)
         params += (limit,)
