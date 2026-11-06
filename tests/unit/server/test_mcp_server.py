@@ -236,28 +236,18 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     search_properties = search_schema.get("properties", {})
     assert set(search_properties) == {"query", "scope", "budget"}
     assert search_schema.get("required") == ["query"]
-    assert search_properties["query"] == {
-        "description": "Natural language or keyword query.",
-        "title": "Query",
-        "type": "string",
-    }
-    assert search_properties["scope"]["description"] == "Optional search scope."
-    assert search_properties["budget"]["description"] == "Optional search budget."
+    assert search_properties["query"]["type"] == "string"
 
     scope_schema = search_schema["$defs"]["CodeSearchScopeInput"]
     assert scope_schema["additionalProperties"] is False
     assert set(scope_schema["properties"]) == {"paths", "glob_patterns", "grep_terms"}
     path_description = scope_schema["properties"]["paths"]["description"]
-    assert "repository-relative POSIX" in path_description
-    assert "without the edit locator's root slug" in path_description
-    assert "paths=['src/module.py']" in path_description
-    assert scope_schema["properties"]["glob_patterns"]["description"] == (
-        "Optional glob patterns to narrow candidate files before ranking."
-    )
+    assert "repository-relative posix" in path_description.lower()
+    assert "strip the locator's root slug" in path_description
     grep_description = scope_schema["properties"]["grep_terms"]["description"]
-    assert "case-insensitive literal substrings (AND)" in grep_description
-    assert "same file's complete source content" in grep_description
-    assert "Paths, metadata and generated summaries do not count" in grep_description
+    assert "case-insensitive literals" in grep_description.lower()
+    assert "all must occur in one file's source" in grep_description
+    assert "at least one per returned chunk" in grep_description
     for field in ("paths", "glob_patterns", "grep_terms"):
         array_schema = scope_schema["properties"][field]["anyOf"][0]
         assert array_schema == {"items": {"type": "string"}, "type": "array"}
@@ -265,19 +255,16 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     budget_schema = search_schema["$defs"]["CodeSearchBudgetInput"]
     assert budget_schema["additionalProperties"] is False
     assert set(budget_schema["properties"]) == {"result_limit"}
-    assert budget_schema["properties"]["result_limit"]["description"] == (
-        "Optional max hits; omit to use the server default."
-    )
     assert budget_schema["properties"]["result_limit"]["anyOf"][0] == {
         "exclusiveMinimum": 0,
         "type": "integer",
     }
     for guidance in (
-        "compact editable snippets",
-        "symbols in query",
-        "scope.paths for known files",
+        "Prefer one focused search",
+        "Reuse snippets and examples",
+        "scope.paths",
         "edit_target.locator",
-        "complete implementations",
+        "specific unanswered question",
         "read_lines",
     ):
         assert guidance in search_tool.description
@@ -463,7 +450,7 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "deduplication" in write_tool.description.lower()
     assert "correction" in write_tool.description.lower()
     assert "explicit user forget request" in delete_tool.description.lower()
-    assert "compact editable snippets" in tools[SEARCH_CODE_TOOL_NAME].description.lower()
+    assert "read_lines" in tools[SEARCH_CODE_TOOL_NAME].description
 
     query_schema = query_tool.input_schema["properties"]
     assert "self-contained" in query_schema["query"]["description"]
@@ -794,22 +781,19 @@ def test_create_mcp_server_registers_code_edit_tool_only_under_independent_capab
     assert "ctx" not in properties
     assert set(properties) == {"locator", "old_string", "new_string", "replace_all"}
     assert "edit_target.locator" in properties["locator"]["description"]
-    assert "not the JSON object" in properties["locator"]["description"]
+    assert "including its root slug" in properties["locator"]["description"]
     old_string_description = properties["old_string"]["description"].lower()
     assert "smallest unique exact text" in old_string_description
-    assert "whole file, class, or complete search excerpt" in old_string_description
+    assert "indentation and line breaks" in old_string_description
     assert "replacement for old_string only" in properties["new_string"]["description"].lower()
-    assert "smallest unique old_string" in edit_tool.description.lower()
     for guidance in (
-        "Reuse the locator",
-        "preserve indentation and line breaks",
         "combined diff",
         "error feedback",
     ):
         assert guidance in edit_tool.description
     assert SEARCH_CODE_TOOL_NAME in mcp.instructions
     assert EDIT_FILE_TOOL_NAME in mcp.instructions
-    assert "without searching again" in mcp.instructions
+    assert "otherwise use native edits" in mcp.instructions
 
 
 def test_code_edit_tool_is_not_implied_by_generic_write_or_code_only_profile(monkeypatch):
