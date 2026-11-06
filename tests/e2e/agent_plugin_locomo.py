@@ -325,9 +325,10 @@ def create_host(args: argparse.Namespace) -> AgentHost:
 
 
 class PluginAdapter:
-    def __init__(self, args, common):
+    def __init__(self, args, common, *, host_factory=None):
         self.args = args
         self.common = common
+        self.host_factory = host_factory
         self.host = self.proxy = None
         self.description = {
             "transport": "plugin",
@@ -347,7 +348,7 @@ class PluginAdapter:
         child.runtime_root = (
             (self.args.runtime_root or self.args.output_dir / "runtime") / self.args.agent / phase
         )
-        self.host = create_host(child)
+        self.host = (self.host_factory or create_host)(child)
         self.host.prepare()
 
     def ingest(self, text, key):

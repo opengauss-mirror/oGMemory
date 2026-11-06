@@ -78,6 +78,29 @@ python tests/e2e/run_deepagents_smoke.py --wait-seconds 300
 JSON 报告默认保存在已被 Git 忽略的 `.tmp/deepagents-e2e/`，可用 `--report` 指定路径。
 测试会为配置的用户留下持久记忆，请使用专用测试身份。
 
+### LoCoMo 评测
+
+`tests/e2e/run_deepagents_locomo.py` 复用 `eval.py` 的数据选择、写入、问答、
+判分和统计。通过 `--host-factory 模块:函数` 接入已挂载 `OGMemoryMiddleware`
+的应用。工厂模块需能在评测 Python 环境导入。
+
+```bash
+python tests/e2e/run_deepagents_locomo.py ingest "$DATA" \
+  --host-factory my_app.eval_host:create_host --run-id "$RUN_ID" --sample 0 --verify-writes
+```
+
+工厂接收评测参数，其中 `ogmemory_url` 是本轮代理地址，身份字段和
+`runtime_root` 对应本轮测试。返回提供 `prepare()`、`invoke(prompt, key)` 和
+`close()` 的宿主对象。宿主将每个逻辑会话键映射为实际会话，等待本轮钩子执行后
+返回 `(回答文本, token 用量)`。串行宿主使用 `--parallel 1`。
+
+运行 `qa` 时沿用数据和运行身份，代理默认拦截问答写回。
+`judge` 和 `stat` 读取评测产物，无需宿主工厂。严格写入核验会匹配原文指纹；
+每段写入后通过 `wait_until_idle` 检查服务端状态。若部署版本采用不同的归档判据，
+宿主可以实现 `settle(session_id)`，等待记忆可召回并返回含 `session_id` 的证据字典，
+未就绪时抛出异常。更换宿主工厂时使用新的评测身份和写入记录。
+四阶段参数见[记忆评测教程](../testing/memory-evaluation-guide-zh.md)。
+
 ## 环境变量与配置导出
 
 `OGMemoryMiddleware.from_env()` 读取：
