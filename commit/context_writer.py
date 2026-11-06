@@ -364,6 +364,9 @@ class ContextWriter:
                     if on_persistence is not None:
                         on_persistence(True)
                     persist(*write_args)
+                    if use_atomic:
+                        from commit.outbox_scope import record_persisted_event
+                        record_persisted_event(node.uri, write_args[2].event_id)
                 except ConcurrentModificationError:
                     if on_persistence is not None:
                         on_persistence(False)

@@ -43,13 +43,11 @@ def test_shared_uri_workers_preserve_completed_projection():
     first = OutboxWorker(index, embedder, fs=fs)
     second = OutboxWorker(index, embedder, fs=fs)
     restarted = OutboxStore(client, AGFSContextFS(client))
-    store.list_pending = lambda account: deepcopy(pending)
-    restarted.list_pending = lambda account: deepcopy(pending)
     with ThreadPoolExecutor(max_workers=1) as pool:
-        running = pool.submit(first.run_once, store, [ctx.account_id], "first")
+        running = pool.submit(first.run_once, store, [ctx.account_id], "first", deepcopy(pending))
         try:
             assert entered.wait(3)
-            overlapping = second.run_once(restarted, [ctx.account_id], "second")
+            overlapping = second.run_once(restarted, [ctx.account_id], "second", deepcopy(pending))
             assert overlapping["skipped"] == 1
             assert store.count_unfinished(ctx.account_id) == {"pending": 0, "processing": 1, "total": 1}
             hidden_locks = {path.split(".resource-mutation-lock", 1)[0] + ".resource-mutation-lock"
@@ -60,7 +58,7 @@ def test_shared_uri_workers_preserve_completed_projection():
         finally:
             finish.set()
         assert running.result()["succeeded"] == 1
-    replay = second.run_once(restarted, [ctx.account_id], "second")
+    replay = second.run_once(restarted, [ctx.account_id], "second", pending)
     assert replay["skipped"] == 1
     expected = build_index_records(fs.read_node(event.uri, ctx))
     assert set(index._records) == {record.id for record in expected}

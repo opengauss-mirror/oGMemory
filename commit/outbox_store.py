@@ -17,6 +17,7 @@ from commit.code_resource_events import (
     build_code_resource_delete_event,
     build_code_resource_write_event,
 )
+from commit.outbox_scope import record_persisted_event, remember_persisted_event
 from core.enums import EventType
 from core.interfaces import ContextFS
 from core.logging_config import get_logger
@@ -465,6 +466,7 @@ class OutboxStore:
         }, ensure_ascii=False, indent=2)
 
         self._client.write(outbox_path, event_json.encode('utf-8'))
+        record_persisted_event(dir_uri, event.event_id)
 
         return event
 
@@ -533,6 +535,7 @@ class OutboxStore:
             return self._mount_prefix + base_path
         return base_path
 
+    @remember_persisted_event
     def _write_event(self, event: OutboxEvent, node_uri: str) -> None:
         """Write OutboxEvent to .outbox/ directory using atomic write pattern.
 
@@ -977,6 +980,16 @@ class OutboxStore:
         except Exception:
             pass
         return sorted(results, key=lambda item: (item[1].created_at, item[1].event_id))
+
+    def list_pending_events(self, references) -> list[tuple[str, "OutboxEvent"]]:
+        """Load the durable events recorded by the current write invocation."""
+        results = []
+        for node_uri, event_id in dict.fromkeys(references):
+            path = self._uri_to_agfs_path(node_uri) + ".outbox"
+            if not event_id or any(char in event_id for char in ("/", "\\", ".")):
+                raise ValueError("event identity must be a path component")
+            self._collect_outbox_events(path, [{"name": event_id + ".json"}], results)
+        return results
 
     def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
         """Count every live account Outbox event without claiming it.
