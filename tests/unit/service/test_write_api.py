@@ -476,7 +476,7 @@ class TestWriteMemory:
         assert result["action"] == "create"
         assert fs.atomic_writes == []
         assert len(fs.fallback_writes) == 1
-        assert outbox.built_nodes == []
+        assert outbox.built_nodes == [fs.fallback_writes[0][0]]
         assert outbox.registered_writes == [fs.fallback_writes[0]]
 
     def test_write_memory_skipped_candidate(self):

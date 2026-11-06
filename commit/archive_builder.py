@@ -120,6 +120,8 @@ class ArchiveBuilder:
         # Add expected_version for optimistic locking (from merge policies)
         if "expected_version" in plan.merged_fields:
             metadata["expected_version"] = plan.merged_fields["expected_version"]
+            if plan.action == "create" and metadata["expected_version"] == 0:
+                metadata["_expected_version"] = 0
 
         # Add any merged metadata
         if "usage_count" in plan.merged_fields:

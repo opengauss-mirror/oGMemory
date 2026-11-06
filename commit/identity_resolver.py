@@ -500,7 +500,7 @@ class MemoryIdentityResolver:
                            "identity_create": existing is None and archived_version is None},
         )
 
-    def write(self, candidate, ctx, commit):
+    def write(self, candidate, ctx, commit, *, recover_receipt=None):
         if candidate.owner_scope == "agent" and not ctx.agent_id:
             return commit(candidate, ctx)
         candidate = self._normalize_subject(candidate, ctx)
@@ -508,7 +508,8 @@ class MemoryIdentityResolver:
             try:
                 with self._lock(self._directory(candidate, ctx), ctx):
                     if candidate.write_operation_id:
-                        committed = receipt_plan(self.fs, self.uris, candidate, ctx)
+                        committed = (recover_receipt() if recover_receipt is not None
+                                     else receipt_plan(self.fs, self.uris, candidate, ctx))
                         if committed is not None:
                             return committed
                     return self._write_once(candidate, ctx, commit)

@@ -396,7 +396,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             if checkpoint.outcome_uncertain(index):
                 resolver = self._writer._identity_resolver
                 normalized = resolver._normalize_subject(candidate, ctx)
-                committed = receipt_plan(self._fs, resolver.uris, normalized, ctx)
+                committed = receipt_plan(self._fs, resolver.uris, normalized, ctx,
+                                         outbox_store=self._outbox_store)
                 if committed is None:
                     raise RecoveryNeedsConfirmationError(
                         f"write outcome needs confirmation for operation {candidate.write_operation_id}")

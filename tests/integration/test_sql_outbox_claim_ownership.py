@@ -80,9 +80,9 @@ def test_request_projection_completes_successive_sql_references(sql_runtime):
     pending = store.list_pending_events(references)
     first = worker.run_once(store, [ctx.account_id], pending_events=pending)
     assert first["succeeded"] == 2
-    assert store.get_event(ctx.account_id, first_version.event_id).status == "DONE"
-    assert store.get_event(ctx.account_id, requested.event_id).status == "DONE"
-    assert store.get_event(ctx.account_id, existing.event_id).status == "PENDING"
+    assert store.get_event_status(first_version.uri, first_version.event_id) == "DONE"
+    assert store.get_event_status(requested.uri, requested.event_id) == "DONE"
+    assert store.get_event_status(existing.uri, existing.event_id) == "PENDING"
     assert set(index._records) == {new_record.id}
     assert index._records[new_record.id].text == "Current request latest version"
     worker.run_once(store, [ctx.account_id], pending_events=[(existing.uri, existing)])
@@ -159,8 +159,8 @@ def test_slow_batch_continues_after_delete_and_rebuild(sql_runtime, next_worker)
     assert original_stats["failed"] == 0
     assert set(index._records) == {first_record.id, rebuilt_record.id}
     assert index._records[old_record.id].text == "Receiver rebuilt and tested"
-    assert original.get_event(ctx.account_id, deletion.event_id).status == "DONE"
-    assert original.get_event(ctx.account_id, rebuilt.event_id).status == "DONE"
+    assert original.get_event_status(deletion.uri, deletion.event_id) == "DONE"
+    assert original.get_event_status(rebuilt.uri, rebuilt.event_id) == "DONE"
     assert original.count_unfinished(ctx.account_id)["total"] == 0
 
 
@@ -178,7 +178,7 @@ def test_agent_claim_keeps_checkpoint_and_completion_with_same_ticket(sql_runtim
         store.save_payload(claimed)
         assert store.get_event(ctx.account_id, event.event_id).payload["cursor"] == 1
         store.mark_done(claimed, uri)
-    assert store.get_event(ctx.account_id, event.event_id).status == "DONE"
+    assert store.get_event_status(uri, event.event_id) == "DONE"
 
 
 def test_individual_claim_release_and_completion_share_uri_lock(sql_runtime):
@@ -193,4 +193,4 @@ def test_individual_claim_release_and_completion_share_uri_lock(sql_runtime):
     with store.claim_processing_event(event, event.uri, "next-owner") as acquired:
         assert acquired
         store.mark_done(event, event.uri)
-    assert store.get_event(ctx.account_id, event.event_id).status == "DONE"
+    assert store.get_event_status(event.uri, event.event_id) == "DONE"

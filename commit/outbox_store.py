@@ -250,6 +250,11 @@ class OutboxStore:
         return event
 
     def register_once(self, event: OutboxEvent, ctx: RequestContext) -> None:
+        if event.event_type != EventType.EXTRACT_AGENT_MEMORY.value:
+            with self.processing_lock(event.uri, timeout_seconds=5):
+                if self.get_event_status(event.uri, event.event_id) is None:
+                    self.persist_event(event)
+            return
         with self._agent_event_lock(event):
             node_path = self._uri_to_agfs_path(event.uri)
             if self._cleanup_completed_agent_event(event):
@@ -753,8 +758,56 @@ class OutboxStore:
 
         self._client.write(event_path, event_json.encode('utf-8'))
 
+    def _done_receipt_path(self, node_uri: str, event_id: str) -> str:
+        from fs.agfs_adapter.agfs_context_fs import parse_uri
+
+        account = parse_uri(node_uri)["account"]
+        if not event_id or any(char in event_id for char in ("/", "\\", ".")):
+            raise ValueError("event identity must be a path component")
+        identity = hashlib.sha256((node_uri + "\n" + event_id).encode()).hexdigest()
+        return f"{self._mount_prefix}/accounts/{account}/.outbox-done/{identity}.json"
+
+    def _persist_done(self, event: OutboxEvent, node_uri: str) -> None:
+        """Publish an account-scoped projection receipt under the processing lease."""
+        path = self._done_receipt_path(node_uri, event.event_id)
+        receipt = {"event_id": event.event_id, "uri": node_uri, "status": "DONE",
+                   "event_type": event.event_type, "completed_at": datetime.now(UTC).isoformat(),
+                   "payload_sha256": hashlib.sha256(json.dumps(
+                       event.payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+        self.ensure_processing_owned(event, node_uri)
+        try:
+            self._client.mkdir(path.rsplit("/", 1)[0])
+        except Exception as exc:
+            if "already exists" not in str(exc).lower():
+                raise
+        temporary = path + "." + uuid.uuid4().hex + ".tmp"
+        data = json.dumps(receipt, ensure_ascii=False).encode()
+        try:
+            self._client.write(temporary, data)
+            self.ensure_processing_owned(event, node_uri)
+            self._client.mv(temporary, path)
+            self.ensure_processing_owned(event, node_uri)
+        finally:
+            self._rm_if_present(temporary)
+
+    def get_event_status(self, node_uri: str, event_id: str) -> str | None:
+        """Read a durable projection receipt or its current queued event."""
+        done_path = self._done_receipt_path(node_uri, event_id)
+        event_path = self._uri_to_agfs_path(node_uri) + ".outbox/" + event_id + ".json"
+        for path in (done_path, event_path, event_path.replace("/.outbox/", "/.outbox/dlq/")):
+            try:
+                data = self._load_event_json(self._client.read(path))
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    continue
+                raise
+            if data.get("event_id") != event_id or data.get("uri") != node_uri:
+                raise ValueError("Outbox receipt identity differs from the requested event")
+            return str(data.get("status") or "UNKNOWN")
+        return None
+
     def mark_done(self, event: OutboxEvent, node_uri: str) -> None:
-        """Acknowledge the completed event under its processing lease.
+        """Persist completion evidence and remove the live event.
 
         Args:
             event: OutboxEvent to complete
@@ -770,10 +823,12 @@ class OutboxStore:
                 self._check_agent_lease(event)
                 audit = {key: event.payload[key] for key in ("trace_uri", "value_reviews") if key in event.payload}
                 self._client.write(node_path + ".agent_memory_done", json.dumps(audit, ensure_ascii=False).encode())
+                self._persist_done(event, node_uri)
                 self._remove_agent_event_files(event)
             return
 
         if event.event_type != EventType.DELETE_CONTEXT.value:
+            self._persist_done(event, node_uri)
             if getattr(event, "_outbox_processing_lease", None) is not None:
                 self._remove_processing_file(event_path, event, node_uri)
                 self._remove_processing_file(processing_path, event, node_uri)
@@ -794,6 +849,7 @@ class OutboxStore:
             event,
             node_uri,
         )
+        self._persist_done(event, node_uri)
 
         if not has_tombstone:
             # Generic DELETE events predate the durable resource tombstone
@@ -1088,7 +1144,7 @@ class OutboxStore:
                 self._count_unfinished_outbox(child_path, counts)
             elif (
                 is_dir
-                and name != ".outbox"
+                and name not in {".outbox", ".outbox-done", ".write_operations"}
                 and not self._is_atomic_resource_staging_directory(name)
             ):
                 self._count_unfinished_recursive(child_path + "/", counts)
@@ -1153,7 +1209,7 @@ class OutboxStore:
                 self._collect_outbox_events(child_path, ev_entries, results)
             elif (
                 is_dir
-                and name not in (".outbox", "dlq")
+                and name not in (".outbox", ".outbox-done", "dlq", ".write_operations")
                 and not self._is_atomic_resource_staging_directory(str(name))
             ):
                 self._scan_outbox_recursive(child_path + "/", results)
