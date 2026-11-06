@@ -748,6 +748,10 @@ def ingest(args, samples, adapter):
             if not args.force_ingest and (
                 prior.get("success") or (args.verify_writes and prior.get("write_verified"))
             ):
+                if prior.get("adapter", adapter.description) != adapter.description:
+                    raise RuntimeError(
+                        f"Ingest adapter changed for {sid}/{name}; use a fresh identity and ingest record"
+                    )
                 if args.verify_writes and (
                     not prior.get("write_verified") or not prior.get("source_ids")
                     or prior.get("source_sha256") != source_sha256 or prior.get("session_key") != key
@@ -772,6 +776,7 @@ def ingest(args, samples, adapter):
                     "success": not args.verify_writes, "session_key": key, "source_ids": source_ids,
                     "write_verified": args.verify_writes,
                     "source_sha256": source_sha256,
+                    "adapter": adapter.description,
                 }
                 selected_source_ids.update(source_ids)
             except Exception as error:
@@ -893,8 +898,9 @@ def run(args, adapter_factory=None, judge_fn=judge):
         adapter.close()
 
 
-def main(argv=None, *, agent=None, transports=None):
-    parser = build_parser(agent, transports=transports)
+def main(argv=None, *, agent=None, transports=None, parser=None, adapter_factory=None):
+    if parser is None:
+        parser = build_parser(agent, transports=transports)
     args = parser.parse_args(argv)
     args.dataset = args.dataset.resolve()
     args.output = args.output.resolve() if args.output else None
@@ -913,7 +919,7 @@ def main(argv=None, *, agent=None, transports=None):
     args.llm_api_key = os.environ.get(args.llm_api_key_env, "")
     if args.transport in ("ce", "mcp", "gateway") and args.agent != "openclaw":
         raise ValueError("CE/MCP/gateway require OpenClaw")
-    return run(args)
+    return run(args, adapter_factory=adapter_factory)
 
 
 if __name__ == "__main__":
