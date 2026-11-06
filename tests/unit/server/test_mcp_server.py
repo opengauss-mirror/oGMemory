@@ -260,11 +260,13 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
         "type": "integer",
     }
     for guidance in (
-        "Prefer one focused search",
+        "Prefer one focused `ogm_search_code` call",
         "Reuse snippets and examples",
         "scope.paths",
-        "edit_target.locator",
-        "specific unanswered question",
+        "fall back to regular workspace methods",
+        "diagnose or verify the issue",
+        "add regression coverage, or verify a fix",
+        "after completing the task requirements and necessary verification",
         "read_lines",
     ):
         assert guidance in search_tool.description
