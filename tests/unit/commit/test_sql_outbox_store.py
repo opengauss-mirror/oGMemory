@@ -323,7 +323,10 @@ def test_processing_lock_times_out_without_unlocking_unowned_lock(
         side_effect=[0.0, 6.0],
     ):
         with pytest.raises(TimeoutError, match="URI processing lock"):
-            with store.processing_lock("ctx://acme/users/alice/memories/profile"):
+            with store.processing_lock(
+                "ctx://acme/users/alice/memories/profile",
+                timeout_seconds=1.0,
+            ):
                 raise AssertionError("lock body must not run")
 
     assert lock_cursor.execute.call_count == 1

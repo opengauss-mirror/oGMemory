@@ -1,0 +1,117 @@
+# ============================================================================
+# oGMemory — M3-Bench runner runtime config (WS 1.4)
+# ============================================================================
+#
+# Consumed by the m3 pipeline drivers (m3/config.py::load_m3_runtime_config)
+# inside the `m3runner` compose service, which mounts this file at
+# /etc/ogmem/config.yaml and exports OGMEM_CONFIG=/etc/ogmem/config.yaml.
+#
+# Placeholder style: whole-string `${VAR}` refs — exactly what
+# m3.config._expand_env_ref resolves against the process environment
+# (unlike the serving ogmemory.yaml, whose inline DSN refs are rendered by
+# the serving entrypoint, the m3 drivers do NOT run an entrypoint render).
+# Compose wires those vars in docker-compose.yml (m3runner service):
+#
+#   M3_STORAGE_DSN / M3_VECTOR_DSN   full DSNs built from STORAGE_DB_* /
+#                                    VECTOR_DB_* — keep single-DB deployments
+#                                    pointing both at the same Postgres.
+#   M3_EMBED_API_KEY                 embedder bearer token
+#   LLM_PROVIDER / LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+#
+# Outside compose, either export them yourself or pass --connection-string
+# / --judge-model etc. on the CLI (explicit flags win).
+#
+# Topology note (this repo's single-DB mode): the graph store
+# (graph_nodes/graph_edges) and everything else SQL live on the STORAGE_DB
+# Postgres; the vector index lives in the same instance (pgvector) but in
+# its own table (`m3_episodic_vectors`). OpenGaussVectorIndex's SQL is
+# pgvector-compatible, so only the label differs.
+
+llm:
+  provider: "${LLM_PROVIDER}"
+  api_key: "${LLM_API_KEY}"
+  base_url: "${LLM_BASE_URL}"
+  model: "${LLM_MODEL}"
+  temperature: 0.7
+  # Reasoning models (deepseek-r*-style) emit reasoning_content and burn
+  # several thousand tokens before the answer; a small budget truncates
+  # tool calls mid-flight (finish_reason=length → hard extraction
+  # failures). Keep this large.
+  max_tokens: 32768
+  # 300 s: kimi-k2.6 multimodal extraction + glm-5.3 reasoning calls can
+  # exceed the 120 s default under 8-way parallelism.
+  request_timeout_seconds: 300
+
+embedding:
+  provider: openai
+  model: "Qwen/Qwen3-Embedding-0.6B"
+  base_url: "http://127.0.0.1:18000/v1"  # dedicated embedder (rychkov-embedding), NOT the shared :8000 service
+  api_key: "${M3_EMBED_API_KEY}"
+  multimodal: false
+  # MUST equal vector_db.dimension below (sync both if you swap embedders;
+  # openGauss HNSW caps at 2000 dims).
+  dimension: 1024
+
+storage:
+  backend: sql
+  # Whole-string ${VAR} refs only — see the header note. This is also the
+  # default graph-store DSN (m3.graph_store.connection_string overrides).
+  connection_string: "${M3_STORAGE_DSN}"
+  pool_size: 5
+
+vector_db:
+  type: opengauss
+  connection_string: "${M3_VECTOR_DSN}"
+  dimension: 1024
+  table_name: vector_index
+  pool_size: 5
+
+# M3 bench identity — one dedicated account so runs are isolated and
+# wipe_stages can reset them (m3/wipe_stages.py is account-scoped).
+identity:
+  account_id: "m3bench"
+  user_id: "m3bench-user"
+  agent_id: "m3bench-agent"
+
+m3:
+  # Per-role LLM blocks (all on Huawei MaaS, OpenAI-compatible):
+  #   episodic  kimi-k2.6      — vision-capable (verified: accepts image_url
+  #                             parts on MaaS despite text-only docs)
+  #   qa        glm-5.3        — strongest reasoner on the plan
+  #   judge     deepseek-v4.1-flash — SAME judge as the 2026-10-15/16
+  #                             baselines (0.033 / 0.267 / 0.300) so new
+  #                             scores stay directly comparable; also keeps
+  #                             all three roles on distinct models.
+  episodic_llm:
+    provider: "${LLM_PROVIDER}"
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "kimi-k2.6"
+    temperature: 0.2
+    max_tokens: 32768
+
+  qa_llm:
+    provider: "${LLM_PROVIDER}"
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "glm-5.3"
+    temperature: 0.2
+    max_tokens: 16384
+
+  judge_llm:
+    provider: "${LLM_PROVIDER}"
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "deepseek-v4.1-flash"
+    temperature: 0.0
+    max_tokens: 8192
+
+  # M3-specific vector index knobs. `backend: pgvector` selects the
+  # pgvector-compatible SQL path (works on both PG+pgvector and openGauss;
+  # the code path is OpenGaussVectorIndex either way).
+  vector_index:
+    table_name: m3_episodic_vectors
+    backend: pgvector
+    # Env wins over YAML: OGMEM_VECTOR_POOL_SIZE. Keep pool_size >= the
+    # parallel worker count (OGMEM_M3_MAX_WORKERS).
+    pool_size: 8

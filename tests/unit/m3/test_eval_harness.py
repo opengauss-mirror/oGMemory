@@ -327,13 +327,28 @@ class _ScriptedAdapterLLM(MockLLM):
 
 
 class _ScriptedJudgeLLM(MockLLM):
-    """Mock judge that returns the next score from a queue on each call."""
+    """Mock judge returning scripted scores.
+
+    ``scores`` may be a list (legacy queue — only safe when judging is
+    serial) or a mapping of ``{question substring: score}`` — the mapping
+    form matches the question inside the judge prompt and is deterministic
+    under the parallel judge, whose call order is completion order rather
+    than question order.
+    """
     def __init__(self, scores):
         super().__init__()
-        self._queue = list(scores)
+        self._queue = [] if isinstance(scores, dict) else list(scores)
+        self._mapping = scores if isinstance(scores, dict) else {}
     def complete_json(self, prompt, schema):
         self._call_count += 1
-        score = self._queue.pop(0) if self._queue else 0.0
+        if self._mapping:
+            score = 0.0
+            for needle, value in self._mapping.items():
+                if needle in prompt:
+                    score = value
+                    break
+        else:
+            score = self._queue.pop(0) if self._queue else 0.0
         return {"score": score, "reasoning": f"scored {score}"}
 
 
@@ -381,7 +396,9 @@ def test_run_end_to_end_writes_results_and_summary(tmp_path: Path):
 
     def _judge_llm_factory(*a, **kw):
         # Score 1.0 for q1 (correct), 0.5 for q2 (partial), 0.0 for q3.
-        return _ScriptedJudgeLLM([1.0, 0.5, 0.0])
+        # Keyed by question text: the parallel judge calls in completion
+        # order, so a positional queue would be order-dependent.
+        return _ScriptedJudgeLLM({"mug": 1.0, "enter": 0.5, "dog": 0.0})
     monkey.setattr(eval_mod, "build_judge_llm", _judge_llm_factory)
 
     try:
@@ -684,7 +701,11 @@ def test_build_judge_llm_defaults_to_minimax(monkeypatch):
     import providers.llm as providers_llm
     monkeypatch.setattr(providers_llm, "get_minimax_llm", lambda: _FakeMiniMaxLLM)
 
-    llm = build_judge_llm()
+    # Hermetic (P3-4): point at a nonexistent YAML so an OGMEM_CONFIG in
+    # the ambient environment (e.g. a rendered deploy config with an
+    # m3.judge_llm block) can't flip this to the OpenAI-compatible path.
+    # _load_yaml_config returns {} for a missing path → role defaults → minimax.
+    llm = build_judge_llm(config_path="/nonexistent/ogmemory-hermetic-test.yaml")
     assert isinstance(llm, _FakeMiniMaxLLM)
     # The MiniMax class handles its own api_key fallback via
     # OGMEM_MINIMAX_API_KEY — we just pass through whatever the
@@ -771,7 +792,9 @@ def test_run_with_input_qa_results_judges_existing_predictions(
     )
     monkeypatch.setattr(
         eval_mod, "build_judge_llm",
-        lambda *a, **kw: _ScriptedJudgeLLM([1.0, 0.5, 0.0]),
+        # Keyed by question text — deterministic under the parallel judge.
+        lambda *a, **kw: _ScriptedJudgeLLM(
+            {"color?": 1.0, "How many?": 0.5, "Where?": 0.0}),
     )
 
     out_dir = tmp_path / "eval_out"
@@ -1138,3 +1161,114 @@ def test_no_gain_cli_rejects_invalid_threshold(parser_name, limit):
     parser = parse_react_qa_args if parser_name == "qa" else parse_args
     with pytest.raises(SystemExit):
         parser(["--annotations", "x.json", "--no-gain-limit", str(limit)])
+
+
+# ---------------------------------------------------------------------------
+# Parallel judging
+# ---------------------------------------------------------------------------
+
+class _ImmediateAnswerLLM(MockLLM):
+    """Answers immediately with fixed text; raises for one marked question.
+
+    Stateless per call, so it is safe to share across worker threads
+    (each thread gets its own adapter but the same LLM instance).
+    """
+
+    def __init__(self, answer_text: str, fail_marker: str | None = None):
+        super().__init__()
+        self._answer_text = answer_text
+        self._fail_marker = fail_marker
+
+    def complete_with_tools_messages(self, messages, tools=None, tool_choice="auto"):
+        self._call_count += 1
+        if self._fail_marker:
+            blob = "\n".join(str(m.get("content") or "") for m in messages)
+            if self._fail_marker in blob:
+                raise RuntimeError("boom: transport down")
+        return [], self._answer_text
+
+
+class _MappedJudge(MockLLM):
+    """Returns a per-question score by matching the prompt text."""
+
+    def __init__(self, scores: dict[str, float]):
+        super().__init__()
+        self._scores = scores
+
+    def complete_json(self, prompt, schema):
+        self._call_count += 1
+        for marker, score in self._scores.items():
+            if marker in prompt:
+                return {"score": score, "reasoning": f"scored {score}"}
+        return {"score": 0.0, "reasoning": "unmapped"}
+
+
+def test_run_parallel_judging_preserves_order_and_classification(tmp_path, monkeypatch):
+    """With OGMEM_M3_MAX_WORKERS=4 questions answer+judge on a bounded
+    pool: output order matches the input order, per-question judge
+    scores land on the right rows, and a transport failure still
+    classifies as a failed row (error set, no prediction)."""
+    monkeypatch.setenv("OGMEM_M3_MAX_WORKERS", "4")
+
+    questions = [
+        {"question_id": f"q{i}", "question": f"Question number {i}?",
+         "answer": f"A{i}", "type": "object"}
+        for i in range(1, 7)
+    ]
+    # q3's adapter LLM raises a transport error.
+    questions[2]["question"] = "Question number 3 that explodes?"
+    annotations_path = _write_annotations(tmp_path, questions)
+
+    import m3.eval as eval_mod
+    from m3.eval import parse_args
+
+    args = parse_args([
+        "--annotations", str(annotations_path),
+        "--output-dir", str(tmp_path / "out"),
+        "--graph-store", "memory",
+        "--embedder", "mock",
+        "--embedding-dimension", "8",
+        "--llm", "mock",
+        "--judge-base-url", "http://mock-judge",
+        "--judge-model", "mock-judge-model",
+        "--judge-api-key", "mock-judge-key",
+    ])
+
+    def _answer_llm_factory(*a, **kw):
+        return _ImmediateAnswerLLM(
+            "the immediate answer", fail_marker="that explodes",
+        )
+    monkeypatch.setattr(eval_mod, "build_llm", _answer_llm_factory)
+
+    scores = {q["question"]: 1.0 if i % 2 else 0.5 for i, q in enumerate(questions)}
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm", lambda *a, **kw: _MappedJudge(scores),
+    )
+
+    rc = eval_mod.run(args)
+    # One failed row, five answered -> rc 0 (rc=2 requires zero answered).
+    assert rc == 0
+
+    records = [
+        json.loads(l)
+        for l in (tmp_path / "out" / "m3_eval_results.jsonl").read_text().splitlines()
+        if l
+    ]
+    # Deterministic output order: identical to the input question order.
+    assert [r["question_id"] for r in records] == [f"q{i}" for i in range(1, 7)]
+    # Per-question judge scores land on the right rows (not call order).
+    # q3 is excluded: its empty prediction short-circuits the judge to 0.0.
+    for r in records:
+        if r["question_id"] == "q3":
+            continue
+        assert r["judge_score"] == scores[r["question"]]
+        assert r["predicted_answer"] == "the immediate answer"
+    # Failure classification unchanged: q3 has an error and no prediction.
+    q3 = records[2]
+    assert q3["error"] != ""
+    assert q3["predicted_answer"] == ""
+
+    summary = json.loads((tmp_path / "out" / "m3_eval_summary.json").read_text())
+    assert summary["answered"] == 5
+    assert summary["failed"] == 1
+    assert summary["total_questions"] == 6
