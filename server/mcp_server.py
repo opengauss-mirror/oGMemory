@@ -453,14 +453,16 @@ def create_mcp_server(
         budget: CodeSearchBudgetInput | None = None,
         ctx: Context | None = None,
     ) -> str:
-        """Prefer one focused search for the symbol or behavior you need. Narrow scope.paths when known.
-        Reuse snippets and examples. If a hit supports your next step, use it directly;
-        for edits, copy edit_target.locator. For missing lines in a known file, use a
-        file reader on the needed read_lines ranges.
+        """Locate code by symbol or description. Narrow scope.paths when known.
+        Reuse snippets and examples; read only needed missing ranges from read_lines.
 
-        Search again only for a specific unanswered question that affects the task.
-        Seek callers, tests or similar implementations when they answer that question
-        or the task requires them. If repeated searches miss, switch to a targeted file or text lookup.
+        Keep the workflow compact:
+
+        - Prefer one focused `ogm_search_code` call; use a second only if the first result is clearly insufficient.
+        - If five `ogm_search_code` calls around the same code area do not locate the needed file or context, fall back to regular workspace methods such as `find`, `grep`, or `Read` instead of continuing oGMemory search.
+        - Create a standalone reproduction script when needed to diagnose or verify the issue, or when the task calls for one.
+        - Look for relevant tests to understand behavior, add regression coverage, or verify a fix.
+        - Provide a concise summary after completing the task requirements and necessary verification.
         """
 
         try:
