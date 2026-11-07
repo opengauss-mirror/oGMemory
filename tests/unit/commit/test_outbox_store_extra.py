@@ -181,7 +181,7 @@ def test_mark_done_ignores_delete_errors(store):
         payload={"records": []},
         status="PENDING",
     )
-    store._client.rm.side_effect = RuntimeError("already gone")
+    store._client.rm.side_effect = FileNotFoundError("No such file")
 
     store.mark_done(event, event.uri)
 
@@ -337,10 +337,13 @@ def test_delete_mark_done_publishes_ack_before_removing_event_and_marker_last(st
 
     store.mark_done(event, uri)
 
-    temp_path, raw = store._client.write.call_args.args
+    temp_path, raw = store._client.write.call_args_list[0].args
     acknowledging = json.loads(raw.decode("utf-8"))
     assert acknowledging == {**marker, "status": "ACKNOWLEDGING"}
-    store._client.mv.assert_called_once_with(temp_path, tombstone_path)
+    store._client.mv.assert_any_call(temp_path, tombstone_path)
+    receipt_temp, receipt_raw = store._client.write.call_args_list[1].args
+    assert json.loads(receipt_raw)["status"] == "DONE"
+    store._client.mv.assert_any_call(receipt_temp, store._done_receipt_path(uri, event.event_id))
 
     calls = store._client.mock_calls
 
@@ -396,6 +399,9 @@ def test_delete_mark_done_continues_when_ambiguous_event_remove_is_absent(store)
         pending_temp[path] = raw
 
     def move(from_path, to_path):
+        if to_path == store._done_receipt_path(uri, event.event_id):
+            assert json.loads(pending_temp[from_path])["status"] == "DONE"
+            return
         assert to_path == tombstone_path
         marker.update(json.loads(pending_temp[from_path].decode("utf-8")))
 
@@ -418,7 +424,7 @@ def test_delete_mark_done_continues_when_ambiguous_event_remove_is_absent(store)
 
     assert event_remove_attempts == 1
     assert marker == {}
-    assert store._client.write.call_count == 1
+    assert store._client.write.call_count == 2
 
 
 def test_delete_mark_done_raises_when_ambiguous_event_remove_is_still_live(store):
@@ -454,6 +460,9 @@ def test_delete_mark_done_raises_when_ambiguous_event_remove_is_still_live(store
         pending_temp[path] = raw
 
     def move(from_path, to_path):
+        if to_path == store._done_receipt_path(uri, event.event_id):
+            assert json.loads(pending_temp[from_path])["status"] == "DONE"
+            return
         assert to_path == tombstone_path
         marker.update(json.loads(pending_temp[from_path].decode("utf-8")))
 
@@ -470,7 +479,7 @@ def test_delete_mark_done_raises_when_ambiguous_event_remove_is_still_live(store
         store.mark_done(event, uri)
 
     assert marker["status"] == "ACKNOWLEDGING"
-    assert store._client.write.call_count == 1
+    assert store._client.write.call_count == 2
     assert not any(
         item.args[0] == tombstone_path
         for item in store._client.rm.call_args_list
@@ -511,6 +520,9 @@ def test_delete_mark_done_retains_ack_when_event_remove_outcome_is_unknown(store
         pending_temp[path] = raw
 
     def move(from_path, to_path):
+        if to_path == store._done_receipt_path(uri, event.event_id):
+            assert json.loads(pending_temp[from_path])["status"] == "DONE"
+            return
         assert to_path == tombstone_path
         marker.update(json.loads(pending_temp[from_path].decode("utf-8")))
 
@@ -527,7 +539,7 @@ def test_delete_mark_done_retains_ack_when_event_remove_outcome_is_unknown(store
 
     assert marker["status"] == "ACKNOWLEDGING"
     removed = [item.args[0] for item in store._client.rm.call_args_list]
-    assert removed == [event_path]
+    assert [path for path in removed if not path.endswith(".tmp")] == [event_path]
     assert processing_path not in removed
     assert tombstone_path not in removed
 
@@ -565,6 +577,9 @@ def test_delete_mark_done_cleanup_failure_retains_ack_marker(store, failure_poin
         pending_temp[path] = raw
 
     def move(from_path, to_path):
+        if to_path == store._done_receipt_path(uri, event.event_id):
+            assert json.loads(pending_temp[from_path])["status"] == "DONE"
+            return
         assert to_path == tombstone_path
         marker.update(json.loads(pending_temp[from_path].decode("utf-8")))
 

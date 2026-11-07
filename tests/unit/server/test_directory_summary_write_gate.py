@@ -69,7 +69,10 @@ def test_directory_summary_write_path(monkeypatch, enabled, backend, atomic, act
     else:
         outbox = SQLOutboxStore.__new__(SQLOutboxStore)
         outbox._fs = fs
+        outbox.bind_context = Mock()
         monkeypatch.setattr(outbox, "_insert_event", lambda event, account: events.append(event))
+
+    monkeypatch.setattr(outbox, "register_once", lambda event, ctx: events.append(event))
 
     service = MemoryService(
         config=OgMemConfig(

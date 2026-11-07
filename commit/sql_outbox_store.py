@@ -450,6 +450,10 @@ class SQLOutboxStore(PoolAdapterMixin):
             self._return_connection(conn)
         return self._row_to_event(row)[1] if row else None
 
+    def get_event_status(self, node_uri: str, event_id: str) -> str | None:
+        account_id = self._extract_account_id(node_uri)
+        event = self.get_event(account_id, event_id)
+        return event.status if event is not None and event.uri == node_uri else None
 
     def retry_failed(self, account_id: str, event: OutboxEvent) -> OutboxEvent | None:
         """Atomically requeue a failed task with a fresh retry budget."""

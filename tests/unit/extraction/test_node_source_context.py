@@ -78,7 +78,7 @@ def test_long_conversation_commits_complete_focused_sources(mode, occurrence_rec
     api._pipeline._extractors[0]._source_occurrence_reconciliation_enabled = occurrence_reconciliation
     result = api.commit_session(messages, ctx, session_time=datetime(2026, 10, 10, 10))
     assert len(json.dumps(messages)) > 110000
-    assert result["writes_completed"] == len(fs.nodes) == 4
+    assert result["writes_completed"] == sum(node.category == "entity" for node in fs.nodes.values()) == 4
     assert sorted(native) == list(range(4))
     assert len(processed) == 2
     assert all(any(f"{37+i} MHz" in n.content for n in fs.nodes.values()) for i in range(4))
@@ -103,7 +103,7 @@ def test_cas_replays_original_spans_after_combining_one_target():
                                 candidate_checkpoint=checkpoint)
     restored = CandidateCheckpoint(checkpoint.journal, "0")
     accepted = restored.load()[0][0]
-    assert result["writes_completed"] == len(fs.nodes) == 1
+    assert result["writes_completed"] == sum(node.category == "entity" for node in fs.nodes.values()) == 1
     assert len(processed) == 4
     assert sorted(native) == list(range(4))
     assert accepted.node_draft_indices == list(range(4))
@@ -122,7 +122,7 @@ def test_saved_span_drafts_resume_node_processing():
     checkpoint.save_drafts([replace(c, node_draft_indices=[i]) for i, c in enumerate(drafts)], messages)
     restored = CandidateCheckpoint(checkpoint.journal, "0")
     result = api.commit_session(messages, ctx, candidate_checkpoint=restored)
-    assert result["writes_completed"] == len(fs.nodes) == 4
+    assert result["writes_completed"] == sum(node.category == "entity" for node in fs.nodes.values()) == 4
     assert sorted(native) == list(range(4))
     assert len(processed) == 2
     assert all(len(c.source_contexts) == 1 for c in restored.load_drafts())
