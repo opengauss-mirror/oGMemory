@@ -31,7 +31,14 @@ except ImportError:
 logger = get_logger(__name__)
 
 _PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS = 5
-_PROCESSING_LOCK_TIMEOUT_SECONDS = 5.0
+# Same-URI index processing can legitimately take tens of seconds (large
+# entity/profile nodes embed their full content on every merge), and other
+# queued events for the same hot URI must wait, not fail. A 5s budget made
+# concurrent events for hot nodes exhaust their retries, move to the DLQ,
+# and poison the account-wide index barrier, failing every subsequent
+# ingestion chunk (parallel ingest). 300s matches the LLM/embedding scale;
+# holders of the advisory lock release it as soon as the slow upsert lands.
+_PROCESSING_LOCK_TIMEOUT_SECONDS = 300.0
 _PROCESSING_LOCK_POLL_SECONDS = 0.05
 _PROCESSING_CONNECTIONS = ContextVar("sql_outbox_processing_connections", default=None)
 
@@ -69,21 +76,13 @@ class SQLOutboxStore(PoolAdapterMixin):
         self._ensure_table()
 
     # ------------------------------------------------------------------
-    # Connection pool (standalone fallback — used when pool=None)
+    # Connection pool: PoolAdapterMixin provides the bounded standalone
+    # pool; _create_connection uses this module's psycopg2 so unit tests
+    # that patch it keep working.
     # ------------------------------------------------------------------
 
-    def _get_connection(self):
-        if self._pool:
-            conn = self._pool.pop()
-            if conn.closed == 0:
-                return conn
+    def _create_connection(self):
         return psycopg2.connect(self._connection_string)
-
-    def _return_connection(self, conn):
-        if len(self._pool) < self._pool_size and conn.closed == 0:
-            self._pool.append(conn)
-        else:
-            conn.close()
 
     # ------------------------------------------------------------------
     # Schema

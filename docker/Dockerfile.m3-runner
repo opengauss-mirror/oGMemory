@@ -1,0 +1,74 @@
+# M3 pipeline runner — extends the serving image with ffmpeg + opencv +
+# faster-whisper for local video processing (preprocess, extract_frames, ASR).
+#
+# ⚠ Deliberate deviation from specs/parallel_dockerize.md WS 1.1: the base is
+# the LOCAL serving image, not a self-contained python:3.11-slim-bookworm
+# build. Rationale: the serving image already carries the full
+# serving+retrieval pip set (rank-bm25, nltk, networkx, psycopg2, ...),
+# the entrypoint and the baked source tree, and it is the image the
+# pipeline actually runs against on this host. Rebuilding that stack from
+# a slim base duplicates deploy/Dockerfile and re-validates nothing.
+# The base is parameterized so the compose `with-m3runner` profile chains
+# onto the same ogmem image the ogmem service builds:
+#   docker build --build-arg OGMEM_BASE_IMAGE=ogmemory:ogmem-rychkov-local ...
+# (compose passes ${OGMEM_IMAGE:-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}).
+# Other WS 1.1 deviations:
+#   * insightface/onnxruntime CV layers are NOT included — cv_service runs
+#     as its own image (docker/Dockerfile.cv) per the repo's existing split.
+#   * pyannote/speechbrain speaker diarization stays out (torch tax; needs
+#     HF tokens) — only the ASR path (faster-whisper) is enabled.
+#   * No trailing USER is forced here: the effective default is inherited
+#     from the serving image, and every documented invocation passes an
+#     explicit --user $(id -u):$(id -g) so host-mounted work dirs are owned
+#     by the invoking user.
+ARG OGMEM_BASE_IMAGE=ogmemory:ogmem-local
+FROM ${OGMEM_BASE_IMAGE}
+
+USER root
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# The serving image bakes only the server-side source; the M3 drivers
+# (m3/) are runner-specific and get baked here (spec WS 1.1's COPY layer).
+# PYTHONPATH=/opt/ogmem comes from the serving image, so `python3 -m m3...`
+# works in this image without mounting the source.
+COPY m3/ /opt/ogmem/m3/
+
+RUN pip install --no-cache-dir -q opencv-python-headless==4.10.0.84 || \
+    pip install --no-cache-dir -q opencv-python-headless
+
+# Bake the NLTK corpora BM25 tokenization needs (retrieval/bm25_index.py
+# _ensure_nltk). The lazy runtime download silently fails in offline /
+# firewalled containers → every BM25 search returns empty → QA degrades to
+# "cannot determine". /usr/local/nltk_data is in nltk.data.path for every
+# user, so a root-time download here is found at runtime.
+# The verification line fails the build if the corpora did not land.
+RUN python3 -c "import nltk; [nltk.download(r, download_dir='/usr/local/nltk_data', quiet=True) for r in ('punkt_tab', 'stopwords')]" && \
+    python3 -c "import nltk; nltk.data.find('tokenizers/punkt_tab'); nltk.data.find('corpora/stopwords'); print('nltk corpora baked')"
+
+# Local ASR via faster-whisper (CTranslate2 Whisper, CPU int8). The ASR
+# stack defaults to the "large-v3-turbo" model — see
+# extraction/operators/builtin/asr_backends.py::FasterWhisperBackend
+# (m3/voice_asr.py --model defaults to it). Pinned per spec WS 1.1 and to
+# the version the end-to-end smoke was run with. Build-time verification:
+# import must work without the model present.
+RUN pip install --no-cache-dir -q "faster-whisper==1.2.1" && \
+    python3 -c "from faster_whisper import WhisperModel; print('faster-whisper OK')"
+
+# HF model cache (the ~1.6 GB large-v3-turbo download lands here on first
+# use). Container-local by default and world-writable (sticky bit) so it
+# works for ANY --user; bind-mount for persistence and cross-run sharing:
+#   -v /data/hf_cache/rychkov:/hf-cache
+# (an explicit -e HF_HOME=... overrides this default).
+ENV HF_HOME=/hf-cache
+RUN mkdir -p /hf-cache && chmod 1777 /hf-cache
+
+# The serving base declares ENTRYPOINT ["/opt/entrypoint.sh"], which boots
+# IndexService + MCP + gunicorn and IGNORES positional arguments — both the
+# compose `command: ["sleep", "infinity"]` and
+# `docker compose run --rm m3runner python3 -m m3...` would be silently
+# dropped and the runner would come up as a second (port-colliding, on
+# host networking) ogmem server instead. Reset the entrypoint so the
+# image runs exactly what the caller asks for (review item 3).
+ENTRYPOINT []

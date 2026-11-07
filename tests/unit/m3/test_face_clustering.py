@@ -33,6 +33,7 @@ from m3.config import M3BENCH_ACCOUNT_ID
 from m3.face_clustering import (
     ClusterMember,
     FaceRecord,
+    _UnionFind,
     _cosine_distance,
     build_cluster_output,
     cluster_faces,
@@ -385,3 +386,122 @@ def test_face_clustering_yaml_stage_position():
     assert "threshold" in fc["params"]
     # face_clusters artifact wired up.
     assert "face_clusters" in spec["artifacts"]
+
+class TestVectorizedClusteringEquivalence:
+    """WS 3.7: the numpy-blocked GEMM must be an exact-match equivalent
+    of the legacy O(N²) loop (same unions, same exclusions)."""
+
+    def _faces(self, n, seed=7):
+        import random
+
+        rng = random.Random(seed)
+        faces = []
+        for i in range(n):
+            emb = [rng.uniform(-1, 1) for _ in range(16)]
+            faces.append(FaceRecord(
+                node_id=f"n{i}",
+                embedding=emb,
+                video_id=None if i % 11 == 0 else f"v{i % 3}",
+                clip_id=None if i % 13 == 0 else i % 4,
+                confidence=0.9, bbox=[0.1, 0.1, 0.5, 0.5],
+            ))
+        return faces
+
+    def _legacy_clusters(self, faces, threshold):
+        uf = _UnionFind(len(faces))
+        for i in range(len(faces)):
+            fi = faces[i]
+            for j in range(i + 1, len(faces)):
+                fj = faces[j]
+                if (fi.video_id is not None and fj.video_id is not None
+                        and fi.video_id == fj.video_id
+                        and fi.clip_id is not None and fj.clip_id is not None
+                        and fi.clip_id == fj.clip_id):
+                    continue
+                if _cosine_distance(fi.embedding, fj.embedding) < threshold:
+                    uf.union(i, j)
+        groups = {}
+        for i in range(len(faces)):
+            groups.setdefault(uf.find(i), []).append(i)
+        return sorted(sorted(g) for g in groups.values())
+
+    def test_matches_legacy_loop_exactly(self):
+        faces = self._faces(120)
+        for threshold in (0.3, 0.4, 0.6, 1.2):
+            legacy = self._legacy_clusters(faces, threshold)
+            vectorized = sorted(cluster_faces(faces, threshold=threshold))
+            assert vectorized == legacy, f"mismatch at threshold={threshold}"
+
+    def test_zero_norm_embeddings_never_cluster(self):
+        faces = [
+            FaceRecord(node_id="a", embedding=[0.0] * 8, bbox=[0, 0, 1, 1],
+                       video_id="v", clip_id=1, confidence=0.9),
+            FaceRecord(node_id="b", embedding=[0.0] * 8, bbox=[0, 0, 1, 1],
+                       video_id="v", clip_id=2, confidence=0.9),
+        ]
+        assert cluster_faces(faces, threshold=0.4) == [[0], [1]]
+        # ...and at a pathological >1 threshold the legacy behaviour
+        # (distance 1.0 < 1.5 -> union) is preserved exactly.
+        assert cluster_faces(faces, threshold=1.5) == [[0, 1]]
+
+    def test_within_clip_pairs_never_merge(self):
+        emb = [1.0, 0.0, 0.0]
+        faces = [
+            FaceRecord(node_id="a", embedding=emb, confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=1),
+            FaceRecord(node_id="b", embedding=emb, confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=1),
+            FaceRecord(node_id="c", embedding=[0.0, 1.0, 0.0], confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=2),
+        ]
+        # a-b same clip: never merged directly. c is orthogonal to both.
+        # The legacy loop produces the same partition.
+        assert cluster_faces(faces, threshold=0.4) == [[0], [1], [2]]
+        assert self._legacy_clusters(faces, 0.4) == [[0], [1], [2]]
+
+    def test_single_linkage_bridges_through_cross_clip(self):
+        """a-b are same-clip (masked), but both merge with c cross-clip:
+        single linkage still joins all three (legacy-equivalent)."""
+        emb = [1.0, 0.0, 0.0]
+        faces = [
+            FaceRecord(node_id="a", embedding=emb, confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=1),
+            FaceRecord(node_id="b", embedding=emb, confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=1),
+            FaceRecord(node_id="c", embedding=emb, confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=2),
+        ]
+        assert cluster_faces(faces, threshold=0.4) == [[0, 1, 2]]
+        assert self._legacy_clusters(faces, 0.4) == [[0, 1, 2]]
+
+    def test_missing_coordinates_are_never_masked(self):
+        emb = [1.0, 0.0, 0.0]
+        faces = [
+            FaceRecord(node_id="a", embedding=emb, confidence=0.9, bbox=[0, 0, 1, 1], video_id=None, clip_id=None),
+            FaceRecord(node_id="b", embedding=emb, confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=1),
+        ]
+        # a has no coordinates: the within-clip mask must not apply.
+        assert cluster_faces(faces, threshold=0.4) == [[0, 1]]
+
+    def test_dimension_mismatch_raises(self):
+        faces = [
+            FaceRecord(node_id="a", embedding=[1.0, 0.0], confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=1),
+            FaceRecord(node_id="b", embedding=[1.0, 0.0, 0.0], confidence=0.9, bbox=[0, 0, 1, 1], video_id="v", clip_id=2),
+        ]
+        import pytest
+
+        with pytest.raises(ValueError, match="embedding dim mismatch"):
+            cluster_faces(faces)
+
+    def test_block_boundary_matches_legacy(self):
+        # >2048 faces (two GEMM blocks) with identical embeddings and
+        # unique clips: every pair is cross-clip and within threshold,
+        # so the whole set must merge into ONE cluster — pairs spanning
+        # the block boundary are computed against all columns.
+        faces = [
+            FaceRecord(
+                node_id=f"n{i}",
+                embedding=[1.0, 0.0],
+                confidence=0.9, bbox=[0, 0, 1, 1],
+                video_id="v",
+                clip_id=i,
+            )
+            for i in range(2100)
+        ]
+        clusters = cluster_faces(faces, threshold=0.4)
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 2100

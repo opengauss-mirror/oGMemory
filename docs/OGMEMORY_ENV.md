@@ -294,3 +294,29 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 | `/api/v1/evict_idle_sessions` | POST | 按 `maxIdleSeconds` 淘汰空闲会话 |
 
 > 运维注意：`prepare_compaction` 会在返回 token 前执行本轮增量抽取。当前实现中这一步仍在 HTTP worker 内同步运行，大上下文或慢 LLM 会阻塞该请求；生产侧应配置合理的网关超时、worker 数量，并优先让 OpenClaw 使用两阶段 compact，避免在最终 compact 阶段重复抽取。
+
+---
+
+## 并行与可靠性参数（parallel-reliability knobs）
+
+以下环境变量在并行化与可靠性改造（spec `parallel_dockerize.md`，Workstream 2–4）中引入，用于在有界资源下控制并发度、连接池大小、重试预算和降级行为。
+
+| 环境变量 | 默认值 | 作用位置 | 用途 |
+|---------|--------|---------|------|
+| `OGMEM_M3_MAX_WORKERS` | 8 | `m3/_parallel.env_max_workers` | 每片段 + 每问题的线程池大小（驱动、QA、eval judge） |
+| `OGMEM_M3_FACE_WORKERS` | 4 | `m3/_parallel.face_max_workers` | 每帧人脸检测扇出上限（cv_service 串行化 detect） |
+| `OGMEM_GRAPH_POOL_SIZE` | 32 | `m3/load_clips`、`m3/resume` | SQL graph-store 连接池；保持 ≥ worker 数 |
+| `OGMEM_VECTOR_POOL_SIZE` | 5（或 YAML） | `m3/config.load_m3_runtime_config` | Vector-index 连接池 |
+| `OGMEM_EMBED_MAX_CONCURRENCY` | 8 | `providers/embedder/openai_embedder` | 限制在途 embed 调用数 |
+| `OGMEM_EMBED_RETRIES` | 2 | embedder | 瞬态 embed 失败的抖动退避尝试次数 |
+| `OGMEM_EMBED_BASE_DELAY` | 1.0 | embedder | 基础退避延迟（秒） |
+| `OGMEM_EXTRACT_MAX_WORKERS` | 4 | `extraction/tools` | Phase-2 span dual-run 并行度 |
+| `OGMEM_EXTRACT_SPAN_TIMEOUT` | 180 | `extraction/tools` | 一个并行 span 块的等待预算（秒）——每当任一 span 完成时预算重置，因此一个病态滞后者只有在**没有任何 span 完成超过该秒数**时才会被丢弃（不是严格的每-span 硬截止时间） |
+| `OGMEM_EXTRACT_SPAN_RETRIES` | 1 | `extraction/tools` | 丢弃 span 前的额外尝试次数 |
+| `OGMEM_LLM_TIMEOUT` | 120 | `providers/llm/openai_llm` | OpenAI 客户端读/连接超时（秒） |
+| `OGMEM_ASR_FAIL_RATIO` | 0.15 | `m3/voice_asr`、`m3/pipeline/stages` | 每片段 ASR 失败容忍比率，超过则判定该视频失败 |
+| `OGMEM_TENANT_SCOPE` | m3bench | compose（ogmem service） | 后台 worker 的多租户隔离守卫（**尚未接入**：等待 WS 1.3 compose 变更；在此之前此表项仅作为规格记录） |
+| `ORTSESSION_INTRA_OP_THREADS` | 8 | `scripts/cv_service` | onnxruntime intra-op 线程上限（避免 192 线程抖动） |
+| `OMP_NUM_THREADS` | 8 | compose（runner） | pyannote 的 torch intra-op 线程（比默认快 23×） |
+
+> **调参建议：** 在嵌入式服务饱和时，先将 `OGMEM_EMBED_MAX_CONCURRENCY` 调低（如 4）以减少 429/超时；`OGMEM_EXTRACT_SPAN_TIMEOUT` 在慢 LLM 下可调至 300–600；`OGMEM_GRAPH_POOL_SIZE` 应 ≥ `OGMEM_M3_MAX_WORKERS` 以避免连接饥饿。
