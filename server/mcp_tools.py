@@ -2034,6 +2034,7 @@ def write_memory(
     if client_request_id:
         params["clientRequestId"] = client_request_id
         params["client_request_id"] = client_request_id
+        params["retryInBackground"] = True
     if force_extract:
         params["forceExtract"] = True
     if wait:
@@ -2042,19 +2043,21 @@ def write_memory(
     try:
         result = service.after_turn(params)
     except Exception as exc:
-        _record_mcp_write_audit(
-            service,
-            ctx,
-            session_id=session_id,
-            agent_id=agent_id,
-            client_request_id=client_request_id,
-            result="failed",
-            details={"error": f"{type(exc).__name__}: {exc}"},
-        )
-        raise
+        from core.write_contract import error_fields, normalize_write_result
+        fields = error_fields(exc, client_request_id)
+        if fields["error_detail"]["code"] == "WRITE_INTERNAL_ERROR":
+            _record_mcp_write_audit(
+                service, ctx, session_id=session_id, agent_id=agent_id,
+                client_request_id=client_request_id, result="failed",
+                details={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
+        result = normalize_write_result({"ok": False, "accepted": False,
+                                         "status": "failed", **fields}, client_request_id)
 
+    from core.write_contract import PUBLIC_FIELDS
     raw_status = result.get("status")
-    accepted = not (
+    accepted = bool(result.get("accepted")) if "accepted" in result else not (
         result.get("ok") is False
         or result.get("retryable") is True
         or (isinstance(raw_status, int) and 400 <= raw_status <= 599)
@@ -2082,7 +2085,7 @@ def write_memory(
             session_id=session_id, client_request_id=client_request_id,
         )
     return {
-        "ok": accepted,
+        "ok": result.get("ok", accepted),
         "status": result.get("status", "accepted"),
         "retryable": bool(result.get("retryable", False)),
         "session_id": session_id,
@@ -2091,7 +2094,19 @@ def write_memory(
         "submitted_messages": len(normalized_messages),
         "accepted_messages": accepted_messages,
         "stats": _public_write_stats(result),
+        **{key: result[key] for key in PUBLIC_FIELDS if key in result},
     }
+
+def get_write_request_status(service, *, session_id, client_request_id, agent_id=None,
+                             transport_headers=None, allow_stdio_env_auth=True,
+                             resolved_identity=None, request_context=None):
+    ctx = request_context or build_mcp_context(
+        service, {"session_id": session_id, "agent_id": agent_id},
+        transport_headers=transport_headers, allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity)
+    return service.get_write_request_status({"sessionId": session_id,
+        "clientRequestId": client_request_id, "_ctx": ctx})
+
 
 
 def validate_write_arguments(arguments: Mapping[str, Any]) -> None:

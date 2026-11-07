@@ -444,6 +444,7 @@ def lazy_service(fs, ctx):
 
     service.get_write_api = Mock(side_effect=initialize)
     manager = service.get_session_manager()
+    manager._get_llm = lambda: None
     manager.commit_snapshot = Mock(return_value={"ok": True, "status": "completed", "archived": True})
     return service, writer, manager
 

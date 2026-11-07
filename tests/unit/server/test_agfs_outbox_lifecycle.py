@@ -69,7 +69,7 @@ def publish_atlas(fs, store, *, revision=1):
 
 def assert_published(store, index, node, event):
     assert store.completed.wait(3)
-    assert store.list_pending(CTX.account_id) == []
+    assert store.get_event_status(node.uri, event.event_id) == "DONE"
     expected = build_index_records(node)
     assert {record.id for record in expected} == set(index._records)
     assert [(index._records[record.id].level, index._records[record.id].text)

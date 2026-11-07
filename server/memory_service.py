@@ -12,10 +12,14 @@ import logging
 import os
 import re as _re
 import threading
-from commit.outbox_scope import capture_outbox_events, current_outbox_events, restore_outbox_events
+from commit.outbox_scope import capture_outbox_events, current_outbox_events
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
+from core.write_contract import (
+    OUTCOMES_KEY, error_fields, needs_projection_refresh, normalize_write_result, projection_outcome,
+    store_outcome, write_request_contract,
+)
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime as _dt
@@ -52,6 +56,7 @@ from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.token_tracker import request_usage_scope
+from providers.token_tracker import UsagePersistenceError
 from providers.unified_config import OgMemConfig, get_config
 from retrieval.bm25_index import Bm25Index
 from retrieval.code_intent_filter import classify_code_retrieval_intent
@@ -163,7 +168,8 @@ def _after_turn_deadline(function):
             with operation_deadline(timeout):
                 return function(self, params)
         except OperationDeadlineExceededError as exc:
-            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc)}
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc),
+                    **error_fields(exc, str(params.get("clientRequestId") or params.get("client_request_id") or ""))}
     return bounded
 
 
@@ -218,8 +224,9 @@ def _guard_session_mutation(function):
                 if "drain" in result:
                     result["drain"] = drain
             return result
-        except SessionMutationBusyError:
-            return {"ok": False, "status": "processing", "retryable": True}
+        except SessionMutationBusyError as exc:
+            return {"ok": False, "status": "processing", "retryable": True,
+                    "accepted": False, **error_fields(exc)}
         except (SessionMutationLostError, RecoveryNeedsConfirmationError) as exc:
             return {"ok": False, "status": "needs_confirmation", "retryable": False, "error": str(exc)}
     return guarded
@@ -1906,7 +1913,8 @@ class MemoryService:
         with self._init_lock:
             if self._extraction_discovery is None:
                 self._extraction_discovery = ExtractionRecoveryDiscovery(
-                    self._get_context_fs, self._extraction_recovery_account_ids)
+                    self._get_context_fs, self._extraction_recovery_account_ids,
+                    projection_handler=self._refresh_write_outcomes)
                 self._extraction_retry.start_discovery(self._extraction_discovery)
 
     def _extraction_recovery_account_ids(self):
@@ -5289,9 +5297,116 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                   "extraction_archive_id": archive_id, "client_request_id": client_request_id})
         if task is None or task.get("status") not in {"queued", "running"}:
             return None
-        return {"ok": True, "status": "queued", "reason": "memory_card_format",
-                "recovery_task": task, "last_error": str(error)}
+        return {"ok": True, "status": "queued", "reason": "memory_card_format", "request_id": client_request_id,
+                "recovery_task": task, "last_error": str(error), **error_fields(error, client_request_id)}
 
+    def _refresh_write_outcomes(self, ctx):
+        """Persist completed projection receipts under the existing session fence."""
+        try:
+            with self._session_mutation_scope(ctx):
+                manager = self.get_session_manager()
+                buf = manager.get_or_create(ctx.session_id, ctx)
+                with buf.session_state_save_lock:
+                    with buf.extraction_lock:
+                        entries = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+                        updates = {}
+                        for request_id, outcome in entries.items():
+                            if needs_projection_refresh(outcome):
+                                resolved = self._resolve_write_outcome(outcome)
+                                if resolved != outcome:
+                                    updates[request_id] = resolved
+                        if not updates:
+                            return
+                        previous = {key: entries[key] for key in updates}
+                        entries.update(updates)
+                    if not manager.save_session_state(ctx.session_id, ctx):
+                        with buf.extraction_lock:
+                            entries.update(previous)
+                        raise RecoveryNeedsConfirmationError("projection receipt checkpoint was not acknowledged")
+        except (SessionMutationBusyError, SessionOperationInProgress):
+            return
+
+    def _resolve_write_outcome(self, outcome):
+        if not outcome.get("outbox_tracking_complete") or not outcome.get("outbox_events"):
+            return projection_outcome(outcome, None)
+        try:
+            manager = self.get_session_manager()
+            fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
+            store = self._get_outbox_store(fs) if fs is not None else None
+            paused = ("PROJECT_GRAPH",) if (_HAS_SQL and isinstance(store, SQLOutboxStore)
+                                             and not self._graph_enabled()) else ()
+            return projection_outcome(outcome, store, paused_event_types=paused)
+        except Exception as exc:
+            return normalize_write_result({**outcome, "projection_status": "UNKNOWN",
+                                           "request_status": "DEGRADED" if outcome.get("semantic_status") == "DEGRADED"
+                                           else "PROJECTING", **error_fields(exc, outcome.get("request_id", ""))})
+
+    def get_write_request_status(self, params: dict) -> dict:
+        """Read the owner-scoped durable receipt and its exact projection events."""
+        import json
+        from core.errors import NodeNotFoundError
+
+        session_id = str(params.get("sessionId") or params.get("session_id") or "").strip()
+        request_id = str(params.get("clientRequestId") or params.get("client_request_id") or "").strip()
+        if not session_id or not request_id or len(request_id) > 128:
+            raise ValueError("session_id and client_request_id are required")
+        ctx = params.get("_ctx") or self.build_context(params)
+        if ctx.session_id != session_id:
+            raise ValueError("request context must match its session")
+        manager = self.get_session_manager()
+        fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
+        if fs is None:
+            raise RecoveryNeedsConfirmationError("durable request state unavailable")
+        payload = None
+        for uri in (manager._session_state.state_uri(ctx.account_id, session_id),
+                    manager._session_state.legacy_state_uri(ctx.account_id, session_id)):
+            try:
+                node = fs.read_node(uri, ctx)
+            except (NodeNotFoundError, FileNotFoundError):
+                continue
+            if (node.category != "state" or node.owner_space != f"session:{session_id}"
+                    or node.metadata.get("owner_user_id") != ctx.user_id
+                    or node.metadata.get("owner_agent_id") != ctx.agent_id):
+                raise AccessDeniedError(uri, ctx.account_id, "request receipt owner differs")
+            payload = json.loads(node.content)
+            break
+        extensions = (payload or {}).get("runtime_extensions", {})
+        receipt = extensions.get(OUTCOMES_KEY, {}).get("entries", {}).get(request_id)
+        batch = extensions.get("memory_extraction_recovery", {}).get("batch", {})
+        owns_batch = batch.get("client_request_id") == request_id
+        buffered_batch = (receipt is not None and receipt.get("source_status") == "BUFFERED"
+                          and (owns_batch or set(receipt.get("source_message_ids", [])).difference(
+                              receipt.get("archived_source_ids", [])).intersection(batch.get("message_ids", []))))
+        if (receipt is None and owns_batch) or buffered_batch:
+            task = batch.get("retry_task", {})
+            lifecycle = batch.get("lifecycle", {})
+            failure = lifecycle.get("last_error", {})
+            if failure.get("status") not in {"needs_confirmation", "failed"}:
+                failure = {}
+            if failure:
+                state = "NEEDS_CONFIRMATION" if failure["status"] == "needs_confirmation" else "FAILED"
+            elif task.get("status") == "needs_confirmation":
+                state = "NEEDS_CONFIRMATION"
+            else:
+                state = "RECOVERING" if task else "RUNNING"
+            detail = (failure or task).get("error_detail")
+            if (state == "FAILED" and lifecycle.get("kind") == "dispose" and failure.get("retryable")
+                    and detail and detail.get("retry_action") == "retry_same_request"):
+                detail = {**detail, "retry_action": "retry_dispose"}
+            return normalize_write_result({**(receipt or {}), **failure,
+                "request_status": state, "request_id": request_id, "retryable": False,
+                "source_status": "CHECKPOINTED", "semantic_status": "PENDING",
+                "archive_id": batch.get("archive_id"), "accepted": True,
+                **({"error_detail": detail} if detail else {})})
+        if receipt is not None:
+            return self._resolve_write_outcome(receipt)
+        return normalize_write_result({"request_status": "UNKNOWN", "request_id": request_id,
+                                       "accepted": request_id in (payload or {}).get("completed_request_ids", [])})
+
+
+
+
+    @write_request_contract
     @capture_outbox_events
     @retry_failed_source
     @_after_turn_deadline
@@ -5327,9 +5442,18 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if claim_status == "completed":
             return self._after_turn(params)
         if claim_status == "processing":
+            batch = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
+            if batch.get("client_request_id") == client_request_id:
+                return {"ok": True, "status": "processing", "client_request_id": client_request_id,
+                        "request_status": "RUNNING", "source_status": "CHECKPOINTED", "accepted": True}
             return {
                 "ok": False,
-                "status": "processing",
+                "status": "request_in_progress",
+                "request_status": "FAILED",
+                "accepted": False,
+                "http_status": 409,
+                "error_detail": {"code": "WRITE_REQUEST_IN_PROGRESS", "component": "memory",
+                                 "request_id": client_request_id, "retry_action": "retry_same_request"},
                 "retryable": True,
                 "client_request_id": client_request_id,
             }
@@ -5370,7 +5494,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         with buf.extraction_lock:
             if buf.lifecycle_prepare_in_progress:
                 return {"ok": False, "status": "processing", "retryable": True,
-                        "reason": "lifecycle_preparing"}
+                        "reason": "lifecycle_preparing",
+                        **error_fields(SessionOperationInProgress(conflict_type="lifecycle_preparing", retryable=True),
+                                       str(params.get("clientRequestId") or params.get("client_request_id") or ""))}
             if lifecycle_kind(buf) is not None:
                 return {"ok": False, "status": "needs_confirmation", "retryable": False,
                         "error": "resume the pending lifecycle batch before after_turn"}
@@ -5432,11 +5558,29 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 return True
             return mgr.save_session_state(session_id, ctx)
 
+        request_source_ids = set()
+        completed_outcome = {}
+
         def _complete_request(result: dict) -> dict:
             if client_request_id and result.get("ok", True):
+                previous_completed = list(buf.completed_request_ids)
+                previous_outcomes = deepcopy(buf.runtime_extensions.get(OUTCOMES_KEY))
+                receipt = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {}).get(client_request_id)
+                if receipt is None:
+                    receipt = {"request_id": client_request_id, "request_status": "ACCEPTED",
+                               "source_status": "BUFFERED", "semantic_status": "PENDING",
+                               "projection_status": "UNKNOWN", "accepted": True,
+                               "source_message_ids": sorted(request_source_ids)}
                 buf.mark_request_completed(client_request_id)
+                receipt = store_outcome(buf, client_request_id, receipt,
+                                        resolve_outcome=self._resolve_write_outcome)
                 result["client_request_id"] = client_request_id
                 if not _save_idempotency_state():
+                    buf.completed_request_ids = previous_completed
+                    if previous_outcomes is None:
+                        buf.runtime_extensions.pop(OUTCOMES_KEY, None)
+                    else:
+                        buf.runtime_extensions[OUTCOMES_KEY] = previous_outcomes
                     return {
                         "ok": False,
                         "status": "failed",
@@ -5445,6 +5589,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "client_request_id": client_request_id,
                     }
                 buf.release_request(client_request_id)
+                result.update(deepcopy(receipt))
+            elif completed_outcome and request_source_ids <= archive_snapshot_ids:
+                result.update(completed_outcome)
+            elif completed_outcome:
+                result.update(status="accumulating", request_status="ACCEPTED",
+                              source_status="BUFFERED", semantic_status="PENDING")
             return result
         governance_fallback_token = params.get(
             "toolResultGovernanceFallbackToken"
@@ -5477,6 +5627,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "ok": True,
                 "status": "duplicate",
                 "client_request_id": client_request_id,
+                **deepcopy(buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {}).get(client_request_id, {})),
             }
 
         after_turn_governance = None
@@ -5505,6 +5656,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"ok": False, "status": "needs_confirmation", "retryable": False,
                     "error": "a stable source ID is required to distinguish a pending replay from a new message"}
         if not new_messages:
+            if after_turn_governance is not None and after_turn_governance.ledger_registration is not None:
+                source_ids = after_turn_governance.ledger_registration.source_ids
+                request_source_ids.update(message.id for message in buf.messages if message.id in source_ids)
             return _complete_request({"ok": True, "status": "no_new_messages"})
 
         request_session_time = None
@@ -5528,6 +5682,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 ctx=ctx,
                 session_id=session_id,
             )
+            request_source_ids.update(governance_result.source_message_ids)
         elif not pending_request_retry:
             # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest().
             buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
@@ -5545,6 +5700,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                                      or not existing.id.startswith("msg_request_"))
                                 and existing.role == role and existing.content == content):
                             buf.ingest_handoff_ids.discard(existing.id)
+                            request_source_ids.add(existing.id)
                             buf_snapshot.remove(existing)
                             content = None
                             break
@@ -5554,7 +5710,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         if isinstance(msg, dict)
                         else getattr(msg, "created_at", None)
                     )
-                    mgr.add_message(
+                    added = mgr.add_message(
                         session_id,
                         role,
                         content,
@@ -5562,7 +5718,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         created_at=created_at,
                         message_id=message_id,
                     )
-                    buf.ingest_handoff_ids.discard(message_id)
+                    buf.ingest_handoff_ids.discard(added["message_id"])
+                    request_source_ids.add(added["message_id"])
                 if parsed["tool_calls"]:
                     update_buffer_stats(
                         buf.usage_stats,
@@ -5587,7 +5744,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         if pending_tokens < threshold and not force_extract and not buf.pending_extraction_ids():
             return _complete_request(
-                {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
+                {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens,
+                 "source_status": "BUFFERED", "semantic_status": "PENDING"}
             )
 
         # Step 2: Threshold reached → extract memories + write + index + archive
@@ -5658,8 +5816,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     session_time=extraction_state["session_time"] or request_session_time,
                     session_summary=extraction_claim["extraction_summary"],
                     tool_stats_text=extraction_state["tool_stats_text"],
-                    client_request_id=client_request_id, request_messages=new_messages)
+                    client_request_id=client_request_id or "extraction-retry-" + archive_id,
+                    request_messages=new_messages,
+                    request_source_ids=sorted(request_source_ids))
                 archive_id = extraction_journal.batch["archive_id"]
+                if not extraction_journal.batch.get("client_request_id"):
+                    extraction_journal.mutate(lambda batch: batch.update(
+                        client_request_id="extraction-retry-" + archive_id))
             except Exception as exc:
                 buf.rewind_watermark_to_ids(archive_snapshot_ids)
                 if extraction_claim["extraction_started"]:
@@ -5667,9 +5830,22 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 return {"ok": False, "status": "needs_confirmation" if isinstance(exc, RecoveryNeedsConfirmationError) else "failed",
                         "error": str(exc), "retryable": not isinstance(exc, RecoveryNeedsConfirmationError)}
 
-        def _finish_archived_batch():
+        def _finish_archived_batch(write_result=None):
+            write_result = write_result or {}
             if extraction_journal is not None:
-                extraction_journal.finish()
+                degraded = bool(write_result.get("degraded") or write_result.get("recovery_mode") == "source_only")
+                outcome = {"semantic_status": "DEGRADED" if degraded else "COMPLETE",
+                           "request_status": "DEGRADED" if degraded else "PROJECTING",
+                           "accepted": True,
+                           "writes_completed": write_result.get("writes_completed", 0),
+                           "candidates_extracted": write_result.get("candidates_extracted", 0)}
+                if degraded:
+                    outcome["error_detail"] = {"code": "EXTRACTION_SOURCE_ONLY", "component": "extraction",
+                        "request_id": extraction_journal_request_id, "retry_action": "manual_review",
+                        "cause": {"message": str(write_result.get("reason", "source preserved after recovery"))[:1000]}}
+                completed_outcome.update(extraction_journal.finish(
+                    outcome=outcome, resolve_outcome=self._resolve_write_outcome,
+                    current_request_id=client_request_id, current_source_ids=request_source_ids))
                 return len(archive_snapshot)
             removed = buf.remove_messages_by_id(archive_snapshot_ids)
             if removed:
@@ -5677,8 +5853,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return removed
 
         def _completion_status():
-            if (extraction_journal is not None
-                    and client_request_id != extraction_journal_request_id and buf.messages):
+            if extraction_journal is not None and request_source_ids - archive_snapshot_ids:
                 return "accumulating"
             return "completed"
 
@@ -5719,7 +5894,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 check_deadline()
                 drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
                 check_deadline()
-                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+                commit_result = mgr.commit_snapshot(
+                    session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
             except OperationDeadlineExceededError:
                 _rewind_failed_archive_watermark()
                 if extraction_claim["extraction_started"]:
@@ -5737,7 +5913,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 removed,
                 commit_result.get("reason", ""),
             )
-            if commit_result.get("status") == "failed":
+            if commit_result.get("status") in {"failed", "needs_confirmation"}:
                 rewound = _rewind_failed_archive_watermark()
                 logger.error(
                     "after_turn no-extractable snapshot commit failed: "
@@ -5749,7 +5925,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
                 return {
                     "ok": False,
-                    "status": "failed",
+                    "status": commit_result.get("status", "failed"),
                     "error": commit_result.get("error", "archive commit failed"),
                     "drain": drain_stats,
                     "commit": commit_result,
@@ -5831,9 +6007,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 except Exception as exc:
                     logger.warning("outbox_drain failed after background extract: %s", exc)
 
-                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+                commit_result = mgr.commit_snapshot(
+                    session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
                 removed = 0
-                if commit_result.get("status") == "failed":
+                if commit_result.get("status") in {"failed", "needs_confirmation"}:
                     rewound = _rewind_failed_archive_watermark()
                     logger.error(
                         "after_turn background snapshot commit failed: "
@@ -5844,7 +6021,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         commit_result.get("error", "archive commit failed"),
                     )
                 elif commit_result.get("archived"):
-                    removed = _finish_archived_batch()
+                    removed = _finish_archived_batch(write_result)
                 logger.info(
                     "after_turn background snapshot commit done: run=%s session=%s "
                     "archived=%s reason=%s removed=%d buffer_len=%d watermark=%d",
@@ -5856,7 +6033,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     len(buf.messages),
                     buf.extraction_watermark,
                 )
-                if commit_result.get("status") != "failed":
+                if commit_result.get("status") == "completed" and commit_result.get("archived"):
                     _complete_request({"ok": True, "status": "completed"})
                     # Bench clients use this marker as a completion barrier.
                     # Emitting it before commit_snapshot could announce
@@ -5889,6 +6066,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         @capture_outbox_events
         def _background_owned():
             """The child acquires its own connection after the HTTP handoff."""
+            nonlocal extraction_journal
             ran = False
             try:
                 with self._session_mutation_scope(ctx) as guard:
@@ -5900,7 +6078,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                             # Another fenced worker durably finished the original source.
                             return
                     if extraction_journal is not None:
-                        restore_outbox_events(extraction_journal.batch, ctx.account_id)
+                        extraction_journal = ExtractionBatchJournal.resume(mgr, buf, ctx)
                     ran = True
                     _background_extract_write()
                 if guard is not None and guard.post_commit_drain:
@@ -5962,9 +6140,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     archive_snapshot,
                     ctx,
                     wait=True,
-                    archive_id=archive_id,
+                    archive_id=archive_id
                 )
-                if commit_result.get("status") == "failed":
+                if commit_result.get("status") in {"failed", "needs_confirmation"}:
                     rewound = _rewind_failed_archive_watermark()
                     logger.error(
                         "after_turn wait snapshot commit failed: "
@@ -5977,14 +6155,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     return {
                         **write_result,
                         "ok": False,
-                        "status": "failed",
+                        "status": commit_result.get("status", "failed"),
                         "error": commit_result.get("error", "archive commit failed"),
                         "drain": drain_stats,
                         "commit": commit_result,
                         "extraction_run_id": extraction_run_id,
                     }
                 if commit_result.get("archived"):
-                    _finish_archived_batch()
+                    _finish_archived_batch(write_result)
                 result = _complete_request(
                     {
                         "ok": True,
@@ -6032,6 +6210,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "extraction_run_id": extraction_run_id,
                     "failure_kind": ("memory_card_format" if isinstance(exc, MemoryCardFormatError) else
                                      "llm_transient" if isinstance(exc, LLMTransientError) else ""),
+                    **error_fields(exc, extraction_journal_request_id),
                 }
             finally:
                 buf.end_extraction()
@@ -6070,7 +6249,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
             return _extract_synchronously()
 
-        return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
+        return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id,
+                "request_id": extraction_journal_request_id}
 
     @_attribute_request_usage
     @_guard_session_mutation
@@ -6189,8 +6369,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "retryable": False, "error": "durable extraction state unavailable: " + str(exc)}
         buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
         try:
-            with buf.lifecycle_lock:
+            with request_usage_scope(ctx), buf.lifecycle_lock:
                 return self._compact_impl(params)
+        except UsagePersistenceError as exc:
+            return {"compacted": False, **self._lifecycle_usage_failure(exc, params, buf, ctx)}
         except (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError) as exc:
             return {"ok": False, "compacted": False, "status": "needs_confirmation",
                     "retryable": False, "error": str(exc)}
@@ -6198,6 +6380,25 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"ok": False, "compacted": False, "status": "failed", "retryable": True, "error": str(exc)}
         finally:
             buf.end_operation()
+
+    def _lifecycle_usage_failure(self, exc, params, buf, ctx):
+        request_id = str(params.get("clientRequestId") or params.get("client_request_id") or "")
+        batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
+        checkpointed = isinstance(batch, dict) and batch.get("owner") == recovery_owner(ctx)
+        lifecycle = batch.get("lifecycle", {}) if checkpointed else {}
+        if lifecycle.get("kind") == "compaction":
+            journal = LifecycleBatchJournal.resume(self.get_session_manager(), buf, ctx)
+            self._update_lifecycle_error(journal, exc, retryable=False)
+        logger.exception("Lifecycle model usage persistence failed: session=%s", ctx.session_id)
+        return normalize_write_result({
+            "ok": False, "status": "failed", "error": str(exc), "retryable": False,
+            "request_status": "FAILED", "accepted": checkpointed,
+            "source_status": "CHECKPOINTED" if checkpointed else "UNKNOWN",
+            "semantic_status": lifecycle.get("semantic_status", "UNKNOWN"), "projection_status": "UNKNOWN",
+            "archive_id": batch.get("archive_id") if checkpointed else None,
+            **error_fields(exc, request_id),
+        }, request_id)
+
 
     def _compact_impl(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
@@ -6232,7 +6433,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                                                  archive_checkpoint=journal)
             if commit_result.get("archived") and commit_result.get("status") == "completed":
                 try:
-                    journal.finish(reset_window_state=True)
+                    semantic = journal.batch.get("lifecycle", {}).get("semantic_status", "COMPLETE")
+                    journal.finish(reset_window_state=True, outcome={"semantic_status": semantic},
+                                   resolve_outcome=self._resolve_write_outcome)
                 except Exception as exc:
                     return {"ok": False, "compacted": False, "status": "failed",
                             "retryable": True, "error": str(exc), "commit": commit_result}
@@ -6415,6 +6618,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             prepared = journal.prepare_state(ttl_seconds)
             if prepared is None or prepared["prepareToken"] != prepare_token:
                 raise ValueError("invalid prepare token")
+            self._update_lifecycle_error(journal)
             result.update(prepared)
             result["_lifecycle_journal"] = journal
             return result
@@ -6491,7 +6695,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "error": "durable extraction state unavailable: " + str(exc)}
         buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
         try:
-            with buf.lifecycle_lock:
+            with request_usage_scope(ctx), buf.lifecycle_lock:
                 with buf.lifecycle_source_scope() as conflict:
                     if conflict is not None:
                         return {"ok": False, "status": "processing", "retryable": True,
@@ -6501,6 +6705,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         return self._prepare_compaction_impl(params)
                     finally:
                         buf.end_extraction()
+        except UsagePersistenceError as exc:
+            return self._lifecycle_usage_failure(exc, params, buf, ctx)
         except (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError) as exc:
             return {"ok": False, "status": "needs_confirmation", "retryable": False, "error": str(exc)}
         except RecoveryPersistenceError as exc:
@@ -6526,6 +6732,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             result["archive_id"] = journal.batch["archive_id"]
             result["_lifecycle_journal"] = journal
             prepared = journal.prepare_state(ttl_seconds)
+            self._update_lifecycle_error(journal)
             if prepared is not None:
                 result.update(prepared)
                 return result
@@ -6542,6 +6749,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 if write_result.get("candidates_extracted", 0) > 0:
                     buf.extraction_summary = _update_extraction_summary(buf.extraction_summary, write_result)
                 result["write_result"] = write_result
+                journal.mutate(lambda batch: batch["lifecycle"].update(
+                    semantic_status="DEGRADED" if write_result.get("degraded") else "COMPLETE"))
             result["prepareToken"] = journal.issue_prepare_token()
             source_ids = set(journal.batch["message_ids"])
             buf.extraction_watermark = max((index + 1 for index, message in enumerate(buf.messages)
@@ -6629,16 +6838,52 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def on_subagent_ended(self, params: dict) -> dict:
         return {"cleaned": True}
 
-    def _save_dispose_snapshot(self, mgr, session_id, params, buf, snapshot_ids):
+    @staticmethod
+    def _update_lifecycle_error(journal, exc=None, *, retryable=True):
+        if exc is None:
+            if journal.batch["lifecycle"].get("last_error"):
+                journal.mutate(lambda batch: batch["lifecycle"].pop("last_error", None))
+            return
+        try:
+            needs_confirmation = isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError))
+            failure = {"status": "needs_confirmation" if needs_confirmation else "failed",
+                       "retryable": retryable and not needs_confirmation,
+                       "error": str(exc),
+                       **error_fields(exc, journal.batch.get("client_request_id", ""))}
+            journal.mutate(lambda batch: batch["lifecycle"].update(last_error=failure))
+        except Exception:
+            logger.exception("lifecycle failure checkpoint unavailable: session=%s", journal.buffer.session_id[:8])
+
+    def _save_dispose_snapshot(self, mgr, params, buf, snapshot_ids):
         with buf.session_state_save_lock, mgr._lock, buf.extraction_lock:
-            rollback = buf.capture_rollback_state()
-            try:
-                buf.remove_messages_by_id(snapshot_ids)
-                self._save_session_state_best_effort(mgr, session_id, params)
-            except Exception:
-                buf.restore_rollback_state(rollback)
-                buf.rewind_watermark_to_ids(snapshot_ids)
-                raise
+            snapshot = [message for message in buf.messages if message.id in snapshot_ids]
+        if not snapshot:
+            return
+        ctx = params.get("_ctx") or self.build_context(params)
+        journal = self._dispose_journal(mgr, buf, ctx, snapshot)
+        try:
+            self._update_lifecycle_error(journal)
+            archived = self.get_write_api().write_raw_chunk(
+                messages=[{"role": message.role, "content": message.content, "id": message.id} for message in snapshot],
+                ctx=ctx, session_id=journal.batch["archive_id"], chunk_index=0,
+                session_time=_parse_session_time(journal.batch.get("session_time")),
+                candidate_checkpoint=journal.checkpoint("raw:source"))
+            if not archived.get("target_uri"):
+                raise RecoveryPersistenceError("dispose source archive requires confirmation")
+            journal.finish(outcome={"semantic_status": "DEGRADED", "request_status": "DEGRADED",
+                "source_status": "RAW_ARCHIVED", "raw_source_uris": [archived["target_uri"]],
+                "error_detail": {"code": "SEMANTIC_EXTRACTION_SKIPPED", "component": "extraction",
+                    "request_id": "", "retry_action": "manual_review",
+                    "cause": {"message": "dispose extraction threshold or extractable source requirement was not met"}}},
+                resolve_outcome=self._resolve_write_outcome)
+        except Exception as exc:
+            self._update_lifecycle_error(journal, exc)
+            raise
+        if (_HAS_AGFS and not self._cfg.role_control_enabled
+                and ctx.account_id != self._default_account_id):
+            recovery = AGFSContextFS.active_session_recovery()
+            if recovery is not None:
+                recovery[0].post_commit_drain = True
 
     @capture_outbox_events
     def _run_dispose_background(self, mgr, session_id: str, params: dict, ctx, buf, source_snapshot=None, operation=None) -> None:
@@ -6782,6 +7027,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 if isinstance(write_api, _CheckpointWriteAPI):
                     journal = self._dispose_journal(mgr, buf, effective_ctx, snapshot)
                     extraction_messages = journal.batch["messages"]
+                    self._update_lifecycle_error(journal)
                 tool_stats_text = ""
                 try:
                     from extraction.tool_collector import format_tool_stats_text
@@ -6804,12 +7050,25 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
                 if self._write_result_has_failures(write_result):
                     raise RuntimeError("dispose extraction write failed")
+                if journal is not None:
+                    assistant_source = [{"role": message.role, "content": message.content, "id": message.id}
+                                        for message in snapshot if message.role == "assistant"]
+                    if assistant_source:
+                        write_api.write_raw_chunk(messages=assistant_source, ctx=effective_ctx,
+                            session_id=journal.batch["archive_id"], chunk_index=0,
+                            session_time=_parse_session_time(journal.batch.get("session_time")),
+                            candidate_checkpoint=journal.checkpoint("raw:assistant"))
                 self._invalidate_identity_cache_if_profile_written(session_id, write_result)
                 self.drain_outbox_sync(account_id=effective_ctx.account_id)
                 if journal is not None:
-                    journal.finish()
+                    raw_uris = [operation["plan"]["target_uri"]
+                        for slot, record in journal.batch["slots"].items() if slot.startswith("raw:")
+                        for operation in record["operations"].values() if operation.get("status") == "complete"]
+                    journal.finish(outcome={"semantic_status": "DEGRADED" if write_result.get("degraded") else "COMPLETE",
+                                             "source_status": "RAW_ARCHIVED", "raw_source_uris": raw_uris},
+                                   resolve_outcome=self._resolve_write_outcome)
                 else:
-                    self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+                    self._save_dispose_snapshot(mgr, params, buf, snapshot_ids)
                 succeeded = True
                 logger.info(
                     "dispose background flush done: run=%s session=%s extracted=%d writes=%d",
@@ -6819,19 +7078,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     write_result.get("writes_completed", 0),
                 )
             else:
-                self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+                self._save_dispose_snapshot(mgr, params, buf, snapshot_ids)
                 succeeded = True
         except Exception as exc:
             if snapshot_ids:
                 buf.rewind_watermark_to_ids(snapshot_ids)
             if journal is not None:
-                try:
-                    failure = {
-                        "status": "needs_confirmation" if isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)) else "failed",
-                        "retryable": not isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)), "error": str(exc)}
-                    journal.mutate(lambda batch: batch["lifecycle"].update(last_error=failure))
-                except Exception:
-                    logger.exception("dispose failure checkpoint unavailable: session=%s", session_id[:8])
+                self._update_lifecycle_error(journal, exc)
             logger.exception("dispose background flush failed: session=%s", session_id[:8])
         finally:
             source_stack.close()
@@ -6847,6 +7100,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     self._flush_session_tool_usage_async(session_id, effective_ctx)
 
     @_attribute_request_usage
+    @capture_outbox_events
     @_guard_session_mutation
     def dispose(self, params: dict | None = None) -> dict:
         """Session end: safely dispatch a non-blocking pending-memory flush."""
@@ -6964,7 +7218,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         snapshot_ids = {message.id for message in unextracted}
 
         if fast_path_reason is not None:
-            self._save_dispose_snapshot(mgr, session_id, params, buf, snapshot_ids)
+            self._save_dispose_snapshot(mgr, params, buf, snapshot_ids)
             removed_session = mgr.remove_session_if_empty(
                 session_id,
                 buf,

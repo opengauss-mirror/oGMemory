@@ -381,6 +381,7 @@ def test_create_mcp_server_read_write_toolset_registers_write_only():
     tools = anyio.run(mcp.list_tools)
 
     assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_get_write_request_status",
         "ogm_write_memory",
     } | _SKILL_WRITE_TOOLS
 
@@ -394,6 +395,7 @@ def test_create_mcp_server_all_toolset_registers_write_and_delete():
     tools = anyio.run(mcp.list_tools)
 
     assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_get_write_request_status",
         "ogm_write_memory",
         "ogm_delete_memory",
     } | _SKILL_WRITE_TOOLS | _SKILL_DELETE_TOOLS
@@ -705,6 +707,7 @@ def test_create_mcp_server_registers_write_tool_when_enabled():
     write_tool = next(tool for tool in tools if tool.name == "ogm_write_memory")
 
     assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_get_write_request_status",
         "ogm_write_memory",
     } | _SKILL_WRITE_TOOLS
     assert "ctx" not in write_tool.input_schema.get("properties", {})
@@ -739,6 +742,7 @@ def test_create_mcp_server_registers_read_write_and_delete_tools_when_enabled():
     tools = anyio.run(mcp.list_tools)
 
     assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_get_write_request_status",
         "ogm_write_memory",
         "ogm_delete_memory",
     } | _SKILL_WRITE_TOOLS | _SKILL_DELETE_TOOLS
@@ -806,6 +810,7 @@ def test_code_edit_tool_is_not_implied_by_generic_write_or_code_only_profile(mon
     )
 
     assert {tool.name for tool in anyio.run(mcp.list_tools)} == _READ_TOOLS | {
+        "ogm_get_write_request_status",
         "ogm_write_memory"
     } | _SKILL_WRITE_TOOLS
 

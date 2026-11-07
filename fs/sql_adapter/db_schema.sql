@@ -168,6 +168,8 @@ DECLARE
     job RECORD;
     refreshed_edges TEXT[] := ARRAY[]::TEXT[];
     active_batch_key BIGINT := ogmem_graph_projection_batch_key();
+    wakeup_id TEXT;
+    wakeup_ids TEXT[] := ARRAY[]::TEXT[];
 BEGIN
     IF (OLD.version, OLD.content, OLD.abstract, OLD.overview)
        IS DISTINCT FROM
@@ -224,11 +226,13 @@ BEGIN
            AND edge_id = job.edge_id;
             -- Same transaction as invalidation: restart cannot lose discovery
             -- even after the ordinary node event was acknowledged.
+            wakeup_id := md5(NEW.account_id || job.edge_id || clock_timestamp()::text || random()::text);
             INSERT INTO outbox_events
                 (event_id,event_type,uri,account_id,payload,status,retry_count)
-            VALUES (md5(NEW.account_id || job.edge_id || clock_timestamp()::text || random()::text),
+            VALUES (wakeup_id,
                     'PROJECT_GRAPH',NEW.uri,NEW.account_id,
                     ('{"edge_id":"' || job.edge_id || '"}')::jsonb,'PENDING',0);
+            wakeup_ids := array_append(wakeup_ids, wakeup_id);
         END LOOP;
         UPDATE relation_edges
            SET edge_projection = NULL, updated_at = NOW()
@@ -236,6 +240,10 @@ BEGIN
            AND (from_uri = NEW.uri OR to_uri = NEW.uri)
            AND projection_edge_id IS NOT NULL
            AND NOT (projection_edge_id = ANY(refreshed_edges));
+    END IF;
+    IF array_length(wakeup_ids, 1) > 0 THEN
+        PERFORM set_config('ogmemory.node_write_events',
+            '{"uri":' || to_json(NEW.uri)::text || ',"event_ids":' || array_to_json(wakeup_ids)::text || '}', true);
     END IF;
     RETURN NEW;
 END;

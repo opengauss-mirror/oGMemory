@@ -221,7 +221,10 @@ def _successful_write_result() -> dict:
 
 def test_dispose_preserves_messages_added_after_its_snapshot():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
-    service._get_context_fs = Mock(return_value=None)
+    from tests.unit.commit.test_memory_identity import MemoryFS
+    fs = MemoryFS()
+    service._get_context_fs = Mock(return_value=fs)
+    service._get_archive_store = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-race"
     ctx = _threaded_ctx(session_id)
@@ -237,12 +240,20 @@ def test_dispose_preserves_messages_added_after_its_snapshot():
     def blocked_write_api():
         write_api_requested.set()
         release_write_api.wait(timeout=3)
-        return object()
+        return writer
 
     def fake_extract(**kwargs):
         flushed_contents.extend(message["content"] for message in kwargs["messages"])
-        return _successful_write_result()
+        archived = writer.write_raw_chunk(messages=kwargs["messages"], ctx=ctx,
+                                          session_id=kwargs["archive_id"], chunk_index=0,
+                                          candidate_checkpoint=kwargs["extraction_journal"].checkpoint("raw:source"))
+        return {**_successful_write_result(), "raw_source_uris": [archived["target_uri"]],
+                "source_status": "RAW_ARCHIVED"}
 
+    from service.api import MemoryWriteAPI
+    from providers.llm import MockLLM
+    writer = MemoryWriteAPI(fs, MockLLM(), directory_summary_enabled=False)
+    service._write_api = writer
     service.get_write_api = blocked_write_api
     service._chunk_and_extract = fake_extract
     service.drain_outbox_sync = Mock(return_value={"processed": 0})
@@ -269,7 +280,10 @@ def test_dispose_preserves_messages_added_after_its_snapshot():
 
 def test_dispose_fast_path_preserves_messages_added_during_cleanup():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
-    service._get_context_fs = Mock(return_value=None)
+    from tests.unit.commit.test_memory_identity import MemoryFS
+    fs = MemoryFS()
+    service._get_context_fs = Mock(return_value=fs)
+    service._get_archive_store = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-fast-race"
     ctx = _threaded_ctx(session_id)
@@ -280,11 +294,17 @@ def test_dispose_fast_path_preserves_messages_added_during_cleanup():
     save_started = threading.Event()
     release_save = threading.Event()
 
+    save = service._save_dispose_snapshot
+    from service.api import MemoryWriteAPI
+    from providers.llm import MockLLM
+    service._write_api = MemoryWriteAPI(fs, MockLLM(), directory_summary_enabled=False)
+
     def blocked_save(*_args, **_kwargs):
         save_started.set()
         release_save.wait(timeout=3)
+        return save(*_args, **_kwargs)
 
-    service._save_session_state_best_effort = blocked_save
+    service._save_dispose_snapshot = blocked_save
     result_holder = []
     dispose_thread = threading.Thread(
         target=lambda: result_holder.append(

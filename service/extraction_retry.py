@@ -13,7 +13,9 @@ from copy import deepcopy
 from functools import wraps
 from queue import Empty, Queue
 
+from commit.outbox_scope import capture_outbox_events
 from core.errors import LLMTransientError, MemoryCardFormatError
+from core.write_contract import error_fields
 from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from service.extraction_checkpoint import (
     EXTENSION_KEY,
@@ -68,14 +70,17 @@ def retry_failed_source(function):
         if requested and not client_request_id:
             raise ValueError("retryInBackground requires a stable clientRequestId")
         result = function(self, params)
-        if (requested and not _running.get() and result.get("ok") is False
+        if (not _running.get() and client_request_id and result.get("extraction_archive_id")
+                and result.get("ok") is False
                 and result.get("status") == "failed" and result.get("retryable") is True
                 and result.get("client_request_id") == client_request_id):
             ctx = params.get("_ctx") or self.build_context(params)
             try:
                 task = self._extraction_retry.register(ctx, result)
                 if task:
-                    return {**result, "recovery_task": task}
+                    state = "NEEDS_CONFIRMATION" if task.get("status") == "needs_confirmation" else "RECOVERING"
+                    return {**result, "recovery_task": task, "request_status": state,
+                            "source_status": "CHECKPOINTED", "semantic_status": "PENDING", "accepted": True}
             except Exception as exc:
                 logger.exception("Cannot persist extraction retry")
                 return {**result, "retryable": False, "status": "needs_confirmation",
@@ -144,6 +149,8 @@ class ExtractionRetryWorker:
                 else:
                     task = deepcopy(task)
                 kind = failure.get("failure_kind", "")
+                if failure.get("error_detail"):
+                    task["error_detail"] = deepcopy(failure["error_detail"])
                 if (task["status"] == "queued" and failure.get("error")
                         and (kind != "busy" or not task.get("last_error"))):
                     task.update(last_error=str(failure["error"])[:1000],
@@ -172,6 +179,7 @@ class ExtractionRetryWorker:
             "failure_kind": ("memory_card_format" if isinstance(error, MemoryCardFormatError) else
                              "llm_transient" if isinstance(error, LLMTransientError) else
                              "busy" if isinstance(error, SessionMutationBusyError) else ""),
+            **(error_fields(error, journal.batch["client_request_id"]) if error else {}),
         }, wake=wake)
 
     def wake(self, ctx, task):
@@ -218,6 +226,7 @@ class ExtractionRetryWorker:
                         self._queued.discard(identity)
                 self._queue.task_done()
 
+    @capture_outbox_events
     def run_once(self, ctx, archive_id):
         """One fenced attempt; return backoff seconds or None for a terminal task."""
         try:
@@ -291,6 +300,8 @@ class ExtractionRetryWorker:
                 if not processing:
                     task.update(last_error=str(result.get("error", result.get("status", "pending")))[:1000],
                                 failure_kind=result.get("failure_kind", ""))
+                    if result.get("error_detail"):
+                        task["error_detail"] = deepcopy(result["error_detail"])
                     if task["failure_kind"] == "memory_card_format":
                         task["format_error"] = task["last_error"]
                 exhausted = (task["attempts"] >= MAX_ATTEMPTS

@@ -9,6 +9,8 @@ from dataclasses import asdict, replace
 
 from commit.outbox_scope import current_outbox_events, restore_outbox_events
 from commit.write_receipts import operation_digest
+from service.model_stage import stage_digest
+from core.write_contract import OUTCOMES_KEY, store_outcome, merge_source_outcome
 from core.models import CandidateMemory
 
 EXTENSION_KEY = "memory_extraction_recovery"
@@ -48,7 +50,7 @@ class ExtractionBatchJournal:
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
-                 request_messages=None, lifecycle=None):
+                 request_messages=None, lifecycle=None, request_source_ids=None):
         self.manager, self.buffer, self.ctx = manager, buffer, ctx
         extension = buffer.runtime_extensions.get(EXTENSION_KEY, {})
         batch = extension.get("batch")
@@ -69,6 +71,7 @@ class ExtractionBatchJournal:
             batch = {"owner": recovery_owner(ctx), "archive_id": archive_id,
                      "client_request_id": client_request_id,
                      "request_messages": deepcopy(request_messages or []),
+                     "request_source_ids": list(request_source_ids) if request_source_ids is not None else [message.id for message in snapshot],
                      "message_ids": [message.id for message in snapshot],
                      "snapshot": [asdict(message) for message in snapshot],
                      "messages": deepcopy(messages),
@@ -138,16 +141,32 @@ class ExtractionBatchJournal:
             return ("rejected_before_write" in statuses
                     and statuses <= {"complete", "rejected_before_write"})
 
-    def finish(self, *, reset_window_state=False):
+    def finish(self, *, reset_window_state=False, outcome=None, resolve_outcome=None,
+               current_request_id="", current_source_ids=()):
         """Clear source claim, pending drafts and request ID in one durable state."""
         with self.buffer.session_state_save_lock:
             with self.buffer.extraction_lock:
                 batch = self.batch
                 rollback = self.buffer.capture_rollback_state()
                 old_completed = list(self.buffer.completed_request_ids)
-                old_extension = deepcopy(self.buffer.runtime_extensions[EXTENSION_KEY])
+                old_extension = self.buffer.runtime_extensions[EXTENSION_KEY]
+                old_outcomes = deepcopy(self.buffer.runtime_extensions.get(OUTCOMES_KEY))
                 client_request_id = batch.get("client_request_id", "")
-                self.buffer.remove_messages_by_id(set(batch["message_ids"]))
+                receipt = deepcopy(outcome or {})
+                references = [tuple(item) for item in batch.get("outbox_events", [])]
+                references.extend(current_outbox_events(self.ctx.account_id) or [])
+                receipt.update(request_id=client_request_id, archive_id=batch["archive_id"],
+                               source_sha256=stage_digest(batch["messages"]),
+                               outbox_events=[list(item) for item in dict.fromkeys(references)],
+                               outbox_tracking_complete=batch.get("outbox_tracking_version") == 1)
+                receipt.setdefault("source_status", "ARCHIVED")
+                if batch.get("lifecycle", {}).get("source_digest"):
+                    receipt["source_snapshot_sha256"] = batch["lifecycle"]["source_digest"]
+                receipt.setdefault("semantic_status", "UNKNOWN")
+                receipt.setdefault("projection_status", "UNKNOWN")
+                receipt.setdefault("request_status", "PROJECTING")
+                batch_ids = set(batch["message_ids"])
+                self.buffer.remove_messages_by_id(batch_ids)
                 if (batch.get("lifecycle", {}).get("kind") == "compaction"
                         and self.buffer.compaction_prepare_archive_id == batch["archive_id"]):
                     self.buffer.compaction_prepare_archive_id = ""
@@ -156,13 +175,38 @@ class ExtractionBatchJournal:
                     self.buffer.window_state = SessionWindowState()
                 if client_request_id:
                     self.buffer.mark_request_completed(client_request_id)
+                pending_receipts = dict(self.buffer.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {}))
+                batch_receipt = receipt
+                if client_request_id not in pending_receipts and client_request_id:
+                    pending_receipts[client_request_id] = {"source_status": "BUFFERED",
+                        "source_message_ids": batch.get("request_source_ids", batch["message_ids"])}
+                if (current_request_id and current_request_id not in pending_receipts
+                        and not batch_ids.isdisjoint(current_source_ids)):
+                    pending_receipts[current_request_id] = {"source_status": "BUFFERED",
+                        "source_message_ids": sorted(current_source_ids)}
+                for request_id, pending_receipt in pending_receipts.items():
+                    source_ids = set(pending_receipt.get("source_message_ids", []))
+                    if (pending_receipt.get("source_status") == "BUFFERED" and source_ids
+                            and not batch_ids.isdisjoint(source_ids)) or request_id == client_request_id:
+                        merged = merge_source_outcome(pending_receipt, {**batch_receipt, "request_id": request_id}, batch["message_ids"])
+                        if request_id == current_request_id and request_id != client_request_id:
+                            self.buffer.mark_request_completed(request_id)
+                        merged = store_outcome(self.buffer, request_id, merged,
+                                               resolve_outcome=resolve_outcome)
+                        if request_id == client_request_id:
+                            receipt = merged
                 self.buffer.runtime_extensions.pop(EXTENSION_KEY)
             if not self.manager.save_session_state(self.buffer.session_id, self.ctx):
                 with self.buffer.extraction_lock:
                     self.buffer.restore_rollback_state(rollback)
                     self.buffer.completed_request_ids = old_completed
                     self.buffer.runtime_extensions[EXTENSION_KEY] = old_extension
+                    if old_outcomes is None:
+                        self.buffer.runtime_extensions.pop(OUTCOMES_KEY, None)
+                    else:
+                        self.buffer.runtime_extensions[OUTCOMES_KEY] = old_outcomes
                 raise RecoveryPersistenceError("completed extraction checkpoint could not be saved")
+            return receipt
 
 
 class CandidateCheckpoint:
@@ -184,6 +228,12 @@ class CandidateCheckpoint:
                 suffix = f":revision:{revision}" if revision else ""
                 expected = hashlib.sha256(
                     f"{self.journal.batch['archive_id']}:{self.slot}:{index}{suffix}".encode()).hexdigest()
+                identity_version = record.get("operation_id_versions", {}).get(
+                    str(index), record.get("operation_id_version", 1))
+                if identity_version == 2:
+                    expected = "receipt-v2:" + expected
+                elif identity_version != 1:
+                    raise ValueError("operation identity version is unsupported")
                 if candidate.write_operation_id != expected:
                     raise ValueError("operation identity changed")
                 if operation_digest(candidate, self.journal.ctx) != record["candidate_digests"][index]:
@@ -196,14 +246,31 @@ class CandidateCheckpoint:
         if self.record is not None:
             raise RecoveryNeedsConfirmationError("accepted extraction candidates cannot be replaced")
         batch = self.journal.batch
-        accepted = [replace(candidate, write_operation_id=hashlib.sha256(
+        accepted = [replace(candidate, write_operation_id="receipt-v2:" + hashlib.sha256(
             f"{batch['archive_id']}:{self.slot}:{index}".encode()).hexdigest())
                     for index, candidate in enumerate(candidates)]
         record = {"candidates": [asdict(candidate) for candidate in accepted],
                   "candidate_digests": [operation_digest(candidate, self.journal.ctx) for candidate in accepted],
-                  "extracted": extracted, "filtered": filtered, "operations": {}}
+                  "extracted": extracted, "filtered": filtered, "operations": {},
+                  "operation_id_version": 2, "relation_tracking": True}
         self.journal.mutate(lambda value: value["slots"].update({self.slot: record}))
         return accepted
+
+    def restore_relation_tracking(self):
+        record = self.record
+        if ("relation_tracking" not in record and record["operations"]
+                and len(record["operations"]) == len(record["candidates"])
+                and self.journal.batch.get("outbox_tracking_version") == 1):
+            self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=0))
+
+    def begin_relation_write(self):
+        if self.journal.batch.get("outbox_tracking_version") != 1:
+            return False
+        self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=0))
+        return True
+
+    def complete_relation_write(self):
+        self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=1))
 
     def load_drafts(self):
         record = self.journal.batch.get("node_drafts", {}).get(self.slot)
@@ -235,12 +302,13 @@ class CandidateCheckpoint:
             raise RecoveryNeedsConfirmationError("node revision requires confirmed pre-write rejection")
         revision = self.record.get("revisions", {}).get(str(index), 0) + 1
         identity = f"{self.journal.batch['archive_id']}:{self.slot}:{index}:revision:{revision}"
-        candidate = replace(candidate, write_operation_id=hashlib.sha256(identity.encode()).hexdigest())
+        candidate = replace(candidate, write_operation_id="receipt-v2:" + hashlib.sha256(identity.encode()).hexdigest())
         def revise(batch):
             record = batch["slots"][self.slot]
             record.setdefault("revision_history", []).append({"index": index,
                 "candidate": record["candidates"][index], "operation": record["operations"][str(index)]})
             record.setdefault("revisions", {})[str(index)] = revision
+            record.setdefault("operation_id_versions", {})[str(index)] = 2
             record["candidates"][index] = asdict(candidate)
             record["candidate_digests"][index] = operation_digest(candidate, self.journal.ctx)
             record["operations"].pop(str(index))
@@ -271,6 +339,9 @@ class CandidateCheckpoint:
         # Recovery needs the acknowledged action and target, not another copy of
         # full memory bodies and accumulated identity metadata in session state.
         saved = {"action": plan.action, "target_uri": plan.target_uri,
-                 "merged_fields": {"status": plan.merged_fields["status"]}
-                 if "status" in plan.merged_fields else {}, "relation_edges": []}
+                 "merged_fields": {key: deepcopy(plan.merged_fields[key])
+                                   for key in ("status", "outbox_events", "projection_evidence_known")
+                                   if key in plan.merged_fields}, "relation_edges": []}
+        if plan.merged_fields.get("projection_evidence_known") is False:
+            self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=0))
         self._set_operation(index, {"status": "complete", "plan": saved})

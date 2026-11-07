@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 
+from commit.outbox_scope import record_persisted_event
 from core.errors import AccessDeniedError
 from core.models import RelationEdge, RelationNeighbor, RequestContext
 from fs.sql_adapter.pool import PoolAdapterMixin
@@ -401,7 +402,7 @@ class SQLRelationStore(PoolAdapterMixin):
             for row in authorized_rows
         ]
 
-    def _enqueue_edge_projection(self, cur, edge: RelationEdge, ctx: RequestContext) -> None:
+    def _enqueue_edge_projection(self, cur, edge: RelationEdge, ctx: RequestContext) -> tuple[str, str] | None:
         """Queue in the canonical edge transaction, using portable SQL.
 
         Caller locks all endpoints first. Lock/update the job before writing
@@ -465,6 +466,8 @@ class SQLRelationStore(PoolAdapterMixin):
                 (event_id,edge.from_uri,ctx.account_id,Json({"edge_id":edge_id})))
             self.sql_dialect.notify_outbox(cur,"ogmem_outbox",json.dumps(
                 dict(event_id=event_id,account_id=ctx.account_id,event_type="PROJECT_GRAPH")))
+            return edge.from_uri, event_id
+        return None
 
     def upsert_edges(self, edges: list[RelationEdge], ctx: RequestContext) -> None:
         if not edges:
@@ -476,6 +479,7 @@ class SQLRelationStore(PoolAdapterMixin):
                 self._ensure_accessible(edge.to_uri, ctx)
 
         conn = self._get_connection()
+        events = []
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
@@ -497,10 +501,14 @@ class SQLRelationStore(PoolAdapterMixin):
                         ctx.account_id,
                     )
                     if self._edge_projection_profile_id:
-                        self._enqueue_edge_projection(cur, edge, ctx)
+                        event = self._enqueue_edge_projection(cur, edge, ctx)
+                        if event is not None:
+                            events.append(event)
                     else:
                         self.sql_dialect.upsert_relation_edge(cur, params)
             conn.commit()
+            for node_uri, event_id in events:
+                record_persisted_event(node_uri, event_id)
         except Exception:
             conn.rollback()
             raise

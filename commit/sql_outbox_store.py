@@ -223,7 +223,7 @@ class SQLOutboxStore(PoolAdapterMixin):
     def _claim_filter(event):
         claim = getattr(event, "_outbox_claim", None)
         if claim is None:
-            return "", ()
+            return " AND status <> 'CANCELLED'", ()
         return " AND status = 'PROCESSING' AND worker_id = %s AND locked_at = %s", claim
 
     def ensure_processing_owned(self, event: OutboxEvent, node_uri: str) -> None:
@@ -238,8 +238,8 @@ class SQLOutboxStore(PoolAdapterMixin):
             cur.execute("SELECT status, worker_id, locked_at FROM outbox_events "
                         "WHERE event_id = %s AND uri = %s", (event.event_id, node_uri))
             row = cur.fetchone()
-        # Source relocation can remove a row after this lock validated its claim.
-        if row is None and getattr(event, "_outbox_verified_connection", None) is conn:
+        # A verified worker can finish its cleanup after source relocation.
+        if (row is None or row[0] == "CANCELLED") and getattr(event, "_outbox_verified_connection", None) is conn:
             return
         if row != ("PROCESSING", *claim):
             raise RuntimeError("Outbox processing claim changed")
@@ -255,10 +255,10 @@ class SQLOutboxStore(PoolAdapterMixin):
 
     def register_once(self, event: OutboxEvent, ctx: RequestContext) -> None:
         self.bind_context(ctx)
-        if self.is_event_current(event.event_id, event.uri):
+        if self.get_event_status(event.uri, event.event_id) is not None:
             return
         with self.processing_lock(event.uri):
-            if not self.is_event_current(event.event_id, event.uri):
+            if self.get_event_status(event.uri, event.event_id) is None:
                 self._insert_event(event, ctx.account_id)
 
     def save_payload(self, event: OutboxEvent) -> None:
@@ -507,8 +507,18 @@ class SQLOutboxStore(PoolAdapterMixin):
 
     def get_event_status(self, node_uri: str, event_id: str) -> str | None:
         account_id = self._extract_account_id(node_uri)
-        event = self.get_event(account_id, event_id)
-        return event.status if event is not None and event.uri == node_uri else None
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM outbox_events WHERE account_id = %s AND uri = %s AND event_id = %s",
+                    (account_id, node_uri, event_id),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        return row[0] if row else None
 
     def retry_failed(self, account_id: str, event: OutboxEvent) -> OutboxEvent | None:
         """Atomically requeue a failed task with a fresh retry budget."""
@@ -786,23 +796,18 @@ class SQLOutboxStore(PoolAdapterMixin):
         event_id: str,
         node_uri: str | None = None,
     ) -> bool:
-        """Check whether an event still exists in the outbox table.
-
-        Returns True if the event row exists, False if it was deleted
-        (e.g. by move_node).  Raises on database errors so the caller
-        can distinguish "tombstoned" from "DB unavailable".
-        """
+        """Return whether a persisted event remains current, including DONE and FAILED."""
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 if node_uri is None:
                     cur.execute(
-                        "SELECT 1 FROM outbox_events WHERE event_id = %s",
+                        "SELECT 1 FROM outbox_events WHERE event_id = %s AND status <> 'CANCELLED'",
                         (event_id,),
                     )
                 else:
                     cur.execute(
-                        "SELECT 1 FROM outbox_events WHERE event_id = %s AND uri = %s",
+                        "SELECT 1 FROM outbox_events WHERE event_id = %s AND uri = %s AND status <> 'CANCELLED'",
                         (event_id, node_uri),
                     )
                 exists = cur.fetchone() is not None

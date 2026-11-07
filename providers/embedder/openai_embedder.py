@@ -10,6 +10,9 @@ import time
 import os
 from typing import Final
 
+import httpx
+
+from core.errors import EmbeddingError
 from core.interfaces import Embedder
 from providers.token_tracker import (
     TokenTracker,
@@ -34,7 +37,7 @@ KEYLESS_ENV_VAR: Final[str] = "OGMEM_EMBED_KEYLESS"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 try:
-    from openai import OpenAI
+    from openai import APIError, OpenAI
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAIEmbedder. "
@@ -133,7 +136,6 @@ class OpenAIEmbedder(Embedder):
         # Increase connection pool limits to avoid PoolTimeout when
         # background drain thread and main request thread compete for
         # the same embedding API connection pool.
-        import httpx
         http_client = httpx.Client(
             limits=httpx.Limits(
                 max_connections=50,
@@ -181,7 +183,7 @@ class OpenAIEmbedder(Embedder):
             List of embedding vectors, one per input text.
 
         Raises:
-            OpenAIError: If the API request fails.
+            EmbeddingError: If the embedding provider request fails.
             ValueError: If the returned vectors have an unexpected shape.
         """
         if not texts:
@@ -238,6 +240,8 @@ class OpenAIEmbedder(Embedder):
             # Provider exception messages can contain upstream URL, request, or
             # implementation details, so retain only the safe exception type.
             logger.error("embed_texts FAILED: %s", type(e).__name__)
+            if isinstance(e, (APIError, httpx.HTTPError)):
+                raise EmbeddingError("", f"Embedding provider failed: {type(e).__name__}") from e
             raise
         for emb in embeddings:
             if len(emb) != self._dimension:
@@ -269,8 +273,6 @@ class OpenAIEmbedder(Embedder):
         The multimodal endpoint treats `input` as parts of ONE embedding
         (e.g. text + image), so each text must be a separate request.
         """
-        import httpx
-
         base = (self._base_url or "https://api.openai.com/v1").rstrip("/")
         url = f"{base}/embeddings/multimodal"
         headers = {

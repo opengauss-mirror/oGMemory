@@ -4,6 +4,8 @@ from unittest.mock import Mock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("service_threading")
+
 from index.outbox_worker import OutboxWorker
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
