@@ -7,12 +7,21 @@ only builds the disposable search projection consumed by Stage 8R retrieval.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import math
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
-from providers.relation_store.projection_identity import REPRESENTATION_VERSION
+from index.embedding_components import EmbeddingComponentCache, EmbeddingComponentKey
+from providers.relation_store.projection_identity import (
+    FACTORIZED_REPRESENTATION_VERSION,
+    REPRESENTATION_VERSION,
+)
+from providers.token_tracker import embedding_input_scope
 
+DEFAULT_PROJECTION_BATCH_BYTES = 8192
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -83,13 +92,40 @@ def build_searchable_text(edge: AcceptedEdgeProjectionInput) -> str:
     return "\n".join(part for part in parts if not part.endswith(": "))
 
 
+def projection_embedding_key(edge: AcceptedEdgeProjectionInput) -> tuple[str, str]:
+    """Reuse identical input within one canonical source owner."""
+    owner = "/".join(edge.source_uri.split("/")[:5])
+    return owner, build_searchable_text(edge)
+
+
+def bounded_projection_batch(
+    edges: list[AcceptedEdgeProjectionInput],
+    max_bytes: int = DEFAULT_PROJECTION_BATCH_BYTES,
+) -> list[AcceptedEdgeProjectionInput]:
+    """Bound unique UTF-8 input per claim; preserve an oversized input whole."""
+    selected: list[AcceptedEdgeProjectionInput] = []
+    seen: set[tuple[str, str]] = set()
+    total = 0
+    for edge in edges:
+        key = projection_embedding_key(edge)
+        size = 0 if key in seen else len(key[1].encode("utf-8"))
+        if selected and size and total + size > max_bytes:
+            break
+        selected.append(edge)
+        seen.add(key)
+        total += size
+    return selected
+
+
 class EdgeProjectionWorker:
     """Batch projection worker called only after canonical edge acceptance."""
 
-    def __init__(self, embedder, store: EdgeProjectionStore, profile: dict) -> None:
+    def __init__(self, embedder, store: EdgeProjectionStore, profile: dict,
+                 component_cache: EmbeddingComponentCache | None = None) -> None:
         self._embedder = embedder
         self._store = store
         self._profile = dict(profile)
+        self._component_cache = component_cache if component_cache is not None else EmbeddingComponentCache()
         self._pending: dict[str, AcceptedEdgeProjectionInput] = {}
 
     def enqueue_accepted(self, edges: list[AcceptedEdgeProjectionInput]) -> None:
@@ -117,10 +153,23 @@ class EdgeProjectionWorker:
         """Project a batch for the synchronous outbox worker."""
         if not edges:
             return []
+        representation = self._profile.get("representation_version", REPRESENTATION_VERSION)
         texts = [build_searchable_text(edge) for edge in edges]
-        vectors = self._embedder.embed_texts(texts)
-        if len(vectors) != len(edges):
-            raise ValueError("embedder returned a different number of vectors")
+        if representation == FACTORIZED_REPRESENTATION_VERSION:
+            vectors = self._factorized_vectors(edges)
+        elif representation == REPRESENTATION_VERSION:
+            keys = [projection_embedding_key(edge) for edge in edges]
+            unique = {}
+            for index, key in enumerate(keys):
+                unique.setdefault(key, index)
+            with embedding_input_scope(list(unique.values())):
+                embedded = self._embedder.embed_texts([key[1] for key in unique])
+            if len(embedded) != len(unique):
+                raise ValueError("embedder returned a different number of vectors")
+            vectors_by_key = dict(zip(unique, embedded, strict=True))
+            vectors = [vectors_by_key[key] for key in keys]
+        else:
+            raise ValueError("unsupported edge projection representation")
         projections: list[EdgeProjection] = []
         for edge, text, vector in zip(edges, texts, vectors, strict=True):
             dimension = len(vector)
@@ -134,7 +183,7 @@ class EdgeProjectionWorker:
                     edge_id=edge.edge_id,
                     text=text,
                     vector=tuple(float(value) for value in vector),
-                    representation_version=REPRESENTATION_VERSION,
+                    representation_version=representation,
                     embedding_profile=str(self._profile["profile_id"]),
                     model=str(self._profile["model"]),
                     dimension=dimension,
@@ -145,6 +194,67 @@ class EdgeProjectionWorker:
             )
         self._store.put_many(projections)
         return projections
+
+    def _factorized_vectors(self, edges: list[AcceptedEdgeProjectionInput]) -> list[tuple[float, ...]]:
+        preprocessing = (
+            ("max_input_chars", str(self._profile.get("max_input_chars", getattr(self._embedder, "max_input_chars", None)))),
+            ("multimodal", str(self._profile.get("multimodal", False))),
+        )
+        edge_components = []
+        first_edge: dict[EmbeddingComponentKey, int] = {}
+        for index, edge in enumerate(edges):
+            owner = projection_embedding_key(edge)[0]
+            components = []
+            for kind, text in (("target", edge.target_text.strip()),
+                               ("relation", f"Relationship: {edge.relation.strip()}")):
+                if kind == "target" and not text:
+                    components.append(None)
+                    continue
+                key = EmbeddingComponentKey(owner=owner, profile_id=str(self._profile["profile_id"]),
+                    model=str(self._profile["model"]), dimension=int(self._profile.get("dimension") or 0),
+                    representation=FACTORIZED_REPRESENTATION_VERSION, kind=kind, text=text,
+                    preprocessing=preprocessing)
+                components.append(key)
+                first_edge.setdefault(key, index)
+            edge_components.append(components)
+
+        def compute(keys):
+            weights = [max(1, len(key.text.encode("utf-8"))) for key in keys]
+            with embedding_input_scope([first_edge[key] for key in keys], weights=weights):
+                result = self._embedder.embed_texts([key.text for key in keys])
+            if len(result) != len(keys):
+                raise ValueError("component vector count must match input count")
+            return [self._unit_vector(vector) for vector in result]
+
+        values = {}
+        batch = []
+        size = 0
+        for key in first_edge:
+            length = len(key.text.encode("utf-8"))
+            if batch and size + length > DEFAULT_PROJECTION_BATCH_BYTES:
+                values.update(self._component_cache.resolve(batch, compute))
+                batch = []
+                size = 0
+            batch.append(key)
+            size += length
+        if batch:
+            values.update(self._component_cache.resolve(batch, compute))
+        projected = [values[relation_key] if target_key is None else
+                self._unit_vector([.75 * target + .25 * relation
+                for target, relation in zip(values[target_key], values[relation_key], strict=True)])
+                for target_key, relation_key in edge_components]
+        _logger.info("graph_component_cache_totals %s", json.dumps(self._component_cache.snapshot(), sort_keys=True))
+        return projected
+
+    def _unit_vector(self, vector) -> tuple[float, ...]:
+        values = tuple(float(value) for value in vector)
+        dimension = self._profile.get("dimension")
+        if dimension and len(values) != int(dimension):
+            raise ValueError("edge projection dimension does not match profile")
+        scale = math.sqrt(sum(value * value for value in values))
+        if scale <= 0 or not math.isfinite(scale):
+            raise ValueError("component vector must have a finite positive norm")
+        return tuple(value / scale for value in values)
 
     def edge_changed(self, edge: AcceptedEdgeProjectionInput) -> None:
         """Invalidate stale content and enqueue its replacement projection."""

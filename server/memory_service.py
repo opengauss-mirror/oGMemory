@@ -712,6 +712,7 @@ class MemoryService:
         self._lexical_index = None
         self._lexical_backfill = None
         self._embedder = None
+        self._graph_component_cache = None
         self._model_usage_store = None
         # Candidate-local retrieval owns a distinct provider client whose
         # embedding-result cache is disabled.  It deliberately shares no
@@ -916,7 +917,10 @@ class MemoryService:
         """Create the appropriate RelationStore implementation based on config."""
         if self._use_sql:
             return SQLRelationStore(pool=self._get_shared_sql_pool(),
-                edge_projection_profile_id=(self._cfg.graph_edge_embedding_profile if self._graph_enabled() else None))
+                edge_projection_profile_id=(self._cfg.graph_edge_embedding_profile if self._graph_enabled() else None),
+                edge_projection_representation=getattr(
+                    self._cfg, "graph_projection_representation", "relation-target-v2",
+                ))
         if _HAS_AGFS:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
@@ -926,20 +930,41 @@ class MemoryService:
         return getattr(self._cfg,"graph_backend","none") == "sql"
 
     def _graph_profile(self):
-        from providers.relation_store.projection_identity import REPRESENTATION_VERSION
+        from providers.relation_store.projection_identity import (
+            FACTORIZED_REPRESENTATION_VERSION, REPRESENTATION_VERSION,
+        )
         embedder = self._get_shared_embedder()
-        return dict(profile_id=self._cfg.graph_edge_embedding_profile,
+        profile = dict(profile_id=self._cfg.graph_edge_embedding_profile,
                     model=getattr(embedder,"model",type(embedder).__name__),
                     dimension=int(getattr(embedder,"dimension",None) or getattr(embedder,"dimensions",None)
                                   or self._cfg.opengauss_dimension),
-                    representation_version=REPRESENTATION_VERSION)
+                    representation_version=getattr(
+                        self._cfg, "graph_projection_representation", REPRESENTATION_VERSION,
+                    ))
+        if profile["representation_version"] == FACTORIZED_REPRESENTATION_VERSION:
+            profile.update(max_input_chars=self._cfg.embedding_max_input_chars,
+                           multimodal=self._cfg.embedding_multimodal)
+        return profile
+
+    @_serialize_lazy_initialization("_graph_component_cache")
+    def _get_graph_component_cache(self):
+        """Share bounded target and relation components across projection drains."""
+        if self._graph_component_cache is None:
+            from index.embedding_components import EmbeddingComponentCache
+            self._graph_component_cache = EmbeddingComponentCache(max_entries=1024)
+        return self._graph_component_cache
 
     def _graph_projection_components(self):
         if not self._graph_enabled():
             return None,None
         from providers.relation_store.sql_projection import SQLEdgeProjectionStore
+        from providers.relation_store.projection_identity import FACTORIZED_REPRESENTATION_VERSION
+        profile = self._graph_profile()
+        options = {}
+        if profile["representation_version"] == FACTORIZED_REPRESENTATION_VERSION:
+            options["component_cache"] = self._get_graph_component_cache()
         # Workers own their claim bookkeeping; canonical jobs are shared SQL rows.
-        return SQLEdgeProjectionStore(pool=self._get_shared_sql_pool()),self._graph_profile()
+        return SQLEdgeProjectionStore(pool=self._get_shared_sql_pool(), **options),profile
 
     @_serialize_lazy_initialization("_trace_event_store")
     def _get_trace_event_store(self):
@@ -2797,17 +2822,32 @@ class MemoryService:
                 return [self._default_account_id]
 
             def _outbox_loop():
-                logger.info("OutboxWorker thread started (polling every 5s)")
+                logger.info("OutboxWorker thread started (idle polling every 5s)")
                 while not self._outbox_stop.is_set():
+                    wait_seconds = 5
                     try:
                         account_ids = _get_account_ids_to_scan()
-                        worker.run_once(
+                        stats = worker.run_once(
                             outbox_store=outbox_store,
                             account_ids=account_ids,
                         )
+                        progressed = any(stats.get(key, 0) > 0 for key in (
+                            "succeeded", "edge_projections",
+                        ))
+                        failed = any(stats.get(key, 0) > 0 for key in (
+                            "failed", "edge_projection_failures", "moved_to_dlq",
+                        ))
+                        # Drain further work after progress; wait when idle or backing off.
+                        if progressed and not failed:
+                            continue
+                        future_delay = getattr(outbox_store, "future_pending_delay", None)
+                        if not failed and callable(future_delay):
+                            delay = future_delay(account_ids)
+                            if delay is not None and delay > 0:
+                                wait_seconds = min(wait_seconds, delay)
                     except Exception as exc:
                         logger.warning("OutboxWorker poll error: %s", exc)
-                    self._outbox_stop.wait(5)
+                    self._outbox_stop.wait(wait_seconds)
 
             self._outbox_thread = threading.Thread(
                 target=_outbox_loop, daemon=True, name="outbox-worker"

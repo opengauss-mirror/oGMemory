@@ -39,6 +39,7 @@ class SQLRelationStore(PoolAdapterMixin):
         pool=None,
         dialect: str = "postgresql",
         edge_projection_profile_id: str | None = None,
+        edge_projection_representation: str = "relation-target-v2",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
@@ -48,8 +49,10 @@ class SQLRelationStore(PoolAdapterMixin):
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
         self._edge_projection_profile_id = edge_projection_profile_id
+        self._edge_projection_representation = edge_projection_representation
 
     _edge_projection_profile_id = None
+    _edge_projection_representation = "relation-target-v2"
 
     # ------------------------------------------------------------------
     # Connection pool (standalone fallback — used when pool=None)
@@ -404,7 +407,7 @@ class SQLRelationStore(PoolAdapterMixin):
         Caller locks all endpoints first. Lock/update the job before writing
         its relation row, matching the node-update trigger and projector.
         """
-        from providers.relation_store.projection_identity import canonical_edge_id, REPRESENTATION_VERSION
+        from providers.relation_store.projection_identity import canonical_edge_id
         edge_id = canonical_edge_id(ctx.account_id, edge.from_uri, edge.to_uri, edge.relation_type)
         cur.execute("""SELECT s.version, t.version, concat_ws(E'\\n', t.abstract, t.overview, t.content)
                        FROM context_nodes s JOIN context_nodes t ON t.account_id=s.account_id
@@ -414,7 +417,7 @@ class SQLRelationStore(PoolAdapterMixin):
         if endpoints is None:
             raise ValueError("Cannot project an edge with missing endpoints")
         source_rev, target_rev, target_text = endpoints
-        signature = (edge.reason, target_text, source_rev, target_rev, REPRESENTATION_VERSION,
+        signature = (edge.reason, target_text, source_rev, target_rev, self._edge_projection_representation,
                      self._edge_projection_profile_id)
         cur.execute("""SELECT reason,target_text,source_revision,target_revision,
                               representation_version,embedding_profile
@@ -425,13 +428,24 @@ class SQLRelationStore(PoolAdapterMixin):
         if old is None:
             cur.execute("""INSERT INTO edge_projection_jobs
                 (account_id,edge_id,source_uri,target_uri,relation_type,reason,target_text,
-                 source_revision,target_revision,representation_version,embedding_profile)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                 source_revision,target_revision,representation_version,embedding_profile,
+                 mutation_batch_key,next_retry_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    ogmem_graph_projection_batch_key(),
+                    CASE WHEN ogmem_graph_projection_batch_key() IS NOT NULL
+                         THEN NOW()+INTERVAL '30 seconds' ELSE NULL END)""",
                 (ctx.account_id,edge_id,edge.from_uri,edge.to_uri,edge.relation_type,*signature))
         elif changed:
             cur.execute("""UPDATE edge_projection_jobs SET reason=%s,target_text=%s,
                 source_revision=%s,target_revision=%s,representation_version=%s,embedding_profile=%s,
-                status='PENDING',last_error=NULL,next_retry_at=NULL,claim_token=NULL,updated_at=NOW()
+                status='PENDING',last_error=NULL,
+                mutation_batch_key=ogmem_graph_projection_batch_key(),
+                next_retry_at=CASE
+                    WHEN status='PENDING' AND next_retry_at IS NOT NULL THEN next_retry_at
+                    WHEN ogmem_graph_projection_batch_key() IS NULL THEN NULL
+                    ELSE NOW()+INTERVAL '30 seconds'
+                END,
+                claim_token=NULL,updated_at=NOW()
                 WHERE account_id=%s AND edge_id=%s""", (*signature,ctx.account_id,edge_id))
         self.sql_dialect.upsert_relation_edge(cur, (
             edge.from_uri,edge.to_uri,edge.relation_type,edge.weight,edge.reason,ctx.account_id))

@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS edge_projection_jobs (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     claim_token VARCHAR(64),
+    mutation_batch_key BIGINT,
     next_retry_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -138,6 +139,7 @@ CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_pending
     ON edge_projection_jobs (account_id, status, next_retry_at)
     WHERE status IN ('PENDING','FAILED');
 ALTER TABLE edge_projection_jobs ADD COLUMN IF NOT EXISTS claim_token VARCHAR(64);
+ALTER TABLE edge_projection_jobs ADD COLUMN IF NOT EXISTS mutation_batch_key BIGINT;
 CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_source
     ON edge_projection_jobs (account_id, source_uri);
 CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_target
@@ -151,26 +153,72 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
+CREATE OR REPLACE FUNCTION ogmem_graph_projection_batch_key()
+RETURNS BIGINT AS $$
+BEGIN
+    RETURN NULLIF(current_setting('app.graph_projection_batch_key'), '')::bigint;
+EXCEPTION WHEN undefined_object THEN
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION invalidate_edge_projections_for_node_update()
 RETURNS TRIGGER AS $$
 DECLARE
     job RECORD;
+    refreshed_edges TEXT[] := ARRAY[]::TEXT[];
+    active_batch_key BIGINT := ogmem_graph_projection_batch_key();
 BEGIN
     IF (OLD.version, OLD.content, OLD.abstract, OLD.overview)
        IS DISTINCT FROM
        (NEW.version, NEW.content, NEW.abstract, NEW.overview) THEN
-        FOR job IN SELECT edge_id FROM edge_projection_jobs
+        FOR job IN SELECT * FROM edge_projection_jobs
                     WHERE account_id = NEW.account_id
                       AND (source_uri = NEW.uri OR target_uri = NEW.uri)
                     ORDER BY edge_id FOR UPDATE
         LOOP
+            -- Target-based encodings reuse vectors when the source version advances.
+            -- A completed projection can follow a source-only revision in place.
+            IF job.source_uri = NEW.uri AND job.target_uri <> NEW.uri
+               AND job.status = 'COMPLETE' AND job.claim_token IS NULL
+               AND job.source_revision = OLD.version
+               AND job.representation_version IN (
+                   'relation-target-v2', 'relation-target-factorized-full-v1'
+               ) THEN
+                UPDATE relation_edges
+                   SET edge_projection = jsonb_set(
+                           edge_projection, '{source_revision}', NEW.version::text::jsonb),
+                       updated_at = NOW()
+                 WHERE account_id = NEW.account_id AND projection_edge_id = job.edge_id
+                   AND from_uri = job.source_uri AND to_uri = job.target_uri
+                   AND relation_type = job.relation_type
+                   AND edge_projection->>'edge_id' = job.edge_id
+                   AND edge_projection->>'representation_version' = job.representation_version
+                   AND edge_projection->>'embedding_profile' = job.embedding_profile
+                   AND edge_projection->'source_revision' = job.source_revision::text::jsonb
+                   AND edge_projection->'target_revision' = job.target_revision::text::jsonb;
+                IF FOUND THEN
+                    UPDATE edge_projection_jobs
+                       SET source_revision = NEW.version, updated_at = NOW()
+                     WHERE account_id = NEW.account_id AND edge_id = job.edge_id;
+                    refreshed_edges := array_append(refreshed_edges, job.edge_id::text);
+                    CONTINUE;
+                END IF;
+            END IF;
         UPDATE edge_projection_jobs
            SET source_revision = CASE WHEN source_uri = NEW.uri THEN NEW.version ELSE source_revision END,
                target_revision = CASE WHEN target_uri = NEW.uri THEN NEW.version ELSE target_revision END,
                target_text = CASE WHEN target_uri = NEW.uri
                                   THEN concat_ws(E'\n', NEW.abstract, NEW.overview, NEW.content)
                                   ELSE target_text END,
-               status = 'PENDING', last_error = NULL, next_retry_at = NULL, claim_token = NULL,
+               status = 'PENDING', last_error = NULL,
+               mutation_batch_key = active_batch_key,
+               next_retry_at = CASE
+                   WHEN status = 'PENDING' AND next_retry_at IS NOT NULL THEN next_retry_at
+                   WHEN active_batch_key IS NULL THEN NULL
+                   ELSE NOW() + INTERVAL '30 seconds'
+               END,
+               claim_token = NULL,
                updated_at = NOW()
          WHERE account_id = NEW.account_id
            AND edge_id = job.edge_id;
@@ -186,7 +234,8 @@ BEGIN
            SET edge_projection = NULL, updated_at = NOW()
          WHERE account_id = NEW.account_id
            AND (from_uri = NEW.uri OR to_uri = NEW.uri)
-           AND projection_edge_id IS NOT NULL;
+           AND projection_edge_id IS NOT NULL
+           AND NOT (projection_edge_id = ANY(refreshed_edges));
     END IF;
     RETURN NEW;
 END;

@@ -72,7 +72,7 @@ class ProjectionQueue:
         self.due = due
         self.checks, self.drains = [], []
 
-    def has_due_work(self, account):
+    def has_due_work(self, account, *, profile=None):
         self.checks.append(account)
         return self.due
 

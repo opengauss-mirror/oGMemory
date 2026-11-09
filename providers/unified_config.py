@@ -618,6 +618,7 @@ class OgMemConfig:
     graph_min_weight: float = 0.0
     graph_edge_similarity_threshold: float = 0.35
     graph_edge_embedding_profile: str = "shared-node-embedding-v1"
+    graph_projection_representation: str = "relation-target-v2"
     graph_supplement_enabled: bool = True
 
     # -- Scene memory ---------------------------------------------------------
@@ -790,6 +791,10 @@ class OgMemConfig:
             raise ValueError("graph expansion supports 1..5 anchors and 1..3 outgoing edges per anchor")
         if not self.graph_edge_embedding_profile.strip():
             raise ValueError("graph edge embedding profile must not be empty")
+        if self.graph_projection_representation not in {
+            "relation-target-v2", "relation-target-factorized-full-v1",
+        }:
+            raise ValueError("graph.projection_representation must select a supported graph encoding")
         from fs.sql_adapter.dialect import normalize_sql_dialect
 
         if self.sql_dialect is None:
@@ -1992,6 +1997,9 @@ class OgMemConfig:
             graph_min_weight=_resolve(graph.get("min_weight"), "GRAPH_MIN_WEIGHT", 0.0, float),
             graph_edge_similarity_threshold=_resolve(graph.get("edge_similarity_threshold"), "GRAPH_EDGE_SIMILARITY_THRESHOLD", 0.35, float),
             graph_edge_embedding_profile=_resolve(graph.get("edge_embedding_profile"), "GRAPH_EDGE_EMBEDDING_PROFILE", "shared-node-embedding-v1"),
+            graph_projection_representation=_resolve(
+                graph.get("projection_representation"), "GRAPH_PROJECTION_REPRESENTATION", "relation-target-v2",
+            ),
             graph_supplement_enabled=_resolve_bool(graph.get("supplement_enabled"), "GRAPH_SUPPLEMENT_ENABLED", True),
             # Agent skill sedimentation
             agent_memory_enabled=_resolve_bool(

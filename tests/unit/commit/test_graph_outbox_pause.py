@@ -9,7 +9,7 @@ from tests.unit.commit.test_sql_outbox_store import mock_sql_outbox_store as moc
     (["PROJECT_GRAPH"], ["PROJECT_GRAPH"]),
     (["EXTRACT_AGENT_MEMORY", "PROJECT_GRAPH"], ["PROJECT_GRAPH"]),
 ])
-def test_only_explicitly_paused_graph_jobs_are_nonblocking(mock_sql_outbox_store, excluded, paused):
+def test_claim_filter_preserves_explicit_feature_pauses(mock_sql_outbox_store, excluded, paused):
     store, _, _, cursor = mock_sql_outbox_store
     cursor.fetchall.return_value = []
     assert store.claim_batch("worker", limit=7, exclude_event_types=excluded) == []

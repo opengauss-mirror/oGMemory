@@ -1,6 +1,7 @@
 """Opt-in SQL graph integration tests; use an isolated test database only.
 
-Run with GRAPH_TEST_DSN pointing to a disposable PostgreSQL/pgvector database.
+Run with GRAPH_TEST_DSN pointing to a disposable SQL database.
+Set GRAPH_TEST_DIALECT=opengauss for an openGauss database.
 No external LLM or embedding service is called.
 """
 import os
@@ -33,16 +34,17 @@ def graph_db():
     dsn = os.environ.get("GRAPH_TEST_DSN")
     if not dsn:
         pytest.skip("GRAPH_TEST_DSN must point to a disposable database")
+    dialect = os.environ.get("GRAPH_TEST_DIALECT", "postgresql")
     account = "graph-test-" + uuid4().hex[:12]
     ctx = RequestContext(account,"alice","agent","session","trace")
-    fs = SQLContextFS(dsn)
+    fs = SQLContextFS(dsn, dialect=dialect)
     profile = dict(profile_id="test",model="test-embedding",dimension=2,representation_version="relation-target-v2")
     embedder = Mock(model="test-embedding")
     embedder.embed_texts.side_effect = lambda texts: [[1.,0.] for _ in texts]
-    index = OpenGaussVectorIndex(dsn,dimension=2,table_name="graph_test_vectors")
-    store = SQLRelationStore(dsn,edge_projection_profile_id="test")
-    projections = SQLEdgeProjectionStore(dsn)
-    outbox = SQLOutboxStore(dsn,fs=fs)
+    index = OpenGaussVectorIndex(dsn,dimension=2,table_name="graph_test_vectors",dialect=dialect)
+    store = SQLRelationStore(dsn,edge_projection_profile_id="test",dialect=dialect)
+    projections = SQLEdgeProjectionStore(dsn,dialect=dialect)
+    outbox = SQLOutboxStore(dsn,fs=fs,dialect=dialect)
     worker = OutboxWorker(index,embedder,fs=fs,directory_summary_enabled=False,
                           edge_projection_components=(projections,profile))
     root = f"ctx://{account}/users/alice/memories/entity/"
@@ -264,7 +266,8 @@ def test_move_rekeys_projection_jobs_rebuilds_descriptor_and_survives_next_updat
     assert store.get_relation_neighbors(source,ctx)[0].edge_projection['edge_id']==new_id
     current=fs.read_node(destination,ctx);current.content='Changed moved node';current.metadata['_expected_version']=current.metadata['version']
     fs.write_node(current,ctx)
-    assert _graph_sql(fs,ctx,'SELECT status FROM edge_projection_jobs WHERE account_id=%s',(ctx.account_id,))==[('PENDING',)]
+    expected_status = 'COMPLETE' if endpoint == 'source' else 'PENDING'
+    assert _graph_sql(fs,ctx,'SELECT status FROM edge_projection_jobs WHERE account_id=%s',(ctx.account_id,))==[(expected_status,)]
     projections.drain_sync(ctx.account_id,worker._embedder,profile)
     assert store.get_relation_neighbors(source,ctx)[0].edge_projection is not None
 
