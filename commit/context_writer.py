@@ -167,16 +167,14 @@ class ContextWriter:
                 candidate, ctx, identity_plan, on_persistence=mark_persistence,
             )
 
-        def publish_recovered(committed):
+        def recover_receipt():
+            committed = receipt_plan(self._fs, resolver.uris, candidate, ctx,
+                                     outbox_store=self._outbox_store)
             if (committed is not None and self._require_index_event
                     and not committed.merged_fields.get("outbox_events")):
                 node = self._fs.read_node(committed.target_uri, ctx)
                 self._outbox_store.register_write(node, ctx)
             return committed
-
-        def recover_receipt():
-            return publish_recovered(receipt_plan(self._fs, resolver.uris, candidate, ctx,
-                                                   outbox_store=self._outbox_store))
 
         try:
             if candidate.write_operation_id:
@@ -402,8 +400,6 @@ class ContextWriter:
                     try:
                         if candidate.write_operation_id and event is not None and register_once is not None:
                             register_once(event, ctx)
-                            from commit.outbox_scope import record_persisted_event
-                            record_persisted_event(node.uri, event.event_id)
                         else:
                             self._outbox_store.register_write(node, ctx)
                     except Exception as e:

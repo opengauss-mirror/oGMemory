@@ -106,6 +106,10 @@ class ExtractionIncompleteError(ContextEngineError, RuntimeError):
     """Extraction stopped with unresolved or incomplete draft operations."""
 
 
+class ExtractionSemanticError(ExtractionIncompleteError):
+    """Generated identity or facts require semantic verification."""
+
+
 class LLMTransientError(ExtractionIncompleteError):
     """The model provider can be retried after a transport or service failure."""
 
@@ -216,3 +220,7 @@ class LLMCallError(ContextEngineError):
         super().__init__(message)
         self.status_code = status_code
         self.cause = cause
+
+
+class ExtractionBudgetError(ExtractionIncompleteError):
+    """The complete extraction context exceeds the configured model budget."""

@@ -7,6 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("service_threading")
+
 from commit.write_receipts import WriteNotStartedError
 from core.models import RequestContext
 from service.extraction_checkpoint import EXTENSION_KEY, RecoveryNeedsConfirmationError
@@ -128,7 +130,7 @@ def test_dispose_exception_releases_only_its_owned_operation(ctx, monkeypatch, f
             with pytest.raises(KeyError, match="source_snapshot"):
                 service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
         elif fault == "fast_path_save":
-            service._save_session_state_best_effort = Mock(side_effect=ValueError("save failure"))
+            service._save_dispose_snapshot = Mock(side_effect=ValueError("save failure"))
             with pytest.raises(ValueError, match="save failure"):
                 service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
         else:
@@ -808,7 +810,7 @@ def test_idle_cannot_report_success_for_an_ordinary_pending_batch(ctx, restart):
         service, writer, manager = lifecycle_service(fs, ctx)
     result = service.wait_until_idle({"sessionId": ctx.session_id, "_ctx": ctx,
                                      "drainOutbox": False, "waitOutbox": False})
-    assert result["idle"] is False and result["reason"] == "extraction_recovery_pending"
+    assert result["idle"] is False and result["reason"] == "extraction_retry_task"
     assert manager.get_or_create(ctx.session_id).pending_extraction_ids()
     assert len(nodes(fs, "event")) == 1 and not nodes(fs, "entity")
     writer._pipeline.extract.side_effect = AssertionError("idle retry re-extracted accepted candidates")

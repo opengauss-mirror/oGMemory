@@ -1,14 +1,20 @@
 """Canonical session state reuses committed static files under its lease."""
 
+from commit.outbox_scope import capture_outbox_events
+
 import json
 
 import pytest
 
 from core.models import RequestContext
+from core.write_contract import OUTCOMES_KEY, projection_outcome
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+from service.api import MemoryWriteAPI
+from service.extraction_checkpoint import ExtractionBatchJournal, stage_digest
 from session.session_manager import SessionManager
 from session.session_state import SessionState
 from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
+from tests.unit.server.test_extraction_batch_recovery import candidate
 
 
 def state_stack():
@@ -29,6 +35,7 @@ def published(operations):
 
 
 @pytest.mark.parametrize("publication", [".overview.md", ".meta.json"])
+@capture_outbox_events
 def test_original_layout_restored_after_interrupted_static_update(monkeypatch, publication):
     client, fs, ctx, manager, buffer, uri = state_stack()
     assert manager.save_session_state(ctx.session_id, ctx)
@@ -64,6 +71,7 @@ def test_original_layout_restored_after_interrupted_static_update(monkeypatch, p
     assert published(client.operations[start:]) == ["content.md", ".meta.json"]
 
 
+@capture_outbox_events
 def test_twenty_two_saves_publish_forty_seven_state_files():
     client, fs, ctx, manager, buffer, uri = state_stack()
     saves = []
@@ -87,6 +95,7 @@ def test_twenty_two_saves_publish_forty_seven_state_files():
     assert json.loads(state.content)["buffer_messages"][0]["id"] == "message-one"
 
 
+@capture_outbox_events
 def test_legacy_layout_initializes_then_reuses_static_files_after_reload():
     client, fs, ctx, manager, buffer, uri = state_stack()
     assert manager.save_session_state(ctx.session_id, ctx)
@@ -109,6 +118,7 @@ def test_legacy_layout_initializes_then_reuses_static_files_after_reload():
     assert next_fs.read_node(uri, ctx).overview == node.overview
 
 
+@capture_outbox_events
 def test_updated_static_layout_is_published_then_reused():
     client, fs, ctx, manager, buffer, uri = state_stack()
     with fs.session_recovery_lock(uri, ctx):
@@ -125,3 +135,51 @@ def test_updated_static_layout_is_published_then_reused():
     stored = fs.read_node(uri, ctx)
     assert (stored.abstract, stored.overview) == (node.abstract, node.overview)
 
+
+@capture_outbox_events
+def test_saved_candidates_replay_and_finish_through_canonical_state():
+    client, fs, ctx, manager, buffer, uri = state_stack()
+    source = list(buffer.messages)
+    messages = [{"role": "user", "content": source[0].content}]
+    with fs.session_recovery_lock(uri, ctx):
+        journal = ExtractionBatchJournal(manager, buffer, ctx, source, archive_id="replay-archive",
+                                         messages=messages, session_time=None, session_summary="", tool_stats_text="",
+                                         client_request_id="request-one")
+        checkpoint = journal.checkpoint("chunk:0")
+        accepted = checkpoint.accept([candidate()], 1, 0)
+        writer = MemoryWriteAPI(fs, None, directory_summary_enabled=False)
+        plans = writer._write_checkpointed_candidates(accepted, ctx, checkpoint)
+        assert len(plans) == 1
+    restored = SessionManager(get_context_fs=lambda: fs)
+    restored.get_or_create(ctx.session_id, ctx)
+    with fs.session_recovery_lock(uri, ctx):
+        restored.enable_extraction_recovery(ctx.session_id, ctx, fs)
+        next_buffer = restored.get_or_create(ctx.session_id, ctx)
+        resumed = ExtractionBatchJournal.resume(restored, next_buffer, ctx)
+        pending = resumed.checkpoint("chunk:0")
+        replay = writer._write_checkpointed_candidates(pending.load()[0], ctx, pending)
+        assert replay[0].target_uri == plans[0].target_uri
+        assert fs.read_node(plans[0].target_uri, ctx).metadata["version"] == 1
+        resumed.finish(outcome={"semantic_status": "COMPLETE"},
+                       resolve_outcome=lambda receipt: projection_outcome(receipt, None))
+    final = SessionManager(get_context_fs=lambda: fs)
+    final.get_or_create(ctx.session_id, ctx)
+    assert final.load_session_state(ctx.session_id, ctx)
+    completed = final.get_or_create(ctx.session_id)
+    assert completed.request_completed("request-one")
+    assert completed.messages == []
+    assert set(completed.runtime_extensions) == {OUTCOMES_KEY}
+    outcomes = completed.runtime_extensions[OUTCOMES_KEY]
+    assert outcomes["version"] == 1
+    assert set(outcomes["entries"]) == {"request-one"}
+    receipt = outcomes["entries"]["request-one"]
+    assert receipt["request_id"] == "request-one"
+    assert receipt["archive_id"] == "replay-archive"
+    assert receipt["source_message_ids"] == receipt["archived_source_ids"] == ["message-one"]
+    assert receipt["source_sha256"] == stage_digest(messages)
+    assert receipt["archive_receipts"] == {"replay-archive": stage_digest(messages)}
+    assert (receipt["source_status"], receipt["semantic_status"], receipt["projection_status"],
+            receipt["request_status"]) == ("ARCHIVED", "COMPLETE", "NOT_REQUIRED", "SUCCEEDED")
+    assert receipt["outbox_events"] == []
+    assert receipt["outbox_tracking_complete"] is True
+    assert fs.read_node(uri, ctx).metadata["session_state_layout"]["version"] == 1

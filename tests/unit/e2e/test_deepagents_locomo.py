@@ -69,7 +69,7 @@ def test_deepagents_entry_uses_per_question_sessions_and_blocks_qa_writes(tmp_pa
     with (output / "qa_results.csv").open() as stream:
         assert [row["response"] for row in csv.DictReader(stream)] == ["Fixture answer"] * 2
     observations = json.loads((output / "qa-write-observations.json").read_text())
-    assert observations == {"accepted": [], "intercepted": ["/api/v1/after_turn"] * 2}
+    assert observations == {"accepted": [], "intercepted": ["/api/v1/after_turn"] * 2, "observed": [], "request_status": []}
     manifest = json.loads((output / "qa-manifest.json").read_text())
     assert manifest["adapter"]["host_factory"] == "fixture_deepagents_host:create"
 
@@ -162,4 +162,4 @@ def test_verified_ingest_saves_host_readiness_evidence(tmp_path, monkeypatch):
     ]
     assert settled == ["native-source"]
     evidence = json.loads((output / "source-completion.json").read_text())
-    assert evidence == {"sources": [{"session_id": "native-source", "recall_verified": True}]}
+    assert evidence == {"complete": True, "sources": [{"session_id": "native-source", "recall_verified": True}]}

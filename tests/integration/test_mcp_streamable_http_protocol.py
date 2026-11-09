@@ -206,6 +206,7 @@ async def _run_streamable_http_all_tools_check() -> None:
                         "ogm_install_skill",
                         "ogm_update_skill",
                         "ogm_delete_skill",
+                        "ogm_get_write_request_status",
                         "ogm_write_memory",
                         "ogm_delete_memory",
                     }

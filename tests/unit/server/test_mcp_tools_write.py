@@ -268,7 +268,7 @@ def test_registered_mcp_write_tool_persists_and_finalizes_trace():
                 {"role": "assistant", "content": "Python selected."},
             ],
         )
-        assert result["ok"] is True
+        assert result.structured_content["ok"] is True
     turns = store._read_state("acct-1", collections=("turns",), session_id="s1")["turns"]
     assert len(turns) == 1
     turn = next(iter(turns.values()))
@@ -301,7 +301,7 @@ def test_registered_mcp_tool_result_completes_skill_trace(result, is_error, role
     ]
     messages = [{**message, "role": f"{role_padding}{message['role']}{role_padding}"} for message in messages]
     for _ in range(2):
-        assert tool.fn(session_id="s1", client_request_id="paired-write", messages=messages)["ok"]
+        assert tool.fn(session_id="s1", client_request_id="paired-write", messages=messages).structured_content["ok"]
     turns = service.store._read_state("acct-1", collections=("turns",), session_id="s1")["turns"]
     assert len(turns) == 1
     turn = next(iter(turns.values()))

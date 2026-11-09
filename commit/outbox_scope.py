@@ -7,6 +7,10 @@ _events = ContextVar("request_outbox_events", default=None)
 _untracked_accounts = ContextVar("request_outbox_untracked_accounts", default=None)
 
 
+def is_capturing_outbox_events():
+    return _events.get() is not None
+
+
 def record_persisted_event(node_uri, event_id):
     events = _events.get()
     if events is not None:

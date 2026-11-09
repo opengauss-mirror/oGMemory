@@ -87,11 +87,13 @@ class LifecycleBatchJournal(ExtractionBatchJournal):
     def archive_complete(self, uri):
         self.mutate(lambda batch: batch["lifecycle"]["archive"].update(status="complete", uri=uri))
 
-    def finish(self, *, reset_window_state=False):
+    def finish(self, *, reset_window_state=False, outcome=None, resolve_outcome=None):
         archive = self.archive_record()
-        super().finish(reset_window_state=reset_window_state)
+        receipt = super().finish(reset_window_state=reset_window_state, outcome=outcome,
+                                 resolve_outcome=resolve_outcome)
         if archive is not None and archive.get("status") == "complete":
             self.manager._maybe_merge_archives(self.buffer.session_id, self.ctx)
+        return receipt
 
     def archive_recover(self, manager):
         """An uncertain archive is confirmed only by a complete exact read."""

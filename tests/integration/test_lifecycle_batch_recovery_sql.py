@@ -20,6 +20,8 @@ from tests.unit.server.test_lifecycle_batch_recovery import (
     reject_entity_once,
 )
 
+pytestmark = pytest.mark.usefixtures("service_threading")
+
 
 @pytest.fixture
 def ctx():
@@ -281,6 +283,7 @@ def test_sql_cold_idle_observes_failed_batch_without_initializing_writer(ctx, en
             service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
         assert manager.get_or_create(ctx.session_id).pending_extraction_ids()
     finally:
+        service._extraction_retry.close(timeout=5)
         close_stores(fs, outbox)
 
     fs, outbox = stores()
@@ -293,7 +296,7 @@ def test_sql_cold_idle_observes_failed_batch_without_initializing_writer(ctx, en
         result = service.wait_until_idle({"sessionId": ctx.session_id, "_ctx": ctx,
                                          "drainOutbox": False, "waitOutbox": False})
         assert result["idle"] is False
-        assert result["reason"] == ("extraction_recovery_pending" if entry == "after_turn"
+        assert result["reason"] == ("extraction_retry_task" if entry == "after_turn"
                                     else "lifecycle_recovery_pending")
         assert service._session_mgr.get_or_create(ctx.session_id).pending_extraction_ids()
         assert len(category_nodes(writer, "event", ctx)) == 1
@@ -301,6 +304,7 @@ def test_sql_cold_idle_observes_failed_batch_without_initializing_writer(ctx, en
         service.get_write_api.assert_not_called()
         writer._pipeline.extract.assert_not_called()
     finally:
+        service._extraction_retry.close(timeout=5)
         close_stores(fs, outbox)
 
 

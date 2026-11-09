@@ -18,7 +18,7 @@ from tests.unit.extraction.test_node_processing import NodeLLM, operation
     AccessDeniedError("ctx://denied", "node-errors", "denied"), OSError("storage unavailable"),
     ValueError("provider configuration invalid")])
 @pytest.mark.parametrize("background", [False, True])
-def test_node_operational_failure_preserves_requested_recovery(error, background):
+def test_node_operational_failure_preserves_durable_recovery(error, background):
     ctx = RequestContext("node-errors", "reader", "agent", "source", "proof")
     fs = MemoryFS()
     service, writer, manager = setup_service(fs, ctx, entries=[card()])
@@ -28,14 +28,11 @@ def test_node_operational_failure_preserves_requested_recovery(error, background
     writer._llm.complete_with_tools.side_effect = error
     request = {**params(ctx), "retryInBackground": background}
     response = service.after_turn(request)
-    assert response["ok"] is False and response["status"] == "failed"
+    assert response["ok"] is True and response["request_status"] == "RECOVERING"
     writer._llm = NodeLLM(lambda _: [operation([0])])
-    if background:
-        assert response["recovery_task"]["status"] == "queued"
-        ready(manager, ctx)
-        service._extraction_retry.run_once(ctx, response["recovery_task"]["id"])
-    else:
-        assert service.after_turn(request)["status"] == "completed"
+    assert response["recovery_task"]["status"] == "queued"
+    ready(manager, ctx)
+    service._extraction_retry.run_once(ctx, response["recovery_task"]["id"])
     assert manager.get_or_create(ctx.session_id).request_completed("original")
     assert len(nodes(fs, "entity")) == 1
 
@@ -115,7 +112,8 @@ def test_node_output_contract_recovers_saved_drafts(update, path, value):
     target = writer.write_memory(card(), ctx)["target_uri"] if update else ""
     enable(service, writer)
     service._cfg.node_processing_enabled = writer._node_processing_enabled = True
-    payload = {"operations": [operation([0], target=target, action="update" if update else "create")]}
+    payload = {"operations": [operation([0], target=target, action="update" if update else "create")],
+               "related_reconciliations": []}
     parent = payload
     for part in path[:-1]:
         parent = parent[part]
@@ -278,7 +276,7 @@ def test_cas_retry_operational_failure_resumes_accepted_node(fault, monkeypatch)
         patch.setattr(fs, "read_node", read_with_failure)
         patch.setattr(writer._writer, "write_candidate", concurrent_write)
         result = service.after_turn(params(ctx))
-    assert result["ok"] is False and result["status"] == "failed"
+    assert result["ok"] is True and result["request_status"] == "RECOVERING"
     assert versions == [1, 2]
     assert service.after_turn(params(ctx))["status"] == "completed"
     stored = fs.read_node(uri, ctx)

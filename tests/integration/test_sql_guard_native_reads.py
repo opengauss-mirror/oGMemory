@@ -332,7 +332,8 @@ def test_public_guarded_source_receipt_restart_does_not_reextract_or_duplicate(n
     slot = batch['slots']['chunk:0']
     accepted = slot['candidates'][0]
     assert len(slot['candidates']) == 1 and slot['operations']['0']['status'] == 'writing'
-    assert len(accepted['source_occurrence_id']) == 64 and len(accepted['write_operation_id']) == 64
+    assert len(accepted['source_occurrence_id']) == 64 and accepted['write_operation_id'].startswith('receipt-v2:')
+    assert len(accepted['write_operation_id'].removeprefix('receipt-v2:')) == 64
     directory = writer._writer._identity_resolver.uris.get_directory_uri('event', ctx)
     event_uri, = fs.list_children(directory, ctx)
     before = fs.read_node(event_uri, ctx)

@@ -4,6 +4,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("service_threading")
+
 from core.lexical import HybridLexicalIndex
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService

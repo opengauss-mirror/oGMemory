@@ -22,6 +22,7 @@ from pydantic import (
     ValidationInfo,
 )
 
+from core.write_contract import error_fields, normalize_write_result, write_http_status
 from features.tool_result_externalization.store_base import (
     ArtifactStoreUnavailableError,
 )
@@ -61,6 +62,7 @@ from server.mcp_tools import search_tool_result_artifacts as search_tool_result_
 from server.mcp_tools import update_skill as update_skill_tool
 from server.mcp_tools import validate_write_arguments
 from server.mcp_tools import write_memory as write_memory_tool
+from server.mcp_tools import get_write_request_status as get_write_request_status_tool
 from server.memory_service import MemoryService
 from service.tool_output import parse_tool_output_uri
 
@@ -869,7 +871,7 @@ def create_mcp_server(
                 ),
             ] = False,
             ctx: Context | None = None,
-        ) -> dict[str, Any]:
+        ) -> Any:
             """Submit durable interaction context for extraction, deduplication, and evolution.
 
             Use for user-provided facts, preferences, corrections, decisions, or
@@ -882,7 +884,7 @@ def create_mcp_server(
             """
 
             validate_write_arguments(_raw_tool_arguments())
-            return write_memory_tool(
+            result = write_memory_tool(
                 service,
                 text=text,
                 messages=messages,
@@ -893,6 +895,17 @@ def create_mcp_server(
                 wait=wait,
                 **_auth_kwargs_from_context(ctx),
             )
+            from mcp.types import CallToolResult, TextContent
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False))],
+                                  structuredContent=result,
+                                  isError=result.get("request_status") in {"FAILED", "DEGRADED", "NEEDS_CONFIRMATION"})
+
+        @mcp.tool(name="ogm_get_write_request_status")
+        def get_write_request_status(session_id: str, client_request_id: str,
+                                     agent_id: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
+            """Read durable source, semantic and projection status for a submitted request."""
+            return get_write_request_status_tool(service, session_id=session_id,
+                client_request_id=client_request_id, agent_id=agent_id, **_auth_kwargs_from_context(ctx))
 
     if not code_toolset and mcp_delete_tools_enabled(cfg):
 
@@ -1186,19 +1199,14 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
             )
             params["_ctx"] = ctx
             result = await anyio.to_thread.run_sync(service.dispose, params)
-            raw_status = result.get("status") if isinstance(result, dict) else None
-            status_code = (
-                503
-                if isinstance(result, dict) and result.get("retryable") is True
-                else raw_status
-                if isinstance(raw_status, int) and 400 <= raw_status <= 599
-                else 400
-                if isinstance(result, dict) and result.get("ok") is False
-                else 200
-            )
-            return JSONResponse(result, status_code=status_code)
+            return JSONResponse(result, status_code=write_http_status(result))
         except Exception as exc:
-            return _mcp_http_error_response(exc)
+            fields = error_fields(exc, str(params.get("clientRequestId") or params.get("client_request_id") or ""))
+            if fields["error_detail"]["code"] == "WRITE_INTERNAL_ERROR":
+                return _mcp_http_error_response(exc)
+            result = normalize_write_result({"ok": False, "accepted": False, **fields},
+                                            fields["error_detail"]["request_id"])
+            return JSONResponse(result, status_code=write_http_status(result))
 
     async def idle(request):
         try:
@@ -1223,6 +1231,21 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
 
     app.add_route("/api/v1/dispose", dispose, methods=["POST"])
     app.add_route("/api/v1/idle", idle, methods=["POST"])
+    async def write_request_status(request):
+        try:
+            params = {**dict(request.query_params), "sessionId": request.path_params["session_id"]}
+            if "client_request_id" in request.path_params:
+                params["clientRequestId"] = request.path_params["client_request_id"]
+            params["_ctx"] = build_mcp_context(service, params, transport_headers=dict(request.headers),
+                                                allow_stdio_env_auth=False)
+            result = await anyio.to_thread.run_sync(service.get_write_request_status, params)
+            return JSONResponse(result)
+        except Exception as exc:
+            return _mcp_http_error_response(exc)
+    app.add_route("/api/v1/sessions/{session_id}/write-requests",
+                  write_request_status, methods=["GET"])
+    app.add_route("/api/v1/sessions/{session_id}/write-requests/{client_request_id:path}",
+                  write_request_status, methods=["GET"])
     limited_app = RequestBodyLimitMiddleware(app, runtime.max_request_body_size)
     return _MCPHTTPAuthenticationGuard(limited_app, service)
 

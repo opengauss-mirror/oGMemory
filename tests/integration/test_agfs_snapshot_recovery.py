@@ -115,7 +115,8 @@ def test_prewrite_read_expiry_resumes_checkpoint(native_agfs, monkeypatch):
     emit("REQUEST retry after_turn", {**request, "timeoutSeconds": 10})
     retried = service.after_turn({**request, "timeoutSeconds": 10})
     emit("RESPONSE retry after_turn", retried)
-    assert first["status"] == "failed" and first["retryable"] is True
+    assert first["request_status"] == "RECOVERING"
+    assert first["retry_action"] == "poll" and first["http_status"] == 202
     assert retried["status"] == "completed"
     assert manager.get_or_create(ctx.session_id).request_completed("original")
     client.session.close()

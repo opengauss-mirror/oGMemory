@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from urllib.parse import unquote
 
+from commit.outbox_scope import is_capturing_outbox_events, record_persisted_event
 from core.enums import ContextType, EventType, NodeStatus
 from core.errors import (
     AccessDeniedError,
@@ -815,6 +816,19 @@ class SQLContextFS(PoolAdapterMixin):
             row = cur.fetchone()
             raise ConcurrentModificationError(node.uri, 0, row[0] if row else 0)
 
+    @contextmanager
+    def _capture_node_trigger_events(self, cur, node, create_only):
+        references = []
+        capture = not create_only and is_capturing_outbox_events()
+        if capture:
+            cur.execute("SELECT set_config('ogmemory.node_write_events', '', true)")
+        yield references
+        if capture:
+            cur.execute("SELECT current_setting('ogmemory.node_write_events')")
+            result = json.loads(cur.fetchone()[0] or "{}")
+            if result.get("uri") == node.uri:
+                references.extend((node.uri, event_id) for event_id in result["event_ids"])
+
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None:
         """Write a node — atomic upsert with optimistic locking.
 
@@ -845,7 +859,10 @@ class SQLContextFS(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
+            with (
+                conn.cursor() as cur,
+                self._capture_node_trigger_events(cur, node, create_only) as references,
+            ):
                 self._guard_code_resource_write(cur, node, account_id)
                 self._execute_write(
                     cur,
@@ -859,6 +876,8 @@ class SQLContextFS(PoolAdapterMixin):
                     now,
                 )
             conn.commit()
+            for uri, event_id in references:
+                record_persisted_event(uri, event_id)
         except ConcurrentModificationError:
             conn.rollback()
             raise
@@ -902,7 +921,10 @@ class SQLContextFS(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
+            with (
+                conn.cursor() as cur,
+                self._capture_node_trigger_events(cur, node, create_only) as references,
+            ):
                 # Step 1: Serialize against durable deletion and write the node.
                 self._guard_code_resource_write(cur, node, account_id)
                 self._execute_write(
@@ -951,6 +973,8 @@ class SQLContextFS(PoolAdapterMixin):
                     ),
                 )
             conn.commit()
+            for uri, event_id in references:
+                record_persisted_event(uri, event_id)
         except ConcurrentModificationError:
             conn.rollback()
             raise
@@ -1500,7 +1524,7 @@ class SQLContextFS(PoolAdapterMixin):
                            abstract, metadata, created_at, updated_at, version,
                            COALESCE(content <> '', false) AS has_content
                     FROM context_nodes
-                    WHERE LEFT(uri, CHAR_LENGTH(%s)) = %s
+                    WHERE SUBSTRING(uri FROM 1 FOR CHAR_LENGTH(%s)) = %s
                       AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
                       AND account_id = %s
                       AND (%s IS NULL OR owner_space = %s)
@@ -1654,8 +1678,9 @@ class SQLContextFS(PoolAdapterMixin):
                     to_prefix=to_prefix,
                     json_wrapper=Json,
                 )
-                from providers.relation_store.projection_identity import canonical_edge_id
                 from uuid import uuid4
+
+                from providers.relation_store.projection_identity import canonical_edge_id
                 def moved(uri):
                     if uri == from_uri:
                         return to_uri
@@ -1677,27 +1702,13 @@ class SQLContextFS(PoolAdapterMixin):
                 if self.sql_dialect.table_exists(cur, "outbox_events"):
                     import uuid as _uuid
 
-                    # --- 5a) Delete PENDING and PROCESSING events for old URIs.
-                    #
-                    # We delete both PENDING and PROCESSING events.  The
-                    # PROCESSING events may have been claimed by a worker that
-                    # has read the payload into memory.  However, if we leave
-                    # them, the worker will upsert stale records at the old URI
-                    # *after* our DELETE_CONTEXT runs, undoing the move.
-                    #
-                    # By deleting the rows, the worker's final mark_done DELETE
-                    # matches 0 rows (harmless), and we rely on the tombstone
-                    # check in _process_upsert_context to catch the rare case
-                    # where the worker has already started processing.
+                    # Preserve cancellation receipts for workers and write-status queries.
                     cur.execute(
-                        "DELETE FROM outbox_events "
-                        "WHERE uri = %s AND status IN ('PENDING', 'PROCESSING')",
-                        (from_uri,),
-                    )
-                    cur.execute(
-                        "DELETE FROM outbox_events "
-                        "WHERE uri LIKE %s AND status IN ('PENDING', 'PROCESSING')",
-                        (from_prefix + "%",),
+                        "UPDATE outbox_events SET status = 'CANCELLED', payload = %s, "
+                        "worker_id = NULL, locked_at = NULL, next_retry_at = NULL "
+                        "WHERE account_id = %s AND (uri = %s OR uri LIKE %s) "
+                        "AND status IN ('PENDING', 'PROCESSING')",
+                        (Json({"cancel_reason": "node_moved"}), account_id, from_uri, from_prefix + "%"),
                     )
 
                     # --- 5b) Emit DELETE_CONTEXT for old URIs.

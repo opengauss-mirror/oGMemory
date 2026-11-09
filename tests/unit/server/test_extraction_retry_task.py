@@ -28,7 +28,8 @@ def queued(ctx, error_type=ToolCallProtocolError):
     service._extraction_retry.wake = Mock()  # deterministically drive the real worker below
     writer._pipeline.extract.side_effect = error_type("temporary extraction failure")
     result = service.after_turn({**params(ctx), "retryInBackground": True})
-    assert result["ok"] is False and result["recovery_task"]["status"] == "queued"
+    assert result["ok"] is True and result["request_status"] == "RECOVERING"
+    assert result["recovery_task"]["status"] == "queued"
     assert not nodes(fs, "event")
     return fs, service, writer, manager, result["recovery_task"]["id"]
 
@@ -47,6 +48,8 @@ def test_delayed_registration_keeps_new_request_checkpoint(ctx):
     expected = []
 
     def delayed_register(request_ctx, failure):
+        if failure["client_request_id"] != "original":
+            return register(request_ctx, failure)
         writer._pipeline.extract.side_effect = None
         writer._pipeline.extract.return_value = [candidate()]
         assert service.after_turn(params(ctx))["status"] == "completed"
@@ -219,7 +222,10 @@ def test_exhausted_source_finishes_with_original_archive_and_other_session(ctx):
     assert buf.request_completed("original")
     assert service.wait_until_idle({"_ctx": ctx, "sessionId": ctx.session_id})["idle"] is True
     assert len(nodes(fs, "session_archive")) == 2
-    assert service.after_turn(params(ctx))["status"] == "duplicate"
+    replay = service.after_turn(params(ctx))
+    assert replay["status"] == "degraded"
+    assert replay["semantic_status"] == "DEGRADED"
+    assert len(nodes(fs, "session_archive")) == 2
 
 
 def test_transient_provider_budget_finishes_original_source_archive(ctx):

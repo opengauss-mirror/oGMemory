@@ -100,6 +100,8 @@ class ReadOnlyQaProxy:
         self.read_only = False
         self.intercepted: list[str] = []
         self.accepted_writes: list[dict[str, Any]] = []
+        self.observed_writes: list[dict[str, Any]] = []
+        self.request_observations: list[dict[str, Any]] = []
         proxy = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -121,6 +123,7 @@ class ReadOnlyQaProxy:
                     for key, value in self.headers.items()
                     if key.lower() not in {"host", "content-length", "connection"}
                 }
+                started = time.monotonic()
                 response = requests.request(
                     self.command,
                     f"{proxy.target_url}{self.path}",
@@ -128,17 +131,45 @@ class ReadOnlyQaProxy:
                     data=body,
                     timeout=1200,
                 )
-                if path.endswith("/after_turn") and response.ok:
-                    result = response.json()
-                    if (result.get("ok") is not False
+                if path.endswith("/after_turn"):
+                    payload = json.loads(body)
+                    try:
+                        result = response.json()
+                    except ValueError:
+                        result = {}
+                    observation = {
+                        "method": self.command, "path": path,
+                        "session_id": payload.get("sessionId") or payload.get("session_id"),
+                        "client_request_id": payload.get("clientRequestId") or payload.get("client_request_id"),
+                        "request_id": result.get("request_id"),
+                        "user_message_fingerprints": _user_message_fingerprints(payload),
+                        "http_status": response.status_code,
+                        "duration_seconds": time.monotonic() - started,
+                        "at": time.time(),
+                        **{key: result.get(key) for key in ("request_status", "retry_action",
+                           "source_status", "semantic_status", "projection_status", "error_code", "error_type")},
+                    }
+                    proxy.observed_writes.append(observation)
+                    if (response.ok and result.get("ok") is not False
+                            and result.get("request_status") not in {"DEGRADED", "FAILED", "NEEDS_CONFIRMATION"}
                             and result.get("status") not in ("failed", "needs_confirmation")
                             and not result.get("error")):
-                        payload = json.loads(body)
-                        proxy.accepted_writes.append({
-                            "session_id": payload.get("sessionId") or payload.get("session_id"),
-                            "user_message_fingerprints": _user_message_fingerprints(payload),
-                            "at": time.time(),
-                        })
+                        proxy.accepted_writes.append(observation)
+                if "/write-requests/" in path or path.endswith("/write-requests"):
+                    try:
+                        result = response.json()
+                    except ValueError:
+                        result = {}
+                    proxy.request_observations.append({
+                        "method": self.command, "path": path, "at": time.time(),
+                        "http_status": response.status_code,
+                        "duration_seconds": time.monotonic() - started,
+                        "request_id": result.get("request_id"),
+                        "outcome": {key: result[key] for key in (
+                            "request_id", "request_status", "source_status", "semantic_status",
+                            "projection_status", "retry_action", "error_code", "error_type",
+                        ) if key in result},
+                    })
                 self.send_response(response.status_code)
                 for key, value in response.headers.items():
                     if key.lower() not in {"content-length", "transfer-encoding", "connection"}:
@@ -352,12 +383,12 @@ class PluginAdapter:
         self.host.prepare()
 
     def ingest(self, text, key):
-        offset = len(self.proxy.accepted_writes)
+        offset = len(self.proxy.observed_writes)
         fingerprint = text_fingerprint(text)
         reply, usage = self.host.invoke(text, key)
         deadline = time.monotonic() + self.args.write_wait_timeout
         while True:
-            writes = self.proxy.accepted_writes[offset:]
+            writes = self.proxy.observed_writes[offset:]
             ids = {
                 row["session_id"]
                 for row in writes
@@ -371,15 +402,33 @@ class PluginAdapter:
             if not self.args.verify_writes:
                 return reply, usage, sorted(ids)
             if ids:
-                for sid in ids:
-                    self.common.wait_idle(self.args, sid)
+                matching = { (row["session_id"], row.get("request_id") or row.get("client_request_id")): row
+                    for row in writes if row["session_id"] in ids
+                    and fingerprint in row["user_message_fingerprints"] }
+                for (sid, request_id), row in matching.items():
+                    state = row.get("request_status")
+                    if state in {"DEGRADED", "FAILED", "NEEDS_CONFIRMATION"}:
+                        raise self.common.WriteRequestTerminal(row)
+                    if request_id and state and row.get("source_status") != "BUFFERED":
+                        self.common.wait_write_request(self.args, sid, request_id,
+                            observations=self.proxy.request_observations, deadline=deadline)
+                    else:
+                        self.common.wait_idle(self.args, sid, observations=self.proxy.request_observations,
+                                              deadline=deadline)
                 return reply, usage, sorted(ids)
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"plugin write acknowledgement missing: {key}")
+                raise self.common.WriteObservationTimeout(f"plugin write acknowledgement unobserved: {key}")
             time.sleep(1)
 
     def settle(self, sid):
-        return self.common.flush_source(self.args, sid)
+        result = self.common.flush_source(self.args, sid)
+        requests_by_id = {row.get("request_id") or row.get("client_request_id"): row for row in self.proxy.observed_writes
+                          if row["session_id"] == sid and (row.get("request_id") or row.get("client_request_id"))
+                          and row.get("request_status")}
+        result["requests"] = [self.common.write_status_summary(self.common.wait_write_request(
+            self.args, sid, request_id, observations=self.proxy.request_observations))
+            for request_id in requests_by_id]
+        return result
 
     def answer(self, prompt, key):
         return self.host.invoke(prompt, key)
@@ -396,6 +445,8 @@ class PluginAdapter:
                     json.dumps(
                         {
                             "accepted": self.proxy.accepted_writes,
+                            "observed": self.proxy.observed_writes,
+                            "request_status": self.proxy.request_observations,
                             "intercepted": self.proxy.intercepted,
                         },
                         indent=2,

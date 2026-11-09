@@ -49,6 +49,7 @@ class AfterTurnGovernanceState:
 class AfterTurnGovernanceResult:
     failed: bool = False
     fallback_token: str = ""
+    source_message_ids: tuple[str, ...] = ()
 
 
 class ToolResultGovernanceService:
@@ -435,6 +436,7 @@ class ToolResultGovernanceService:
                         )
             return AfterTurnGovernanceResult(
                 failed=failed,
+                source_message_ids=tuple(governed.source_message_ids),
                 fallback_token=(
                     self._issue_tool_result_governance_fallback_token(
                         state.params,

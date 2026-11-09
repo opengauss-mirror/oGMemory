@@ -232,7 +232,10 @@ def test_accepted_prewrite_deadline_retries_without_reextracting(clock, monkeypa
     else:
         writer._writer._archive_builder.build = late_build
     result = service.after_turn({**params(ctx), "timeoutSeconds": 1})
-    assert result["status"] == "failed" and result["retryable"] is True
+    assert result["request_status"] == "RECOVERING"
+    assert result["accepted"] is True and result["http_status"] == 202
+    assert result["retry_action"] == "poll"
+    assert result["recovery_task"]["status"] == "queued"
     assert not nodes(fs, "event")
     buf = manager.get_or_create(ctx.session_id)
     slot = buf.runtime_extensions[EXTENSION_KEY]["batch"]["slots"]["chunk:0"]

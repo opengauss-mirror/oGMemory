@@ -289,6 +289,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
         else:
             filtered, extracted_count, filtered_count = accepted
+            if self._graph_enabled:
+                candidate_checkpoint.restore_relation_tracking()
 
         # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
         deduplicated = filtered
@@ -332,13 +334,20 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                                      native_relation_rejections=native_rejections)
             if lookup_error:
                 graph_diagnostics["historical_recommendation_failure"] = lookup_error
+            tracking_relation_write = (
+                bool(edges) and candidate_checkpoint is not None
+                and candidate_checkpoint.begin_relation_write()
+            )
             try:
                 self._relation_store.upsert_edges(edges,ctx)
-                graph_diagnostics["relation_persisted"] = len(edges)
             except Exception as exc:
                 graph_diagnostics.update(status="persistence_failed",relation_persisted=0,
                                          persistence_error=type(exc).__name__)
                 logger.exception("Graph relation persistence failed")
+            else:
+                if tracking_relation_write:
+                    candidate_checkpoint.complete_relation_write()
+                graph_diagnostics["relation_persisted"] = len(edges)
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")

@@ -1276,7 +1276,6 @@ class OutboxStore:
 
     def move_to_dlq(self, event: "OutboxEvent", node_uri: str) -> None:
         """Move a failed event to the dead letter queue."""
-        self._check_agent_lease(event)
         self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         src_path = node_path + ".outbox/" + event.event_id + ".json"
@@ -1317,7 +1316,6 @@ class OutboxStore:
             node_uri: URI of the associated node
             next_retry_at: Optional datetime for scheduled retry (exponential backoff)
         """
-        self._check_agent_lease(event)
         self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
@@ -1428,7 +1426,6 @@ class OutboxStore:
             event: OutboxEvent to release
             node_uri: URI of the associated node
         """
-        self._check_agent_lease(event)
         self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         processing_path = node_path + ".outbox/" + event.event_id + ".processing"
