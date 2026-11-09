@@ -4,6 +4,7 @@ Orchestrates the write process: extraction → planning → building → writing
 """
 
 import hashlib
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -86,6 +87,20 @@ class ContextWriter:
         if require_index_event and outbox_store is None:
             raise ValueError("index publication requires an Outbox store")
         self._require_index_event = require_index_event
+        # Per-URI write locks: serialize plan→merge→write per target node
+        # within this process (see _write_candidate). One entry per node URI;
+        # bounded by the number of distinct memory nodes written.
+        self._uri_locks: dict[str, threading.Lock] = {}
+        self._uri_locks_guard = threading.Lock()
+
+    def _lock_for_uri(self, uri: str) -> threading.Lock:
+        """Return the process-wide write lock for a target node URI."""
+        with self._uri_locks_guard:
+            lock = self._uri_locks.get(uri)
+            if lock is None:
+                lock = threading.Lock()
+                self._uri_locks[uri] = lock
+            return lock
 
     @staticmethod
     def _get_real_method(
@@ -240,9 +255,15 @@ class ContextWriter:
         Returns:
             WritePlan showing what action was taken
         """
-        # Retry loop for concurrent modification (optimistic locking)
-        max_retries = 3
-        retry_delays = [0.1, 0.2, 0.4]  # Exponential backoff in seconds
+        # Retry loop for concurrent modification (optimistic locking).
+        # CAS conflicts are transient by design (re-plan reads fresh data),
+        # but short retry budgets get exhausted by write stampedes when many
+        # extraction runs merge into the same shared nodes at once (e.g.
+        # parallel benchmark ingest with dozens of concurrent sessions whose
+        # LLM extractions finish together). Use a deeper exponential backoff:
+        # 8 attempts, ~12.7s worst case, instead of 3 attempts over 0.7s.
+        max_retries = 8
+        retry_delays = [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4]  # Exponential backoff in seconds
 
         if self._policy_router is None:
             raise RuntimeError(
@@ -281,156 +302,185 @@ class ContextWriter:
                     return plan
                 persist_action = "merge" if receipt_only else plan.action
 
-                # Step 1.5: Idempotency check - prevent duplicate operations
-                fingerprint_content = candidate.content or ""
-                from index.activation_projection import ACTIVATION_VERSION
-                descriptor = candidate.metadata.get("update_activation")
-                if (candidate.metadata.get("update_activation_version") == ACTIVATION_VERSION
-                        and isinstance(descriptor,str) and descriptor.strip()
-                        and "\n" not in descriptor.strip() and "\r" not in descriptor.strip()):
-                    # A changed connection key is a real graph projection
-                    # update, even when ordinary content stays identical.
-                    import json
-                    fingerprint_content = json.dumps([fingerprint_content,descriptor.strip(),ACTIVATION_VERSION])
-                content_hash = hashlib.sha256(fingerprint_content.encode()).hexdigest()[:16]
-                fp = self._operation_fingerprint(plan, ctx, content_hash)
-                cache_operation = (not candidate.write_operation_id and identity_plan is None
-                                   and candidate.category != "profile")
-                if cache_operation and fp in self._executed_ops:
-                    logger.info(f"Skipping duplicate operation: {plan.target_uri}")
-                    return plan
+                # Per-URI write serialization (parallel-ingest reliability):
+                # the semantic content merge in Step 2 can take seconds (LLM
+                # call); without serialization, concurrent extractions that
+                # target the same shared node (e.g. the same entity or
+                # profile) each re-read a fresh version on retry but keep
+                # losing the optimistic-lock race while their own merge is in
+                # flight, eventually exhausting the retry budget and failing
+                # the whole extraction. Holding the per-URI lock from
+                # (re-)planning through the write closes that window: writes
+                # to the same node are ordered, writes to different nodes
+                # stay fully parallel, and the SQL CAS remains as the
+                # cross-process backstop (retry loop still applies).
+                # Durable operations (write_operation_id) and
+                # identity-resolved plans keep their hard CAS semantics and
+                # are NOT re-planned under the lock.
+                replan_in_lock = not candidate.write_operation_id and identity_plan is None
+                with self._lock_for_uri(plan.target_uri):
+                    if replan_in_lock:
+                        # Re-plan against fresh node state acquired under
+                        # the lock (the plan above may be stale after
+                        # waiting for another writer to release the lock).
+                        plan = self._policy_router.plan(candidate, ctx)
+                        if plan.action == "skip":
+                            return plan
+                        persist_action = plan.action
 
-                # Handle archive operation
-                _check_prewrite_deadline()
-                if plan.action == WriteAction.ARCHIVE:
-                    self._executed_ops.add(fp)
-                    return self._handle_archive(plan, ctx)
+                    # Step 1.5: Idempotency check - prevent duplicate
+                    # operations. Runs INSIDE the per-URI lock so the
+                    # fingerprint is computed against the re-planned
+                    # (fresh) plan. A changed connection key is a real
+                    # graph projection update, even when ordinary content
+                    # stays identical (dev activation-projection support).
+                    fingerprint_content = candidate.content or ""
+                    from index.activation_projection import ACTIVATION_VERSION
+                    descriptor = candidate.metadata.get("update_activation")
+                    if (candidate.metadata.get("update_activation_version") == ACTIVATION_VERSION
+                            and isinstance(descriptor, str) and descriptor.strip()
+                            and "\n" not in descriptor.strip() and "\r" not in descriptor.strip()):
+                        import json
+                        fingerprint_content = json.dumps([fingerprint_content, descriptor.strip(), ACTIVATION_VERSION])
+                    content_hash = hashlib.sha256(fingerprint_content.encode()).hexdigest()[:16]
+                    fp = self._operation_fingerprint(plan, ctx, content_hash)
+                    cache_operation = (not candidate.write_operation_id and identity_plan is None
+                                       and candidate.category != "profile")
+                    if cache_operation and fp in self._executed_ops:
+                        logger.info(f"Skipping duplicate operation: {plan.target_uri}")
+                        return plan
 
-                # Handle delete operation
-                if plan.action == WriteAction.DELETE:
-                    self._executed_ops.add(fp)
-                    return self._handle_delete(plan, ctx)
+                    # Handle archive operation
+                    _check_prewrite_deadline()
+                    if plan.action == WriteAction.ARCHIVE:
+                        self._executed_ops.add(fp)
+                        return self._handle_archive(plan, ctx)
 
-                # Step 2: Build - construct ContextNode
-                if receipt_only:
-                    node = self._fs.read_node(plan.target_uri, ctx)
-                    owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
-                    if node.category != candidate.category or node.owner_space != owner:
-                        raise ValueError("operation target is not in the authorized category/owner")
-                    node.metadata["expected_version"] = plan.merged_fields.get(
-                        "expected_version", node.metadata.get("version", 0),
-                    )
-                else:
-                    try:
-                        node = self._archive_builder.build(candidate, plan, ctx)
-                    except OperationDeadlineExceededError as exc:
-                        raise WriteDeadlineExceededError(str(exc)) from exc
-                attach_receipt(self._fs, node, candidate, ctx)
+                    # Handle delete operation
+                    if plan.action == WriteAction.DELETE:
+                        self._executed_ops.add(fp)
+                        return self._handle_delete(plan, ctx)
 
-                # Step 3+4: Write node + outbox event atomically (if supported)
-                atomic_write = self._get_real_method(self._fs, "write_node_with_outbox")
-                supports_atomic_write = self._get_real_method(
-                    self._fs,
-                    "supports_atomic_outbox_write",
-                )
-                build_write_event = self._get_real_method(
-                    self._outbox_store,
-                    "build_write_event",
-                )
-                atomic_write_allowed = (
-                    supports_atomic_write is None
-                    or bool(supports_atomic_write(node))
-                )
-                register_once = self._get_real_method(self._outbox_store, "register_once")
-                event = (build_write_event(node) if build_write_event is not None
-                         and persist_action in ("create", "merge") else None)
-                if candidate.write_operation_id and event is not None and (atomic_write_allowed or register_once):
-                    from commit.write_receipts import PROJECTION_RECEIPTS_KEY
-                    node.metadata.setdefault(PROJECTION_RECEIPTS_KEY, {})[candidate.write_operation_id] = {
-                        "event_id": event.event_id}
-                if self._is_code_resource(node) and (
-                    atomic_write is None
-                    or not atomic_write_allowed
-                    or build_write_event is None
-                ):
-                    raise RuntimeError(
-                        "code resource writes require an atomic Outbox backend"
-                    )
-                if (
-                    atomic_write is not None
-                    and atomic_write_allowed
-                    and build_write_event is not None
-                    and persist_action in ("create", "merge")
-                ):
-                    use_atomic = True
-                    persist = atomic_write
-                    write_args: tuple[object, ...] = (node, ctx, event)
-                else:
-                    use_atomic = False
-                    persist = self._fs.write_node
-                    write_args = (node, ctx)
-                _check_prewrite_deadline()
-                if candidate.write_operation_id:
-                    bind_operation_target(self._fs, self._identity_resolver.uris, candidate, ctx, node.uri)
-                try:
-                    if on_persistence is not None:
-                        on_persistence(True)
-                    persist(*write_args)
-                    if event is not None and (
-                        use_atomic or (candidate.write_operation_id and register_once is not None)
-                    ):
-                        from commit.outbox_scope import record_persisted_event
-                        record_persisted_event(node.uri, event.event_id)
-                except ConcurrentModificationError:
-                    if on_persistence is not None:
-                        on_persistence(False)
-                    raise
-                except Exception as exc:
-                    if candidate.write_operation_id:
-                        raise WriteOutcomeUnknownError(str(exc)) from exc
-                    raise
-
-                # Mark as executed only after successful write
-                if cache_operation:
-                    self._executed_ops.add(fp)
-
-                # Step 4: Outbox - register event for async index synchronization
-                # Skip when atomic path already inserted the event in the same txn
-                if not use_atomic and self._outbox_store and persist_action in ("create", "merge"):
-                    try:
-                        if candidate.write_operation_id and event is not None and register_once is not None:
-                            register_once(event, ctx)
-                        else:
-                            self._outbox_store.register_write(node, ctx)
-                    except Exception as e:
-                        if candidate.write_operation_id and event is not None:
-                            raise WriteOutcomeUnknownError(str(e)) from e
-                        if self._require_index_event:
-                            raise
-                        # Log error but don't fail the write
-                        logger.warning(
-                            "Failed to register outbox event for %s: %s",
-                            node.uri, e
+                    # Step 2: Build - construct ContextNode
+                    if receipt_only:
+                        node = self._fs.read_node(plan.target_uri, ctx)
+                        owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
+                        if node.category != candidate.category or node.owner_space != owner:
+                            raise ValueError("operation target is not in the authorized category/owner")
+                        node.metadata["expected_version"] = plan.merged_fields.get(
+                            "expected_version", node.metadata.get("version", 0),
                         )
-
-                # Step 5: Directory - trigger directory summary update
-                # Skip for profile: parent is memories/, not a category directory
-                if (
-                    self._directory_summary_enabled
-                    and self._outbox_store
-                    and persist_action in ("create", "merge")
-                ):
-                    if candidate.category != "profile":
+                    else:
                         try:
-                            self._outbox_store.register_directory(node, ctx)
+                            node = self._archive_builder.build(candidate, plan, ctx)
+                        except OperationDeadlineExceededError as exc:
+                            raise WriteDeadlineExceededError(str(exc)) from exc
+                    attach_receipt(self._fs, node, candidate, ctx)
+
+                    # Step 3+4: Write node + outbox event atomically (if supported)
+                    atomic_write = self._get_real_method(self._fs, "write_node_with_outbox")
+                    supports_atomic_write = self._get_real_method(
+                        self._fs,
+                        "supports_atomic_outbox_write",
+                    )
+                    build_write_event = self._get_real_method(
+                        self._outbox_store,
+                        "build_write_event",
+                    )
+                    atomic_write_allowed = (
+                        supports_atomic_write is None
+                        or bool(supports_atomic_write(node))
+                    )
+                    register_once = self._get_real_method(self._outbox_store, "register_once")
+                    event = (build_write_event(node) if build_write_event is not None
+                             and persist_action in ("create", "merge") else None)
+                    if candidate.write_operation_id and event is not None and (atomic_write_allowed or register_once):
+                        from commit.write_receipts import PROJECTION_RECEIPTS_KEY
+                        node.metadata.setdefault(PROJECTION_RECEIPTS_KEY, {})[candidate.write_operation_id] = {
+                            "event_id": event.event_id}
+                    if self._is_code_resource(node) and (
+                        atomic_write is None
+                        or not atomic_write_allowed
+                        or build_write_event is None
+                    ):
+                        raise RuntimeError(
+                            "code resource writes require an atomic Outbox backend"
+                        )
+                    if (
+                        atomic_write is not None
+                        and atomic_write_allowed
+                        and build_write_event is not None
+                        and persist_action in ("create", "merge")
+                    ):
+                        use_atomic = True
+                        persist = atomic_write
+                        write_args: tuple[object, ...] = (node, ctx, event)
+                    else:
+                        use_atomic = False
+                        persist = self._fs.write_node
+                        write_args = (node, ctx)
+                    _check_prewrite_deadline()
+                    if candidate.write_operation_id:
+                        bind_operation_target(self._fs, self._identity_resolver.uris, candidate, ctx, node.uri)
+                    try:
+                        if on_persistence is not None:
+                            on_persistence(True)
+                        persist(*write_args)
+                        if event is not None and (
+                            use_atomic or (candidate.write_operation_id and register_once is not None)
+                        ):
+                            from commit.outbox_scope import record_persisted_event
+                            record_persisted_event(node.uri, event.event_id)
+                    except ConcurrentModificationError:
+                        if on_persistence is not None:
+                            on_persistence(False)
+                        raise
+                    except Exception as exc:
+                        if candidate.write_operation_id:
+                            raise WriteOutcomeUnknownError(str(exc)) from exc
+                        raise
+
+                    # Mark as executed only after successful write
+                    if cache_operation:
+                        self._executed_ops.add(fp)
+
+                    # Step 4: Outbox - register event for async index synchronization
+                    # Skip when atomic path already inserted the event in the same txn
+                    if not use_atomic and self._outbox_store and persist_action in ("create", "merge"):
+                        try:
+                            if candidate.write_operation_id and event is not None and register_once is not None:
+                                register_once(event, ctx)
+                            else:
+                                self._outbox_store.register_write(node, ctx)
                         except Exception as e:
+                            if candidate.write_operation_id and event is not None:
+                                raise WriteOutcomeUnknownError(str(e)) from e
+                            if self._require_index_event:
+                                raise
                             # Log error but don't fail the write
                             logger.warning(
-                                "Failed to register directory event for %s: %s",
+                                "Failed to register outbox event for %s: %s",
                                 node.uri, e
                             )
 
-                return plan
+                    # Step 5: Directory - trigger directory summary update
+                    # Skip for profile: parent is memories/, not a category directory
+                    if (
+                        self._directory_summary_enabled
+                        and self._outbox_store
+                        and persist_action in ("create", "merge")
+                    ):
+                        if candidate.category != "profile":
+                            try:
+                                self._outbox_store.register_directory(node, ctx)
+                            except Exception as e:
+                                # Log error but don't fail the write
+                                logger.warning(
+                                    "Failed to register directory event for %s: %s",
+                                    node.uri, e
+                                )
+
+                    return plan
 
             except ConcurrentModificationError as e:
                 if identity_plan is not None or candidate.target_uri:

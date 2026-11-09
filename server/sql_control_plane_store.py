@@ -53,21 +53,9 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         self._ensure_table()
 
     # ------------------------------------------------------------------
-    # Connection pool (standalone fallback)
+    # Connection pool: provided by PoolAdapterMixin (bounded standalone
+    # pool; shared pool binds its own methods at __init__ time).
     # ------------------------------------------------------------------
-
-    def _get_connection(self):
-        if self._pool:
-            conn = self._pool.pop()
-            if conn.closed == 0:
-                return conn
-        return psycopg2.connect(self._connection_string)
-
-    def _return_connection(self, conn):
-        if len(self._pool) < self._pool_size and conn.closed == 0:
-            self._pool.append(conn)
-        else:
-            conn.close()
 
     def _ensure_table(self) -> None:
         from fs.sql_adapter.schema import ensure_schema

@@ -141,10 +141,10 @@ def test_write_candidate_raises_after_max_retries(monkeypatch, candidate, node, 
     from extraction.schemas.registry import SchemaRegistry
 
     fs = Mock()
+    # Exhaust the full retry budget (see write_candidate's max_retries).
     fs.write_node.side_effect = [
-        ConcurrentModificationError(node.uri, expected_version=1, actual_version=2),
-        ConcurrentModificationError(node.uri, expected_version=2, actual_version=3),
-        ConcurrentModificationError(node.uri, expected_version=3, actual_version=4),
+        ConcurrentModificationError(node.uri, expected_version=v, actual_version=v + 1)
+        for v in range(1, 9)
     ]
     plan = WritePlan(action="merge", target_uri=node.uri)
     registry = SchemaRegistry()
@@ -162,8 +162,8 @@ def test_write_candidate_raises_after_max_retries(monkeypatch, candidate, node, 
     with pytest.raises(ConcurrentModificationError):
         writer.write_candidate(candidate, ctx)
 
-    assert fs.write_node.call_count == 3
-    assert sleep.call_count == 2
+    assert fs.write_node.call_count == 8
+    assert sleep.call_count == 7
 
 
 def test_write_candidates_continues_when_one_candidate_fails(ctx):
