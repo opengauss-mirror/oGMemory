@@ -24,6 +24,7 @@ from core.models import (
     RetrievedBlock,
     RetrieverMode,
     SearchMemoryResult,
+    SeedHit,
     SeedResult,
     SeedHit,
     TypedQuery,
@@ -461,8 +462,27 @@ class RetrievalPipeline:
             try:
                 result = self.seed_retriever.search(tq, ctx, mode=mode)
             except Exception as exc:
-                logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
-                raise
+                # Do not re-raise: during embedder/vector-index outages
+                # every turn would otherwise fail. Fall back to a seed
+                # rooted at the typed query's root URIs (score 0.0) so
+                # hierarchical expansion / fallback L2 still has
+                # something to walk and the search run continues.
+                logger.error(
+                    "[seed_retrieval] failed: %s — degrading to "
+                    "root-URI-only seed", exc, exc_info=True,
+                )
+                root_uris = SeedRetriever._get_root_uris(
+                    getattr(tq, "context_type", None), ctx,
+                )
+                result = SeedResult(
+                    starting_points=[
+                        SeedHit(uri=uri, score=0.0)
+                        for uri in root_uris
+                    ],
+                    initial_candidates=[],
+                    query_vector=[],
+                    root_uris=root_uris,
+                )
             st.output_count = len(result.starting_points) + len(result.initial_candidates)
         trace.add_stage(st)
         return result
@@ -488,6 +508,14 @@ class RetrievalPipeline:
             return []
 
         has_dirs = any(v.level < 2 for v in sr.starting_points)
+
+        # Review item 7: hierarchical expansion ranks children by cosine
+        # similarity against sr.query_vector — with an empty vector (embed
+        # degradation, root-URI-only fallback seed) search_children would
+        # build SQL against []::vector, which pgvector cannot execute (and
+        # the expand error path re-raises, failing the whole turn). Skip
+        # the semantic traversal and keep whatever L2 hits the seed has.
+        has_dirs = has_dirs and bool(sr.query_vector)
 
         if has_dirs and self.hierarchical_searcher:
             with TraceTimer("hierarchical") as st:

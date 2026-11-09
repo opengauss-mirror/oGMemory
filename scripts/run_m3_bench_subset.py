@@ -131,10 +131,12 @@ import random
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -792,6 +794,301 @@ def run_judge(
 
 
 # ---------------------------------------------------------------------------
+# Video-parallel orchestration (WS 2.5)
+# ---------------------------------------------------------------------------
+
+
+def _judge_input_digest(
+    jsonl: Path, annotations: Path, args: argparse.Namespace
+) -> str:
+    """Digest of everything a cached judgment depends on (review item 9).
+
+    Predictions, annotations, the effective judge configuration (provider /
+    model / base URL / type filter) and the ``--config`` YAML (it carries
+    ``m3.judge_llm``). The API key is deliberately excluded: rotating a key
+    must not invalidate judgments made by the same model+endpoint.
+    """
+    h = hashlib.sha256()
+    config = getattr(args, "config", None)
+    paths = [jsonl, annotations] + ([Path(config)] if config else [])
+    for path in paths:
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<missing:" + str(path).encode() + b">")
+    judge_identity = "|".join(str(x or "") for x in (
+        getattr(args, "judge_llm", None),
+        getattr(args, "judge_model", None),
+        getattr(args, "judge_base_url", None),
+        getattr(args, "type_filter", None),
+    ))
+    h.update(b"judge:" + judge_identity.encode())
+    return h.hexdigest()
+
+
+def _write_judge_digest(
+    work_dir: Path, digest: str, *, jsonl: Path, annotations: Path
+) -> None:
+    """Persist the digest a future resume must match to reuse the judgment."""
+    def _size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    sidecar = work_dir / "m3_eval_summary.digest.json"
+    try:
+        sidecar.write_text(json.dumps({
+            "digest": digest,
+            "qa_results_bytes": _size(jsonl),
+            "annotations_bytes": _size(annotations),
+        }, indent=2), encoding="utf-8")
+    except OSError:
+        logger.warning("could not write judge digest sidecar %s", sidecar)
+
+
+def live_judge_video(
+    *,
+    video_id: str,
+    work_dir: Path,
+    args: argparse.Namespace,
+    annotations_path: Path,
+) -> dict[str, Any] | None:
+    """Judge one video's predictions immediately after the video finishes.
+
+    Writes per-video ``m3_eval_summary.json`` / ``m3_eval_results.jsonl``
+    under ``<work-dir-root>/<video_id>/``. When a per-video summary already
+    exists (resume) and ``--force`` is unset, it is reused **only when the
+    recorded input digest still matches** (predictions, annotations, judge
+    configuration) — repaired or partial predictions otherwise re-judge
+    instead of silently aggregating stale scores (review item 9).
+    """
+    if args.dry_run:
+        return None
+    jsonl = work_dir / "m3_qa_results.jsonl"
+    if not jsonl.exists():
+        return None
+    if not any(
+        line.strip() for line in jsonl.read_text(encoding="utf-8").splitlines()
+    ):
+        return None
+    summary_path = work_dir / "m3_eval_summary.json"
+    digest = _judge_input_digest(jsonl, annotations_path, args)
+    if summary_path.exists() and not args.force:
+        sidecar = work_dir / "m3_eval_summary.digest.json"
+        recorded = None
+        try:
+            recorded = json.loads(sidecar.read_text(encoding="utf-8")).get("digest")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        if recorded == digest:
+            try:
+                return {
+                    "status": "reused",
+                    "returncode": 0,
+                    "summary_path": str(summary_path),
+                    "summary": json.loads(summary_path.read_text(encoding="utf-8")),
+                }
+            except (OSError, json.JSONDecodeError):
+                logger.warning(
+                    "[%s] per-video judge summary unreadable — re-judging", video_id
+                )
+        else:
+            logger.warning(
+                "[%s] cached judge summary is stale (predictions, annotations "
+                "or judge configuration changed since it was written) — "
+                "re-judging", video_id,
+            )
+    # Reuse the existing judge driver, scoped to this one video: the
+    # ``--video`` filter keeps m3.eval from scoring other videos' questions.
+    result = run_judge(
+        annotations=annotations_path,
+        merged_jsonl=jsonl,
+        output_dir=work_dir,
+        args=args,
+        subset=[video_id],
+    )
+    if result.get("returncode") == 0 and result.get("summary_path"):
+        _write_judge_digest(
+            work_dir, digest, jsonl=jsonl, annotations=annotations_path
+        )
+    return result
+
+
+def merge_per_video_judges(
+    subset: Iterable[str],
+    work_dir_root: Path,
+    output_dir: Path,
+) -> dict[str, Any] | None:
+    """Merge the per-video judge rows into one ``_aggregate`` summary.
+
+    No second judge pass: the final ``m3_eval_summary.json`` is recomputed
+    from the per-video ``m3_eval_results.jsonl`` rows via ``m3.eval.aggregate``
+    (the same aggregation the judge itself uses), so the result is exactly
+    what a single judge pass over the merged JSONL would produce.
+    """
+    from m3.eval import QuestionResult, aggregate
+
+    rows: list[QuestionResult] = []
+    judge_provider = judge_model = ""
+    for vid in subset:
+        summary_path = work_dir_root / vid / "m3_eval_summary.json"
+        results_path = work_dir_root / vid / "m3_eval_results.jsonl"
+        if summary_path.exists():
+            try:
+                per_video = json.loads(summary_path.read_text(encoding="utf-8"))
+                judge_provider = per_video.get("judge_provider") or judge_provider
+                judge_model = per_video.get("judge_model") or judge_model
+            except (OSError, json.JSONDecodeError):
+                logger.warning("[%s] unreadable judge summary skipped in merge", vid)
+        if not results_path.exists():
+            continue
+        for line in results_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(QuestionResult(**json.loads(line)))
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning("[%s] malformed judge row skipped: %s", vid, exc)
+    if not rows:
+        return None
+    merged = aggregate(
+        rows, judge_provider=judge_provider, judge_model=judge_model
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "m3_eval_results.jsonl").write_text(
+        "".join(
+            json.dumps(r.to_jsonl(), ensure_ascii=False) + "\n" for r in rows
+        ),
+        encoding="utf-8",
+    )
+    merged["merge_of_per_video_judges"] = True
+    summary_path = output_dir / "m3_eval_summary.json"
+    summary_path.write_text(
+        json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    merged["summary_path"] = str(summary_path)
+    return merged
+
+
+def run_videos(
+    *,
+    subset: list[str],
+    args: argparse.Namespace,
+    annotations: dict[str, Any],
+    annotations_path: Path,
+    project_root: Path,
+    videos_root: Path,
+    on_video_done: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Run the per-video flow for every video in ``subset`` (WS 2.5).
+
+    ``--video-workers 1`` (default) runs the exact serial loop of the old
+    driver. With ``--video-workers N > 1`` one thread per video runs the
+    full per-video flow — pipeline subprocess, then the live per-video
+    judge when ``--judge`` is set — while only the shared aggregate state
+    (the summaries map / run report via ``on_video_done``) is touched under
+    a lock. Returns summaries in ``subset`` order regardless of completion
+    order.
+    """
+    summaries: dict[str, dict[str, Any]] = {}
+    lock = threading.Lock()
+
+    def _worker(video_id: str) -> dict[str, Any]:
+        try:
+            declared = annotations[video_id].get("video_path", "")
+            video_path = resolve_video_path(
+                declared, project_root=project_root, videos_root=videos_root
+            )
+            if video_path is None:
+                logger.error(
+                    "[%s] cannot resolve video_path=%r under %s",
+                    video_id, declared, videos_root,
+                )
+                return {
+                    "video_id": video_id,
+                    "status": "failed",
+                    "reason": "video_not_found",
+                    "declared_video_path": declared,
+                }
+            expected_qids = {
+                str(q.get("question_id"))
+                for q in load_questions_for_video(annotations, video_id)
+                if q.get("question_id") is not None
+            }
+            try:
+                summary = run_one_video(
+                    video_id=video_id,
+                    video_path=video_path,
+                    args=args,
+                    annotations=annotations,
+                    expected_qids=expected_qids,
+                )
+            except Exception as exc:  # pragma: no cover - top-level guard
+                logger.exception("[%s] driver raised: %s", video_id, exc)
+                summary = {
+                    "video_id": video_id,
+                    "status": "failed",
+                    "reason": "driver_exception",
+                    "error": str(exc),
+                }
+            if not isinstance(summary, dict):
+                summary = {"raw_result": summary}
+            summary.setdefault("video_id", video_id)
+            if args.judge:
+                # Live per-video judge: score this video's predictions
+                # immediately, don't wait for a final pass.
+                try:
+                    judge_result = live_judge_video(
+                        video_id=video_id,
+                        work_dir=Path(args.work_dir_root) / video_id,
+                        args=args,
+                        annotations_path=annotations_path,
+                    )
+                except Exception as exc:  # pragma: no cover - best-effort
+                    logger.warning("[%s] live judge failed: %s", video_id, exc)
+                    judge_result = {
+                        "status": "failed",
+                        "returncode": 1,
+                        "error": str(exc),
+                    }
+                if judge_result is not None:
+                    summary["judge"] = judge_result
+            return summary
+        except Exception as exc:  # pragma: no cover - top-level guard
+            logger.exception("[%s] worker raised: %s", video_id, exc)
+            return {
+                "video_id": video_id,
+                "status": "failed",
+                "reason": "driver_exception",
+                "error": str(exc),
+            }
+
+    def _record(summary: dict[str, Any]) -> None:
+        with lock:
+            summaries[summary["video_id"]] = summary
+            if on_video_done is not None:
+                on_video_done(summary)
+
+    workers = max(1, getattr(args, "video_workers", 1) or 1)
+    if workers <= 1:
+        for video_id in subset:
+            _record(_worker(video_id))
+    else:
+        logger.info("video-parallel run: %d workers over %d videos",
+                    workers, len(subset))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_worker, video_id): video_id for video_id in subset
+            }
+            for future in as_completed(futures):
+                _record(future.result())
+
+    # Deterministic: subset order, independent of completion order.
+    return [summaries[vid] for vid in subset if vid in summaries]
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -875,6 +1172,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Disable the per-stage probe layer (Layer 2) and "
                         "always run every stage from scratch. Forwarded "
                         "as --no-smart-resume to run_video_pipeline.")
+    p.add_argument("--video-workers", type=int, default=1,
+                  help="Video-level parallelism: one thread per video, each "
+                       "running the full per-video flow (pipeline subprocess "
+                       "+ live per-video judge with --judge). Default 1 = the "
+                       "old serial loop. Only the shared aggregate state "
+                       "(run report / merged JSONL) is lock-protected.")
     p.add_argument("--judge", action="store_true",
                    help="After all videos, invoke m3.eval over the merged JSONL.")
     p.add_argument("--output-dir", default=None,
@@ -911,6 +1214,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         p.error("--selection-only requires --sample-size")
     if args.sample_size is not None and (args.videos or args.limit is not None):
         p.error("--sample-size cannot be combined with --videos or --limit")
+    if args.video_workers < 1:
+        p.error("--video-workers must be >= 1")
     return args
 
 
@@ -1011,65 +1316,56 @@ def main(argv: Iterable[str] | None = None) -> int:
         logger.error("config not found: %s", args.config)
         return 1
 
-    summaries: list[dict[str, Any]] = []
-    for video_id in subset:
-        declared = annotations[video_id].get("video_path", "")
-        video_path = resolve_video_path(
-            declared,
-            project_root=project_root,
-            videos_root=videos_root,
-        )
-        if video_path is None:
-            logger.error("[%s] cannot resolve video_path=%r under %s",
-                         video_id, declared, videos_root)
-            summaries.append({
-                "video_id": video_id,
-                "status": "failed",
-                "reason": "video_not_found",
-                "declared_video_path": declared,
-            })
-            continue
-        expected_qids = {
-            str(q.get("question_id"))
-            for q in load_questions_for_video(annotations, video_id)
-            if q.get("question_id") is not None
+    # WS 2.5: video-parallel run with incremental report refresh. After
+    # each video finishes (any completion order) the merged JSONL and
+    # run_report.json are rebuilt under the shared lock, so a crash
+    # mid-run leaves a consistent, resumable report at video granularity.
+    merged_jsonl = output_dir / "all_m3_qa_results.jsonl"
+    run_report_path = output_dir / "run_report.json"
+    run_report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _report_dict(summaries_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "annotations": str(annotations_path),
+            "pipeline": str(Path(args.pipeline).resolve()),
+            "seconds": args.seconds,
+            "graph_store": args.graph_store,
+            "subset": subset,
+            "sample": sample_manifest,
+            "per_video": [
+                summaries_map[vid] for vid in subset if vid in summaries_map
+            ],
+            "aggregate": aggregate_jsonl(subset, args.work_dir_root, merged_jsonl),
         }
-        try:
-            summary = run_one_video(
-                video_id=video_id,
-                video_path=video_path,
-                args=args,
-                annotations=annotations,
-                expected_qids=expected_qids,
-            )
-        except Exception as exc:  # pragma: no cover - top-level guard
-            logger.exception("[%s] driver raised: %s", video_id, exc)
-            summary = {
-                "video_id": video_id,
-                "status": "failed",
-                "reason": "driver_exception",
-                "error": str(exc),
-            }
-        summaries.append(summary)
+
+    summaries_map: dict[str, dict[str, Any]] = {}
+
+    def _on_video_done(summary: dict[str, Any]) -> None:
+        summaries_map[summary["video_id"]] = summary
+        run_report_path.write_text(
+            json.dumps(
+                _report_dict(summaries_map), ensure_ascii=False, indent=2
+            ),
+            encoding="utf-8",
+        )
+
+    summaries = run_videos(
+        subset=subset,
+        args=args,
+        annotations=annotations,
+        annotations_path=annotations_path,
+        project_root=project_root,
+        videos_root=videos_root,
+        # A dry run must not truncate existing aggregate results.
+        on_video_done=None if args.dry_run else _on_video_done,
+    )
 
     if args.dry_run:
         # Preview must not truncate existing aggregate results or run a judge.
         return 2 if any(s.get("status") == "failed" for s in summaries) else 0
 
-    merged_jsonl = output_dir / "all_m3_qa_results.jsonl"
     agg = aggregate_jsonl(subset, args.work_dir_root, merged_jsonl)
-    run_report_path = output_dir / "run_report.json"
-    run_report_path.parent.mkdir(parents=True, exist_ok=True)
-    report = {
-        "annotations": str(annotations_path),
-        "pipeline": str(Path(args.pipeline).resolve()),
-        "seconds": args.seconds,
-        "graph_store": args.graph_store,
-        "subset": subset,
-        "sample": sample_manifest,
-        "per_video": summaries,
-        "aggregate": agg,
-    }
+    report = _report_dict({s["video_id"]: s for s in summaries})
     run_report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -1089,21 +1385,25 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
 
     if args.judge and not args.dry_run:
-        judge_summary = run_judge(
-            annotations=annotations_path,
-            merged_jsonl=merged_jsonl,
-            output_dir=output_dir,
-            args=args,
-            subset=subset,
+        # WS 2.5: the live per-video judges already ran inside run_videos;
+        # the final _aggregate summary is a merge of their rows — no second
+        # judge pass.
+        judge_summary = merge_per_video_judges(
+            subset, args.work_dir_root, output_dir
         )
-        report["judge"] = judge_summary
+        report["judge"] = judge_summary or {
+            "status": "skipped",
+            "reason": "no_per_video_judges",
+        }
         run_report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
     failed = [s for s in summaries if s.get("status") == "failed"]
-    judge_failed = bool(report.get("judge", {}).get("returncode", 0))
+    judge_failed = any(
+        (s.get("judge") or {}).get("returncode", 0) != 0 for s in summaries
+    )
     report["status"] = "failed" if failed or judge_failed else "completed"
     run_report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8",
