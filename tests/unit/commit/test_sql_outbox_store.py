@@ -371,3 +371,27 @@ def test_only_dead_letters_are_reported_even_with_zero_active_total(mock_sql_out
     assert store.count_unfinished('acme') == {
         'pending': 0, 'processing': 0, 'total': 0, 'failed': 1,
     }
+
+
+def test_defer_preserves_retry_budget_and_uses_current_claim(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        "projection", "PROJECT_GRAPH", "ctx://acme/users/alice/memories/entities/item",
+        {"edge_id": "edge"}, "PROCESSING", retry_count=2,
+    )
+    claimed_at = datetime(2026, 11, 6, 10, 0, tzinfo=UTC)
+    scheduled_at = datetime(2026, 11, 6, 10, 1, tzinfo=UTC)
+    event._outbox_claim = ("worker", claimed_at)
+    cursor.rowcount = 1
+
+    store.defer(event, event.uri, scheduled_at)
+
+    sql, params = cursor.execute.call_args.args
+    assert "status = 'PENDING', next_retry_at = %s" in sql
+    assert "worker_id = NULL, locked_at = NULL" in sql
+    assert "AND status = 'PROCESSING' AND worker_id = %s AND locked_at = %s" in sql
+    assert params == (scheduled_at, event.event_id, event.uri, "worker", claimed_at)
+    assert (event.status, event.retry_count) == ("PENDING", 2)
+    assert event.next_retry_at == scheduled_at.isoformat()
+    assert event.payload == {"edge_id": "edge"}
+    conn.commit.assert_called_once()

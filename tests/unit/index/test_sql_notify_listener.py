@@ -35,6 +35,7 @@ def test_run_cycle_drains_ready_events_after_notification(monkeypatch):
     conn = FakeConn()
     conn.notifies = [object(), object()]
     store = Mock()
+    store.future_pending_delay.return_value = None
     worker = Mock()
     worker.run_once.side_effect = [
         _stats(processed=1, succeeded=1),
@@ -61,6 +62,7 @@ def test_run_cycle_drains_ready_events_after_notification(monkeypatch):
 def test_run_cycle_timeout_triggers_fallback_sweep(monkeypatch):
     conn = FakeConn()
     store = Mock()
+    store.future_pending_delay.return_value = None
     worker = Mock()
     worker.run_once.side_effect = [_stats(),]
     listener = SQLNotifyListener(store, worker, worker_id="worker-2")

@@ -65,6 +65,7 @@ class WorkerResult:
     records_upserted: int = 0
     error_message: str = ""
     moved_to_dlq: bool = False
+    deferred: bool = False
 
 
 @dataclass
@@ -138,7 +139,8 @@ class OutboxWorker:
                 return 0
             polled.add(account)
         store = self._edge_projection_store
-        if self._has_real_method(store, "has_due_work") and not store.has_due_work(account):
+        if self._has_real_method(store, "has_due_work") and not store.has_due_work(
+                account, profile=self._edge_projection_profile):
             return 0
         return store.drain_sync(account, self._embedder, self._edge_projection_profile)
 
@@ -234,7 +236,10 @@ class OutboxWorker:
                     raise ValueError("Missing graph projection account")
                 count = self._project_graph_account(resolved_ctx.account_id)
                 if self._edge_projection_store.unfinished(resolved_ctx.account_id,event.payload["edge_id"]):
-                    raise RuntimeError("Graph projection is pending; retain durable wakeup for retry")
+                    return WorkerResult(
+                        event_id=event.event_id, success=False,
+                        records_upserted=count, deferred=True,
+                    )
                 return WorkerResult(event_id=event.event_id,success=True,records_upserted=count)
             else:
                 logger.warning("Unknown event type: %s", event_type)
@@ -784,6 +789,12 @@ class OutboxWorker:
             stats["succeeded"] += 1
             return
 
+        if result.deferred:
+            next_retry_at = datetime.now(UTC) + self.calculate_backoff(0)
+            outbox_store.defer(event, node_uri, next_retry_at)
+            stats["deferred"] = stats.get("deferred", 0) + 1
+            return
+
         reason = str(result.error_message or "").strip()
         previous_reason = str(event.payload.get("failure_reason") or "").strip()
         if reason and (reason != "Max retry exceeded" or not previous_reason):
@@ -1243,6 +1254,13 @@ class OutboxWorker:
                 )
                 self._handle_processing_result(event, node_uri, outbox_store, failure, stats)
 
+    def excluded_event_types(self) -> list[str]:
+        """Events this worker leaves for a handler that can process them."""
+        excluded = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
+        if self._edge_projection_store is None:
+            excluded.append("PROJECT_GRAPH")
+        return excluded
+
     def run_once(
         self,
         outbox_store,
@@ -1278,11 +1296,7 @@ class OutboxWorker:
             Dict with counts: processed / succeeded / failed / moved_to_dlq / skipped
         """
         stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
-        excluded_types = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
-        if self._edge_projection_store is None:
-            # The durable wakeup is needed when graph is enabled again. Leave
-            # its status, retry budget and projection job untouched while off.
-            excluded_types.append("PROJECT_GRAPH")
+        excluded_types = self.excluded_event_types()
 
         # Fast path: SQL outbox with batch-claim support
         if self._supports_batch_claim(outbox_store):

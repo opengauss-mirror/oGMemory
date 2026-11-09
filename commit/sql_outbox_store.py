@@ -34,6 +34,17 @@ _PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS = 5
 _PROCESSING_LOCK_TIMEOUT_SECONDS = 5.0
 _PROCESSING_LOCK_POLL_SECONDS = 0.05
 _PROCESSING_CONNECTIONS = ContextVar("sql_outbox_processing_connections", default=None)
+_NO_UNFINISHED_PREDECESSOR = """
+    NOT EXISTS (
+        SELECT 1 FROM outbox_events AS earlier
+        WHERE earlier.account_id = candidate.account_id
+          AND earlier.uri = candidate.uri
+          AND earlier.seq < candidate.seq
+          AND earlier.status IN ('PENDING', 'PROCESSING')
+          AND earlier.event_type <> ALL(%s)
+          AND (earlier.event_type <> 'PROJECT_GRAPH' OR candidate.event_type = 'PROJECT_GRAPH')
+    )
+"""
 
 
 def _uri_processing_lock_key(uri: str) -> int:
@@ -355,6 +366,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         return event
 
     def list_pending(self, account_id: str) -> list[tuple[str, OutboxEvent]]:
+        """Discover due events and claims whose five-minute lease elapsed."""
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -364,17 +376,60 @@ class SQLOutboxStore(PoolAdapterMixin):
                            retry_count, created_at, next_retry_at
                     FROM outbox_events
                     WHERE account_id = %s
-                      AND status = 'PENDING'
-                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                      AND (
+                          (status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+                          OR (status = 'PROCESSING' AND locked_at < NOW() - INTERVAL '5 minutes')
+                      )
                     ORDER BY created_at ASC
                     """,
                     (account_id,),
                 )
                 rows = cur.fetchall()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             self._return_connection(conn)
 
         return [self._row_to_event(row) for row in rows]
+
+    def future_pending_delay(
+        self, account_ids: list[str] | None, *, exclude_event_types: list[str] | None = None,
+    ) -> float | None:
+        """Find the next retry. None scans all accounts and includes overdue retries."""
+        if account_ids == []:
+            return None
+        excluded = exclude_event_types or []
+        params = (excluded,)
+        if account_ids is None:
+            paused_projections = ["PROJECT_GRAPH"] if "PROJECT_GRAPH" in excluded else []
+            scope = f"AND {_NO_UNFINISHED_PREDECESSOR}"
+            params += (paused_projections,)
+        else:
+            scope = "AND candidate.account_id = ANY(%s) AND candidate.next_retry_at > NOW()"
+            params += (account_ids,)
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT EXTRACT(EPOCH FROM (MIN(candidate.next_retry_at) - NOW()))
+                    FROM outbox_events AS candidate
+                    WHERE candidate.status = 'PENDING' AND candidate.next_retry_at IS NOT NULL
+                      AND candidate.event_type <> ALL(%s)
+                      {scope}
+                    """,
+                    params,
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return float(row[0]) if row and row[0] is not None else None
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
 
     def list_pending_events(self, references) -> list[tuple[str, OutboxEvent]]:
         """Load requested events and their unfinished per-URI predecessors."""
@@ -501,7 +556,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         exclude_event_types: list[str] | None = None,
         event_ids: list[str] | None = None,
     ) -> list[tuple[str, OutboxEvent]]:
-        """Claim supported ready events before the batch limit, preserving per-URI order."""
+        """Claim ready work with ordered node and revision-fenced graph lanes."""
         excluded = exclude_event_types or []
         # Graph wakeups represent an independent, revision-fenced projection.
         # Pausing them must not hold up ordinary indexing for the same URI.
@@ -539,15 +594,7 @@ class SQLOutboxStore(PoolAdapterMixin):
                               AND candidate.event_id <> ALL(%s)
                               AND candidate.event_type <> ALL(%s)
                               {scope}
-                              AND NOT EXISTS (
-                                    SELECT 1
-                                    FROM outbox_events AS earlier
-                                    WHERE earlier.account_id = candidate.account_id
-                                      AND earlier.uri = candidate.uri
-                                      AND earlier.seq < candidate.seq
-                                      AND earlier.status IN ('PENDING', 'PROCESSING')
-                                      AND earlier.event_type <> ALL(%s)
-                                  )
+                              AND {_NO_UNFINISHED_PREDECESSOR}
                             ORDER BY candidate.seq ASC NULLS LAST,
                                      candidate.created_at ASC
                             FOR UPDATE OF candidate SKIP LOCKED
@@ -842,6 +889,33 @@ class SQLOutboxStore(PoolAdapterMixin):
             event.status = "PENDING"
             if next_retry_at:
                 event.next_retry_at = next_retry_at.isoformat()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
+    def defer(
+        self,
+        event: OutboxEvent,
+        node_uri: str,
+        next_retry_at: datetime,
+    ) -> None:
+        """Reschedule an owned wakeup while its projection is progressing."""
+        ownership, claim = self._claim_filter(event)
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE outbox_events SET status = 'PENDING', next_retry_at = %s, "
+                    "worker_id = NULL, locked_at = NULL "
+                    "WHERE event_id = %s AND uri = %s" + ownership,
+                    (next_retry_at, event.event_id, node_uri, *claim),
+                )
+                self._check_claim_update(cur, event, node_uri)
+            conn.commit()
+            event.status = "PENDING"
+            event.next_retry_at = next_retry_at.isoformat()
         except Exception:
             conn.rollback()
             raise

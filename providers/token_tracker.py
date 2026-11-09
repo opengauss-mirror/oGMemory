@@ -131,12 +131,14 @@ def distributed_usage_scope(weights, *, inputs=None):
 
 
 @contextmanager
-def embedding_input_scope(indices):
+def embedding_input_scope(indices, *, weights=None):
     inputs = _embedding_inputs.get()
     if inputs is None:
         yield
         return
     selected = [inputs[i] for i in indices]
+    if weights is not None:
+        selected = [(item[0], weight) for item, weight in zip(selected, weights, strict=True)]
     with distributed_usage_scope(embedding_scope_weights(selected), inputs=selected):
         yield
 

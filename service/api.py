@@ -9,6 +9,7 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 
 import threading
 import uuid
+from contextlib import nullcontext
 from dataclasses import replace
 from providers.llm_observation import correlate_extraction_calls
 
@@ -296,9 +297,16 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         from extraction.relation_proposals import take
         extraction_proposals = take(deduplicated)
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
-        plans = (self._write_checkpointed_candidates(
-                     deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
-                 if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
+        graph_batch = nullcontext()
+        if self._graph_enabled:
+            from fs.sql_adapter.session_mutation import active_session_guard
+            from providers.relation_store.projection_batch import graph_projection_batch
+
+            graph_batch = graph_projection_batch(active_session_guard())
+        with graph_batch:
+            plans = (self._write_checkpointed_candidates(
+                         deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
+                     if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
 
         graph_diagnostics = None
         if self._graph_enabled:
