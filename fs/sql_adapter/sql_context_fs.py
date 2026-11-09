@@ -82,6 +82,15 @@ _SESSION_HISTORY_PATTERN = re.compile(
 _SESSION_STATE_PATTERN = re.compile(
     r"^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$"
 )
+_SESSION_STAGE_PATTERN = re.compile(
+    r"^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/stage_results/(?P<stage_id>[0-9a-f]{64})$"
+)
+_READ_NODE_SQL = (
+    "SELECT uri, context_type, category, level, owner_space, "
+    "abstract, overview, content, relations, metadata, "
+    "status, created_at, updated_at, version "
+    "FROM context_nodes WHERE account_id=%s"
+)
 
 
 def parse_uri(uri: str) -> dict:
@@ -210,6 +219,12 @@ def parse_uri(uri: str) -> dict:
             "category": "history",
             "slug": "",
         }
+
+    match = _SESSION_STAGE_PATTERN.fullmatch(uri)
+    if match:
+        g = match.groupdict()
+        return {"account": g["account"], "owner_type": "sessions", "owner_id": g["session_id"],
+                "category": "stage_result", "slug": g["stage_id"]}
 
     match = _SESSION_STATE_PATTERN.match(uri)
     if match:
@@ -1008,13 +1023,46 @@ class SQLContextFS(PoolAdapterMixin):
         """Read canonical evidence inside the caller's tenant-bound transaction."""
         cls._ensure_accessible(uri, ctx)
         cursor.execute(
-            "SELECT uri, context_type, category, level, owner_space, "
-            "abstract, overview, content, relations, metadata, "
-            "status, created_at, updated_at, version "
-            "FROM context_nodes WHERE account_id=%s AND uri=%s",
+            _READ_NODE_SQL + " AND uri=%s",
             (ctx.account_id, uri),
         )
-        row = cursor.fetchone()
+        return cls._decode_node(uri, cursor.fetchone())
+
+    def read_nodes(
+        self, uris: list[str], ctx: RequestContext,
+    ) -> dict[str, ContextNode | Exception]:
+        """Read canonical nodes in one tenant-bound transaction."""
+        results = {}
+        allowed = []
+        for uri in dict.fromkeys(uris):
+            try:
+                self._ensure_accessible(uri, ctx)
+            except Exception as exc:
+                results[uri] = exc
+            else:
+                allowed.append(uri)
+        if not allowed:
+            return results
+
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(_READ_NODE_SQL + " AND uri = ANY(%s)", (ctx.account_id, allowed))
+                rows = {row[0]: row for row in cur.fetchall()}
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        for uri in allowed:
+            try:
+                results[uri] = self._decode_node(uri, rows.get(uri))
+            except Exception as exc:
+                results[uri] = exc
+        return results
+
+    @staticmethod
+    def _decode_node(uri: str, row) -> ContextNode:
         if row is None:
             raise NodeNotFoundError(uri)
 

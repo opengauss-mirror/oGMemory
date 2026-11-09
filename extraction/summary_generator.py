@@ -24,11 +24,11 @@ SUMMARY_SCHEMA = {
     "properties": {
         "events_with_dates": {
             "type": "string",
-            "description": "Events with absolute dates: [date] description. One per line.",
+            "description": "Events with source-supported year, month, day or range precision: [time] description. Keep ambiguous periods with their session anchor, plus stated status and uncertainty. One per line.",
         },
         "facts_and_details": {
             "type": "string",
-            "description": "Specific facts: names, items, locations, numbers mentioned.",
+            "description": "Specific facts and item details: exact names, book/movie titles, artists, objects, locations and numbers. Each fact appears once.",
         },
         "preferences": {
             "type": "string",
@@ -41,10 +41,6 @@ SUMMARY_SCHEMA = {
         "emotional_reactions": {
             "type": "string",
             "description": "How participants felt about events or topics.",
-        },
-        "key_details": {
-            "type": "string",
-            "description": "Items, books, movies, music, places mentioned with specifics.",
         },
     },
     "required": [
@@ -59,19 +55,27 @@ SUMMARY_PROMPT = """\
 Summarize this conversation, preserving ALL specific details that someone might ask about later.
 Session date: {session_time}. Participants: {participants}
 
-IMPORTANT: Convert ALL relative times to absolute dates using the session date.
-For example: "last weekend" → calculate from session date, "next month" → session month + 1.
+IMPORTANT: Resolve relative times using the session date, preserving the source's year, month,
+day or range precision. Use a specific day only when the source supports that day.
+Resolve relative years to calendar years (YYYY), and relative months to calendar months (YYYY-MM).
+Resolve day-relative expressions such as yesterday against the session date (YYYY-MM-DD).
+Weeks and weekends denote time ranges. Resolve last week or last weekend to a range only when
+the source and context establish its boundaries; otherwise retain the original expression
+together with the session-date anchor. Keep explicit dates and ranges at their stated precision.
+Preserve approximate or unresolved times and their stated uncertainty.
+Retain each event's planned, attempted, ongoing or completed status and qualifications such as
+"tried to", "might" and "plans to" in every section that mentions it.
 
 Return a JSON object with these fields:
 
-- "events_with_dates": Events with absolute dates. Format: "[YYYY-MM-DD] description". One per line.
-- "facts_and_details": Specific facts about people, things, places. Include exact names, titles, numbers.
+- "events_with_dates": Events at the source-supported precision. Format: "[YYYY] description", "[YYYY-MM] description", "[YYYY-MM-DD] description", or "[start to end] description". Keep uncertain times as stated. One per line.
+- "facts_and_details": Specific facts about people, things and places, including books, movies, music, artists, items bought and places visited. Preserve every exact name, title and number here.
 - "preferences": What participants like, dislike, or feel strongly about.
 - "plans_and_intentions": Future plans, goals, or things they intend to do.
 - "emotional_reactions": How participants felt about specific events or topics.
-- "key_details": Lists of specific items: books (with titles), music (with artist names), items bought, places visited, etc.
 
 BE EXHAUSTIVE — include every specific detail, name, title, and number. Do not summarize away details.
+Assign each fact to its most specific section exactly once, retaining its names, dates and qualifiers together.
 
 Conversation:
 {conversation}"""

@@ -31,5 +31,5 @@ def test_nonempty_summary_is_written_unchanged():
         generator.format_summary.return_value = "Source summary"
         service._generate_and_write_summary([{"role": "user", "content": "source"}],
             None, ctx, "source-session", writer)
-        assert generator.build_candidate.call_args.kwargs["formatted_text"] == "Source summary"
+        assert generator.build_candidate.call_args.args[1] == "Source summary"
         writer.write_memory.assert_called_once_with(generator.build_candidate.return_value, ctx)

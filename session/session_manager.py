@@ -1666,6 +1666,8 @@ class SessionManager:
         wait: bool = True,
         archive_id: str | None = None,
         archive_checkpoint=None,
+        compression_work=None,
+        compression_checkpoint=None,
     ) -> dict:
         """Archive a fixed message snapshot without reading/clearing live buffer."""
         sql_mutation = self._require_sql_mutation(ctx)
@@ -1697,6 +1699,9 @@ class SessionManager:
         if wait:
             try:
                 self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx,
+                                       **({"compression_work": compression_work,
+                                           "compression_checkpoint": compression_checkpoint}
+                                          if compression_work is not None or compression_checkpoint is not None else {}),
                                        **({"archive_checkpoint": archive_checkpoint}
                                           if archive_checkpoint is not None else {}))
             except Exception as exc:
@@ -1730,6 +1735,9 @@ class SessionManager:
         def _commit_snapshot_thread():
             try:
                 self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx,
+                                       **({"compression_work": compression_work,
+                                           "compression_checkpoint": compression_checkpoint}
+                                          if compression_work is not None or compression_checkpoint is not None else {}),
                                        **({"archive_checkpoint": archive_checkpoint}
                                           if archive_checkpoint is not None else {}))
             except Exception as exc:
@@ -1781,6 +1789,8 @@ class SessionManager:
         skip_extraction: bool = False,
         session_time=None,
         archive_checkpoint=None,
+        compression_work=None,
+        compression_checkpoint=None,
     ) -> None:
         """Background work: compress → write archive.
 
@@ -1806,9 +1816,9 @@ class SessionManager:
             from session.compressor import SessionCompressor
             overview, abstract = SessionCompressor(llm=None).compress(messages_dicts)
         else:
-            prev_overview, prev_abstract = self._get_latest_archive_context(session_id, ctx)
-            overview, abstract = self._compress(
-                messages_dicts, prev_overview=prev_overview, prev_abstract=prev_abstract)
+            overview, abstract = self._resolve_archive_compression(
+                messages_dicts, session_id, ctx, compression_work,
+                compression_checkpoint or archive_checkpoint, archive_id=archive_id)
         archive_metadata: dict = {}
         if recovery_reason:
             archive_metadata.update(memory_extraction_degraded=True,
@@ -1884,6 +1894,92 @@ class SessionManager:
         else:
             store = None
         return store.read_archive(session_id, archive_id, ctx) if store is not None else None
+
+    def _archive_compression_llm(self):
+        try:
+            return self._get_llm() if self._get_llm is not None else None
+        except Exception as exc:
+            logger.warning("LLM compress initialization failed, using fallback: %s", exc)
+            return None
+
+    def _archive_compression_inputs(self, messages, session_id, ctx, llm, archive_id=""):
+        from core.model_stage import model_signature
+        from session.compressor import SessionCompressor
+
+        previous = (self._get_latest_archive_context(session_id, ctx, archive_id)
+                    if archive_id else self._get_latest_archive_context(session_id, ctx))
+        prompt, schema = SessionCompressor.compression_request(messages, *previous)
+        return {"messages": deepcopy(messages), "archive_id": archive_id,
+                "prev_overview": previous[0],
+                "prev_abstract": previous[1], "prompt": prompt, "schema": schema,
+                "model": model_signature(llm), "version": 1}
+
+    @staticmethod
+    def _compute_archive_compression(inputs, llm):
+        from session.compressor import SessionCompressor
+
+        return SessionCompressor(llm=llm).compress(
+            inputs["messages"], inputs["prev_overview"], inputs["prev_abstract"])
+
+    @contextmanager
+    def parallel_archive_compression(self, snapshot, session_id, ctx, checkpoint=None, archive_id=""):
+        """Freeze archive inputs on the owner and overlap pure compression."""
+        from concurrent.futures import ThreadPoolExecutor
+        from contextvars import copy_context
+        from service.extraction_retry import source_only_reason
+        from core.model_stage import stage_collector_scope, wait_model_result
+
+        if source_only_reason():
+            yield None
+            return
+        llm = self._archive_compression_llm()
+        messages = [{"role": m.role, "content": m.content, "id": m.id,
+                     "created_at": m.created_at} for m in snapshot]
+        archive_id = checkpoint.batch["archive_id"] if checkpoint is not None else archive_id
+        inputs = self._archive_compression_inputs(messages, session_id, ctx, llm, archive_id)
+        cached = checkpoint.load_stage("history_archive", inputs) if checkpoint else None
+        work = {"inputs": inputs, "llm": llm, "result": cached}
+        if cached is not None:
+            yield work
+            return
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="history-archive") as pool:
+            future = pool.submit(copy_context().run, self._compute_archive_compression, inputs, llm)
+
+            def collect():
+                if work["result"] is None and future.done():
+                    overview, abstract = future.result()
+                    result = {"overview": overview, "abstract": abstract}
+                    if checkpoint is not None:
+                        checkpoint.save_stage("history_archive", inputs, result)
+                    work["result"] = result
+
+            with stage_collector_scope(collect):
+                try:
+                    yield work
+                finally:
+                    wait_model_result(future)
+                    collect()
+
+    def _resolve_archive_compression(self, messages, session_id, ctx, work, checkpoint, archive_id=""):
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            guard.ensure_owned()
+        if work is None and checkpoint is None:
+            previous = self._get_latest_archive_context(session_id, ctx)
+            return self._compress(messages, prev_overview=previous[0], prev_abstract=previous[1])
+        llm = work["llm"] if work is not None else self._archive_compression_llm()
+        archive_id = checkpoint.batch["archive_id"] if checkpoint is not None else archive_id
+        inputs = self._archive_compression_inputs(messages, session_id, ctx, llm, archive_id)
+        result = work["result"] if work is not None and work["inputs"] == inputs else None
+        if result is None and checkpoint is not None:
+            result = checkpoint.load_stage("history_archive", inputs)
+        if result is None:
+            overview, abstract = self._compute_archive_compression(inputs, llm)
+            result = {"overview": overview, "abstract": abstract}
+            if checkpoint is not None:
+                checkpoint.save_stage("history_archive", inputs, result)
+        return result["overview"], result["abstract"]
 
     def _compress(
         self,
@@ -1996,7 +2092,7 @@ class SessionManager:
         }
 
     def _get_latest_archive_context(
-        self, session_id: str, ctx: RequestContext,
+        self, session_id: str, ctx: RequestContext, exclude_archive_id: str = "",
     ) -> tuple[str, str]:
         """Fetch overview and abstract from the most recent archive for fusion.
 
@@ -2004,6 +2100,7 @@ class SessionManager:
             (prev_overview, prev_abstract) — empty strings if none found.
         """
         def _latest_from_entries(entries) -> tuple[str, str]:
+            entries = [entry for entry in entries if entry.archive_id != exclude_archive_id]
             if not entries:
                 return "", ""
             entries.sort(key=lambda e: e.created_at or "", reverse=True)

@@ -101,8 +101,8 @@ def test_agfs_after_turn_drains_its_persisted_memory_events(monkeypatch):
     monkeypatch.setattr(service, "_get_archive_store", lambda: SessionArchiveStore(fs))
     monkeypatch.setattr(service, "_get_shared_projection_index", lambda: index)
     monkeypatch.setattr(service, "_get_shared_embedder", lambda: MockEmbedder(16))
-    monkeypatch.setattr("extraction.summary_generator.SessionSummaryGenerator.generate",
-                        lambda *args, **kwargs: {"facts_and_details": "The receiver was repaired."})
+    monkeypatch.setattr(service, "_generate_summary_candidate", lambda *args: memory(
+        "summary", category="session_summary", content="The receiver was repaired."))
     manager = service.get_session_manager()
     monkeypatch.setattr(manager, "_compress", lambda *args, **kwargs: (
         "The receiver was repaired.", "Receiver repair."))

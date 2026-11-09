@@ -193,6 +193,8 @@ class CandidateMemory:
     source_contexts: list[str] = field(default_factory=list)  # Internal complete extraction-span evidence.
     node_draft_indices: list[int] = field(default_factory=list)  # Contributors in the durable draft checkpoint.
     metadata: dict[str, Any] = field(default_factory=dict)
+    node_reconciliation_role: str = "primary"  # Internal primary or related node decision.
+    node_reconciliation_group: str = ""  # Source-bound group accepted before its first write.
 
 
 class WriteAction:

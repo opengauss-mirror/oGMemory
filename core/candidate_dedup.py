@@ -14,6 +14,8 @@ def candidate_draft_fields(candidate: CandidateMemory) -> dict:
     metadata = dict(fields.get("metadata") or {})
     metadata.pop(KEY, None)
     fields["metadata"] = metadata
+    fields.pop("node_reconciliation_role", None)
+    fields.pop("node_reconciliation_group", None)
     for name in ("source_occurrence_id", "source_contexts", "node_draft_indices", "metadata"):
         if not fields.get(name):
             fields.pop(name, None)

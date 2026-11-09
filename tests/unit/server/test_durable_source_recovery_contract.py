@@ -8,10 +8,14 @@ from unittest.mock import Mock
 import pytest
 
 from core.write_contract import write_request_contract
+from commit.outbox_store import OutboxStore
+from index.outbox_worker import OutboxWorker
+from providers.embedder.mock_embedder import MockEmbedder
+from providers.vector_index.in_memory_index import InMemoryVectorIndex
 from service.extraction_checkpoint import EXTENSION_KEY, ExtractionBatchJournal
 from service.extraction_retry import retry_failed_source
 from tests.unit.commit.test_memory_identity import MemoryFS
-from tests.unit.commit.test_request_outbox_events import request_context
+from tests.unit.commit.test_request_outbox_events import CountingAGFSClient, request_context
 from tests.unit.server.test_extraction_batch_recovery import nodes, params, setup_service
 
 
@@ -21,7 +25,8 @@ from tests.unit.server.test_extraction_batch_recovery import nodes, params, setu
 def test_checkpointed_source_is_acknowledged_and_completes(background, registered):
     fs = MemoryFS()
     ctx = request_context("durable-recovery-contract")
-    service, writer, manager = setup_service(fs, ctx)
+    store = OutboxStore(CountingAGFSClient(), fs)
+    service, writer, manager = setup_service(fs, ctx, outbox=store)
     service._extraction_retry.wake = Mock()
     request = params(ctx)
     if background is not None:
@@ -58,6 +63,12 @@ def test_checkpointed_source_is_acknowledged_and_completes(background, registere
 
     journal.mutate(lambda batch: batch["retry_task"].update(next_attempt_at=0))
     assert service._extraction_retry.run_once(ctx, "durable-source") is None
+    final = service.get_write_request_status(request)
+    references = [tuple(item) for item in final["outbox_events"]]
+    stats = OutboxWorker(InMemoryVectorIndex(dimension=16), MockEmbedder(16),
+                        fs=fs, directory_summary_enabled=False).run_once(
+        store, [ctx.account_id], pending_events=store.list_pending_events(references))
+    assert stats["succeeded"] == len(references)
     final = service.get_write_request_status(request)
     assert final["request_status"] == "SUCCEEDED"
     assert final["source_status"] == "ARCHIVED" and final["semantic_status"] == "COMPLETE"

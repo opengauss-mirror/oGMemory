@@ -6,6 +6,7 @@ import extraction.occurrence_qualification as qualification
 
 from core.errors import ExtractionIncompleteError
 from extraction.occurrence_qualification import prompt_fits
+from extraction.tool_builder import build_update_instruction
 from extraction.tools import Extractor
 from tests.unit.extraction.test_lazy_fallback_budget import SOURCE, setup
 
@@ -28,7 +29,7 @@ def test_complete_source_and_identity_survive_optional_example_elision(monkeypat
     assert prompt.endswith(conversation)
     assert prompt_fits(prompt, {"tools": extractor._extraction_tools})
     assert extractor._prompt_manager.render("extraction", "examples") not in prompt
-    assert extractor._update_instruction in prompt
+    assert build_update_instruction(extractor._schema_registry) in prompt
     assert extractor._prompt_manager.render("extraction", "identity_block", user_id=ctx.user_id) in prompt
     assert len(extractor._structure_span_lazy(span, prompt, ctx)) == 1
     assert conversation in llm.calls[0]["prompt"]

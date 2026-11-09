@@ -12,7 +12,8 @@ def test_empty_graph_metadata_preserves_pre_graph_operation_digest():
     ctx=RequestContext('acct','user','agent','session','trace')
     legacy=asdict(candidate)
     for key in ('metadata','write_operation_id','verified_routing_aliases','verified_object_aliases',
-                'source_contexts','node_draft_indices','source_occurrence_id'):
+                'source_contexts','node_draft_indices','source_occurrence_id',
+                'node_reconciliation_role','node_reconciliation_group'):
         legacy.pop(key)
     evidence=dict(candidate=legacy,account_id=ctx.account_id,user_id=ctx.user_id,
                   agent_id=ctx.agent_id,session_id=ctx.session_id)

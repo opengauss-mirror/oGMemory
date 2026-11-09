@@ -12,6 +12,7 @@ from retrieval.identity import canonical_uri
 from core.uri_parser import strip_l2_suffix
 
 logger = logging.getLogger(__name__)
+_READ_ERRORS = (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError)
 
 
 def canonical_agent_node(node):
@@ -83,21 +84,59 @@ class ContextReader:
         try:
             # Strip file suffix from L2 URIs (e.g. "/content.md") — read_node
             # expects the directory URI, not the file URI stored in the vector index.
-            read_uri = uri
-            if read_uri.endswith("/content.md"):
-                read_uri = read_uri[: -len("/content.md")]
-            node = self._fs.read_node(read_uri, ctx)
-        except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
+            node = self._fs.read_node(uri.removesuffix("/content.md"), ctx)
+        except _READ_ERRORS:
             raise
         except Exception as exc:
             logger.warning("[ContextReader] read_node failed for %s: %s", uri, exc, exc_info=True)
             return block
 
-        if unit_key is not None:
-            node = project_memory_unit(node, unit_key)
-        else:
-            node = canonical_agent_node(node)
+        return self._project(uri, node, unit_key)
 
+    def read_many(
+        self, requests: list[tuple[str, str | None]], ctx: RequestContext,
+    ) -> dict[tuple[str, str | None], RetrievedBlock | Exception]:
+        results = {}
+        read_nodes = getattr(self._fs, "read_nodes", None)
+        if self._storage_backend == "sql" and callable(read_nodes):
+            read_uris = {}
+            for uri, unit_key in requests:
+                key = (uri, unit_key)
+                try:
+                    self._check_acl(uri, ctx)
+                    read_uris[key] = uri.removesuffix("/content.md")
+                except Exception as exc:
+                    results[key] = exc
+            if not read_uris:
+                return results
+            try:
+                nodes = read_nodes(list(dict.fromkeys(read_uris.values())), ctx)
+            except Exception as exc:
+                logger.warning("[ContextReader] read_nodes failed: %s", exc)
+            else:
+                for (uri, unit_key), read_uri in read_uris.items():
+                    try:
+                        node = nodes[read_uri]
+                        if isinstance(node, _READ_ERRORS):
+                            raise node
+                        if isinstance(node, Exception):
+                            logger.warning("[ContextReader] read_node failed for %s: %s", uri, node)
+                            results[uri, unit_key] = RetrievedBlock(uri=uri, level_hit="L2")
+                        else:
+                            results[uri, unit_key] = self._project(uri, node, unit_key)
+                    except Exception as exc:
+                        results[uri, unit_key] = exc
+                return results
+
+        for uri, unit_key in requests:
+            try:
+                results[uri, unit_key] = self.read(uri, ctx, unit_key=unit_key)
+            except Exception as exc:
+                results[uri, unit_key] = exc
+        return results
+
+    def _project(self, uri, node, unit_key):
+        node = project_memory_unit(node, unit_key) if unit_key is not None else canonical_agent_node(node)
         return self._hydrate(uri, node)
 
     @staticmethod

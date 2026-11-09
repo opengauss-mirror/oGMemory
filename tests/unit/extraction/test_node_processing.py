@@ -37,7 +37,8 @@ class NodeLLM:
 
     def complete_with_tools(self, **kwargs):
         self.calls.append(kwargs)
-        return [{"tool": "process_memory_nodes", "input": {"operations": self.decide(kwargs)}}]
+        return [{"tool": "process_memory_nodes", "input": {
+            "operations": self.decide(kwargs), "related_reconciliations": []}}]
 
 
 def setup(decide, mode="eager"):

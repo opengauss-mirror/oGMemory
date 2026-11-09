@@ -75,6 +75,8 @@ _FORBIDDEN_WRITE_FIELDS = {
     "verified_object_aliases",
     "source_contexts",
     "node_draft_indices",
+    "node_reconciliation_group",
+    "node_reconciliation_role",
 }
 _WRITE_ARGUMENT_FIELDS = {
     "session_id", "text", "messages", "agent_id", "client_request_id", "force_extract", "wait",
@@ -1076,7 +1078,7 @@ def query_memory(
 
     if use_scene is not None and not isinstance(use_scene, bool):
         raise ValueError("use_scene must be boolean")
-    requested_types = types or []
+    requested_types = list(dict.fromkeys(types or MEMORY_TYPES))
     unknown = sorted(t for t in requested_types if t not in MEMORY_TYPES)
     if unknown:
         raise ValueError(f"Unknown memory types: {', '.join(unknown)}")
@@ -1100,7 +1102,7 @@ def query_memory(
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
     )
-    categories = [MEMORY_TYPES[t].internal_category for t in requested_types] or None
+    categories = list(dict.fromkeys(MEMORY_TYPES[t].internal_category for t in requested_types))
     search_top_k = _internal_search_top_k(service, query, top_k)
     type_filters = {}
     if categories and any(
@@ -1119,6 +1121,7 @@ def query_memory(
                         query.strip(),
                         ctx,
                         top_k=search_top_k,
+                        final_top_k=top_k,
                         categories=categories,
                         score_threshold=score_threshold,
                         include_debug=False,
@@ -2097,6 +2100,7 @@ def write_memory(
         **{key: result[key] for key in PUBLIC_FIELDS if key in result},
     }
 
+
 def get_write_request_status(service, *, session_id, client_request_id, agent_id=None,
                              transport_headers=None, allow_stdio_env_auth=True,
                              resolved_identity=None, request_context=None):
@@ -2106,7 +2110,6 @@ def get_write_request_status(service, *, session_id, client_request_id, agent_id
         resolved_identity=resolved_identity)
     return service.get_write_request_status({"sessionId": session_id,
         "clientRequestId": client_request_id, "_ctx": ctx})
-
 
 
 def validate_write_arguments(arguments: Mapping[str, Any]) -> None:

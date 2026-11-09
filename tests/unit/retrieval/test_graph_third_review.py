@@ -18,6 +18,7 @@ from retrieval.context_reader import ContextReader
 from retrieval.graph_retriever import OneHopRetriever
 from retrieval.graph_supplement import GraphSupplement
 from retrieval.pipeline import RetrievalPipeline
+from retrieval.query_planner import QueryPlanner
 from retrieval.result_ranker import ResultRanker
 from retrieval.seed_retriever import SeedRetriever
 from service.api import ReadAPI
@@ -148,6 +149,29 @@ def test_one_hop_unchanged_projection_keeps_score_reason_and_content():
     assert added.score == 1.
     assert added.content_excerpt == "Original canonical body"
     assert added.metadata["graph_explanation"] == "Old revision-one relationship"
+
+
+def test_all_memories_keeps_skill_hits_and_expands_only_memory_seeds():
+    fs, reader, graph, lane, embedder, (anchor, neighbor, second_hop) = components()
+    skill = "ctx://acct/agents/agent/skills/deploy"
+    fs.nodes[skill] = node(skill, context_type="SKILL")
+    pipe = pipeline(reader, graph, lane, embedder, anchor)
+    pipe._run_planner = RetrievalPipeline._run_planner.__get__(pipe)
+    pipe.planner = QueryPlanner(pipe.cfg)
+    pipe._run_expand.side_effect = lambda tq, *args, **kwargs: (
+        [LeafHit(anchor, .8, category="entity")] if tq.context_type == "MEMORY" else
+        [LeafHit(skill, .95, category="tool")] if not tq.categories else []
+    )
+    request = {"hints": {"include_all_memories": True}, "collect_graph_supplement": True,
+               "include_debug": True, "fill_content_for_top_k": 5}
+    result = ReadAPI(pipe).search_memory("fact", CTX, **request)
+    hits = {hit.uri: hit for hit in result.hits}
+    supplement = (result.trace.graph_expansion or {}).get("two_hop_supplement", {})
+    selected = {row["uri"] for row in supplement.get("selected", [])}
+    print(f"request={request}; hits={list(hits)}; two_hop={sorted(selected)}")
+    assert {anchor, neighbor, skill} <= hits.keys()
+    assert hits[neighbor].metadata["graph_anchor_uri"] == anchor
+    assert second_hop in selected
 
 
 def test_explicit_memory_search_rejects_skill_results_and_skill_bridge():

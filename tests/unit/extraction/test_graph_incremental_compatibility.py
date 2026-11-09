@@ -7,7 +7,7 @@ from core.errors import ToolCallProtocolError
 from extraction import Extractor
 from extraction.extraction_react_loop import ExtractionReActLoop
 from extraction.schemas.registry import SchemaRegistry
-from extraction.tool_builder import build_extraction_tools, parse_tool_call
+from extraction.tool_builder import build_extraction_tools, build_update_instruction, parse_tool_call
 from tests.unit.extraction.test_incremental_edit_flow import profile_read, profile_update
 from tests.unit.extraction.test_relation_proposals import PROPOSAL
 
@@ -49,5 +49,5 @@ def test_graph_eager_prompt_keeps_relationship_guidance_and_dev_update_contract(
     graph=Extractor(Mock(),activation_enabled=True)
     prompt=graph._build_prompt('English','Source conversation')
     assert graph._prompt_manager.render('extraction_graph','lazy_tools_instruction') in prompt
-    assert graph._update_instruction in prompt
+    assert build_update_instruction(graph._schema_registry) in prompt
     assert 'Source conversation' in prompt

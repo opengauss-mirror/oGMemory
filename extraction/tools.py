@@ -19,9 +19,10 @@ import re
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from contextvars import copy_context
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from itertools import islice
 from typing import TYPE_CHECKING, Any, Optional
@@ -37,7 +38,7 @@ from core.candidate_dedup import (
     normalize_same_span_occurrence_runs,
 )
 from core.errors import (
-    ExtractionIncompleteError,
+    ExtractionBudgetError,
     LLMCallError,
     LLMOutputTruncatedError,
     OperationDeadlineExceededError,
@@ -54,6 +55,7 @@ from core.validation import (
     validate_attribution,
     validate_candidate,
 )
+from core.model_stage import run_model_call
 from extraction.event_reconciliation import reconcile_event_drafts
 from extraction.incremental_edit import (
     INCREMENTAL_TOOLS,
@@ -83,6 +85,44 @@ from extraction.tool_builder import (
     validate_read_target,
 )
 from providers.llm_observation import observe_call
+
+_EXTRACTION_RUNTIME = ContextVar("extraction_runtime", default=None)
+
+
+class ExtractionRuntime:
+    """Keep source drafts and storage work on the committing owner thread."""
+    def __init__(self, checkpoint=None):
+        self.checkpoint = checkpoint
+        self.entries = []
+        self.deferred = True
+
+    @contextmanager
+    def activate(self):
+        token = _EXTRACTION_RUNTIME.set(self)
+        try:
+            yield self
+        finally:
+            _EXTRACTION_RUNTIME.reset(token)
+
+    def reconcile(self, messages, ctx, archive_id):
+        from extraction.source_attribution import route_source_preferences
+        self.deferred = False
+        batches = {}
+        with self.activate():
+            for extractor, prepared, candidates, source, reads in self.entries:
+                candidates = route_source_preferences(candidates, messages, ctx, extractor._schema_registry)
+                candidates = [validate_candidate(validate_attribution(c, user_id=ctx.user_id))
+                              for c in candidates if c.confidence >= _CONFIDENCE_THRESHOLD]
+                candidates = [c for c in candidates if c.category not in {"entity", "preference"}]
+                resolved = extractor._reconcile_span_candidates(candidates, prepared, source, reads, ctx, archive_id)
+                batches.setdefault(extractor, []).append((prepared.span, resolved))
+            result = []
+            for extractor, entries in batches.items():
+                result.extend(extractor._merge_span_results(entries, ctx, archive_id)
+                              if len(entries) > 1 or extractor._reconcile_source_occurrences_enabled()
+                              else entries[0][1])
+        return result
+
 
 logger = logging.getLogger(__name__)
 _CONFIDENCE_THRESHOLD = 0.5
@@ -286,8 +326,10 @@ class _Span:
     successful_read_versions: list[dict[str, int]] = field(default_factory=list)
     occurrence_source: dict = field(default_factory=dict)
     fallback_source_prompt: str = ""
+    fallback_read_prompt: str = ""
     prompt_parts: PromptParts | None = field(default=None, repr=False, compare=False)
     fallback_prompt_parts: PromptParts | None = field(default=None, repr=False, compare=False)
+    fallback_read_prompt_parts: PromptParts | None = field(default=None, repr=False, compare=False)
     tool_stats_attached: bool = False
     tool_stats_text: str = ""
 
@@ -501,9 +543,10 @@ class Extractor:
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
-        self._extraction_tools = (build_extraction_tools(self._schema_registry, activation_enabled=True)
-                                  if activation_enabled else build_extraction_tools(self._schema_registry))
-        self._update_instruction = build_update_instruction(self._schema_registry)
+        self._extraction_tools = build_extraction_tools(
+            self._schema_registry, topic_drafts=node_processing_enabled and mode == "eager",
+            activation_enabled=activation_enabled,
+        )
         profile_schema = self._schema_registry.get_compatible("profile")
         self._profile_snapshot_enabled = bool(
             profile_schema and profile_schema.enabled
@@ -653,10 +696,18 @@ class Extractor:
                 minimum=0, maximum=max(0, len(messages) - 1),
             )
 
+        runtime = _EXTRACTION_RUNTIME.get()
+        checkpoint = runtime.checkpoint if runtime is not None and not self._use_lazy_mode() else None
+        inputs = None
+        if checkpoint is not None:
+            from core.model_stage import model_signature
+            inputs = {"prompt": prompt, "schema": schema, "model": model_signature(self._llm),
+                      "message_ids": [message.get("id", "") for message in messages]}
+
         try:
             check_deadline()
-            from providers.llm_observation import observe_call
-            result = observe_call("phase1", self._llm.complete_json, prompt, schema=schema)
+            cached = checkpoint.load_stage("span_identification", inputs) if checkpoint is not None else None
+            result = cached if cached is not None else run_model_call(observe_call, "phase1", self._llm.complete_json, prompt, schema=schema)
             check_deadline()
             spans: list[_Span] = []
             n = len(messages)
@@ -681,6 +732,11 @@ class Extractor:
                 )
                 if span.start <= span.end:
                     spans.append(span)
+            if checkpoint is not None and cached is None:
+                checkpoint.save_stage("span_identification", inputs, {"spans": [
+                    {"start": span.start, "end": span.end, "reason": span.reason,
+                     "categories": list(span.categories)} for span in spans
+                ]})
             if not spans:
                 logger.warning("Phase 1 returned 0 valid spans for %d messages", len(messages))
             return spans
@@ -720,7 +776,7 @@ class Extractor:
                 return self._merge_span_results([(prepared_spans[0].span, candidates)], ctx, archive_id)
             return candidates
 
-        if self._storage_requires_owner_thread():
+        if _EXTRACTION_RUNTIME.get() is not None or self._storage_requires_owner_thread():
             # Preserve both native attempts and their usage context on the storage owner.
             return self._merge_span_results([
                 (prepared.span, self._structure_prepared_span_dual(prepared, ctx, archive_id))
@@ -785,6 +841,9 @@ class Extractor:
     ) -> list[CandidateMemory]:
         """Reconcile independent updates only after choosing each span's snapshot."""
         check_deadline()
+        runtime = _EXTRACTION_RUNTIME.get()
+        if runtime is not None and runtime.deferred:
+            return [candidate for _, batch in span_results for candidate in batch]
         from extraction.relation_proposals import attach, take
         # Source-occurrence and bound-update reconciliation may choose another
         # draft's metadata too. Keep all accepted spans' proposals before either
@@ -829,7 +888,8 @@ class Extractor:
                                          and not (profile_target and user_profile(candidate))
                                          and candidate.confidence >= _CONFIDENCE_THRESHOLD])
                                   for span, batch in sorted(span_results, key=lambda item: (item[0].start, item[0].end))]
-            additions = (reconcile_source_occurrences(occurrence_entries, ctx, archive_id, self._llm)
+            additions = (reconcile_source_occurrences(occurrence_entries, ctx, archive_id, self._llm,
+                                                       **({"checkpoint": runtime.checkpoint} if runtime else {}))
                          if reconcile_additions else additions)
             result = self._merge_preserving_new_occurrences(additions)
         else:
@@ -844,6 +904,7 @@ class Extractor:
             if entries[-1][1].category in {"event", "case"}:
                 result.append(reconcile_occurrence_updates(
                     entries, existing, ctx, self._uri_resolver, self._llm,
+                    **({"checkpoint": runtime.checkpoint} if runtime else {}),
                 ))
                 continue
             layers = ("abstract", "overview", "content")
@@ -883,9 +944,17 @@ class Extractor:
                     "additionalProperties": False,
                 }
             if uri == profile_target and not prompt_fits(prompt, schema):
-                raise ExtractionIncompleteError("Profile reconciliation exceeds complete context budget")
+                raise ExtractionBudgetError("Profile reconciliation exceeds complete context budget")
             check_deadline()
-            snapshot = observe_call("postprocess", self._llm.complete_json, prompt, schema=schema)
+            checkpoint = runtime.checkpoint if runtime is not None else None
+            from core.model_stage import model_signature
+            snapshot = None
+            if checkpoint is not None:
+                inputs = {"prompt": prompt, "schema": schema, "model": model_signature(self._llm),
+                          "existing": asdict(existing), "drafts": [asdict(candidate) for _, candidate in entries]}
+                snapshot = checkpoint.load_stage("target_reconciliation", inputs)
+            if snapshot is None:
+                snapshot = run_model_call(observe_call, "postprocess", self._llm.complete_json, prompt, schema=schema)
             check_deadline()
             if not isinstance(snapshot, dict) or not all(
                 isinstance(snapshot.get(name), str) and snapshot[name].strip() for name in layers
@@ -916,7 +985,11 @@ class Extractor:
                 if (len(reconciled.abstract) > MAX_ABSTRACT_LEN
                         or len(reconciled.overview) > MAX_OVERVIEW_LEN):
                     reconciled = self._repair_candidate_summaries([reconciled])[0]
+            if uri == profile_target or checkpoint is not None:
                 validate_candidate(reconciled)
+            if checkpoint is not None:
+                checkpoint.save_stage("target_reconciliation", inputs,
+                                      {name: getattr(reconciled, name) for name in layers})
             result.append(reconciled)
         result = [*topic_drafts, *result]
         attach(result, proposals)
@@ -932,6 +1005,28 @@ class Extractor:
         archive_id: str | None,
     ) -> list[CandidateMemory]:
         """Run configured native passes and finalize their extraction results."""
+        runtime = _EXTRACTION_RUNTIME.get()
+        checkpoint = runtime.checkpoint if runtime is not None and not self._use_lazy_mode() else None
+        inputs = None
+        if checkpoint is not None:
+            from core.model_stage import model_signature
+            stable_span = replace(prepared.span, prompt_parts=None,
+                                  fallback_prompt_parts=None, fallback_read_prompt_parts=None)
+            span_inputs = {name: value for name, value in asdict(stable_span).items()
+                           if name not in {"reason", "successful_read_versions"}}
+            span_inputs["categories"] = sorted(set(span_inputs["categories"]))
+            inputs = {"prompt": prepared.prompt, "tools": self._extraction_tools,
+                      "model": model_signature(self._llm), "mode": self._mode,
+                      "temperatures": list(self._native_temperatures()), "archive_id": archive_id,
+                      "source": prepared.source_context,
+                      "span": json.loads(json.dumps(span_inputs, ensure_ascii=False,
+                                                    default=lambda value: sorted(value) if isinstance(value, set) else str(value)))}
+            cached = checkpoint.load_stage("native_extraction", inputs)
+            if cached is not None:
+                prepared.span.successful_read_versions = cached["reads"]
+                candidates = [validate_candidate(CandidateMemory(**c)) for c in cached["candidates"]]
+                return self._finalize_span_outcome(
+                    _NativeSpanOutcome(prepared=prepared, candidates=candidates), ctx, archive_id)
         outcome = _NativeSpanOutcome(prepared=prepared)
         for temperature in self._native_temperatures():
             check_deadline()
@@ -951,6 +1046,13 @@ class Extractor:
                     temperature,
                     exc,
                 )
+        if checkpoint is not None:
+            candidates = self._resolve_native_span_outcome(outcome, ctx, archive_id)
+            candidates = [validate_candidate(c) for c in candidates]
+            checkpoint.save_stage("native_extraction", inputs,
+                                  {"candidates": [asdict(c) for c in candidates],
+                                   "reads": prepared.span.successful_read_versions})
+            outcome = _NativeSpanOutcome(prepared=prepared, candidates=candidates)
         return self._finalize_span_outcome(outcome, ctx, archive_id)
 
     def _finalize_span_outcome(self, outcome, ctx, archive_id):
@@ -978,15 +1080,28 @@ class Extractor:
             successful = prepared.span.successful_read_versions
             read_versions = {uri: version for uri, version in successful[0].items()
                              if all(reads.get(uri) == version for reads in successful[1:])}
+        attach(candidates, proposals)
+        runtime = _EXTRACTION_RUNTIME.get()
+        if runtime is not None and runtime.deferred:
+            runtime.entries.append((self, prepared, candidates, source, read_versions))
+            return candidates
+        return self._reconcile_span_candidates(candidates, prepared, source, read_versions, ctx, archive_id)
+
+    def _reconcile_span_candidates(self, candidates, prepared, source, read_versions, ctx, archive_id):
+        from extraction.relation_proposals import attach, take
+        proposals = take(candidates)
+        runtime = _EXTRACTION_RUNTIME.get()
         candidates = qualify_occurrence_drafts(
             candidates, source, prepared.span.safe_user_text, read_versions,
             self._fs, self._uri_resolver, self._schema_registry, ctx, self._llm,
             self._occurrence_update_eligible,
+            **({"checkpoint": runtime.checkpoint} if runtime else {}),
         )
         # Bound revisions have already verified their retained facts against stored
         # evidence. Source-only event reconciliation applies to remaining additions.
         if not self._reconcile_source_occurrences_enabled():
-            candidates = reconcile_event_drafts(candidates, source, self._llm)
+            candidates = reconcile_event_drafts(candidates, source, self._llm,
+                                                **({"checkpoint": runtime.checkpoint} if runtime else {}))
         targets = [candidate.target_uri for candidate in candidates
                    if candidate.category in {"event", "case"} and candidate.target_uri]
         profiles = [candidate for candidate in candidates
@@ -1153,9 +1268,25 @@ class Extractor:
 
     @correlate_extraction_calls
     def _select_span(self, span, request, ctx):
-        from extraction.prompt_assembly import run_selection_request
+        from extraction.prompt_assembly import AssemblySelection, run_selection_request
+        from core.model_stage import model_signature
 
-        return run_selection_request(self._llm, request)
+        runtime = _EXTRACTION_RUNTIME.get()
+        checkpoint = runtime.checkpoint if runtime is not None and not self._use_lazy_mode() else None
+        cached = None
+        if checkpoint is not None:
+            inputs = {"prompt": request.prompt, "schema": request.schema,
+                      "message_ids": span.message_ids, "model": model_signature(self._llm)}
+            cached = checkpoint.load_stage("assembly_selection", inputs)
+        if cached is not None:
+            return AssemblySelection(frozenset(cached["categories"]), frozenset(cached["shared_tools"]),
+                                     cached["scope"], cached["reason"], cached["raw_output"])
+        result = run_selection_request(self._llm, request)
+        if checkpoint is not None and result.reason is None:
+            checkpoint.save_stage("assembly_selection", inputs, {
+                **asdict(result), "categories": sorted(result.categories),
+                "shared_tools": sorted(result.shared_tools)})
+        return result
 
     def _select_spans(self, spans, messages, session_time, tool_stats_text, ctx):
         from extraction.prompt_assembly import AssemblyState, selection_request_for
@@ -1171,7 +1302,7 @@ class Extractor:
             jobs.setdefault(key, (span, request))
             keys.append(key)
 
-        if len(jobs) > 1 and not self._storage_requires_owner_thread():
+        if len(jobs) > 1 and _EXTRACTION_RUNTIME.get() is None and not self._storage_requires_owner_thread():
             results = self._select_independent_spans(list(jobs.values()), ctx)
         else:
             results = [self._select_span(span, request, ctx) for span, request in jobs.values()]
@@ -1390,8 +1521,17 @@ class Extractor:
             else:
                 prompt = self._with_prefetch_context(span, prompt, ctx)
         if getattr(self, "_node_processing_enabled", False):
-            draft_instruction = "\nTOPIC_DRAFTS: For entity/preference extract source facts for the later node processor. Use source-grounded object names."
+            draft_instruction = ("\nTOPIC_DRAFTS: For entity/preference extract source facts for the later node processor. "
+                                 "Use source-grounded object names. In eager mode abstract identifies the subject/topic; "
+                                 "content lists every supported atomic source fact once. The node processor builds final cards.")
             prompt += draft_instruction
+            if span.fallback_read_prompt_parts is not None:
+                fallback = span.fallback_read_prompt_parts
+                span.fallback_read_prompt_parts = replace(
+                    fallback, suffix_data=fallback.suffix_data + draft_instruction,
+                    data_prompt=(fallback.data_prompt + draft_instruction
+                                 if fallback.data_prompt is not None else None))
+                span.fallback_read_prompt = span.fallback_read_prompt_parts.render()
             if span.fallback_prompt_parts is not None:
                 fallback = span.fallback_prompt_parts
                 span.fallback_prompt_parts = replace(
@@ -1506,6 +1646,12 @@ class Extractor:
             span.fallback_prompt_parts = self._build_prompt_parts(
                 language, conversation, session_summary, ctx=ctx, include_examples=False)
             span.prompt_parts = self._build_prompt_parts(language, conversation, session_summary, ctx=ctx)
+        span.fallback_read_prompt_parts = span.fallback_prompt_parts
+        span.fallback_read_prompt = span.fallback_read_prompt_parts.render()
+        span.fallback_prompt_parts = replace(span.fallback_prompt_parts, include_updates=False,
+            runtime_instruction=build_update_instruction(self._schema_registry,
+                decision.categories if decision is not None and assembly_state.contract is None else None,
+                include_updates=False) + "\n\n")
         span.fallback_source_prompt = span.fallback_prompt_parts.render()
 
         return span.prompt_parts.render()
@@ -1523,7 +1669,7 @@ class Extractor:
         """Eager mode: prefetch + single-shot extraction."""
         check_deadline()
         tools = self._extraction_tools if extraction_tools is None else extraction_tools
-        tool_calls = observe_call("extraction", self._llm.complete_with_tools,
+        tool_calls = run_model_call(observe_call, "extraction", self._llm.complete_with_tools,
             correlation={"session_id": ctx.session_id, "trace_id": ctx.trace_id,
                          "span_start": span.start, "span_end": span.end},
             prompt=prompt,
@@ -1601,6 +1747,7 @@ class Extractor:
                 self._prefetch_prompt(compact, reads), tools,
             )
             if truncated or not prompt_fits(fallback_prompt, schema):
+                compact = compact_prepared_prompt(prepared, request.contract, source_only=True)
                 compact += ("\n\nExtract only facts from this source within the output budget. "
                             "Extract complete source facts without target_uri or expected_version.")
                 source_tools = source_only_tools(tools)
@@ -1609,6 +1756,7 @@ class Extractor:
                 tools = source_tools
                 schema = build_extraction_envelope_schema(source_tools)
                 reads = None
+                source_only = True
             logger.info("JSON extraction fallback compacted: span=%d-%d native_chars=%d "
                         "fallback_chars=%d retained_reads=%d", prepared.span.start, prepared.span.end,
                         len(prepared.prompt), len(fallback_prompt), len(reads.read_versions) if reads else 0)
@@ -1619,11 +1767,13 @@ class Extractor:
             if prompt_fits(with_feedback, schema):
                 fallback_prompt = with_feedback
         if not prompt_fits(fallback_prompt, schema):
-            raise ExtractionIncompleteError("JSON extraction fallback exceeds the context budget")
+            raise ExtractionBudgetError("JSON extraction fallback exceeds the context budget: "
+                f"prompt_chars={len(fallback_prompt)}, schema_chars={len(json.dumps(schema))}, "
+                f"source_only={source_only}, retained_reads={len(reads.read_versions) if reads else 0}")
         record_attempt(prepared.assembly_state, request.contract, tools, mode="eager",
                        reason="json_recovery", source_only=source_only)
         try:
-            raw = observe_call("recovery", self._llm.complete_json,
+            raw = run_model_call(observe_call, "recovery", self._llm.complete_json,
                 fallback_prompt, correlation={"session_id": ctx.session_id, "trace_id": ctx.trace_id,
                                                "span_start": prepared.span.start, "span_end": prepared.span.end},
                 schema=schema,
@@ -1778,7 +1928,7 @@ class Extractor:
                 # source and correction feedback must survive. Removing a read
                 # snapshot also removes its authority to bind a versioned update.
                 if not prompt_fits(source_prompt, {"tools": tools}):
-                    raise ExtractionIncompleteError("native validation recovery exceeds the context budget") from e
+                    raise ExtractionBudgetError("native validation recovery exceeds the context budget") from e
                 tools = source_only_tools(tools)
                 source_only = True
                 prompt = source_prompt + "\n\nExtract complete source facts without target_uri or expected_version."
@@ -1869,10 +2019,12 @@ class Extractor:
         ctx: RequestContext | None = None,
         *,
         include_examples: bool = True,
+        include_updates: bool = True,
     ) -> str:
         """Build extraction input from independently rendered template and data parts."""
         return self._build_prompt_parts(
             language, conversation, session_summary, ctx, include_examples=include_examples,
+            include_updates=include_updates,
         ).render()
 
     def _build_prompt_parts(
@@ -1884,6 +2036,7 @@ class Extractor:
         *,
         include_examples: bool = True,
         decision=None,
+        include_updates: bool = True,
     ) -> PromptParts:
         """Render template and data sections once, preserving their boundaries."""
         from extraction.prompt_assembly import PromptParts
@@ -1931,14 +2084,18 @@ class Extractor:
             )
         from service.extraction_retry import card_format_feedback
         feedback = card_format_feedback()
+        if getattr(self, "_node_processing_enabled", False) and feedback.startswith("node_processing:"):
+            feedback = ""
         if feedback:
             prefix += ("Correct the previous output format using the tool field descriptions. "
                        "Validation feedback (data): " + json.dumps(feedback) + "\n\n")
         suffix = f"{output_instruction}\n\nConversation:\n{conversation}"
         parts = PromptParts(
             system_prompt, prefix, examples, suffix, include_examples,
-            runtime_instruction=(build_update_instruction(self._schema_registry, decision.categories)
-                                 if decision is not None else self._update_instruction) + "\n\n",
+            include_updates=include_updates,
+            runtime_instruction=build_update_instruction(self._schema_registry,
+                decision.categories if decision is not None else None,
+                include_updates=include_updates) + "\n\n",
             manager=self._prompt_manager, registry=self._schema_registry,
             template_variables={"session_summary": session_summary},
             data_prompt=prefix[len(identity_prefix):] + "Conversation:\n" + conversation,

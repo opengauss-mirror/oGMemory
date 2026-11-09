@@ -17,7 +17,7 @@ from typing import Optional
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
 from commit.write_receipts import WriteDeadlineExceededError, WriteNotStartedError, receipt_plan
-from core.errors import ConcurrentModificationError, ExtractionIncompleteError
+from core.errors import ConcurrentModificationError, ExtractionIncompleteError, MemoryCardFormatError
 from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
@@ -187,6 +187,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         tool_stats_text: str = "",
         archive_id: str | None = None,
         candidate_checkpoint=None,
+        before_write=None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -233,7 +234,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         def extract():
             thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
             execution_options = {"parallel": False} if (
-                remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
+                self._node_processing_enabled or remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
             return self._pipeline.extract(
                 messages, ctx, session_time=session_time,
                 session_summary=session_summary,
@@ -254,19 +255,40 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
         if accepted is None:
             # Extraction must finish before the first accepted candidate is written.
+            from extraction.tools import ExtractionRuntime
+            runtime = ExtractionRuntime(candidate_checkpoint)
             candidates = (candidate_checkpoint.load_drafts() if self._node_processing_enabled
-                          and candidate_checkpoint is not None else None)
+                          and candidate_checkpoint is not None
+                          and not candidate_checkpoint.has_stage("native_extraction") else None)
             if candidates is None:
-                candidates = extract()
-                if self._node_processing_enabled and candidate_checkpoint is not None:
+                if self._node_processing_enabled:
+                    with runtime.activate():
+                        candidates = extract()
+                    candidates = sorted(candidates, key=lambda c: c.category not in {"entity", "preference"})
                     candidates = [replace(c, node_draft_indices=[i]) if c.category in {"entity", "preference"}
                                   else c for i, c in enumerate(candidates)]
+                else:
+                    candidates = extract()
+                if self._node_processing_enabled and candidate_checkpoint is not None and not runtime.entries:
                     candidate_checkpoint.save_drafts(candidates, messages)
             check_deadline()
             filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
             extracted_count, filtered_count = len(candidates), len(candidates) - len(filtered)
             if self._node_processing_enabled:
-                filtered = self._node_processor().process(filtered, messages, ctx)
+                def reconcile():
+                    nonlocal extracted_count, filtered_count
+                    others = runtime.reconcile(messages, ctx, archive_id)
+                    drafts = [c for c in candidates if c.category in {"entity", "preference"}]
+                    complete = self._pipeline._validate_candidates([*drafts, *others], ctx)
+                    selected = self._pipeline.filter_by_confidence(complete, confidence_threshold)
+                    extracted_count, filtered_count = len(complete), len(complete) - len(selected)
+                    if candidate_checkpoint is not None:
+                        candidate_checkpoint.save_drafts(complete, messages)
+                    return [c for c in selected if c.category not in {"entity", "preference"}]
+
+                filtered = self._node_processor().process(
+                    filtered, messages, ctx, checkpoint=candidate_checkpoint,
+                    reconcile=reconcile if runtime.entries else None)
             else:
                 from commit.topic_aliases import reconcile_topic_aliases
                 filtered = reconcile_topic_aliases(
@@ -279,18 +301,36 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 from extraction.card_format import validate_memory_card
                 for candidate in filtered:
                     validate_memory_card(candidate)
+            if self._node_processing_enabled:
+                targets = [c.target_uri for c in filtered if c.target_uri]
+                if len(targets) != len(set(targets)):
+                    raise ExtractionIncompleteError("memory decisions require one update per target")
+                for candidate in filtered:
+                    if candidate.target_uri:
+                        current = self._fs.read_node(candidate.target_uri, ctx)
+                        version = current.metadata.get("version", 0)
+                        if version != candidate.expected_version:
+                            raise ConcurrentModificationError(candidate.target_uri, candidate.expected_version, version)
+            if before_write is not None:
+                before_write()
             if candidate_checkpoint is not None:
                 resolver = self._writer._identity_resolver
                 if resolver is not None:
-                    resolver.preflight_new_batch(
-                        [candidate for candidate in filtered
-                         if self._writer.prewrite_skip(candidate, ctx) is None], ctx)
+                    prepared = [candidate for candidate in filtered
+                                if self._writer.prewrite_skip(candidate, ctx) is None]
+                    try:
+                        resolver.preflight_new_batch(prepared, ctx)
+                    except ExtractionIncompleteError as exc:
+                        candidate_checkpoint.invalidate_unaccepted_preparation()
+                        raise MemoryCardFormatError(str(exc)) from exc
                 check_deadline()
                 filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
         else:
             filtered, extracted_count, filtered_count = accepted
             if self._graph_enabled:
                 candidate_checkpoint.restore_relation_tracking()
+            if before_write is not None:
+                before_write()
 
         # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
         deduplicated = filtered
@@ -452,7 +492,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                             and isinstance(exc.__cause__, ConcurrentModificationError)):
                         revised = self._node_processor().process(
                             checkpoint.reprocessing_drafts(candidate),
-                            checkpoint.draft_source(), ctx)
+                            checkpoint.draft_source(), ctx, target_candidate=candidate)
                         if (len(revised) != 1 or candidate.target_uri
                                 and revised[0].target_uri != candidate.target_uri):
                             raise MemoryCardFormatError(
@@ -819,6 +859,8 @@ class ReadAPI:
         memory_directories: list[str] | None = None,
         collect_graph_supplement: bool = False,
         use_scene: bool | None = None,
+        final_top_k: int | None = None,
+        hints: dict | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -844,6 +886,8 @@ class ReadAPI:
             memory_directories=memory_directories,
             **({"collect_graph_supplement": True} if collect_graph_supplement else {}),
             **({"use_scene": use_scene} if use_scene is not None else {}),
+            final_top_k=final_top_k,
+            hints=hints,
         )
 
         if not include_debug:
@@ -864,3 +908,8 @@ class ReadAPI:
         read_memory only reads the actual md file content.
         """
         return self._read_service.read(uri, ctx=ctx, **({"unit_key": unit_key} if unit_key is not None else {}))
+
+    def read_memories(
+        self, requests: list[tuple[str, str | None]], ctx: RequestContext,
+    ) -> dict[tuple[str, str | None], RetrievedBlock | Exception]:
+        return self._read_service.read_many(requests, ctx)

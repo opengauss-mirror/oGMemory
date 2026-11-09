@@ -38,7 +38,7 @@ from extraction.schemas.registry import SchemaRegistry
 
 MEMORY_CATEGORIES = frozenset({"entity", "preference", "pattern"})
 OCCURRENCE_CATEGORIES = frozenset({"event", "case"})
-_USER_ROLE_MARKERS = frozenset({"user", "<user>"})
+_USER_ROLE_MARKERS = frozenset({"user", "<user>", "用户"})
 _LOCAL_LOCKS: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
 _LOCAL_LOCKS_GUARD = threading.Lock()
 
@@ -101,13 +101,20 @@ class MemoryIdentityResolver:
 
     @staticmethod
     def _self_holder(value, ctx):
-        holder = canonical_scope(value or "")
-        return canonical_scope(ctx.user_id) if holder in _USER_ROLE_MARKERS else holder
+        normalized = unicodedata.normalize("NFKC", value or "").strip()
+        holder = canonical_scope(normalized)
+        subject, separator, annotation = normalized.rpartition("(")
+        if (holder in _USER_ROLE_MARKERS
+                or (separator and annotation.endswith(")")
+                    and canonical_scope(annotation[:-1]) in _USER_ROLE_MARKERS
+                    and subject.strip() == unicodedata.normalize("NFKC", ctx.user_id).strip())):
+            return canonical_scope(ctx.user_id)
+        return holder
 
     @staticmethod
     def _normalize_subject(candidate, ctx):
         if (candidate.category == "preference" and candidate.who
-                and canonical_scope(candidate.who) in _USER_ROLE_MARKERS):
+                and MemoryIdentityResolver._self_holder(candidate.who, ctx) == canonical_scope(ctx.user_id)):
             return replace(candidate, who=ctx.user_id)
         return candidate
 
@@ -168,10 +175,19 @@ class MemoryIdentityResolver:
     @staticmethod
     def _in_scope(node, candidate, ctx):
         owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
-        if (node.category != candidate.category or node.owner_space != owner
-                or canonical_scope(node.metadata.get("scope_ref", ""))
-                != canonical_scope(candidate.scope_ref)):
+        if node.category != candidate.category or node.owner_space != owner:
             return False
+        stored_scope = canonical_scope(node.metadata.get("scope_ref", ""))
+        incoming_scope = canonical_scope(candidate.scope_ref)
+        if stored_scope != incoming_scope:
+            if candidate.category != "entity" or not MemoryIdentityResolver._names_match(node, candidate):
+                return False
+            self_scopes = {"", *(canonical_scope(value) for value in (
+                node.metadata.get("object_name", ""), *node.metadata.get("object_name_aliases", []),
+                candidate.object_name, *candidate.verified_object_aliases,
+            ) if value)}
+            if stored_scope not in self_scopes or incoming_scope not in self_scopes:
+                return False
         if candidate.category != "preference":
             return True
         stored = MemoryIdentityResolver._self_holder(node.metadata.get("who"), ctx)
@@ -442,7 +458,7 @@ class MemoryIdentityResolver:
         object_aliases = list(dict.fromkeys(filter(None, object_names)))
         return dict(identity_version=2, routing_key=routing_key,
                     routing_key_aliases=routing_aliases, object_name_aliases=object_aliases,
-                    scope_ref=candidate.scope_ref,
+                    scope_ref=meta.get("scope_ref", "") if existing and candidate.category == "entity" else candidate.scope_ref,
                     object_name=meta.get("object_name") or candidate.object_name)
 
     def _plan(self, candidate, existing, nodes, directory, ctx, *, duplicate=False):

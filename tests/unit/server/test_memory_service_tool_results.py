@@ -417,6 +417,7 @@ def test_chunk_extract_keeps_stub_messages_without_automatic_artifact_evidence(
         "session",
     )
     assert set(write_api.commit_kwargs) == {
+        "before_write",
         "messages",
         "ctx",
         "confidence_threshold",

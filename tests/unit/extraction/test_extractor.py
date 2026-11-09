@@ -207,6 +207,7 @@ class TestExtractorPhase2PromptDedupe:
         extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
         extractor._mode = "lazy"
         extractor._fs = object()
+        extractor._schema_registry = SchemaRegistry()
         extractor._uri_resolver = object()
         ctx = RequestContext(
             account_id="test-account",

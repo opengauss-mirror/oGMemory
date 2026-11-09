@@ -15,11 +15,16 @@ def prepare(fs):
     writer = api(fs, MergeLLM())
     drafts = [memory("atlas_painting", content="Atlas is a red painting."),
               memory("atlas_painting", object_name="Atlas (painting)", content="Atlas was painted by Nora.")]
-    journal = SimpleNamespace(batch={"archive_id": "archive", "slots": {}}, ctx=ctx)
+    journal = SimpleNamespace(batch={"archive_id": "archive", "slots": {}}, ctx=ctx,
+                              _verified_stage_results=set())
     journal.mutate = lambda fn: fn(journal.batch)
     checkpoint = CandidateCheckpoint(journal, "all")
     writer._pipeline.extract = lambda *a, **k: drafts
     return writer, ctx, drafts, checkpoint
+
+
+def memory_nodes(fs):
+    return {uri: node for uri, node in fs.nodes.items() if node.context_type == "MEMORY"}
 
 
 def test_ambiguous_batch_rejected_before_accept_and_public_write_then_can_reextract():
@@ -32,9 +37,9 @@ def test_ambiguous_batch_rejected_before_accept_and_public_write_then_can_reextr
     drafts[0].object_name = "Atlas (painting)"
     result = writer.commit_session([], ctx, candidate_checkpoint=checkpoint)
     assert result["writes_completed"] == 2 and result["writes_failed"] == 0
-    assert sum(node.category == "entity" for node in fs.nodes.values()) == 1
+    assert len(memory_nodes(fs)) == 1
     replay = writer.commit_session([], ctx, candidate_checkpoint=checkpoint)
-    assert replay["writes_failed"] == 0 and sum(node.category == "entity" for node in fs.nodes.values()) == 1
+    assert replay["writes_failed"] == 0 and len(memory_nodes(fs)) == 1
 
 
 def test_old_accepted_batch_is_not_rewritten():
@@ -43,7 +48,7 @@ def test_old_accepted_batch_is_not_rewritten():
     checkpoint.accept(drafts, len(drafts), 0)
     frozen = deepcopy(checkpoint.record["candidates"])
     result = writer.commit_session([], ctx, candidate_checkpoint=checkpoint)
-    assert result["writes_failed"] == 1 and sum(node.category == "entity" for node in fs.nodes.values()) == 1
+    assert result["writes_failed"] == 1 and len(memory_nodes(fs)) == 1
     assert checkpoint.record["candidates"] == frozen
 
 
@@ -53,7 +58,7 @@ def test_distinct_scopes_keep_separate_nodes():
     drafts[0].scope_ref = "Project A"
     drafts[1].scope_ref = "Project B"
     result = writer.commit_session([], ctx, candidate_checkpoint=checkpoint)
-    assert result["writes_failed"] == 0 and sum(node.category == "entity" for node in fs.nodes.values()) == 2
+    assert result["writes_failed"] == 0 and len(memory_nodes(fs)) == 2
 
 
 def test_existing_exact_object_identity_does_not_create_false_collision():
@@ -62,7 +67,7 @@ def test_existing_exact_object_identity_does_not_create_false_collision():
     writer.write_memory(memory("atlas_painting", object_name="Atlas (painting)"), ctx)
     drafts[0].object_name = "Atlas (painting)"
     result = writer.commit_session([], ctx, candidate_checkpoint=checkpoint)
-    assert result["writes_failed"] == 0 and sum(node.category == "entity" for node in fs.nodes.values()) == 1
+    assert result["writes_failed"] == 0 and len(memory_nodes(fs)) == 1
 
 
 @pytest.mark.parametrize("target_alias", [True, False])
@@ -85,7 +90,7 @@ def test_projected_names_match_writer_for_target_alias_and_filename_template(tar
     assert fs.nodes == original
     result = writer.commit_session([], ctx, candidate_checkpoint=checkpoint)
     assert result["writes_completed"] == 2 and result["writes_failed"] == 0
-    assert sum(node.category == "entity" for node in fs.nodes.values()) == 1
+    assert len(memory_nodes(fs)) == 1
 
 
 def test_direct_name_match_precedes_other_node_alias():
@@ -99,7 +104,7 @@ def test_direct_name_match_precedes_other_node_alias():
     drafts[:] = [memory("atlas", object_name="Atlas", content="Atlas was painted by Nora.")]
     result = writer.commit_session([], ctx, candidate_checkpoint=checkpoint)
     assert result["writes_completed"] == 1 and result["writes_failed"] == 0
-    assert sum(node.category == "entity" for node in fs.nodes.values()) == 2
+    assert len(memory_nodes(fs)) == 2
 
 
 def test_bound_batch_reads_each_target_once_and_projects_successive_names():

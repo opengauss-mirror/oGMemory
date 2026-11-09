@@ -12,7 +12,6 @@ import logging
 import os
 import re as _re
 import threading
-from commit.outbox_scope import capture_outbox_events, current_outbox_events
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
@@ -20,7 +19,7 @@ from core.write_contract import (
     OUTCOMES_KEY, error_fields, needs_projection_refresh, normalize_write_result, projection_outcome,
     store_outcome, write_request_contract,
 )
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC
 from datetime import datetime as _dt
 from functools import wraps
@@ -28,6 +27,7 @@ from typing import Any
 from uuid import uuid4
 
 from commit.write_receipts import WriteOutcomeUnknownError
+from commit.outbox_scope import capture_outbox_events, current_outbox_events
 from core.errors import (
     AccessDeniedError,
     ExtractionIncompleteError,
@@ -39,6 +39,7 @@ from core.errors import (
 )
 from core.models import (
     ArchiveRef,
+    CandidateMemory,
     ComposedContext,
     ContextNode,
     RequestContext,
@@ -55,8 +56,7 @@ from extraction.chunking import ConversationChunker
 from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
-from providers.token_tracker import request_usage_scope
-from providers.token_tracker import UsagePersistenceError
+from providers.token_tracker import UsagePersistenceError, request_usage_scope
 from providers.unified_config import OgMemConfig, get_config
 from retrieval.bm25_index import Bm25Index
 from retrieval.code_intent_filter import classify_code_retrieval_intent
@@ -1587,6 +1587,109 @@ class MemoryService:
             use_llm_boundary=getattr(self._cfg, "chunk_llm_boundary", True),
         )
 
+    @staticmethod
+    def _generate_summary_candidate(messages, session_time, session_id, llm):
+        """Generate the summary candidate from a frozen source snapshot."""
+        from extraction.summary_generator import SessionSummaryGenerator
+
+        check_deadline()
+        lines, participants = [], set()
+        for msg in messages:
+            role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+            if isinstance(content, list):
+                content = " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("text"))
+            if content:
+                lines.append(f"{role}: {content}")
+                if role not in ("system", "assistant"):
+                    participants.add(role)
+        messages_text = "\n".join(lines)
+        if not messages_text.strip():
+            return None
+        participants_str = ", ".join(sorted(participants))
+        generator = SessionSummaryGenerator(llm=llm)
+        summary = generator.generate(messages_text, session_time, participants_str)
+        check_deadline()
+        if summary:
+            formatted = generator.format_summary(summary)
+            if not formatted.strip():
+                logger.info("Skipping blank L0 summary: session=%s", session_id[:8])
+                return None
+            return generator.build_candidate(
+                summary, formatted, session_time, participants_str, session_id,
+            )
+        return None
+
+    @staticmethod
+    def _summary_stage_inputs(messages, session_time, session_id, llm):
+        from extraction.summary_generator import SUMMARY_PROMPT, SUMMARY_SCHEMA
+        from core.model_stage import model_signature
+
+        return {"messages": deepcopy(messages), "session_id": session_id,
+                "session_time": session_time.isoformat() if session_time else None,
+                "prompt": SUMMARY_PROMPT, "schema": SUMMARY_SCHEMA,
+                "model": model_signature(llm), "version": 1}
+
+    @contextmanager
+    def _parallel_session_summary(self, messages, session_time, ctx, session_id, write_api,
+                                  candidate_checkpoint=None):
+        """Join summary generation at the owner-thread write boundary."""
+        from concurrent.futures import Future, ThreadPoolExecutor
+        from contextvars import copy_context
+        from core.model_stage import stage_collector_scope, wait_model_result
+
+        restored = candidate_checkpoint.load() if candidate_checkpoint is not None else None
+        if restored is not None:
+            self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
+                                             candidate_checkpoint=candidate_checkpoint,
+                                             accepted_candidates=restored[0])
+            yield lambda: None
+            return
+        llm = self.get_llm()
+        inputs = (self._summary_stage_inputs(messages, session_time, session_id, llm)
+                  if candidate_checkpoint is not None else None)
+        cached = (candidate_checkpoint.load_stage("session_summary", inputs)
+                  if candidate_checkpoint is not None else None)
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="session-summary") as pool:
+            if cached is not None:
+                future = Future()
+                future.set_result(CandidateMemory(**cached["candidate"]) if cached["candidate"] else None)
+            else:
+                future = pool.submit(copy_context().run, self._generate_summary_candidate,
+                                     deepcopy(messages), session_time, session_id, llm)
+            written, saved = False, cached is not None
+
+            def collect():
+                nonlocal saved
+                if (candidate_checkpoint is not None and not saved and future.done()
+                        and future.exception() is None):
+                    candidate = future.result()
+                    candidate_checkpoint.save_stage("session_summary", inputs,
+                        {"candidate": asdict(candidate) if candidate is not None else None})
+                    saved = True
+
+            def before_write():
+                nonlocal written
+                if not written:
+                    self._generate_and_write_summary(
+                        messages, session_time, ctx, session_id, write_api,
+                        candidate_checkpoint=candidate_checkpoint, candidate_future=future,
+                    )
+                    written = True
+
+            with stage_collector_scope(collect):
+                try:
+                    yield before_write
+                    before_write()
+                finally:
+                    try:
+                        wait_model_result(future)
+                    except Exception:
+                        if not future.done() or future.exception() is None:
+                            raise
+                    else:
+                        collect()
+
     def _generate_and_write_summary(
         self,
         messages: list[dict],
@@ -1595,63 +1698,29 @@ class MemoryService:
         session_id: str,
         write_api,
         candidate_checkpoint=None,
+        candidate_future=None,
+        accepted_candidates=None,
     ) -> None:
         """Generate L0 structured summary for a session and write to storage."""
+        from core.model_stage import wait_model_result
+
         check_deadline()
         try:
-            if candidate_checkpoint is not None and candidate_checkpoint.load() is not None:
-                accepted = candidate_checkpoint.load()[0]
-                plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
-                if accepted and not plans:
+            if accepted_candidates is None and candidate_checkpoint is not None:
+                restored = candidate_checkpoint.load()
+                accepted_candidates = restored[0] if restored is not None else None
+            if accepted_candidates is not None:
+                plans = write_api._write_checkpointed_candidates(accepted_candidates, ctx, candidate_checkpoint)
+                if accepted_candidates and not plans:
                     raise RuntimeError("summary rejected before writing")
                 return
-            from extraction.summary_generator import SessionSummaryGenerator
-
-            # Format messages into text
-            lines = []
-            participants = set()
-            for msg in messages:
-                role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
-                content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-                if isinstance(content, list):
-                    content = " ".join(
-                        b.get("text", "") for b in content
-                        if isinstance(b, dict) and b.get("text")
-                    )
-                if content:
-                    lines.append(f"{role}: {content}")
-                    if role not in ("system", "assistant"):
-                        participants.add(role)
-
-            messages_text = "\n".join(lines)
-            if not messages_text.strip():
-                if candidate_checkpoint is not None:
-                    candidate_checkpoint.accept([], 0, 0)
-                return
-
-            participants_str = ", ".join(participants) if participants else ""
-            gen = SessionSummaryGenerator(llm=self.get_llm())
-            summary = gen.generate(messages_text, session_time, participants_str)
+            candidate = (wait_model_result(candidate_future) if candidate_future is not None else
+                         self._generate_summary_candidate(messages, session_time, session_id, self.get_llm()))
             check_deadline()
-            if not summary:
+            if candidate is None:
                 if candidate_checkpoint is not None:
                     candidate_checkpoint.accept([], 0, 0)
                 return
-
-            formatted = gen.format_summary(summary)
-            # A valid structured response can still contain no summary text.
-            # Do not enqueue an empty auxiliary memory for the embedding API;
-            # ordinary extraction and nonempty summaries remain unchanged.
-            if not formatted.strip():
-                logger.info("Skipping blank L0 summary: session=%s", session_id[:8])
-                return
-            candidate = gen.build_candidate(
-                summary=summary,
-                formatted_text=formatted,
-                session_time=session_time,
-                participants=participants_str,
-                session_id=session_id,
-            )
             if candidate_checkpoint is not None:
                 check_deadline()
                 accepted = candidate_checkpoint.accept([candidate], 1, 0)
@@ -1662,7 +1731,7 @@ class MemoryService:
                 write_api.write_memory(candidate, ctx)
             logger.info(
                 "L0 summary written: session=%s len=%d",
-                session_id[:8], len(formatted),
+                session_id[:8], len(candidate.content),
             )
         except OperationDeadlineExceededError:
             raise
@@ -1700,10 +1769,13 @@ class MemoryService:
             guard.ensure_owned()
         if extraction_journal is not None:
             return self._chunk_and_extract_recoverable(write_api, ctx, session_id, extraction_journal)
-        # Step 0: Generate L0 summary for the whole session
-        self._generate_and_write_summary(
-            messages, session_time, ctx, session_id, write_api,
-        )
+        with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api) as before_write:
+            return self._commit_session_chunks(messages, write_api, ctx, session_time, session_summary,
+                                               tool_stats_text, extraction_run_id, session_id, archive_id,
+                                               before_write)
+
+    def _commit_session_chunks(self, messages, write_api, ctx, session_time, session_summary,
+                               tool_stats_text, extraction_run_id, session_id, archive_id, before_write):
         chunker = self._get_chunker()
 
         if chunker is None:
@@ -1716,6 +1788,7 @@ class MemoryService:
                 session_summary=session_summary,
                 tool_stats_text=tool_stats_text,
                 archive_id=archive_id,
+                before_write=before_write,
             )
             # Store raw chunk text for retrieval fallback
             try:
@@ -1758,6 +1831,7 @@ class MemoryService:
                 session_summary=session_summary,
                 tool_stats_text=tool_stats_text,
                 archive_id=archive_id,
+                before_write=before_write,
             )
             # Store raw chunk text for retrieval fallback
             try:
@@ -1803,6 +1877,7 @@ class MemoryService:
                     session_summary=session_summary,
                     tool_stats_text=tool_stats_text,
                     archive_id=archive_id,
+                    before_write=before_write,
                 )
                 for key in (
                     "candidates_extracted",
@@ -1876,19 +1951,19 @@ class MemoryService:
             logger.warning("Extraction completed from preserved source session=%s archive=%s reason=%s",
                            session_id, batch["archive_id"], reason)
             return {**aggregated, "degraded": True, "recovery_mode": "source_only", "reason": reason}
-        self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
-                                         candidate_checkpoint=journal.checkpoint("summary"))
-        for index, chunk in enumerate(chunks):
-            check_deadline()
-            result = write_api.commit_session(
-                messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
-                session_time=session_time, session_summary=batch["session_summary"],
-                tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
-                candidate_checkpoint=journal.checkpoint(f"chunk:{index}"))
-            for key in ("candidates_extracted", "candidates_filtered", "writes_completed",
-                        "writes_skipped", "writes_failed"):
-                aggregated[key] += result.get(key, 0)
-            aggregated["plans"].extend(result.get("plans", []))
+        with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api,
+                                            journal.checkpoint("summary")) as before_write:
+            for index, chunk in enumerate(chunks):
+                check_deadline()
+                result = write_api.commit_session(
+                    messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
+                    session_time=session_time, session_summary=batch["session_summary"],
+                    tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
+                    candidate_checkpoint=journal.checkpoint(f"chunk:{index}"), before_write=before_write)
+                for key in ("candidates_extracted", "candidates_filtered", "writes_completed",
+                            "writes_skipped", "writes_failed"):
+                    aggregated[key] += result.get(key, 0)
+                aggregated["plans"].extend(result.get("plans", []))
         return aggregated
 
     def _complete_extraction_source(self, ctx, archive_id, reason):
@@ -2128,7 +2203,7 @@ class MemoryService:
         """Two-round vector search for memory nodes.
 
         Round 1: All categories → structured items for retrievedEvidence.
-        Round 2: session_summary only, top_k=1 → L0 summary for sessionContext.
+        Round 2: session_summary only, top_k=1 → historical retrieval evidence.
 
         Returns (structured_items, summary_items, stats).
         """
@@ -2150,6 +2225,7 @@ class MemoryService:
                     query=query, ctx=ctx, top_k=15,
                     fill_content_for_top_k=5 if self._graph_enabled() else 0, mode="QUICK",
                     **graph_kwargs,
+                    hints={"include_all_memories": True},
                 )
             if self._graph_enabled() and result is not None and result.trace is not None:
                 stats["graph_expansion"] = dict(result.trace.graph_expansion)
@@ -2203,12 +2279,12 @@ class MemoryService:
                             type(exc).__name__,
                         )
 
-            # Round 2: L0 session summary for sessionContext injection
+            # Round 2: historical session summary with source provenance.
             try:
                 summary_result = read_api.search_memory(
                     query=query, ctx=ctx, top_k=1,
                     categories=["session_summary"],
-                    fill_content_for_top_k=1, mode="QUICK",
+                    fill_content_for_top_k=0, mode="QUICK",
                 )
                 if summary_result and summary_result.hits:
                     summary_items = [
@@ -2219,14 +2295,14 @@ class MemoryService:
                             "content": h.content_excerpt or "",
                             "score": h.score,
                             "category": h.category,
+                            "metadata": dict(h.metadata or {}),
                         }
                         for h in summary_result.hits
                     ]
                     logger.info(
-                        "L0 summary search: found=%d score=%.3f len=%d",
+                        "L0 summary search: found=%d score=%.3f",
                         len(summary_items),
                         summary_items[0]["score"] if summary_items else 0,
-                        len(summary_items[0]["content"]) if summary_items else 0,
                     )
             except Exception as exc:
                 logger.debug("L0 summary search failed: %s", exc)
@@ -2265,6 +2341,7 @@ class MemoryService:
             fill_content_for_top_k=fill_content_for_top_k,
             mode="QUICK",
             **(dict(include_debug=True,collect_graph_supplement=True) if self._graph_enabled() else {}),
+            hints={"include_all_memories": True},
         )
         if result is None:
             return None
@@ -3953,6 +4030,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     top_k=top_k,
                     fill_content_for_top_k=0,
                     mode="QUICK",
+                    hints={"include_all_memories": True},
                 )
             ordinary_hits = list(getattr(result, "hits", []) or [])
             hits = [
@@ -4581,6 +4659,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         search_stats: dict = {}
         try:
             working_set, summary_items, search_stats = self._search_working_set(query, ctx)
+            working_set.extend(summary_items)
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
@@ -4610,8 +4689,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                            if (item.get("metadata") or {}).get("retrieval_origin") == "graph_neighbor"]
             ordinary_items = [item for item in working_set
                               if (item.get("metadata") or {}).get("retrieval_origin") != "graph_neighbor"]
+            read_many = None
+            if self._cfg.storage_backend == "sql" and not self._graph_enabled():
+                def read_many(requests, read_ctx):
+                    return self.get_read_api().read_memories(requests, read_ctx)
             working_set, delivery_stats = hydrate_evidence(
-                ordinary_items, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs), ctx,
+                ordinary_items, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs),
+                ctx, read_many=read_many,
             )
             if graph_items:
                 graph_items, _ = hydrate_evidence(
@@ -4702,23 +4786,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except Exception as exc:
             logger.warning("assemble session_state_suffix build failed: %s", exc)
 
-        # Step 4c: Inject L0 summary into sessionContext
-        summary_context = ""
-        try:
-            if summary_items:
-                summary_content = summary_items[0].get("content", "")
-                if summary_content:
-                    summary_context = f"## Session Summary\n{summary_content}"
-                    logger.info(
-                        "L0 summary injected into sessionContext: len=%d score=%.3f",
-                        len(summary_context),
-                        summary_items[0].get("score", 0),
-                    )
-        except Exception as exc:
-            logger.warning("assemble L0 summary injection failed: %s", exc)
-
-        # Combine session state + L0 summary into session_context
-        session_context = "\n\n".join(p for p in [session_state_suffix, summary_context] if p)
+        session_context = session_state_suffix
 
         # Step 5d: Trim archived messages from the message list.
         # If archives exist, the archived content is already represented in
@@ -5403,9 +5471,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return normalize_write_result({"request_status": "UNKNOWN", "request_id": request_id,
                                        "accepted": request_id in (payload or {}).get("completed_request_ids", [])})
 
-
-
-
     @write_request_contract
     @capture_outbox_events
     @retry_failed_source
@@ -5892,10 +5957,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if not extraction_messages:
             try:
                 check_deadline()
-                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
-                check_deadline()
+                with mgr.parallel_archive_compression(
+                    archive_snapshot, session_id, ctx, extraction_journal, archive_id=archive_id,
+                ) as compression_work:
+                    drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                    check_deadline()
                 commit_result = mgr.commit_snapshot(
-                    session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+                    session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id,
+                    compression_work=compression_work, compression_checkpoint=extraction_journal)
             except OperationDeadlineExceededError:
                 _rewind_failed_archive_watermark()
                 if extraction_claim["extraction_started"]:
@@ -5954,18 +6023,21 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         def _background_extract_write():
             start_time = _time.monotonic()
             try:
-                write_result = self._chunk_and_extract(
-                    messages=extraction_messages,
-                    write_api=write_api,
-                    ctx=ctx,
-                    session_time=session_time,
-                    session_summary=extraction_summary,
-                    tool_stats_text=tool_stats_text,
-                    extraction_run_id=extraction_run_id,
-                    session_id=session_id,
-                    archive_id=archive_id,
-                    extraction_journal=extraction_journal,
-                )
+                with mgr.parallel_archive_compression(
+                    archive_snapshot, session_id, ctx, extraction_journal, archive_id=archive_id,
+                ) as compression_work:
+                    write_result = self._chunk_and_extract(
+                        messages=extraction_messages,
+                        write_api=write_api,
+                        ctx=ctx,
+                        session_time=session_time,
+                        session_summary=extraction_summary,
+                        tool_stats_text=tool_stats_text,
+                        extraction_run_id=extraction_run_id,
+                        session_id=session_id,
+                        archive_id=archive_id,
+                        extraction_journal=extraction_journal,
+                    )
                 if self._write_result_has_failures(write_result):
                     raise RuntimeError("memory extraction write failed")
                 self._invalidate_identity_cache_if_profile_written(session_id, write_result)
@@ -6008,7 +6080,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     logger.warning("outbox_drain failed after background extract: %s", exc)
 
                 commit_result = mgr.commit_snapshot(
-                    session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+                    session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id,
+                    compression_work=compression_work, compression_checkpoint=extraction_journal)
                 removed = 0
                 if commit_result.get("status") in {"failed", "needs_confirmation"}:
                     rewound = _rewind_failed_archive_watermark()
@@ -6095,18 +6168,21 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 recovering_source = (extraction_journal is not None
                                      and is_frozen_source_retry(ctx, extraction_journal.batch))
                 check_deadline()
-                write_result = self._chunk_and_extract(
-                    messages=extraction_messages,
-                    write_api=write_api,
-                    ctx=ctx,
-                    session_time=session_time,
-                    session_summary=extraction_summary,
-                    tool_stats_text=tool_stats_text,
-                    extraction_run_id=extraction_run_id,
-                    session_id=session_id,
-                    archive_id=archive_id,
-                    extraction_journal=extraction_journal,
-                )
+                with mgr.parallel_archive_compression(
+                    archive_snapshot, session_id, ctx, extraction_journal, archive_id=archive_id,
+                ) as compression_work:
+                    write_result = self._chunk_and_extract(
+                        messages=extraction_messages,
+                        write_api=write_api,
+                        ctx=ctx,
+                        session_time=session_time,
+                        session_summary=extraction_summary,
+                        tool_stats_text=tool_stats_text,
+                        extraction_run_id=extraction_run_id,
+                        session_id=session_id,
+                        archive_id=archive_id,
+                        extraction_journal=extraction_journal,
+                    )
                 if self._write_result_has_failures(write_result):
                     rewound = _rewind_failed_archive_watermark()
                     logger.error(
@@ -6140,7 +6216,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     archive_snapshot,
                     ctx,
                     wait=True,
-                    archive_id=archive_id
+                    archive_id=archive_id,
+                    compression_work=compression_work,
+                    compression_checkpoint=extraction_journal,
                 )
                 if commit_result.get("status") in {"failed", "needs_confirmation"}:
                     rewound = _rewind_failed_archive_watermark()
@@ -6398,7 +6476,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "archive_id": batch.get("archive_id") if checkpointed else None,
             **error_fields(exc, request_id),
         }, request_id)
-
 
     def _compact_impl(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""

@@ -98,7 +98,7 @@ class _ResourceMutationLease:
 
 def _is_not_found_error(exc: AGFSClientError) -> bool:
     message = str(exc).lower()
-    return any(text in message for text in ("no such file", "no such directory", "not found"))
+    return any(marker in message for marker in ("no such file", "no such directory", "not found"))
 
 
 # URI patterns for different memory types
@@ -169,6 +169,10 @@ _SESSION_HISTORY_PATTERN = re.compile(
 # ctx://{account}/sessions/{session_id}/state
 _SESSION_STATE_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$'
+)
+
+_SESSION_STAGE_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/stage_results/(?P<stage_id>[0-9a-f]{64})$'
 )
 
 
@@ -293,6 +297,13 @@ def uri_to_path(uri: str) -> str:
     if match:
         groups = match.groupdict()
         path = PurePosixPath('/accounts') / groups['account'] / 'sessions' / groups['session_id'] / 'history'
+        return str(path) + '/'
+
+    match = _SESSION_STAGE_PATTERN.fullmatch(uri)
+    if match:
+        groups = match.groupdict()
+        path = (PurePosixPath('/accounts') / groups['account'] / 'sessions'
+                / groups['session_id'] / 'stage_results' / groups['stage_id'])
         return str(path) + '/'
 
     # Try session state pattern
@@ -451,6 +462,13 @@ def parse_uri(uri: str) -> dict:
             'category': 'history',
             'slug': '',
         }
+
+    match = _SESSION_STAGE_PATTERN.fullmatch(uri)
+    if match:
+        groups = match.groupdict()
+        return {'account': groups['account'], 'owner_type': 'sessions',
+                'owner_id': groups['session_id'], 'category': 'stage_result',
+                'slug': groups['stage_id']}
 
     # Try session state pattern
     match = _SESSION_STATE_PATTERN.match(uri)
@@ -2558,7 +2576,6 @@ class AGFSContextFS:
         encoded = json.dumps(static, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return {"version": 1, "sha256": hashlib.sha256(encoded).hexdigest()}
 
-
     def _build_node_metadata(
         self,
         node: ContextNode,
@@ -2626,7 +2643,6 @@ class AGFSContextFS:
             if time.monotonic() >= deadline:
                 raise ConcurrentModificationError(uri, observed_version, self._read_node_version(node_path))
             time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
-
 
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
         return self._read_node_snapshot(uri, ctx, lambda: self._read_node_once(uri, ctx))
@@ -2710,7 +2726,6 @@ class AGFSContextFS:
             metadata=metadata,
         ), meta_content
 
-
     def read_node_fields(self, uri: str, ctx: RequestContext, level: str) -> ContextNode:
         """Read only the MCP-requested detail fields for a node."""
 
@@ -2764,7 +2779,6 @@ class AGFSContextFS:
             content=content,
             metadata=metadata,
         ), meta_content
-
 
     def exists(self, uri: str, ctx: RequestContext) -> bool:
         """Check if node exists and is ACTIVE.

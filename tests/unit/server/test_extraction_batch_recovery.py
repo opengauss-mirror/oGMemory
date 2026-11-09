@@ -7,6 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("service_threading")
+
 from commit.write_receipts import RECEIPTS_KEY, WriteNotStartedError
 from core.models import CandidateMemory, RequestContext
 from providers.unified_config import OgMemConfig
@@ -45,10 +47,14 @@ def setup_service(fs, ctx, *, entries=None, extract=None, outbox=None):
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
     service._cfg.after_turn_threshold = 1
     service._write_api = writer
-    service._generate_and_write_summary = Mock()
+    service._get_outbox_store = Mock(return_value=outbox)
+    service.get_llm = Mock(return_value=NoModel())
+    service._generate_summary_candidate = Mock(return_value=None)
     service.drain_outbox_sync = Mock(return_value={})
     service._async_drain = Mock()
     manager = service.get_session_manager()
+    manager._get_archive_store = lambda: None
+    manager._get_agfs = lambda: fs
     manager.commit_snapshot = Mock(return_value={"ok": True, "status": "completed", "archived": True})
     return service, writer, manager
 
@@ -110,7 +116,7 @@ def test_agent_skip_recovers_after_result_checkpoint_failure(ctx, legacy_writing
     state = nodes(fs, "state")[0]
     payload = json.loads(state.content)
     batch = payload["runtime_extensions"][EXTENSION_KEY]["batch"]
-    slot = next(slot for slot in batch["slots"].values() if slot["candidates"][0]["category"] == "skill")
+    slot = next(slot for slot in batch["slots"].values() if slot["candidates"] and slot["candidates"][0]["category"] == "skill")
     if legacy_writing:
         # Older writers persisted 'writing' before recognizing this no-write case.
         slot["operations"]["0"] = {"status": "writing"}
@@ -445,6 +451,8 @@ def lazy_service(fs, ctx):
     service.get_write_api = Mock(side_effect=initialize)
     manager = service.get_session_manager()
     manager._get_llm = lambda: None
+    manager._get_archive_store = lambda: None
+    manager._get_agfs = lambda: fs
     manager.commit_snapshot = Mock(return_value={"ok": True, "status": "completed", "archived": True})
     return service, writer, manager
 
@@ -703,7 +711,8 @@ def test_spawn_failure_completes_claimed_source_synchronously(ctx, monkeypatch):
     service, writer, manager = setup_service(fs, ctx)
     request = {key: value for key, value in params(ctx).items() if key != "clientRequestId"}
     request["wait"] = False
-    monkeypatch.setattr(threading.Thread, "start", Mock(side_effect=RuntimeError("thread capacity exhausted")))
+    monkeypatch.setattr("server.memory_service.threading.Thread",
+                        Mock(return_value=Mock(start=Mock(side_effect=RuntimeError("thread capacity exhausted")))))
     result = service.after_turn(request)
     assert result["status"] == "completed"
     assert result["ok"]

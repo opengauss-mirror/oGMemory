@@ -423,6 +423,8 @@ def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints()
     old.pop("verified_object_aliases")
     old.pop("source_contexts")
     old.pop("node_draft_indices")
+    old.pop("node_reconciliation_role")
+    old.pop("node_reconciliation_group")
     for name in ("routing_key", "legacy_routing_key", "target_uri", "expected_version", "confidence",
                  "provenance_ids", "complete_occurrence_context", "write_operation_id"):
         old.pop(name)
@@ -435,6 +437,8 @@ def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints()
     old.pop("verified_object_aliases")
     old.pop("source_contexts")
     old.pop("node_draft_indices")
+    old.pop("node_reconciliation_role")
+    old.pop("node_reconciliation_group")
     old.pop("write_operation_id")
     evidence = {"candidate": old, "account_id": CTX.account_id, "user_id": CTX.user_id,
                 "agent_id": CTX.agent_id, "session_id": CTX.session_id}
@@ -461,6 +465,8 @@ def test_old_field_checkpoint_and_old_receipt_upgrade_retry_without_model_or_new
     legacy_candidate.pop("verified_object_aliases")
     legacy_candidate.pop("source_contexts")
     legacy_candidate.pop("node_draft_indices")
+    legacy_candidate.pop("node_reconciliation_role")
+    legacy_candidate.pop("node_reconciliation_group")
     legacy_payload = {key: value for key, value in legacy_candidate.items() if key != "write_operation_id"}
     legacy_digest = hashlib.sha256(json.dumps(
         {"candidate": legacy_payload, "account_id": CTX.account_id, "user_id": CTX.user_id,

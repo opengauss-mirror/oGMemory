@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
 from copy import deepcopy
 from dataclasses import asdict, replace
 
 from commit.outbox_scope import current_outbox_events, restore_outbox_events
 from commit.write_receipts import operation_digest
-from service.model_stage import stage_digest
+from core.models import CandidateMemory, ContextNode
+from core.model_stage import stage_digest
 from core.write_contract import OUTCOMES_KEY, store_outcome, merge_source_outcome
-from core.models import CandidateMemory
 
 EXTENSION_KEY = "memory_extraction_recovery"
+logger = logging.getLogger(__name__)
 
 
 class RecoveryNeedsConfirmationError(RuntimeError):
@@ -46,12 +49,16 @@ class ExtractionBatchJournal:
         journal.manager, journal.buffer, journal.ctx = manager, buffer, ctx
         journal._archive_id = batch["archive_id"]
         restore_outbox_events(batch, ctx.account_id)
+        journal._stage_owner = threading.get_ident()
+        journal._verified_stage_results = set()
         return journal
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
                  request_messages=None, lifecycle=None, request_source_ids=None):
         self.manager, self.buffer, self.ctx = manager, buffer, ctx
+        self._stage_owner = threading.get_ident()
+        self._verified_stage_results = set()
         extension = buffer.runtime_extensions.get(EXTENSION_KEY, {})
         batch = extension.get("batch")
         if batch is not None:
@@ -133,6 +140,94 @@ class ExtractionBatchJournal:
     def checkpoint(self, slot):
         return CandidateCheckpoint(self, str(slot))
 
+    def _stage_fs(self):
+        if threading.get_ident() != self._stage_owner:
+            raise RecoveryPersistenceError("stage persistence requires its owning thread")
+        fs = self.manager._get_context_fs()
+        self.manager._require_sql_mutation(self.ctx, fs)
+        return fs
+
+    def _stage_uri(self, name, input_digest, output_digest):
+        identity = stage_digest({"owner": recovery_owner(self.ctx), "archive_id": self._archive_id,
+                                 "stage": name, "input": input_digest, "output": output_digest})
+        return f"ctx://{self.ctx.account_id}/sessions/{self.ctx.session_id}/stage_results/{identity}"
+
+    def load_stage(self, name, inputs):
+        input_digest = stage_digest(inputs)
+        record = self.batch.get("stage_results", {}).get(name, {}).get(input_digest)
+        if record is None:
+            return None
+        if (record.get("version") != 1 or record.get("status") != "complete"
+                or record.get("input_sha256") != input_digest
+                or record.get("uri") != self._stage_uri(name, input_digest, record.get("output_sha256"))):
+            raise RecoveryNeedsConfirmationError("model stage reference requires verification")
+        from core.errors import NodeNotFoundError
+        try:
+            node = self._stage_fs().read_node(record["uri"], self.ctx)
+        except (NodeNotFoundError, FileNotFoundError):
+            self._verified_stage_results.discard((name, input_digest, record["output_sha256"]))
+            return None
+        try:
+            saved = json.loads(node.content)
+            if (saved["version"] != 1 or saved["owner"] != recovery_owner(self.ctx)
+                    or saved["archive_id"] != self._archive_id or saved["stage"] != name
+                    or saved["input_sha256"] != input_digest
+                    or stage_digest(saved["result"]) != record["output_sha256"]):
+                raise ValueError("stage identity changed")
+            self._verified_stage_results.add((name, input_digest, record["output_sha256"]))
+            return saved["result"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RecoveryNeedsConfirmationError("model stage result requires verification") from exc
+
+    def has_stage(self, name):
+        return bool(self.batch.get("stage_results", {}).get(name))
+
+    def save_stage(self, name, inputs, result):
+        """Persist one immutable result and keep a compact reference in the batch."""
+        input_digest, output_digest = stage_digest(inputs), stage_digest(result)
+        fs = self._stage_fs()
+        identity = (name, input_digest, output_digest)
+        if identity in self._verified_stage_results:
+            return
+        uri = self._stage_uri(name, input_digest, output_digest)
+        saved = {"version": 1, "owner": recovery_owner(self.ctx), "archive_id": self._archive_id,
+                 "stage": name, "input_sha256": input_digest, "result": result}
+        node = ContextNode(uri=uri, context_type="RESOURCE", category="stage_result", level=0,
+                           owner_space=f"session:{self.ctx.session_id}", abstract="Prepared model stage",
+                           overview="Prepared model stage", content=json.dumps(saved, ensure_ascii=False,
+                                                                              separators=(",", ":")),
+                           metadata={"session_id": self.ctx.session_id, "owner_user_id": self.ctx.user_id,
+                                     "owner_agent_id": self.ctx.agent_id, "archive_id": self._archive_id})
+        fs.write_node(node, self.ctx)
+        def update(batch):
+            batch.setdefault("stage_results", {}).setdefault(name, {})[input_digest] = {
+                "version": 1, "status": "complete", "input_sha256": input_digest,
+                "output_sha256": output_digest, "uri": uri}
+            uris = batch.setdefault("stage_result_uris", [])
+            if uri not in uris:
+                uris.append(uri)
+        self.mutate(update)
+        self._verified_stage_results.add(identity)
+
+    def _release_stage_results(self, uris):
+        from core.errors import NodeNotFoundError
+        if not uris:
+            return
+        fs = self._stage_fs()
+        prefix = f"ctx://{self.ctx.account_id}/sessions/{self.ctx.session_id}/stage_results/"
+        for uri in uris:
+            if (not isinstance(uri, str) or not uri.startswith(prefix)
+                    or len(uri[len(prefix):]) != 64
+                    or any(char not in "0123456789abcdef" for char in uri[len(prefix):])):
+                logger.warning("stage cleanup requires an owned artifact reference")
+                continue
+            try:
+                fs.delete_node(uri, self.ctx)
+            except (NodeNotFoundError, FileNotFoundError):
+                pass
+            except Exception as exc:
+                logger.warning("completed stage cleanup deferred: uri=%s error=%s", uri, type(exc).__name__)
+
     def has_retryable_write_failure(self):
         with self.buffer.session_state_save_lock:
             statuses = {operation.get("status")
@@ -147,6 +242,7 @@ class ExtractionBatchJournal:
         with self.buffer.session_state_save_lock:
             with self.buffer.extraction_lock:
                 batch = self.batch
+                stage_uris = list(batch.get("stage_result_uris", []))
                 rollback = self.buffer.capture_rollback_state()
                 old_completed = list(self.buffer.completed_request_ids)
                 old_extension = self.buffer.runtime_extensions[EXTENSION_KEY]
@@ -206,12 +302,40 @@ class ExtractionBatchJournal:
                     else:
                         self.buffer.runtime_extensions[OUTCOMES_KEY] = old_outcomes
                 raise RecoveryPersistenceError("completed extraction checkpoint could not be saved")
+            self._release_stage_results(stage_uris)
             return receipt
 
 
 class CandidateCheckpoint:
     def __init__(self, journal, slot):
         self.journal, self.slot = journal, slot
+
+    def load_stage(self, name, inputs):
+        return self.journal.load_stage(f"slot:{self.slot}/{name}", inputs)
+
+    def has_stage(self, name):
+        return self.journal.has_stage(f"slot:{self.slot}/{name}")
+
+    def save_stage(self, name, inputs, result):
+        return self.journal.save_stage(f"slot:{self.slot}/{name}", inputs, result)
+
+    def invalidate_unaccepted_preparation(self):
+        """Prepare this slot again after its generated identity needs correction."""
+        prefix = f"slot:{self.slot}/"
+
+        def invalidate(batch):
+            if self.slot in batch["slots"]:
+                raise RecoveryNeedsConfirmationError("identity correction requires an unaccepted slot")
+            stages = batch.get("stage_results", {})
+            for name in list(stages):
+                if name.startswith(prefix):
+                    del stages[name]
+            batch.get("node_drafts", {}).pop(self.slot, None)
+
+        self.journal.mutate(invalidate)
+        self.journal._verified_stage_results = {
+            identity for identity in self.journal._verified_stage_results
+            if not identity[0].startswith(prefix)}
 
     @property
     def record(self):
