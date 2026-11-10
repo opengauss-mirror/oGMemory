@@ -325,9 +325,12 @@ class SharedConnectionPool:
 class PoolAdapterMixin:
     """Mixin that adds optional shared-pool support to a SQL store.
 
-    Subclasses still define their own ``_get_connection`` / ``_return_connection``
-    for the standalone (no-pool) case; this mixin wires those methods to the
-    shared pool when one is provided.
+    Subclasses may rely on the mixin's standalone (no-pool) connection
+    pool: a hard cap on **total live** connections (idle + checked-out)
+    enforced with a semaphore, so N concurrent ``_get_connection`` calls
+    queue for a slot instead of each opening their own connection.  When
+    a shared ``SharedConnectionPool`` is provided, its bounded methods
+    are bound to the instance instead.
 
     Usage in a store::
 
@@ -336,9 +339,16 @@ class PoolAdapterMixin:
                 self._init_pool(pool, connection_string, pool_size)
                 self._ensure_table()
 
-            # Optional: override standalone pool methods
-            def _get_connection(self): ...
-            def _return_connection(self, conn): ...
+    Subclasses that patch ``psycopg2`` at module level (for unit tests)
+    override ``_create_connection`` to use their module reference.
+
+    Timeout semantics (P3-2): the two pool wirings differ by design —
+    the standalone path's ``_get_connection(timeout=None)`` **blocks
+    forever** waiting for a free slot, while a shared
+    ``SharedConnectionPool.get_connection`` defaults to ``timeout=30.0``
+    and raises ``PoolTimeout`` after 30 s. The same call site can thus
+    hang or raise depending on wiring; long-lived batch consumers that
+    must not hang should pass an explicit ``timeout=``.
     """
 
     def _init_pool(
@@ -364,11 +374,120 @@ class PoolAdapterMixin:
             self._sql_dialect = self._dialect.name
             self._pool_size = pool_size
             self._pool: list = []
+            # Guards the idle-queue length check + append/pop, and bounds
+            # total live connections (idle + active) so concurrent
+            # borrowers queue for a slot instead of over-connecting.
+            self._lock = threading.Lock()
+            self._semaphore = threading.Semaphore(max(1, pool_size))
+
+        # Wrap both shared-pool aliases and the standalone pool methods
+        # with the session-mutation guard (SQL archive safety net).
         from fs.sql_adapter.session_mutation import guard_pool_methods
         guard_pool_methods(self, self._connection_string)
 
     def _return_shared_connection(self, conn):
         self._shared_pool.return_connection(conn)
+
+    # ------------------------------------------------------------------
+    # Standalone (no shared pool) connection management
+    # ------------------------------------------------------------------
+
+    def _create_connection(self):
+        """Open a new database connection.
+
+        Subclasses whose unit tests patch ``psycopg2`` at their own module
+        level must override this to use their module reference.
+        """
+        import psycopg2
+
+        return psycopg2.connect(self._connection_string)
+
+    def _pooled_connection_alive(self, conn) -> bool:
+        """Liveness check for a pooled connection on borrow.
+
+        Default is the cheap ``closed`` flag; subclasses that must survive
+        database restarts / network drops override this with a round-trip
+        validation (e.g. ``is_connection_alive``). Fresh connections from
+        ``_create_connection`` are never validated.
+        """
+        return conn.closed == 0
+
+    def _standalone_get_connection(self, timeout=None):
+        """Borrow a standalone connection (blocks if the cap is reached).
+
+        ``timeout=None`` blocks until a slot frees up; a numeric ``timeout``
+        raises ``RuntimeError`` when it elapses.  Dead pooled connections
+        are discarded (loop) until the pool is empty, then a fresh
+        connection is opened.  Objects built via ``__new__`` (no
+        ``_init_pool``) fall back to the legacy unbounded pop-or-create
+        path.
+        """
+        semaphore = getattr(self, "_semaphore", None)
+        if semaphore is None:
+            pool = getattr(self, "_pool", None)
+            while pool:
+                conn = pool.pop()
+                if self._pooled_connection_alive(conn):
+                    return conn
+                # Defensive close for symmetry with the semaphore path
+                # (the conn may already be closed; never raise here).
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return self._create_connection()
+        if timeout is None:
+            semaphore.acquire()
+        elif not semaphore.acquire(timeout=timeout):
+            raise RuntimeError(
+                f"{type(self).__name__}: timed out waiting for a connection "
+                f"slot (pool_size={self._pool_size})"
+            )
+        try:
+            while True:
+                with self._lock:
+                    conn = self._pool.pop() if self._pool else None
+                if conn is None:
+                    return self._create_connection()
+                if self._pooled_connection_alive(conn):
+                    return conn
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            semaphore.release()
+            raise
+
+    def _standalone_return_connection(self, conn):
+        """Return a standalone connection; always release its slot."""
+        semaphore = getattr(self, "_semaphore", None)
+        if semaphore is None:
+            pool = getattr(self, "_pool", None)
+            if (
+                pool is not None
+                and len(pool) < getattr(self, "_pool_size", 0)
+                and conn.closed == 0
+            ):
+                pool.append(conn)
+            elif conn.closed == 0:
+                conn.close()
+            return
+        try:
+            with self._lock:
+                if len(self._pool) < self._pool_size and conn.closed == 0:
+                    self._pool.append(conn)
+                    return
+            if conn.closed == 0:
+                conn.close()
+        finally:
+            semaphore.release()
+
+    def _get_connection(self, timeout=None):
+        return self._standalone_get_connection(timeout=timeout)
+
+    def _return_connection(self, conn):
+        self._standalone_return_connection(conn)
 
     @property
     def sql_dialect(self) -> SQLDialect:

@@ -66,6 +66,7 @@ $RECYCLE.BIN/
 !.env.example
 !config/env.example
 !deploy/.env.example
+!deploy/.env.parallel-locomo.example
 *.pem
 *.key
 *.p12
@@ -205,6 +206,7 @@ deploy/_artifacts/
 # Asciinema recordings (local demo artifacts, not source)
 *.cast
 *.gif
+deploy/ogmemory-rendered.yaml
 
 # SWE-bench local configuration, caches, credentials and generated results
 /benchmarks/swebench/work/

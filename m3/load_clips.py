@@ -87,7 +87,13 @@ def build_graph_service(store_kind: str, connection_string: str | None, vector_i
                 "--connection-string or set OGMEM_GRAPH_CONNECTION_STRING."
             )
         from providers.graph_store import SQLGraphStore
-        return GraphService(SQLGraphStore(connection_string=dsn), vector_index=vector_index), "sql"
+        # OGMEM_GRAPH_POOL_SIZE (default 32): keep >= the parallel-clip
+        # worker count or worker threads serialize on pool checkout.
+        graph_pool_size = int(os.environ.get("OGMEM_GRAPH_POOL_SIZE") or 32)
+        return GraphService(
+            SQLGraphStore(connection_string=dsn, pool_size=graph_pool_size),
+            vector_index=vector_index,
+        ), "sql"
 
     raise ValueError(f"Unknown graph store: {store_kind!r}")
 
