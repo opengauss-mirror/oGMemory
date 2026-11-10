@@ -147,8 +147,8 @@ def test_public_extraction_graph_contract_survives_scoping_and_recovery(
             assert ("── profile (" in prompt.split("Conversation:\n", 1)[0]) is graph_enabled
             assert (graph_guidance in prompt) is graph_enabled
             from extraction.tool_builder import build_update_instruction
-            expected_runtime = (extractor._update_instruction if graph_enabled else
-                                build_update_instruction(extractor._schema_registry, {"entity"}))
+            expected_runtime = build_update_instruction(
+                extractor._schema_registry, None if graph_enabled else {"entity"})
             assert expected_runtime in prompt
             _assert_graph_tools(request.kwargs["tools"], graph_enabled)
     if mode == "lazy":
@@ -208,8 +208,8 @@ def test_prepared_prompt_crops_only_trusted_sections_and_renders_system_once(gra
     assert ("── profile (" in prompt.split("Conversation:\n", 1)[0]) is graph_enabled
     assert "── profile (" in prompt.split("Conversation:\n", 1)[1]
     from extraction.tool_builder import build_update_instruction
-    expected_runtime = (extractor._update_instruction if graph_enabled else
-                        build_update_instruction(extractor._schema_registry, {"entity"}))
+    expected_runtime = build_update_instruction(
+        extractor._schema_registry, None if graph_enabled else {"entity"})
     assert expected_runtime in prompt
     _assert_graph_tools(tools, graph_enabled)
 

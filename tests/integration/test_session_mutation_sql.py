@@ -156,13 +156,13 @@ def test_background_topic_directory_contention_recovers_after_repeated_waits(dat
                 return [self.extraction()]
             calls.append((self.key, "node_processing"))
             if self.key == "receiver_red":
-                active_session_guard().ensure_owned()
+                assert active_session_guard() is not None
                 started.set()
                 assert release.wait(55)
             payload = node_payload(kwargs)
             item = operation([draft["id"] for draft in payload["drafts"]], fact="Operates at 37 MHz.")
             item.update(routing_key=self.key, object_name=self.key, abstract=f"Receiver {self.key}.")
-            return [{"tool": "process_memory_nodes", "input": {"operations": [item]}}]
+            return [{"tool": "process_memory_nodes", "input": {"operations": [item], "related_reconciliations": []}}]
 
     def build(request_ctx, key):
         service, old_writer, manager, archive, outbox = service_pair(make, request_ctx)

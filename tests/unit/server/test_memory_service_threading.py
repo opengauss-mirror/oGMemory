@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import logging
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -12,19 +13,27 @@ from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 
 
-@pytest.mark.parametrize("archive_failed", [False, True])
-def test_background_completion_marker_waits_for_snapshot_commit(caplog, archive_failed):
-    caplog.set_level(logging.INFO, logger="ogmem.service")
+@pytest.fixture
+def after_turn_service():
     service = MemoryService(config=OgMemConfig(
         after_turn_threshold=1, session_state_bridge_enabled=False,
     ))
-    session_id = "archive-completion-barrier"
-    ctx = _threaded_ctx(session_id)
     service._write_api = Mock()
     service._async_drain = Mock()
-    service._chunk_and_extract = Mock(return_value=_successful_write_result())
     mgr = service.get_session_manager()
     mgr.save_session_state = Mock(return_value=True)
+    mgr.parallel_archive_compression = Mock(return_value=nullcontext())
+    mgr.commit_snapshot = Mock(return_value={"ok": True, "archived": True, "status": "completed"})
+    return service, mgr
+
+
+@pytest.mark.parametrize("archive_failed", [False, True])
+def test_background_completion_marker_waits_for_snapshot_commit(caplog, archive_failed, after_turn_service):
+    caplog.set_level(logging.INFO, logger="ogmem.service")
+    service, mgr = after_turn_service
+    session_id = "archive-completion-barrier"
+    ctx = _threaded_ctx(session_id)
+    service._chunk_and_extract = Mock(return_value=_successful_write_result())
 
     def commit(*args, **kwargs):
         assert "after_turn background extract done:" not in caplog.text
@@ -32,7 +41,7 @@ def test_background_completion_marker_waits_for_snapshot_commit(caplog, archive_
             "status": "completed", "archived": True,
         }
 
-    mgr.commit_snapshot = Mock(side_effect=commit)
+    mgr.commit_snapshot.side_effect = commit
     service.after_turn({
         "sessionId": session_id,
         "messages": [{"role": "user", "content": "a" * 100}],
@@ -62,13 +71,8 @@ def test_session_manager_lazy_initialization_is_thread_safe():
     assert len({id(manager) for manager in managers}) == 1
 
 
-def test_concurrent_after_turn_claims_each_message_once():
-    service = MemoryService(
-        config=OgMemConfig(
-            after_turn_threshold=1,
-            session_state_bridge_enabled=False,
-        )
-    )
+def test_concurrent_after_turn_claims_each_message_once(after_turn_service):
+    service, mgr = after_turn_service
     ctx = RequestContext(
         account_id="acct-test",
         user_id="user-test",
@@ -76,11 +80,6 @@ def test_concurrent_after_turn_claims_each_message_once():
         session_id="session-threaded",
         trace_id="trace-threaded",
     )
-    service._write_api = Mock()
-    service._async_drain = Mock()
-    mgr = service.get_session_manager()
-    mgr.save_session_state = Mock(return_value=True)
-
     claim_barrier = threading.Barrier(2)
     buf = mgr.get_or_create("session-threaded", ctx=ctx)
     real_claim = buf.claim_incremental_extraction
@@ -110,9 +109,6 @@ def test_concurrent_after_turn_claims_each_message_once():
         }
 
     service._chunk_and_extract = fake_extract
-    mgr.commit_snapshot = Mock(
-        return_value={"ok": True, "archived": True, "status": "completed"}
-    )
 
     results = []
 
@@ -145,22 +141,10 @@ def test_concurrent_after_turn_claims_each_message_once():
     mgr.commit_snapshot.assert_called_once()
 
 
-def test_after_turn_returns_retryable_while_session_extraction_active():
-    service = MemoryService(
-        config=OgMemConfig(
-            after_turn_threshold=1,
-            session_state_bridge_enabled=False,
-        )
-    )
+def test_after_turn_returns_retryable_while_session_extraction_active(after_turn_service):
+    service, mgr = after_turn_service
     session_id = "session-single-flight"
     ctx = _threaded_ctx(session_id)
-    service._write_api = Mock()
-    service._async_drain = Mock()
-    mgr = service.get_session_manager()
-    mgr.save_session_state = Mock(return_value=True)
-    mgr.commit_snapshot = Mock(
-        return_value={"ok": True, "archived": True, "status": "completed"}
-    )
 
     extract_started = threading.Event()
     release_extract = threading.Event()

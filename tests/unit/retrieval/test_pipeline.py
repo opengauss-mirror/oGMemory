@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,7 @@ from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
+from retrieval.trace import RetrievalTrace
 from tests.unit.retrieval.conftest import make_ctx
 
 
@@ -280,7 +282,7 @@ class TestPipeline:
         assert len(result.hits) == 2
         assert [hit.uri for hit in result.hits] == ["skill-high-1", "skill-high-2"]
 
-    def test_multiple_typed_queries_keep_append_order_when_global_rerank_disabled(self, ctx):
+    def test_multiple_typed_queries_rank_globally_with_default_config(self, ctx):
         class Planner:
             def plan(self, query, ctx, **kwargs):
                 return [
@@ -319,8 +321,32 @@ class TestPipeline:
         result = pipe.run("combined query", ctx, top_k=2)
 
         assert [hit.uri for hit in result.hits] == [
-            "memory-low-1",
-            "memory-low-2",
             "skill-high-1",
             "skill-high-2",
+        ]
+
+    def test_combined_queries_keep_best_ranked_memory_units(self, ctx):
+        uri = "ctx://acct-1/agents/a1/memories/tools/deploy"
+        groups = {
+            "first": [
+                RetrievedBlock(uri=uri + "/content.md", score=0.6, ranking_score=0.7,
+                               metadata={"unit_key": "first"}),
+                RetrievedBlock(uri=uri, score=0.7, ranking_score=0.8,
+                               metadata={"unit_key": "second"}),
+            ],
+            "second": [
+                RetrievedBlock(uri=uri, score=0.5, ranking_score=0.95,
+                               metadata={"unit_key": "first"}),
+                RetrievedBlock(uri="ctx://acct-1/users/u1/memories/preferences/cli",
+                               score=0.9, ranking_score=0.9),
+            ],
+        }
+        queries = [TypedQuery(text, "MEMORY", [], top_k=3) for text in groups]
+        assembly = SimpleNamespace(assemble=lambda tq, *args, **kwargs: groups[tq.text])
+        pipe = RetrievalPipeline(None, None, None, assembly)
+
+        hits = pipe._run_assembly(queries, [], None, RetrievalTrace(), ctx)
+
+        assert [(hit.ranking_score, hit.metadata.get("unit_key")) for hit in hits] == [
+            (0.95, "first"), (0.9, None), (0.8, "second"),
         ]

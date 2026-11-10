@@ -73,7 +73,10 @@ class NativeRelationsLLM:
         # is mocked: the real partition validator consumes this provider result.
         payload = json.loads(prompt.rsplit("\n", 1)[-1])
         groups = []
-        group_schema = schema["properties"]["groups"]["items"]["properties"]
+        group_item = schema["properties"]["groups"]["items"]
+        if "oneOf" in group_item:
+            return {"groups": [{"members": [index]} for index in range(len(payload["drafts"]))]}
+        group_schema = group_item["properties"]
         for index, raw in enumerate(payload["drafts"]):
             draft = raw.get("draft", raw)
             group = {"members": [index], **{key: draft[key] for key in

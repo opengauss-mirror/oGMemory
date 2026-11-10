@@ -96,6 +96,7 @@ class RetrievalPipeline:
         memory_directories: list[str] | None = None,
         collect_graph_supplement: bool = False,
         use_scene: bool | None = None,
+        final_top_k: int | None = None,
     ) -> SearchMemoryResult:
         if use_scene is not None and not isinstance(use_scene, bool):
             raise ValueError("use_scene must be boolean")
@@ -114,10 +115,14 @@ class RetrievalPipeline:
 
         # Stage 2
         all_seed_results: list[SeedResult] = []
+        query_vectors: dict[str, list[float]] = {}
         level_counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0}
         for tq in typed_queries:
             tq.memory_directories = memory_directories
-            sr = self._run_seed(tq, ctx, trace, mode=mode)
+            sr = self._run_seed(
+                tq, ctx, trace, mode=mode, query_vector=query_vectors.get(tq.text),
+            )
+            query_vectors[tq.text] = sr.query_vector
             all_seed_results.append(sr)
             for h in sr.starting_points:
                 level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
@@ -146,35 +151,34 @@ class RetrievalPipeline:
             query_results.append((tq, leaves, sr if self.cfg.expand_hierarchy else None, reserve))
             all_leaf_hits.extend(leaves)
 
-        pregraph_hits = list(all_leaf_hits)
-        # Graph additions must obey the same effective category scope as seeds.
-        # An empty category list means unrestricted, as in the ordinary path.
-        graph_categories = set(categories) if categories else None
-        if graph_categories is None and typed_queries and all(tq.categories for tq in typed_queries):
-            graph_categories = {c for tq in typed_queries for c in tq.categories}
-        # Graph memory never expands resource, trace or skill-only rounds.
-        memory_round = all(str(tq.context_type).upper() == "MEMORY" for tq in typed_queries) and bool(typed_queries)
-        memory_round = memory_round and categories != ["session_summary"]
-        if self.cfg.enable_graph_expansion and self._graph_retriever and memory_round:
-            vector = next((sr.query_vector for tq, sr in zip(typed_queries, all_seed_results)
-                           if tq.text == query and sr.query_vector), None)
-            all_leaf_hits = self._expand_by_graph(query, all_leaf_hits, ctx, trace,
-                                                 query_vector=vector, categories=graph_categories,
-                                                 memory_directories=memory_directories,
-                                                 context_type="MEMORY")
-        if (collect_graph_supplement and memory_round and self.cfg.enable_graph_expansion
-                and self.cfg.graph_supplement_enabled and self._graph_supplement):
-            try:
-                vector = next((sr.query_vector for tq, sr in zip(typed_queries, all_seed_results)
-                               if tq.text == query and sr.query_vector), None)
-                trace.graph_expansion["two_hop_supplement"] = self._graph_supplement.select(
-                    query, pregraph_hits, all_leaf_hits, ctx, query_vector=vector,
-                    context_type="MEMORY",
-                    **({"categories": graph_categories} if graph_categories is not None else {}),
-                    **({"memory_directories": memory_directories} if memory_directories is not None else {}))
-            except Exception as exc:
-                logger.warning("Graph supplement failed; preserving baseline: %s", exc)
-                trace.graph_expansion["two_hop_supplement_error"] = type(exc).__name__
+        if self.cfg.enable_graph_expansion and categories != ["session_summary"]:
+            memory_queries = [(tq, leaves, seed)
+                              for (tq, leaves, _, _), seed in zip(query_results, all_seed_results)
+                              if str(tq.context_type).upper() == "MEMORY"]
+            if memory_queries:
+                memory_hits = [hit for _, leaves, _ in memory_queries for hit in leaves]
+                graph_categories = set(categories) if categories else None
+                if graph_categories is None and all(tq.categories for tq, _, _ in memory_queries):
+                    graph_categories = {category for tq, _, _ in memory_queries for category in tq.categories}
+                vector = next((seed.query_vector for tq, _, seed in memory_queries
+                               if tq.text == query and seed.query_vector), None)
+                expanded_memory = memory_hits
+                if self._graph_retriever:
+                    expanded_memory = self._expand_by_graph(
+                        query, memory_hits, ctx, trace, query_vector=vector, categories=graph_categories,
+                        memory_directories=memory_directories, context_type="MEMORY",
+                    )
+                    all_leaf_hits.extend(expanded_memory[len(memory_hits):])
+                if collect_graph_supplement and self.cfg.graph_supplement_enabled and self._graph_supplement:
+                    try:
+                        trace.graph_expansion["two_hop_supplement"] = self._graph_supplement.select(
+                            query, memory_hits, expanded_memory, ctx, query_vector=vector, context_type="MEMORY",
+                            **({"categories": graph_categories} if graph_categories is not None else {}),
+                            **({"memory_directories": memory_directories} if memory_directories is not None else {}),
+                        )
+                    except Exception as exc:
+                        logger.warning("Graph supplement failed; preserving baseline: %s", exc)
+                        trace.graph_expansion["two_hop_supplement_error"] = type(exc).__name__
 
         # Stage 4
         # Direct mode must not reintroduce candidates rejected by its threshold.
@@ -183,6 +187,7 @@ class RetrievalPipeline:
             typed_queries, all_leaf_hits, merged_seed, trace, ctx,
             fill_content_for_top_k=fill_content_for_top_k,
             query_results=query_results if scene_stage is not None else None,
+            final_top_k=final_top_k,
         )
 
         trace.total_ms = (time.monotonic() - t0) * 1000
@@ -455,11 +460,12 @@ class RetrievalPipeline:
         trace.add_stage(st)
         return queries
 
-    def _run_seed(self, tq, ctx, trace, *, mode) -> SeedResult:
+    def _run_seed(self, tq, ctx, trace, *, mode, query_vector=None) -> SeedResult:
         with TraceTimer("seed_retrieval") as st:
             st.input_count = 1
             try:
-                result = self.seed_retriever.search(tq, ctx, mode=mode)
+                options = {"query_vector": query_vector} if query_vector is not None else {}
+                result = self.seed_retriever.search(tq, ctx, mode=mode, **options)
             except Exception as exc:
                 logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
                 raise
@@ -509,17 +515,23 @@ class RetrievalPipeline:
     def _run_assembly(
         self, typed_queries, leaf_hits, merged_seed, trace, ctx=None,
         fill_content_for_top_k=0, query_results=None,
+        final_top_k=None,
     ) -> list[RetrievedBlock]:
         with TraceTimer("assembly") as st:
             st.input_count = len(leaf_hits)
             all_blocks = []
-            seen_uris = set()
             # Assembly may reread canonical content. Preserve the edge-bound
             # snapshot independently of metadata returned by that later read.
             graph_receipts = {strip_l2_suffix(hit.uri): {
                 key: hit.metadata[key] for key in ("graph_revision_bindings", "graph_context_type")
                 if key in hit.metadata}
                 for hit in leaf_hits if "graph_revision_bindings" in hit.metadata}
+            best_blocks = {}
+
+            def rank_key(block):
+                ranking_score = getattr(block, "ranking_score", None)
+                score = getattr(block, "score", 0.0)
+                return (ranking_score if ranking_score is not None else score, score)
 
             # Run assembly for each typed query (e.g., memory/skill/resource)
             # and deduplicate results by URI
@@ -550,24 +562,22 @@ class RetrievalPipeline:
                 for b in blocks:
                     uri = getattr(b, "uri", None) or getattr(b, "source_uri", None)
                     identity = memory_identity(uri, getattr(b, "metadata", None)) if uri else None
-                    if identity and identity in seen_uris:
-                        continue
                     if identity:
-                        seen_uris.add(identity)
-                    all_blocks.append(b)
+                        previous = best_blocks.get(identity)
+                        if previous is None or rank_key(b) > rank_key(previous):
+                            best_blocks[identity] = b
+                    else:
+                        all_blocks.append(b)
 
-            final_limit = max((getattr(tq, "top_k", 0) for tq in typed_queries), default=0)
-            if getattr(self.cfg, "global_result_rerank_enabled", False) and final_limit > 0:
+            all_blocks.extend(best_blocks.values())
+
+            final_limit = final_top_k if final_top_k is not None else max(
+                (getattr(tq, "top_k", 0) for tq in typed_queries), default=0,
+            )
+            if final_limit > 0:
                 graph_blocks = [b for b in all_blocks if b.metadata.get("retrieval_origin") == "graph_neighbor"]
                 all_blocks = [b for b in all_blocks if b.metadata.get("retrieval_origin") != "graph_neighbor"]
-                all_blocks.sort(
-                    key=lambda block: (
-                        getattr(block, "ranking_score", None)
-                        if getattr(block, "ranking_score", None) is not None
-                        else getattr(block, "score", 0.0)
-                    ),
-                    reverse=True,
-                )
+                all_blocks.sort(key=rank_key, reverse=True)
                 reserve = next((reserve for _, _, _, reserve in inputs if reserve is not None), None)
                 selected = select_scene_evidence(
                     all_blocks, final_limit, reserve,

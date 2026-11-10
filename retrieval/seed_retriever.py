@@ -50,12 +50,14 @@ class SeedRetriever:
         ctx: RequestContext,
         *,
         mode: str = RetrieverMode.QUICK,
+        query_vector: list[float] | None = None,
     ) -> SeedResult:
         semantic_enabled = (
             not self.config.hybrid_enabled or self.config.semantic_weight > 0
         )
         if semantic_enabled:
-            query_vector = self.embedder.embed_texts([typed_query.text])[0]
+            if query_vector is None:
+                query_vector = self.embedder.embed_texts([typed_query.text])[0]
             root_uris = (
                 self._get_root_uris(typed_query.context_type, ctx)
                 if self.config.expand_hierarchy else []

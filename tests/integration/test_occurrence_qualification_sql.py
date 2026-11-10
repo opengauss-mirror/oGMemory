@@ -131,8 +131,8 @@ def test_unverified_qualification_leaves_sql_node_and_outbox_unchanged(category)
         first = draft(category)
         writer = MemoryWriteAPI(fs, QualificationLLM(), outbox, directory_summary_enabled=False)
         uri = writer.write_memory(first, ctx)["target_uri"]
-        with pytest.raises(ExtractionIncompleteError):
-            qualify(fs, ctx, first, uri, valid=False)
+        independent = qualify(fs, ctx, first, uri, valid=False)
+        assert independent.target_uri == ""
 
         assert fs.read_node(uri, ctx).metadata["version"] == 1
         assert fs.read_node(uri, ctx).content == first.content

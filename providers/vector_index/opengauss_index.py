@@ -318,7 +318,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (table_name, migration))""")
                 cur.execute("LOCK TABLE ogmem_vector_migrations IN EXCLUSIVE MODE")
-                key = (tbl, "legacy_columns_v1")
+                key = (tbl, "legacy_columns_v2")
                 cur.execute("""SELECT 1 FROM ogmem_vector_migrations
                     WHERE table_name = %s AND migration = %s""", key)
                 if cur.fetchone() is not None:
@@ -338,19 +338,26 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                       AND column_name = 'node_id'""")
                 if cur.fetchone() is not None:
                     cur.execute(f"""
-                        UPDATE {tbl} vi SET node_id = cn.node_id
-                        FROM context_nodes cn
-                        WHERE vi.node_uri = cn.uri AND vi.node_id IS NULL
-                          AND vi.account_id = cn.account_id
+                        SELECT DISTINCT account_id FROM {tbl}
+                        WHERE node_id IS NULL AND account_id IS NOT NULL AND node_uri IS NOT NULL
                     """)
-                    cur.execute(f"""
-                        UPDATE {tbl} vi SET node_id = cn.node_id
-                        FROM context_nodes cn
-                        WHERE vi.node_id IS NULL
-                          AND vi.node_uri LIKE '%%/content.md'
-                          AND cn.uri = substring(vi.node_uri from '^(.+)/content[.]md')
-                          AND vi.account_id = cn.account_id
-                    """)
+                    # Legacy context nodes are visible only within their tenant's RLS scope.
+                    for (account_id,) in cur.fetchall():
+                        self.bind_tenant(conn, account_id)
+                        cur.execute(f"""
+                            UPDATE {tbl} vi SET node_id = cn.node_id
+                            FROM context_nodes cn
+                            WHERE vi.node_uri = cn.uri AND vi.node_id IS NULL
+                              AND vi.account_id = %s AND vi.account_id = cn.account_id
+                        """, (account_id,))
+                        cur.execute(f"""
+                            UPDATE {tbl} vi SET node_id = cn.node_id
+                            FROM context_nodes cn
+                            WHERE vi.node_id IS NULL
+                              AND vi.node_uri LIKE '%%/content.md'
+                              AND cn.uri = substring(vi.node_uri from '^(.+)/content[.]md')
+                              AND vi.account_id = %s AND vi.account_id = cn.account_id
+                        """, (account_id,))
                 cur.execute("""INSERT INTO ogmem_vector_migrations (table_name, migration)
                     VALUES (%s, %s)""", key)
             conn.commit()

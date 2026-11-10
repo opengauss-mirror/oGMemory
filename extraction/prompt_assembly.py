@@ -16,6 +16,7 @@ from jsonschema import validate
 from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
 from core.operation_deadline import check_deadline
 from extraction.assembly_contract import AssemblyContract, UnsupportedAssemblyTemplateError
+from core.model_stage import run_model_call
 from extraction.occurrence_qualification import prompt_fits
 from extraction.tool_builder import build_update_instruction
 from providers.llm_observation import observe_call, record_assembly_event
@@ -123,7 +124,7 @@ def run_selection_request(llm, request):
         return AssemblySelection(request.available, scope="full", reason="selection_budget")
     result = None
     try:
-        result = observe_call("selection", llm.complete_json, request.prompt, schema=request.schema,
+        result = run_model_call(observe_call, "selection", llm.complete_json, request.prompt, schema=request.schema,
                               correlation={"user_id": request.user_id})
         check_deadline()
         validate(result, request.schema)
@@ -177,6 +178,7 @@ class PromptParts:
     examples: str
     suffix_data: str
     include_examples: bool = True
+    include_updates: bool = True
     runtime_instruction: str = ""
     manager: object = field(default=None, repr=False, compare=False)
     template_variables: dict = field(default_factory=dict, repr=False, compare=False)
@@ -195,7 +197,7 @@ class PromptParts:
         return replace(self,
             system_prompt=self.manager.render("extraction", "system_prompt", **self.template_variables),
             examples=self.manager.render("extraction", "examples") if self.include_examples else "",
-            runtime_instruction=(build_update_instruction(self.registry) + "\n\n"
+            runtime_instruction=(build_update_instruction(self.registry, include_updates=self.include_updates) + "\n\n"
                                  if self.registry is not None else self.runtime_instruction))
 
     def scoped(self, contract) -> PromptParts:
@@ -215,7 +217,7 @@ class PromptParts:
             ),
             examples=examples if self.examples else "",
             runtime_instruction=(
-                build_update_instruction(self.registry, contract.categories) + "\n\n"
+                build_update_instruction(self.registry, contract.categories, include_updates=self.include_updates) + "\n\n"
                 if self.registry is not None and contract.scope != "full"
                 else self.runtime_instruction
             ),
@@ -264,7 +266,7 @@ def selection_for_prepared(extractor, prepared, ctx, *, preparing=False):
                         extractor, prepared.source_context or prepared.span.source_context,
                         ctx, prepared.span.tool_stats_text,
                     )
-                    state.selection = run_selection_request(extractor._llm, request)
+                    state.selection = extractor._select_span(prepared.span, request, ctx)
                 except Exception as exc:
                     state.error = exc
                     raise
@@ -354,10 +356,13 @@ def assemble_prepared(extractor, prepared, ctx):
         return AssemblyRequest(prefix + selected.render() + tail, selected_tools, contract, final_parts)
 
 
-def compact_prepared_prompt(prepared, contract):
+def compact_prepared_prompt(prepared, contract, *, source_only=False):
     """Render compact template parts without inspecting the source-only prompt text."""
     prompt = prepared.span.fallback_source_prompt
     parts = prepared.span.fallback_prompt_parts
+    if not source_only:
+        prompt = prepared.span.fallback_read_prompt or prompt
+        parts = prepared.span.fallback_read_prompt_parts or parts
     if parts is not None and prompt == parts.render():
         try:
             if contract.scope == "full":

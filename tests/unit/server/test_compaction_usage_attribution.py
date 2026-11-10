@@ -6,6 +6,7 @@ import pytest
 
 from core.models import RequestContext
 from providers.token_tracker import TokenTracker
+from core.model_stage import run_model_call
 from tests.unit.commit.test_memory_identity import MemoryFS
 from tests.unit.server.test_extraction_batch_recovery import candidate
 from tests.unit.server.test_lifecycle_batch_recovery import real_archives, seed
@@ -13,7 +14,7 @@ from tests.unit.server.test_lifecycle_batch_recovery import real_archives, seed
 
 @pytest.mark.parametrize("entry", ["prepare_compaction", "compact"])
 @pytest.mark.parametrize("agent_id", ["", "main"])
-def test_compaction_attributes_extraction_and_summary(entry, agent_id):
+def test_compaction_attributes_extraction_and_parallel_summary(entry, agent_id):
     ctx = RequestContext("compact-account", "reader", agent_id, "compact-session", "usage-proof")
     events, calls = [], []
     tracker = TokenTracker("normal-test-model")
@@ -31,10 +32,10 @@ def test_compaction_attributes_extraction_and_summary(entry, agent_id):
             tracker.record_llm(31, 11)
             return [replace(candidate(), provenance_ids=[
                 f"prov:1:archive:{kwargs['archive_id']}:msg-one"])]
-        return complete()
+        return run_model_call(complete)
 
     service, _, manager = real_archives(MemoryFS(), ctx, extract=extract)
-    del service._generate_and_write_summary
+    del service._generate_summary_candidate
     service.get_llm = lambda: SummaryModel()
     seed(manager, ctx)
     result = getattr(service, entry)({"sessionId": ctx.session_id, "_ctx": ctx})
@@ -47,4 +48,5 @@ def test_compaction_attributes_extraction_and_summary(entry, agent_id):
     assert sorted((event["allocations"][(ctx.account_id, expected_owner)]["input_tokens"],
                    event["allocations"][(ctx.account_id, expected_owner)]["output_tokens"])
                   for event in events) == [(21, 7), (31, 11)]
-    assert sorted(kind for kind, _ in calls) == ["extraction", "summary"]
+    assert any(kind == "summary" and name.startswith("session-summary") for kind, name in calls)
+    assert any(kind == "extraction" and name.startswith("model-stage") for kind, name in calls)

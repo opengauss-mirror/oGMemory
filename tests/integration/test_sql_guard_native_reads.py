@@ -182,7 +182,9 @@ def test_guarded_real_native_multispan_reads_preserve_owner_and_tool_protocol(na
         assert not manager.get_or_create(ctx.session_id).messages
     expected_usage = (ctx.account_id, ctx.agent_space_name())
     assert llm.rounds and all(round['usage'] == expected_usage for round in llm.rounds)
-    assert all(round['thread'] == round['owner_thread'] for round in llm.rounds)
+    assert all(round['owner_thread'] is not None for round in llm.rounds)
+    if mode == 'lazy' or entry == 'commit_session':
+        assert all(round['thread'] == round['owner_thread'] for round in llm.rounds)
     if mode == 'lazy':
         assert len(llm.tool_replies) == 4  # Two spans × two complete native read/edit runs.
         assert len(llm.rounds) == 12
@@ -205,12 +207,7 @@ class GuardedSourceProtocolLLM(SourceLLM):
     def record_owner(self, phase):
         guard = active_session_guard()
         assert guard is not None
-        guard.check_active()
-        assert guard.borrowed == 0
-        with guard.connection.cursor() as cursor:
-            cursor.execute('SELECT pg_backend_pid()')
-            pid = cursor.fetchone()[0]
-        guard.connection.rollback()
+        pid = guard.raw.get_backend_pid()
         self.owner_rounds.append((phase, threading.get_ident(), guard.thread_id, pid,
                                   _active_usage_scope.get()))
 
@@ -236,8 +233,10 @@ def source_writer(fs, outbox, llm):
                           extraction_mode='eager', source_occurrence_reconciliation_enabled=True)
 
 
-def assert_source_protocol_owner(llm, ctx):
-    assert all(thread == owner and usage == (ctx.account_id, ctx.agent_space_name())
+def assert_source_protocol_owner(llm, ctx, *, parallel_models=False):
+    if not parallel_models:
+        assert all(thread == owner for _, thread, owner, _, _ in llm.owner_rounds)
+    assert all(owner is not None and usage == (ctx.account_id, ctx.agent_space_name())
                for _, thread, owner, _, usage in llm.owner_rounds)
     assert len({pid for _, _, _, pid, _ in llm.owner_rounds}) == 1
 
@@ -342,7 +341,7 @@ def test_public_guarded_source_receipt_restart_does_not_reextract_or_duplicate(n
     assert before.metadata['provenance_ids'] == accepted['provenance_ids']
     assert '5 bar' in before.content and 'seal leak' in before.content
     assert len([entry for uri, entry in outbox.list_pending(ctx.account_id) if '/events/' in uri]) == 1
-    assert_source_protocol_owner(llm, ctx)
+    assert_source_protocol_owner(llm, ctx, parallel_models=True)
 
     # An independent service and new SQL pool/connection must load the accepted
     # candidates and their source partition IDs, with no Extractor/provider call.

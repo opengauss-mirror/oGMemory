@@ -32,14 +32,16 @@ def _clip(text: str, limit: int) -> str:
     return text.encode("utf-8")[:max(0, limit)].decode("utf-8", errors="ignore")
 
 
-def hydrate_evidence(items, read_memory, ctx, limits=LIMITS):
+def hydrate_evidence(items, read_memory, ctx, limits=LIMITS, *, read_many=None):
     """Read canonical candidates with caller ACL before selecting passages."""
     hydrated, diagnostics, seen = [], [], set()
     total_bytes = 0
     reads = 0
+    candidates = []
+    requests = []
     for item in items:
         if item.get("category") == "code":
-            hydrated.append(item)
+            candidates.append((item, None))
             continue
         uri = canonical_uri(item.get("uri", ""))
         identity = memory_identity(uri, item.get("metadata"))
@@ -57,8 +59,28 @@ def hydrate_evidence(items, read_memory, ctx, limits=LIMITS):
             entry["reason"] = "missing_uri"
             continue
         reads += 1
+        candidates.append((item, entry))
+        requests.append((uri, unit_key or None))
+
+    blocks = None
+    if read_many is not None and requests:
         try:
-            block = read_memory(uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
+            blocks = read_many(requests, ctx)
+        except Exception:
+            pass
+    for item, entry in candidates:
+        if entry is None:
+            hydrated.append(item)
+            continue
+        uri = entry["uri"]
+        unit_key = entry.get("unit_key")
+        try:
+            if blocks is None:
+                block = read_memory(uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
+            else:
+                block = blocks[(uri, unit_key)]
+                if isinstance(block, Exception):
+                    raise block
         except Exception as exc:
             entry["reason"] = "read_failed"
             entry["error_kind"] = type(exc).__name__
