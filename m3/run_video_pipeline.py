@@ -145,6 +145,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
             try:
                 from m3.resume import (
                     build_graph_service,
+                    qa_params_argv,
                     run_qa_only,
                     video_fully_indexed,
                     write_resume_summary,
@@ -185,6 +186,10 @@ def run_pipeline(args: argparse.Namespace) -> dict:
                         top_k=getattr(args, "top_k", None),
                         resume=getattr(args, "resume", False),
                         verbose=args.verbose,
+                        # Pass explicit ``--set qa.params.*`` retrieval knobs
+                        # through to the QA-only resume path (WS 6.4) — they
+                        # are appended last, overriding driver defaults.
+                        qa_params=qa_params_argv(getattr(args, "set", None) or []),
                     )
                     jsonl_path = Path(summary_qa["jsonl"])
                     summary_path = write_resume_summary(

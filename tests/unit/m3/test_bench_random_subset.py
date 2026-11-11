@@ -147,7 +147,20 @@ def test_judge_failure_propagates_to_run_status(tmp_path, monkeypatch):
     argv = setup_main(tmp_path, monkeypatch)
     config = tmp_path / 'config.yaml'
     config.write_text('{}')
-    monkeypatch.setattr(driver, 'run_one_video', lambda **kw: {'status': 'ok'})
+    work_root = tmp_path / "run"
+
+    # WS 2.5: judging is live and per-video — a per-video judge failure
+    # (returncode != 0) must still propagate to the overall run status.
+    def fake_run_one_video(**kw):
+        vid = kw["video_id"]
+        work = work_root / vid
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "m3_qa_results.jsonl").write_text(json.dumps({
+            "video_id": vid, "question_id": "q", "predicted_answer": "a",
+        }) + "\n")
+        return {"video_id": vid, "status": "ok", "returncode": 0}
+
+    monkeypatch.setattr(driver, 'run_one_video', fake_run_one_video)
     monkeypatch.setattr(driver, 'aggregate_jsonl', lambda *a: {
         'total_records': 1, 'answered': 1, 'failed': 0,
     })
