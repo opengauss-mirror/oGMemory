@@ -250,7 +250,7 @@ docker run -d --name ogmemory --network host \
   -e OGMEM_EMBEDDING_MODEL=text-embedding-v4 \
   -e OGMEM_EMBEDDING_API_KEY=your-embedding-api-key \
   -e VECTOR_DB_DIMENSION=1024 \
-  -e VECTOR_DB_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx" \
+  -e VECTOR_DB_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=your_username password=xxx" \
   ogmemory:v0.9
 ```
 
