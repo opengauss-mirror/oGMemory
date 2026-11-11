@@ -5291,7 +5291,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 raise SessionMutationBusyError("session mutation dialect discovery unavailable") from exc
             with SQLContextFS.configured_session_mutation_lock(
                 self._cfg.sql_connection_string, ctx, dialect=pool.sql_dialect.name,
-                timeout_seconds=max(0, deadline - time.monotonic()),
+                slots=pool.session_mutation_slots, timeout_seconds=max(0, deadline - time.monotonic()),
             ) as guard:
                 try:
                     if refresh and not nested:

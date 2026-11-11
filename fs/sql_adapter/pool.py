@@ -34,6 +34,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _dns_slots = threading.BoundedSemaphore(4)
+DEFAULT_SESSION_MUTATION_LIMIT = 8
 
 
 def sql_connection_identity(dsn):
@@ -226,6 +227,10 @@ class SharedConnectionPool:
         self._lock = threading.Lock()
         # Semaphore limits total concurrent connections to pool_size
         self._semaphore = threading.Semaphore(pool_size)
+        # Session mutations reserve dedicated connections alongside the shared pool.
+        self.session_mutation_slots = threading.BoundedSemaphore(
+            max(DEFAULT_SESSION_MUTATION_LIMIT, pool_size)
+        )
 
     @property
     def connection_string(self) -> str:

@@ -442,6 +442,7 @@ def test_sql_bootstrap_uses_owning_connection_without_model_or_pool_wait(databas
     from providers.unified_config import OgMemConfig
     from server.memory_service import MemoryService
     service = MemoryService(config=OgMemConfig(storage_backend="sql", sql_connection_string=dsn,
+                                              sql_dialect=os.environ.get("OGMEM_IDENTITY_TEST_DIALECT", "postgresql"),
                                               session_state_bridge_enabled=False, after_turn_threshold=10000))
     service.get_write_api = Mock(side_effect=AssertionError("bootstrap initialized a writer"))
     service.get_llm = Mock(side_effect=AssertionError("bootstrap initialized a model"))
