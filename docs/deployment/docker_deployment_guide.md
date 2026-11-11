@@ -85,7 +85,7 @@ docker run -d \
   -e OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
   -e OGMEM_EMBEDDING_MODEL=text-embedding-v2 \
   -e OGMEM_LLM_MODEL=glm-5 \
-  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxxxx" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=your_username password=xxxxx" \
   -e OPENCLAW_GATEWAY_TOKEN=my-secret-token \
   -e OG_ACCOUNT_ID=acct-prod \
   -e INDEX_INTERVAL=30 \
@@ -119,7 +119,7 @@ docker exec -it ogmem bash
 
 | 环境变量 | 说明 | 示例 |
 |----------|------|------|
-| `OGMEM_API_KEY` | LLM / Embedding API 密钥 | `sk-bc4cceb67d01420f...` |
+| `OGMEM_API_KEY` | LLM / Embedding API 密钥 | `your-api-key` |
 | `OGMEM_LLM_MODEL` | LLM 模型名称，注入到 OpenClaw 配置中 | `glm-5`, `qwen-plus` |
 | `OPENGAUSS_CONNECTION_STRING` | openGauss 数据库连接串 | `host=127.0.0.1 port=8799 dbname=postgres user=xx password=xx` |
 
