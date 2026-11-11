@@ -579,8 +579,11 @@ class SQLContextFS(PoolAdapterMixin):
         if uri != SessionState.state_uri(ctx.account_id, ctx.session_id):
             raise ValueError("session mutation lock requires its canonical state URI")
         self._ensure_accessible(uri, ctx)
+        slots = (self._shared_pool.session_mutation_slots if self._shared_pool is not None
+                 else _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS)
         with self.configured_session_mutation_lock(
             self._connection_string, ctx, timeout_seconds=timeout_seconds, dialect=self._sql_dialect,
+            slots=slots,
         ) as guard:
             yield guard
 
@@ -591,14 +594,13 @@ class SQLContextFS(PoolAdapterMixin):
 
     @staticmethod
     @contextmanager
-    def configured_session_mutation_lock(dsn, ctx, *, timeout_seconds=1.0, dialect="postgresql"):
+    def configured_session_mutation_lock(dsn, ctx, *, slots, timeout_seconds=1.0, dialect="postgresql"):
         """Acquire before constructing stores, which otherwise borrow from their pool."""
         from fs.sql_adapter.session_mutation import session_mutation_scope
         from session.session_state import SessionState
         uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
         with session_mutation_scope(dsn, ctx, _resource_mutation_lock_key(ctx.account_id, uri),
-                                    _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS, timeout_seconds,
-                                    dialect=dialect) as guard:
+                                    slots, timeout_seconds, dialect=dialect) as guard:
             yield guard
 
     @contextmanager
