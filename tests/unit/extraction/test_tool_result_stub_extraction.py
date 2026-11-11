@@ -12,6 +12,9 @@ def _ctx() -> RequestContext:
 
 def _prompt_manager():
     manager = Mock()
+    from extraction.prompts import PromptManager
+
+    manager.load.return_value = PromptManager().load("extraction")
     manager.render.side_effect = lambda section, key, **kwargs: f"{section}:{key}"
     return manager
 

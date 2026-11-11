@@ -17,7 +17,7 @@ from providers.llm.mock_llm import MockLLM
 @pytest.fixture
 def task():
     extractor = Extractor(MockLLM())
-    extractor._llm.complete_json = Mock(return_value={"categories": ["entity"], "shared_tools": []})
+    extractor._llm.complete_json = Mock(return_value={"categories": ["entity"]})
     ctx = RequestContext("acct", "user", "agent", "session", "trace")
     source = "user: Project Beacon uses PostgreSQL."
     reads = PrefetchResult(messages=["EXISTING MEMORY SNAPSHOT"], read_versions={"old-uri": 4})
@@ -27,13 +27,13 @@ def task():
     return extractor, _PreparedSpan(span, prompt, "sha", source), ctx
 
 
-def test_selection_contract_contains_categories_and_optional_shared_tools(task):
+def test_selection_contract_contains_only_categories(task):
     extractor, prepared, ctx = task
     request = assemble_prepared(extractor, prepared, ctx)
     prompt, tools = request.prompt, request.tools
     request = extractor._llm.complete_json.call_args
     schema = request.kwargs["schema"]
-    assert set(schema["properties"]) == {"categories", "shared_tools"}
+    assert set(schema["properties"]) == {"categories"}
     assert schema["additionalProperties"] is False
     assert "Project Beacon uses PostgreSQL" in request.args[0]
     assert "EXISTING MEMORY SNAPSHOT" not in request.args[0]
@@ -66,9 +66,15 @@ def test_shared_selection_survives_recovery_copies_and_concurrent_passes(task):
     extractor._llm.complete_json.assert_called_once()
 
 
-@pytest.mark.parametrize("result", [{"categories": []}, {"categories": ["missing"], "shared_tools": []},
-                                     {"categories": ["entity"], "target_uri": "invented"},
-                                     {"operations": []}])
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        {"categories": ["missing"]},
+        {"categories": ["entity"], "target_uri": "invented"},
+        {"operations": []},
+    ],
+)
 def test_invalid_selection_keeps_all_available_tools_instead_of_skipping(task, result):
     extractor, prepared, ctx = task
     extractor._llm.complete_json.return_value = result
@@ -100,7 +106,7 @@ def test_provider_error_is_shared_and_propagates(task):
 
 def test_add_only_selection_retains_fixed_incremental_tools(task):
     extractor, prepared, ctx = task
-    extractor._llm.complete_json.return_value = {"categories": ["event"], "shared_tools": []}
+    extractor._llm.complete_json.return_value = {"categories": ["event"]}
     request = assemble_prepared(extractor, prepared, ctx)
     assert {t["name"] for t in request.tools} == {"extract_event", "edit_memory", "append_memory"}
     assert "── event (" in request.prompt and "── profile (" not in request.prompt
@@ -115,7 +121,7 @@ def test_lazy_run_uses_the_same_selected_rules_and_preserves_read_tools(task):
 
     extractor, prepared, ctx = task
     llm = extractor._llm
-    llm.complete_json.return_value = {"categories": ["entity"], "shared_tools": ["get_relations", "get_access_stats"]}
+    llm.complete_json.return_value = {"categories": ["entity"]}
     llm.complete_with_tools_messages = Mock(return_value=([], "[]"))
     registry = SchemaRegistry()
     loop = ExtractionReActLoop(llm, Mock(), registry, URIResolver(registry), PromptManager())
@@ -173,8 +179,8 @@ def test_public_extraction_selects_once_and_keeps_recovery_scoped(mode, recover)
         if properties == {"spans"}:
             # Phase 1 is advisory; shared selection independently reads the complete source.
             return {"spans": [{"start": 0, "end": 0, "categories": ["profile"]}]}
-        if properties == {"categories", "shared_tools"}:
-            return {"categories": ["entity"], "shared_tools": []}
+        if properties == {"categories"}:
+            return {"categories": ["entity"]}
         assert properties == {"operations"}
         return {"operations": [operation]}
     llm.complete_json.side_effect = respond
@@ -192,8 +198,11 @@ def test_public_extraction_selects_once_and_keeps_recovery_scoped(mode, recover)
                                session_time=datetime(2026, 10, 28), archive_id="archive-1")
     assert len(result) == 1 and result[0].content == statement
     assert result[0].provenance_ids
-    selections = [call for call in llm.complete_json.call_args_list
-                  if set(call.kwargs["schema"]["properties"]) == {"categories", "shared_tools"}]
+    selections = [
+        call
+        for call in llm.complete_json.call_args_list
+        if set(call.kwargs["schema"]["properties"]) == {"categories"}
+    ]
     assert len(selections) == 1
     if mode == "eager":
         assert llm.complete_with_tools.call_count == 2
@@ -214,7 +223,7 @@ def test_lazy_reusing_a_loop_does_not_leak_previous_selection(task):
 
     extractor, _, ctx = task
     llm = extractor._llm
-    llm.complete_json.side_effect = [{"categories": ["entity"], "shared_tools": []}, {"categories": ["event"], "shared_tools": []}]
+    llm.complete_json.side_effect = [{"categories": ["entity"]}, {"categories": ["event"]}]
     llm.complete_with_tools_messages = Mock(return_value=([], "[]"))
     registry = extractor._schema_registry
     loop = ExtractionReActLoop(llm, Mock(), registry, URIResolver(registry), PromptManager())
@@ -235,8 +244,14 @@ def test_separate_spans_do_not_mutate_shared_tools(task):
     other = _PreparedSpan(other_span, other_span.prompt_parts.render(), "other", source)
     import json
     extractor._llm.complete_json.side_effect = lambda prompt, schema: {
-        "categories": ["entity" if "Beacon" in json.loads(prompt.split("\n\n", 1)[1])["source"]
-                       else "event"], "shared_tools": []}
+        "categories": [
+            (
+                "entity"
+                if "Beacon" in json.loads(prompt.split("Runtime input (JSON):\n", 1)[1])["source"]
+                else "event"
+            )
+        ]
+    }
     full_tools = list(extractor._extraction_tools)
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda span: assemble_prepared(extractor, span, ctx), [prepared, other]))
@@ -268,7 +283,7 @@ def test_model_can_choose_an_update_after_selection_without_a_preplanned_target(
     original = memory("beverage", category="preference", content="Prefers tea.", who="user")
     ctx, fs, registry, uri, embedder, index, _ = setup_flow("preference", original)
     llm = ExtractionProvider(operation("preference", "beverage", "Prefers green tea.", uri))
-    llm.complete_json = Mock(return_value={"categories": ["preference"], "shared_tools": []})
+    llm.complete_json = Mock(return_value={"categories": ["preference"]})
     from core.uri_resolver import URIResolver
     extractor = Extractor(llm, fs=fs, vector_index=index, embedder=embedder,
                           schema_registry=registry, uri_resolver=URIResolver(registry))
@@ -288,7 +303,7 @@ def test_generic_edit_tool_cannot_write_a_category_outside_the_selection():
     from tests.unit.extraction.test_incremental_edit_flow import eager_flow, edit
 
     ctx, fs, registry, uri, llm, extractor, _ = eager_flow()
-    llm.complete_json = Mock(return_value={"categories": ["entity"], "shared_tools": []})
+    llm.complete_json = Mock(return_value={"categories": ["entity"]})
     llm.complete_with_tools_messages = Mock(return_value=([], "[]"))
     loop = ExtractionReActLoop(llm, fs, registry, URIResolver(registry), PromptManager())
     loop.run("The project uses PostgreSQL.", ctx)
@@ -311,7 +326,7 @@ def test_time_anchored_source_with_tool_stats_is_preserved_and_can_be_scoped(tas
     assert {t["name"] for t in tools} == {"extract_entity", "edit_memory", "append_memory"}
 
 
-def test_custom_template_without_a_common_rule_boundary_keeps_full_text(task):
+def test_custom_template_without_a_common_rule_boundary_uses_category_labels(task):
     extractor, _, ctx = task
     render = extractor._prompt_manager.render
     extractor._prompt_manager.render = lambda name, section, **kw: (
@@ -324,7 +339,7 @@ def test_custom_template_without_a_common_rule_boundary_keeps_full_text(task):
     request = assemble_prepared(extractor, prepared, ctx)
     prompt, tools = request.prompt, request.tools
     assert prompt == prepared.prompt
-    assert tools is extractor._extraction_tools
+    assert {tool["name"] for tool in tools} == {"extract_entity", "edit_memory", "append_memory"}
 
 
 def test_raw_provider_exception_is_shared_without_repeating_selection(task):

@@ -194,8 +194,13 @@ def test_finish_length_recovers_source_through_json():
 
 
 def test_lazy_bad_native_call_returns_error_and_cannot_be_recorded():
-    loop = ExtractionReActLoop(llm=Mock(), fs=Mock(), registry=SchemaRegistry(),
-                              uri_resolver=Mock(), prompt_manager=Mock())
+    loop = ExtractionReActLoop(
+        llm=Mock(),
+        fs=Mock(),
+        registry=SchemaRegistry(),
+        uri_resolver=Mock(),
+        prompt_manager=__import__("extraction.prompts", fromlist=["PromptManager"]).PromptManager(),
+    )
     call = operation(abstract="a" * 201)
 
     result = loop._execute_tool(call["tool"], call["input"], ctx())

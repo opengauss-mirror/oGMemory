@@ -186,6 +186,11 @@ class ExtractionReActLoop(ReactLoop):
         self._uri_resolver = uri_resolver
         self._prefetcher = prefetcher
         self._prompt_manager = prompt_manager
+        from extraction.prompts.manager import validate_prompt_manager
+
+        validate_prompt_manager(
+            self._prompt_manager, "extraction_graph" if activation_enabled else "extraction"
+        )
         self._activation_enabled = activation_enabled
 
         self._extraction_tools = (build_extraction_tools(registry, activation_enabled=True)
@@ -218,37 +223,39 @@ class ExtractionReActLoop(ReactLoop):
         categories: frozenset[str] | None = None,
         prompt_parts=None,
         assembly_contract=None,
+        assembled_tools=None,
     ) -> ExtractionReActResult:
         check_deadline()
         from extraction.prompt_assembly import (
             category_catalog,
             lazy_tools_for_contract,
             select_assembly,
-            shared_tool_catalog,
             supports_assembly,
             tools_for_categories,
         )
-        available = frozenset(item["category"] for item in category_catalog(
-            self._registry, self._base_extraction_tools))
-        shared = shared_tool_catalog(self._fs, "lazy")
+
+        available = frozenset(
+            item["category"]
+            for item in category_catalog(self._registry, self._base_extraction_tools)
+        )
         selected_sections = None
         if self._activation_enabled or not supports_assembly(self._prompt_manager):
             assembly_contract = AssemblyContract(available, (), "lazy", "full", "unsupported_template")
         elif assembly_contract is None:
             if categories is None:
                 selection = select_assembly(
-                    self._llm, self._registry, self._base_extraction_tools, conversation_text,
-                    ctx.user_id, manager=self._prompt_manager, shared_tools=shared,
+                    self._llm,
+                    self._registry,
+                    self._base_extraction_tools,
+                    conversation_text,
+                    ctx.user_id,
+                    manager=self._prompt_manager,
                 )
                 categories = selection.categories
                 scope, reason = selection.scope, selection.reason
-                shared = [tool for tool in shared if tool["name"] in selection.shared_tools]
             else:
-                scope, reason, shared = "scoped" if categories else "no_task", None, []
-            selected = tools_for_categories(self._base_extraction_tools, self._registry, categories)
-            assembly_contract = AssemblyContract(categories,
-                tuple(t["name"] for t in [_READ_TOOL, _LIST_TOOL] + shared + selected),
-                "lazy", scope, reason)
+                scope, reason = "scoped" if categories else "no_task", None
+            assembly_contract = AssemblyContract(categories, (), "lazy", scope, reason)
             if scope == "scoped":
                 variables = prompt_parts.template_variables if prompt_parts is not None else {}
                 try:
@@ -262,13 +269,22 @@ class ExtractionReActLoop(ReactLoop):
         self._extraction_tools = (self._base_extraction_tools if self._assembly_categories is None
             else tools_for_categories(self._base_extraction_tools, self._registry, self._assembly_categories))
         self._prompt_parts = prompt_parts
-        self._update_instruction = build_update_instruction(self._registry, self._assembly_categories)
-        self._offered_extraction_tools = (self._extraction_tools if category_catalog(
-            self._registry, self._base_extraction_tools) else None)
-        self._all_tools = lazy_tools_for_contract(self._extraction_tools, self._fs, assembly_contract)
-        if assembly_contract.scope == "full":
-            assembly_contract = replace(
-                assembly_contract, tool_names=tuple(tool["name"] for tool in self._all_tools))
+        self._update_instruction = build_update_instruction(
+            self._registry, self._assembly_categories
+        )
+        self._offered_extraction_tools = (
+            self._extraction_tools
+            if category_catalog(self._registry, self._base_extraction_tools)
+            else None
+        )
+        self._all_tools = (
+            list(assembled_tools)
+            if assembled_tools is not None
+            else lazy_tools_for_contract(self._extraction_tools, self._fs, assembly_contract)
+        )
+        assembly_contract = replace(
+            assembly_contract, tool_names=tuple(tool["name"] for tool in self._all_tools)
+        )
         self._assembly_contract = assembly_contract
         if assembly_contract.scope == "no_task":
             return ExtractionReActResult(finish_reason="no_task", completed=True)
@@ -317,11 +333,11 @@ class ExtractionReActLoop(ReactLoop):
         )
 
     def _render_selected_sections(self, template, contract, variables):
-        render = self._prompt_manager.render_selected
+        render = self._prompt_manager.render
         return (
-            render(template, "system_prompt", decision=contract, **variables),
-            render(template, "examples", decision=contract),
-            render(template, "lazy_tools_instruction", decision=contract),
+            render(template, "system_prompt", categories=contract.categories, **variables),
+            render(template, "examples", categories=contract.categories),
+            render(template, "lazy_tools_instruction", categories=contract.categories),
         )
 
     def _build_messages(

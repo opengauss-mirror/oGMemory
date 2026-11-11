@@ -16,7 +16,8 @@ STATS = format_tool_stats_text({"web_search": {"call_count": 3, "success_count":
 def provider(categories=("preference",)):
     llm = Mock()
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": list(categories), "shared_tools": []} if set(schema["properties"]) == {"categories", "shared_tools"}
+        {"categories": list(categories)}
+        if set(schema["properties"]) == {"categories"}
         else {"operations": []}
     )
     return llm
@@ -38,7 +39,13 @@ def test_attached_tool_statistics_reach_selector_without_forcing_tool(mode):
     assert "extract_preference" in {tool["name"] for tool in tools}
     assert "── tool (" not in prompt
     import json
-    assert json.loads(extractor._llm.complete_json.call_args.args[0].split("\n\n", 1)[1])["tool_statistics"] == STATS
+
+    assert (
+        json.loads(
+            extractor._llm.complete_json.call_args.args[0].split("Runtime input (JSON):\n", 1)[1]
+        )["tool_statistics"]
+        == STATS
+    )
     assert "── entity (" not in prompt
     extractor._llm.complete_json.assert_called_once()
 

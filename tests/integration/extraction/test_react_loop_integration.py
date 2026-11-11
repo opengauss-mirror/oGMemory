@@ -12,8 +12,8 @@ import pytest
 from core.models import ContextNode, RequestContext
 from core.uri_resolver import URIResolver
 from extraction.extraction_react_loop import ExtractionReActLoop
+from extraction.prompts import PromptManager
 from extraction.schemas.registry import SchemaRegistry
-
 
 # ---------------------------------------------------------------------------
 # Real dependencies
@@ -44,8 +44,12 @@ def ctx():
 def _make_llm():
     llm = Mock()
     llm._queue = []
+    llm.complete_json.return_value = {"categories": ["preference"]}
 
     def _call(messages, tools=None, tool_choice="auto"):
+        names = {tool["name"] for tool in tools}
+        assert "extract_preference" in names
+        assert "extract_profile" not in names
         return llm._queue.pop(0) if llm._queue else ([], "")
 
     llm.complete_with_tools_messages = _call
@@ -121,8 +125,12 @@ class TestReActLoopIntegration:
         }])))
 
         loop = ExtractionReActLoop(
-            llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
-            prompt_manager=Mock(), max_iterations=5,
+            llm=llm,
+            fs=memory_fs,
+            registry=registry,
+            uri_resolver=uri_resolver,
+            prompt_manager=PromptManager(),
+            max_iterations=5,
         )
         result = loop.run(
             "User: I've been using Java for years but recently switched to Python. "
@@ -131,6 +139,7 @@ class TestReActLoopIntegration:
         )
 
         # Verify candidates
+        llm.complete_json.assert_called_once()
         assert len(result.candidates) == 1
         c = result.candidates[0]
         assert c.category == "preference"
@@ -203,13 +212,18 @@ class TestReActLoopIntegration:
         }])))
 
         loop = ExtractionReActLoop(
-            llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
-            prompt_manager=Mock(), max_iterations=5,
+            llm=llm,
+            fs=memory_fs,
+            registry=registry,
+            uri_resolver=uri_resolver,
+            prompt_manager=PromptManager(),
+            max_iterations=5,
         )
         result = loop.run("User: I switched to lattes recently", ctx)
 
         # Refetch should have triggered
         assert any(it.safety_check_triggered for it in result.trace.iterations)
+        llm.complete_json.assert_called_once()
         assert len(result.candidates) == 1
         assert result.candidates[0].routing_key == "coffee"
         assert result.iterations == 2
@@ -238,10 +252,11 @@ class TestReActLoopIntegration:
 
         loop = ExtractionReActLoop(
             llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
-            prompt_manager=Mock(),
+            prompt_manager=PromptManager(),
         )
         result = loop.run("User: I love jazz and blues", ctx)
 
+        llm.complete_json.assert_called_once()
         assert len(result.candidates) == 1
         assert result.candidates[0].category == "preference"
         assert result.candidates[0].routing_key == "music"

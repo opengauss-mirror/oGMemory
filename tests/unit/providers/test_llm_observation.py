@@ -32,10 +32,12 @@ def test_content_capture_is_explicit_and_failure_does_not_leak_context():
             observe_call('selection', fail, 'private source')
     assert 'private source' not in repr(events)
     with capture_llm_events(include_content=True) as events:
-        assert observe_call('selection', lambda prompt: {'categories': [], "shared_tools": []}, 'private') == {'categories': [], "shared_tools": []}
-    assert events[0]['args'] == ('private',)
-    assert events[-1]['result'] == {'categories': [], "shared_tools": []}
-    assert events[-1]['stage'] == 'selection'
+        assert observe_call("selection", lambda prompt: {"categories": []}, "private") == {
+            "categories": []
+        }
+    assert events[0]["args"] == ("private",)
+    assert events[-1]["result"] == {"categories": []}
+    assert events[-1]["stage"] == "selection"
 
 
 def test_parallel_contexts_keep_request_and_stage_isolated():
@@ -55,9 +57,9 @@ def test_parallel_contexts_keep_request_and_stage_isolated():
 
 def test_provider_without_usage_reporting_remains_explicitly_unknown():
     with capture_llm_events() as events:
-        observe_call('selection', lambda: {'categories': [], "shared_tools": []})
-    assert events[-1]['usage_observed'] is False
-    assert not [e for e in events if e['event'] == 'usage']
+        observe_call("selection", lambda: {"categories": []})
+    assert events[-1]["usage_observed"] is False
+    assert not [e for e in events if e["event"] == "usage"]
 
 
 def test_extraction_scope_correlates_early_selection_and_nested_lazy_calls():
@@ -91,6 +93,7 @@ def test_shared_react_loop_does_not_charge_qa_as_extraction(stage):
 
 def test_same_session_operations_have_stable_distinct_correlation_without_archive():
     from types import SimpleNamespace
+
     from providers.llm_observation import correlate_extraction_calls
     @correlate_extraction_calls
     def run(ctx):

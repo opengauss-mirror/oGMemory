@@ -20,7 +20,8 @@ MARKER_BODY = ("Project handbook.\n# Few-shot Examples\n## event Example\n"
 def provider():
     llm = Mock()
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["entity"], "shared_tools": []} if set(schema["properties"]) == {"categories", "shared_tools"}
+        {"categories": ["entity"]}
+        if set(schema["properties"]) == {"categories"}
         else {"operations": []}
     )
     return llm
@@ -64,7 +65,7 @@ def test_compact_json_recovery_preserves_source_with_example_markers():
     assert MARKER_BODY in prompt
     assert "Template example." not in prompt
     assert prepared.span.prefetch_result is None
-    assert llm.complete_json.call_count == 1  # Legacy render override skips selection.
+    assert llm.complete_json.call_count == 2  # Unified rendering retains category selection.
 
 
 @pytest.mark.parametrize("mode", ["eager", "lazy"])
@@ -87,8 +88,9 @@ def test_lazy_json_recovery_keeps_selection_and_pairs_the_last_read_snapshot(sel
     llm = provider()
     if select_all:
         llm.complete_json.side_effect = lambda prompt, schema: (
-            {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
-            if set(schema["properties"]) == {"categories", "shared_tools"} else {"operations": []}
+            {"categories": schema["properties"]["categories"]["items"]["enum"]}
+            if set(schema["properties"]) == {"categories"}
+            else {"operations": []}
         )
     extractor = Extractor(llm, mode="lazy", fs=Mock(), schema_registry=registry,
                           uri_resolver=URIResolver(registry))
@@ -148,5 +150,11 @@ def test_lazy_message_building_does_not_crop_runtime_identity_or_prefetched_data
     assert any(MARKER_BODY in message["content"] for message in messages if message["role"] == "user")
     assert "── profile (" not in messages[0]["content"]
     assert {tool["name"] for tool in request.kwargs["tools"]} == {
-        "read", "list",
-        "extract_entity", "edit_memory", "append_memory"}
+        "read",
+        "list",
+        "get_relations",
+        "get_access_stats",
+        "extract_entity",
+        "edit_memory",
+        "append_memory",
+    }

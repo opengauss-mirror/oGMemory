@@ -6,8 +6,8 @@ from unittest.mock import Mock
 import pytest
 
 from core.errors import LLMOutputTruncatedError
-from core.uri_resolver import URIResolver
 from core.models import RequestContext
+from core.uri_resolver import URIResolver
 from extraction.occurrence_qualification import prompt_fits
 from extraction.tools import Extractor, _NativeSpanOutcome, _Span
 from tests.unit.commit.test_profile_merge import profile
@@ -29,7 +29,8 @@ def prepare(*, old_chars=64000, bound=False, mode="eager", source=SOURCE, exampl
         fields.pop("expected_version")
     llm.complete_json.return_value = {"operations": [{"tool": "extract_profile", "input": fields}]}
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["profile"], "shared_tools": []} if set(schema["properties"]) == {"categories", "shared_tools"}
+        {"categories": ["profile"]}
+        if set(schema["properties"]) == {"categories"}
         else llm.complete_json.return_value
     )
     extractor = Extractor(llm, mode=mode, schema_registry=registry, fs=fs,
@@ -126,7 +127,8 @@ def test_normal_json_fallback_preserves_complete_facts_within_budget(bound):
     llm = Mock()
     llm.complete_json.return_value = {"operations": [{"tool": "extract_profile", "input": fields}]}
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["profile"], "shared_tools": []} if "categories" in schema["properties"]
+        {"categories": ["profile"]}
+        if "categories" in schema["properties"]
         else llm.complete_json.return_value
     )
     extractor = Extractor(llm, mode="eager", schema_registry=registry, fs=fs,
@@ -146,8 +148,11 @@ def test_normal_json_fallback_preserves_complete_facts_within_budget(bound):
     assert candidate.provenance_ids == ["prov:1:archive:archive:source-1"]
     assert (candidate.target_uri, candidate.expected_version) == ((uri, 1) if bound else ("", None))
     assert prepared.span.prefetch_result.read_versions == {uri: 1}
-    assert [set(call.kwargs["schema"]["properties"]) for call in llm.complete_json.call_args_list] == [
-        {"categories", "shared_tools"}, {"operations"},
+    assert [
+        set(call.kwargs["schema"]["properties"]) for call in llm.complete_json.call_args_list
+    ] == [
+        {"categories"},
+        {"operations"},
     ]
 
 
@@ -159,7 +164,8 @@ def test_topic_draft_mode_reaches_both_fallback_prompts_and_preserves_source_fac
     llm = Mock()
     llm.complete_json.return_value = {"operations": [{"tool": "extract_entity", "input": fields}]}
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": ["entity"], "shared_tools": []} if "categories" in schema["properties"]
+        {"categories": ["entity"]}
+        if "categories" in schema["properties"]
         else llm.complete_json.return_value
     )
     extractor = Extractor(llm, node_processing_enabled=True, dual_pass_enabled=False)
@@ -178,7 +184,12 @@ def test_topic_draft_mode_reaches_both_fallback_prompts_and_preserves_source_fac
     assert candidate.content == source and candidate.object_name == fields["object_name"]
     assert candidate.provenance_ids == ["prov:1:archive:archive:gift"]
     assert candidate.source_contexts == [prepared.source_context]
-    assert prompt_fits(llm.complete_json.call_args.args[0], llm.complete_json.call_args.kwargs["schema"])
-    assert [set(call.kwargs["schema"]["properties"]) for call in llm.complete_json.call_args_list] == [
-        {"categories", "shared_tools"}, {"operations"},
+    assert prompt_fits(
+        llm.complete_json.call_args.args[0], llm.complete_json.call_args.kwargs["schema"]
+    )
+    assert [
+        set(call.kwargs["schema"]["properties"]) for call in llm.complete_json.call_args_list
+    ] == [
+        {"categories"},
+        {"operations"},
     ]
