@@ -22,6 +22,7 @@ Offline smoke / tests::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import re
@@ -30,6 +31,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from m3._parallel import ThreadLocalModels, UnitError, iter_parallel_clips, parallel_clips
 from m3.config import M3BENCH_ACCOUNT_ID, video_id_from_path
 from m3.index_episodic import build_embedder
 from m3.search import EpisodicSearcher, Evidence, format_evidence_block
@@ -514,23 +516,30 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
             config_path=args.config,
         )
 
+    # OGMemoryControlAdapter.run() is not re-entrant (it rejects
+    # concurrent questions), so each worker thread gets its own adapter
+    # over the shared, thread-safe graph / embedder / LLM.
     from m3.context_budget import load_context_budget
-    adapter = OGMemoryControlAdapter(
-        llm=llm,
-        graph=graph,
-        embedder=embedder,
-        max_iterations=args.max_iterations,
-        no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
-        timeout_seconds=args.timeout_seconds,
-        default_video_id=args.default_video_id,
-        default_top_k=args.top_k,
-        candidate_k=getattr(args, "candidate_k", None),
-        transcript_top_k=getattr(args, "transcript_top_k", 0),
-        transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
-        context_k=getattr(args, "context_k", 0),
-        include_neighbors=getattr(args, "include_neighbors", 1),
-        context_budget=load_context_budget(args.config),
-    )
+
+    def _build_adapter() -> OGMemoryControlAdapter:
+        return OGMemoryControlAdapter(
+            llm=llm,
+            graph=graph,
+            embedder=embedder,
+            max_iterations=args.max_iterations,
+            no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
+            timeout_seconds=args.timeout_seconds,
+            default_video_id=args.default_video_id,
+            default_top_k=args.top_k,
+            candidate_k=getattr(args, "candidate_k", None),
+            transcript_top_k=getattr(args, "transcript_top_k", 0),
+            transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
+            context_k=getattr(args, "context_k", 0),
+            include_neighbors=getattr(args, "include_neighbors", 1),
+            context_budget=load_context_budget(args.config),
+        )
+
+    adapter_factory = ThreadLocalModels(_build_adapter, name="qa_adapter")
 
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -551,110 +560,152 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         trace_id="m3-qa",
     )
 
-    with output_path.open(mode, encoding="utf-8") as f:
-        for q in questions:
-            key = (str(q["video_id"]), str(q["question_id"]))
-            if key in done_keys:
-                skipped += 1
-                continue
+    pending = []
+    for q in questions:
+        key = (str(q["video_id"]), str(q["question_id"]))
+        if key in done_keys:
+            skipped += 1
+            continue
+        pending.append(q)
 
-            task_ctx = M3TaskContext(
-                question=str(q["question"]),
-                video_id=str(q["video_id"]) if not args.default_video_id else args.default_video_id,
-                temporal_policy=(getattr(args, "temporal_policy", "current_clip")
-                                 if args.respect_before_clip else "unrestricted"),
-                annotation_before_clip=q.get("before_clip"),
-                annotation_timestamp=q.get("timestamp"),
-                lookahead_seconds=(getattr(args, "lookahead_seconds", 0.0)
-                                   if args.respect_before_clip else 0.0),
-            )
-            # Bounds are enforced by retrieval, not appended to the query.
-            search_history: list = []
-            iterations = 0
-            finish_reason = ""
-            warning = ""
-            try:
-                result = adapter.run(ctx, task_ctx)
-                predicted = result.output[0] if result.output else ""
-                iterations = result.iterations
-                finish_reason = result.finish_reason
-                search_history = list(task_ctx.search_history)
-                # Three-way failure classification — mirrors
-                # m3.eval.answer_with_adapter so the two drivers agree
-                # on what "answered" / "failed" mean. The previous
-                # code only checked exceptions, so a loop that
-                # finished with finish_reason="max_iterations" or
-                # content="[Answer] …" (scaffolding leak) was silently
-                # recorded as answered.
-                if finish_reason == "llm_error":
-                    # Surface the upstream's own message + status code
-                    # so the JSONL row tells operators whether it was a
-                    # 400 (protocol mismatch, retry won't help) or a 500
-                    # (transient, retry might). result.llm_error is the
-                    # original :class:`LLMCallError` raised by
-                    # ``_call_llm`` and threaded through to the result.
-                    llm_err = getattr(result, "llm_error", None)
-                    if llm_err is not None:
-                        error = f"llm_error: {llm_err}"
-                    else:
-                        error = "llm_error: adapter loop terminated due to LLM transport failure"
-                    predicted = ""
-                    failed += 1
-                elif not result.completed:
-                    error = f"loop did not complete ({finish_reason})"
-                    failed += 1
-                elif _has_protocol_scaffolding(predicted):
-                    # Salvage before discarding: when the model emits
-                    # "[Answer] <text>" as content in a tool-disabled
-                    # round, <text> IS the answer. Only a [Search]-only
-                    # leak (no [Answer] tag) or an empty residue stays
-                    # a failure.
-                    salvaged = _salvage_scaffolding(predicted)
-                    if len(salvaged) >= 3:
-                        predicted = salvaged
-                        error = ""
-                        warning = (
-                            "scaffolding salvaged: answer was emitted as "
-                            "[Answer] content instead of a tool call"
-                        )
-                        answered += 1
-                    else:
-                        error = (
-                            "predicted_answer contains [Search]/[Answer] "
-                            "protocol scaffolding"
-                        )
-                        predicted = ""
-                        failed += 1
+    def _run_one_question(q: dict) -> dict:
+        """Run one question through a per-thread adapter.
+
+        Never raises — exceptions become an error row, mirroring the
+        serial driver's collect-and-continue semantics.
+        """
+        task_ctx = M3TaskContext(
+            question=str(q["question"]),
+            video_id=str(q["video_id"]) if not args.default_video_id else args.default_video_id,
+            temporal_policy=(getattr(args, "temporal_policy", "current_clip")
+                             if args.respect_before_clip else "unrestricted"),
+            annotation_before_clip=q.get("before_clip"),
+            annotation_timestamp=q.get("timestamp"),
+            lookahead_seconds=(getattr(args, "lookahead_seconds", 0.0)
+                               if args.respect_before_clip else 0.0),
+        )
+        # Bounds are enforced by retrieval, not appended to the query.
+        search_history: list = []
+        iterations = 0
+        finish_reason = ""
+        warning = ""
+        predicted = ""
+        error = ""
+        q_ctx = dataclasses.replace(
+            ctx, trace_id=f"{ctx.trace_id}-{q['video_id']}-{q['question_id']}"
+        )
+        try:
+            result = adapter_factory.get().run(q_ctx, task_ctx)
+            predicted = result.output[0] if result.output else ""
+            iterations = result.iterations
+            finish_reason = result.finish_reason
+            search_history = list(task_ctx.search_history)
+            # Three-way failure classification — mirrors
+            # m3.eval.answer_with_adapter so the two drivers agree
+            # on what "answered" / "failed" mean. The previous
+            # code only checked exceptions, so a loop that
+            # finished with finish_reason="max_iterations" or
+            # content="[Answer] …" (scaffolding leak) was silently
+            # recorded as answered.
+            if finish_reason == "llm_error":
+                # Surface the upstream's own message + status code
+                # so the JSONL row tells operators whether it was a
+                # 400 (protocol mismatch, retry won't help) or a 500
+                # (transient, retry might). result.llm_error is the
+                # original :class:`LLMCallError` raised by
+                # ``_call_llm`` and threaded through to the result.
+                llm_err = getattr(result, "llm_error", None)
+                if llm_err is not None:
+                    error = f"llm_error: {llm_err}"
                 else:
-                    error = ""
-                    answered += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Adapter failed for %s/%s", q["video_id"], q["question_id"],
-                )
+                    error = "llm_error: adapter loop terminated due to LLM transport failure"
                 predicted = ""
-                error = str(exc)
-                failed += 1
+            elif not result.completed:
+                error = f"loop did not complete ({finish_reason})"
+            elif _has_protocol_scaffolding(predicted):
+                # Salvage before discarding: when the model emits
+                # "[Answer] <text>" as content in a tool-disabled
+                # round, <text> IS the answer. Only a [Search]-only
+                # leak (no [Answer] tag) or an empty residue stays
+                # a failure.
+                salvaged = _salvage_scaffolding(predicted)
+                if len(salvaged) >= 3:
+                    predicted = salvaged
+                    error = ""
+                    warning = (
+                        "scaffolding salvaged: answer was emitted as "
+                        "[Answer] content instead of a tool call"
+                    )
+                else:
+                    error = (
+                        "predicted_answer contains [Search]/[Answer] "
+                        "protocol scaffolding"
+                    )
+                    predicted = ""
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Adapter failed for %s/%s", q["video_id"], q["question_id"],
+            )
+            predicted = ""
+            error = str(exc)
 
-            out = {
-                "video_id": q["video_id"],
-                "question_id": q["question_id"],
-                "question_index": q["question_index"],
-                "question": q["question"],
-                "expected_answer": q["answer"],
-                "type": q["type"],
-                "timestamp": q["timestamp"],
-                "before_clip": q["before_clip"],
-                "predicted_answer": str(predicted).strip(),
-                "iterations": iterations,
-                "finish_reason": finish_reason,
-                "search_rounds": len(search_history),
-                "search_history": search_history,
-                "warning": warning,
-                "search_stats": dict(task_ctx.search_stats),
-                "temporal_scope": dict(task_ctx.temporal_scope),
-                "error": error,
-            }
+        return {
+            "video_id": q["video_id"],
+            "question_id": q["question_id"],
+            "question_index": q["question_index"],
+            "question": q["question"],
+            "expected_answer": q["answer"],
+            "type": q["type"],
+            "timestamp": q["timestamp"],
+            "before_clip": q["before_clip"],
+            "predicted_answer": str(predicted).strip(),
+            "iterations": iterations,
+            "finish_reason": finish_reason,
+            "search_rounds": len(search_history),
+            "search_history": search_history,
+            "warning": warning,
+            "search_stats": dict(task_ctx.search_stats),
+            "temporal_scope": dict(task_ctx.temporal_scope),
+            "error": error,
+        }
+
+    with output_path.open(mode, encoding="utf-8") as f:
+        for q, out in iter_parallel_clips(pending, _run_one_question, label="question(s)"):
+            if isinstance(out, UnitError):
+                # _run_one_question never raises; this is a safety net
+                # for bugs in the row construction itself.
+                logger.error(
+                    "QA failed for %s/%s: %s",
+                    q["video_id"], q["question_id"], out,
+                    exc_info=out.exception,
+                )
+                out = {
+                    "video_id": q["video_id"],
+                    "question_id": q["question_id"],
+                    "question_index": q.get("question_index", 0),
+                    "question": q.get("question", ""),
+                    "expected_answer": str(q.get("answer") or ""),
+                    "type": q.get("type"),
+                    "timestamp": q.get("timestamp"),
+                    "before_clip": q.get("before_clip"),
+                    "predicted_answer": "",
+                    "iterations": 0,
+                    "finish_reason": "",
+                    "search_rounds": 0,
+                    "search_history": [],
+                    "warning": "",
+                    "search_stats": {},
+                    "temporal_scope": {},
+                    "error": str(out),
+                }
+            # A row counts as failed only when it has an error AND no
+            # predicted answer — the scaffolding-salvage branch (and a
+            # partial answer with an error note) still carries a real
+            # prediction for the judge to score.
+            if out["error"] and not out["predicted_answer"]:
+                failed += 1
+            else:
+                answered += 1
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
             f.flush()
 

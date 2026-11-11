@@ -25,7 +25,10 @@ if [[ -f .env ]]; then
     set +a
 fi
 
-PROFILES=(--profile with-db --profile with-openclaw)
+# Cover all opt-in profiles so `ps`/`logs` see services from any profile a
+# deployment may have started (extra profiles that aren't running are just
+# absent from the output — they don't fail).
+PROFILES=(--profile with-db --profile with-openclaw --profile with-cv --profile with-m3runner)
 # Defaults below MUST match `deploy/docker-compose.yml` defaults so that a
 # fresh `./check.sh` works against a default `docker compose up -d` with
 # no .env present. Values from .env override these.
