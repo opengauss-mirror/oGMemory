@@ -460,21 +460,21 @@ gsql -U <user> -W '<password>' -d <dbname> -p <port> -c "SELECT count(*) FROM ve
 # === 前提：openGauss 已在 127.0.0.1:8799 运行 ===
 
 # 1. 准备目录
-mkdir -p /data1/sundechao/ogmem/fresh-deploy/agfs-data
-mkdir -p /data1/sundechao/ogmem/fresh-deploy/openclaw-home
-chmod 777 /data1/sundechao/ogmem/fresh-deploy/agfs-data
-chmod 777 /data1/sundechao/ogmem/fresh-deploy/openclaw-home
+mkdir -p /data1/your_username/ogmem/fresh-deploy/agfs-data
+mkdir -p /data1/your_username/ogmem/fresh-deploy/openclaw-home
+chmod 777 /data1/your_username/ogmem/fresh-deploy/agfs-data
+chmod 777 /data1/your_username/ogmem/fresh-deploy/openclaw-home
 
 # 2. 启动 oGMemory
 docker run -d \
   --name ogmem-server \
   --network host \
-  -v /data1/sundechao/ogmem/fresh-deploy/agfs-data:/data/agfs \
-  -e OGMEM_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
+  -v /data1/your_username/ogmem/fresh-deploy/agfs-data:/data/agfs \
+  -e OGMEM_API_KEY="your-api-key" \
   -e OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
   -e OGMEM_EMBEDDING_MODEL="text-embedding-v2" \
   -e OGMEM_LLM_MODEL="glm-5" \
-  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=your_username password=Huawei@123" \
   ogmem-server:v3
 
 # 3. 等待 oGMemory 就绪
@@ -485,8 +485,8 @@ curl http://127.0.0.1:8090/api/v1/health
 docker run -d \
   --name openclaw \
   --network host \
-  -v /data1/sundechao/ogmem/fresh-deploy/openclaw-home:/home/node/.openclaw \
-  -e LLM_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
+  -v /data1/your_username/ogmem/fresh-deploy/openclaw-home:/home/node/.openclaw \
+  -e LLM_API_KEY="your-api-key" \
   -e LLM_PROVIDER="dashscope" \
   -e LLM_MODEL="glm-5" \
   -e LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \

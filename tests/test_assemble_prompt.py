@@ -2,7 +2,7 @@
 """测试 assemble prompt 拼接逻辑。
 
 无需 Docker 镜像，直接从代码目录运行：
-  cd /data1/sundechao/omv2/oG-Memory_7755
+  cd /data1/your_username/omv2/oG-Memory_7755
   python3 tests/test_assemble_prompt.py
 
 该脚本模拟 compose() 各层的输出，展示最终发送给 LLM 的完整 prompt 结构。
