@@ -10,8 +10,8 @@ pip install openai psycopg2-binary pyagfs rich requests apscheduler
 ## 2. 准备 AGFS 数据目录
 
 ```bash
-mkdir -p /data1/sundechao/ogmem/agfs-data
-chmod 777 /data1/sundechao/ogmem/agfs-data
+mkdir -p /data1/your_username/ogmem/agfs-data
+chmod 777 /data1/your_username/ogmem/agfs-data
 
 # 本指南使用插件 local 模式，由 OpenClaw 插件启动 AGFS + ContextEngine。
 # 如果你已经单独启动了 oG-Memory 服务，请将插件配置改为 mode=remote。
@@ -20,7 +20,7 @@ chmod 777 /data1/sundechao/ogmem/agfs-data
 ## 3. 创建 OpenClaw 配置
 
 ```bash
-mkdir -p /data1/sundechao/ogmem/openclaw-home
+mkdir -p /data1/your_username/ogmem/openclaw-home
 ```
 
 编辑 `openclaw-home/openclaw.json`：
@@ -71,9 +71,9 @@ mkdir -p /data1/sundechao/ogmem/openclaw-home
         "enabled": true,
         "config": {
           "mode": "local",
-          "projectRoot": "/data1/sundechao/ogmem/oG-Memory",
-          "agfsServerDir": "/data1/sundechao/ogmem/oG-Memory/agfs",
-          "agfsDataDir": "/data1/sundechao/ogmem/agfs-data",
+          "projectRoot": "/data1/your_username/ogmem/oG-Memory",
+          "agfsServerDir": "/data1/your_username/ogmem/oG-Memory/agfs",
+          "agfsDataDir": "/data1/your_username/ogmem/agfs-data",
           "contextEnginePort": 8090,
           "memoryApiBaseUrl": "http://127.0.0.1:8090",
           "prefetchEnabled": true,
@@ -102,17 +102,17 @@ docker run -d \
   --network host \
   --restart unless-stopped \
   -v /data2/miniconda:/data2/miniconda:ro \
-  -v /home/sundechao/.local:/home/sundechao/.local:ro \
-  -v /data1/sundechao/ogmem/openclaw-home:/home/node/.openclaw \
-  -v /data1/sundechao/ogmem/oG-Memory/plugins/openclaw:/app/extensions/og-memory-context-engine \
-  -v /data1/sundechao/ogmem/oG-Memory:/data1/sundechao/ogmem/oG-Memory \
+  -v /home/your_username/.local:/home/your_username/.local:ro \
+  -v /data1/your_username/ogmem/openclaw-home:/home/node/.openclaw \
+  -v /data1/your_username/ogmem/oG-Memory/plugins/openclaw:/app/extensions/og-memory-context-engine \
+  -v /data1/your_username/ogmem/oG-Memory:/data1/your_username/ogmem/oG-Memory \
   -e OPENCLAW_GATEWAY_TOKEN=test-token-123 \
   -e OGMEM_MODE=local \
   -e OGMEM_API_URL=http://127.0.0.1:8090 \
   -e AGFS_BASE_URL=http://127.0.0.1:1833 \
-  -e AGFS_SERVER_DIR=/data1/sundechao/ogmem/oG-Memory/agfs \
-  -e AGFS_DATA_DIR=/data1/sundechao/ogmem/agfs-data \
-  -e CONTEXTENGINE_PROJECT_ROOT=/data1/sundechao/ogmem/oG-Memory \
+  -e AGFS_SERVER_DIR=/data1/your_username/ogmem/oG-Memory/agfs \
+  -e AGFS_DATA_DIR=/data1/your_username/ogmem/agfs-data \
+  -e CONTEXTENGINE_PROJECT_ROOT=/data1/your_username/ogmem/oG-Memory \
   -e CONTEXTENGINE_PROVIDER=openai \
   -e OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
   -e OPENAI_API_KEY=<你的API Key> \
@@ -123,15 +123,15 @@ docker run -d \
   -e OGMEM_COMPACT_TAKEOVER_ENABLED=true \
   -e OGMEM_SHORT_TERM_INDEX_MODE=sync \
   -e VECTOR_DB_TYPE=opengauss \
-  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
-  -e "PYTHONPATH=/data1/sundechao/ogmem/oG-Memory:/home/sundechao/.local/lib/python3.13/site-packages" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=your_username password=Huawei@123" \
+  -e "PYTHONPATH=/data1/your_username/ogmem/oG-Memory:/home/your_username/.local/lib/python3.13/site-packages" \
   alpine/openclaw:latest
 ```
 
 ## 5. 启动 IndexService
 
 ```bash
-cd /data1/sundechao/ogmem/oG-Memory
+cd /data1/your_username/ogmem/oG-Memory
 
 export CONTEXTENGINE_PROVIDER=openai
 export OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -139,7 +139,7 @@ export OGMEM_API_KEY="<你的API Key>"
 export OGMEM_EMBEDDING_MODEL="text-embedding-v2"
 export OGMEM_LLM_MODEL="glm-5"
 export VECTOR_DB_TYPE=opengauss
-export OPENGAUSS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123"
+export OPENGAUSS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=your_username password=Huawei@123"
 export AGFS_BASE_URL="http://127.0.0.1:1833"
 export OG_ACCOUNT_ID="acct-demo"
 export INDEX_INTERVAL=15
@@ -173,7 +173,7 @@ tail -20 /tmp/index_service.log
 docker logs openclaw-ogmem 2>&1 | grep -E "og-memory|compose|prepare_compaction|compact"
 
 # openGauss 数据
-gsql -U sundechao -W Huawei@123 -d postgres -p 8799 -r -c \
+gsql -U your_username -W Huawei@123 -d postgres -p 8799 -r -c \
   "SELECT id, uri, level, substring(text,1,60) FROM vector_index ORDER BY created_at DESC LIMIT 5;"
 ```
 
