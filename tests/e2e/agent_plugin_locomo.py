@@ -407,9 +407,9 @@ class PluginAdapter:
                     and fingerprint in row["user_message_fingerprints"] }
                 for (sid, request_id), row in matching.items():
                     state = row.get("request_status")
-                    if state in {"DEGRADED", "FAILED", "NEEDS_CONFIRMATION"}:
+                    if state in {"FAILED", "NEEDS_CONFIRMATION"} or (state == "DEGRADED" and not request_id):
                         raise self.common.WriteRequestTerminal(row)
-                    if request_id and state and row.get("source_status") != "BUFFERED":
+                    if request_id and state and (state == "DEGRADED" or row.get("source_status") != "BUFFERED"):
                         self.common.wait_write_request(self.args, sid, request_id,
                             observations=self.proxy.request_observations, deadline=deadline)
                     else:

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
-import plugin, { callHttp } from "./index.js";
+import plugin, { callHttp, runCompactControlFlow } from "./index.js";
 
 async function receiptServer(t, buffered = false, requestId = "server-receipt", replies = []) {
   const calls = [];
@@ -16,6 +16,10 @@ async function receiptServer(t, buffered = false, requestId = "server-receipt", 
       source_status: buffered ? "BUFFERED" : "ARCHIVED",
       retry_action: accepted && !buffered ? "poll" : "none",
     }];
+    if (status === null) {
+      req.socket.destroy();
+      return;
+    }
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(response));
   });
@@ -76,6 +80,36 @@ test("buffered write keeps its accepted receipt for normal session flush", async
   assert.equal(result.http_observations[0].request_id, "server-receipt");
 });
 
+test("compaction completes after a source-only receipt finishes projection", async (t) => {
+  const receipt = {
+    ok: false, request_id: "compact-1", request_status: "DEGRADED", source_status: "ARCHIVED",
+    semantic_status: "DEGRADED", archive_id: "archive-1", source_message_ids: ["msg-1"],
+    archived_source_ids: ["msg-1"], recovery_mode: "source_only", retry_action: "manual_review",
+  };
+  const { url, calls } = await receiptServer(t, false, "compact-1", [
+    [200, { ok: true, prepareToken: "prepared-1" }],
+    [200, { ...receipt, projection_status: "PENDING", compacted: true,
+      result: { summary: "Alice saved the deployment command.", tokensBefore: 12 } }],
+    [200, { ...receipt, projection_status: "DONE" }],
+  ]);
+  const boundaries = [];
+  const result = await runCompactControlFlow({
+    cfg: { compactTakeoverEnabled: true },
+    params: { sessionId: "compact-session", userId: "alice" },
+    call: (method, params) => callHttp(url, method, params, { requestTimeoutMs: 5000 }),
+    persistTakeoverCompactionBoundary: async (boundary) => { boundaries.push(boundary); },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.compacted, true);
+  assert.equal(result.request_status, "DEGRADED");
+  assert.equal(result.projection_status, "DONE");
+  assert.equal(boundaries[0].summary, "Alice saved the deployment command.");
+  assert.deepEqual(calls.map(({ method }) => method), ["POST", "POST", "GET"]);
+  assert.equal(calls[1].body.prepareToken, "prepared-1");
+  assert.equal(calls[2].path, "/api/v1/sessions/compact-session/write-requests?clientRequestId=compact-1");
+});
+
 function receiptEngine(url, toolResultExternalizationEnabled = false) {
   let factory;
   plugin.register({
@@ -87,6 +121,54 @@ function receiptEngine(url, toolResultExternalizationEnabled = false) {
     registerContextEngine(_id, create) { factory = create; },
   });
   return factory();
+}
+
+const pendingSourceReceipt = {
+  ok: false, request_id: "original-request", request_status: "DEGRADED",
+  source_status: "ARCHIVED", semantic_status: "DEGRADED", projection_status: "PENDING",
+  archive_id: "archive-1", source_message_ids: ["msg-1"], archived_source_ids: ["msg-1"],
+  retry_action: "manual_review",
+};
+
+for (const [name, reply, observationStatus] of [
+  ["unrelated receipt", [200, { ...pendingSourceReceipt, request_id: "other-request",
+    archive_id: "archive-2", projection_status: "DONE" }],
+    "OBSERVATION_RECEIPT_MISMATCH"],
+  ["HTTP 503", [503, {}], "OBSERVATION_HTTP_ERROR"],
+  ["closed connection", [null], "OBSERVATION_ERROR"],
+]) {
+  test(`after_turn resumes receipt polling after ${name}`, async (t) => {
+    const { url, calls } = await receiptServer(t, false, "next-request", [
+      [200, pendingSourceReceipt],
+      reply,
+      [200, { ...pendingSourceReceipt, projection_status: "DONE" }],
+      [200, { ok: true, request_id: "next-request", request_status: "SUCCEEDED", retry_action: "none" }],
+    ]);
+    const engine = receiptEngine(url, true);
+    const snapshot = { sessionId: "resume-poll", userId: "alice", agentId: "worker",
+      prePromptMessageCount: 0, messages: [{ role: "user", content: "Remember blue." }] };
+    const pending = await engine.afterTurn({
+      ...snapshot, runtimeContext: { currentMessageId: "inbound-1" },
+    });
+    const next = await engine.afterTurn({
+      ...snapshot, runtimeContext: { currentMessageId: "inbound-2" },
+    });
+    const receiptPath = "/api/v1/sessions/resume-poll/write-requests?clientRequestId=original-request";
+
+    assert.deepEqual(calls.map(({ method, path }) => [method, path]), [
+      ["POST", "/api/v1/after_turn"],
+      ["GET", receiptPath],
+      ["GET", receiptPath],
+      ["POST", "/api/v1/after_turn"],
+    ], JSON.stringify({ pending, next }));
+    assert.equal(pending.request_id, pendingSourceReceipt.request_id);
+    assert.equal(pending.archive_id, pendingSourceReceipt.archive_id);
+    assert.equal(pending.projection_status, "PENDING");
+    assert.equal(pending.retry_action, "poll");
+    assert.equal(pending.observation_status, observationStatus);
+    assert.equal(next.request_id, "next-request");
+    assert.equal(next.request_status, "SUCCEEDED");
+  });
 }
 
 test("missing write receipt stays unconfirmed and the next queued turn completes", async (t) => {

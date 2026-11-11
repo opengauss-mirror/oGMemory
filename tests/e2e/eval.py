@@ -458,6 +458,24 @@ def memory_headers(args) -> dict[str, str]:
     }
 
 
+def degraded_source_archived(outcome):
+    source_ids = outcome.get("source_message_ids")
+    archived_ids = outcome.get("archived_source_ids")
+    return bool(
+        outcome.get("request_status") == "DEGRADED"
+        and outcome.get("semantic_status") == "DEGRADED"
+        and outcome.get("source_status") in {"ARCHIVED", "RAW_ARCHIVED"}
+        and outcome.get("archive_id")
+        and isinstance(source_ids, list) and source_ids
+        and isinstance(archived_ids, list) and set(source_ids) == set(archived_ids)
+    )
+
+
+def degraded_write_settled(outcome):
+    return (degraded_source_archived(outcome)
+            and outcome.get("projection_status") in {"DONE", "NOT_REQUIRED"})
+
+
 def memory_call(args, method: str, sid: str, *, observations=None, deadline=None, **extra) -> dict:
     started, response = time.monotonic(), None
     path = f"/api/v1/call/{method}"
@@ -478,10 +496,22 @@ def memory_call(args, method: str, sid: str, *, observations=None, deadline=None
         raise
     record_write_observation(observations, "POST", path, sid, None, started,
                              response=response, outcome=result)
-    if result.get("request_status") in {"DEGRADED", "FAILED", "NEEDS_CONFIRMATION"}:
+    state = result.get("request_status")
+    if state in {"FAILED", "NEEDS_CONFIRMATION"}:
         raise WriteRequestTerminal(result, observations)
     response.raise_for_status()
-    if result.get("ok") is False or result.get("status") == "failed":
+    if state == "DEGRADED":
+        if degraded_write_settled(result):
+            return result
+        if (result.get("request_id") and degraded_source_archived(result)
+                and result.get("projection_status") == "PENDING"):
+            settled = wait_write_request(args, sid, result["request_id"],
+                                         observations=observations, deadline=deadline)
+            return {**result, **settled}
+        raise WriteRequestTerminal(result, observations)
+    if result.get("ok") is False or (
+        result.get("status") == "failed" and state not in {"RUNNING", "RECOVERING", "PROJECTING"}
+    ):
         raise RuntimeError(f"{method} rejected for {sid}: {write_status_summary(result)}")
     return result
 
@@ -507,12 +537,17 @@ class WriteObservationTimeout(TimeoutError):
 
 
 def write_status_summary(outcome):
-    return {key: outcome[key] for key in (
+    summary = {key: outcome[key] for key in (
         "request_id", "client_request_id", "request_status", "source_status",
         "semantic_status", "projection_status", "retry_action", "error_code", "error_type",
         "ok", "idle", "compacted", "disposed", "archive_id", "message_count",
-        "commit_count", "archive_count", "pending_tokens",
+        "commit_count", "archive_count", "pending_tokens", "source_message_ids",
+        "archived_source_ids", "recovery_mode",
     ) if key in outcome}
+    error_code = (outcome.get("error_detail") or {}).get("code")
+    if error_code:
+        summary.setdefault("error_code", error_code)
+    return summary
 
 
 def record_write_observation(observations, method, path, sid, request_id, started,
@@ -549,11 +584,18 @@ def wait_write_request(args, sid, request_id, *, observations=None, deadline=Non
         record_write_observation(observations, "GET", url, sid, request_id, started,
                                  response=response, outcome=outcome)
         state = outcome.get("request_status", "UNKNOWN")
-        if state in {"DEGRADED", "FAILED", "NEEDS_CONFIRMATION"}:
+        if state in {"FAILED", "NEEDS_CONFIRMATION"}:
             raise WriteRequestTerminal(outcome, observations)
         response.raise_for_status()
         if state == "SUCCEEDED":
             return outcome
+        if state == "DEGRADED":
+            if outcome.get("request_id") != request_id or not degraded_source_archived(outcome):
+                raise WriteRequestTerminal(outcome, observations)
+            if degraded_write_settled(outcome):
+                return outcome
+            if outcome.get("projection_status") != "PENDING":
+                raise WriteRequestTerminal(outcome, observations)
         time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise WriteObservationTimeout(f"write request observation expired: {sid}/{request_id}",
                                   request_status=state, observations=observations)
@@ -580,6 +622,7 @@ def flush_source(args, sid: str) -> dict:
     started = time.monotonic()
     deadline = started + args.write_wait_timeout
     observations = []
+    lifecycle_writes = {}
     wait_idle(args, sid, observations=observations, deadline=deadline)
     state = source_state(args, sid, observations=observations, deadline=deadline)
     if not (state.get("message_count", 0) or state.get("commit_count", 0)
@@ -589,9 +632,15 @@ def flush_source(args, sid: str) -> dict:
         compacted = memory_call(args, "compact", sid, observations=observations, deadline=deadline)
         if compacted.get("compacted") is not True:
             raise RuntimeError(f"source compaction incomplete: {sid}: {write_status_summary(compacted)}")
+        if degraded_write_settled(compacted):
+            lifecycle_writes["compact"] = write_status_summary(compacted)
         wait_idle(args, sid, observations=observations, deadline=deadline)
+    dispose_request_id = None
     while time.monotonic() < deadline:
         result = memory_call(args, "dispose", sid, observations=observations, deadline=deadline)
+        dispose_request_id = result.get("request_id") or dispose_request_id
+        if degraded_write_settled(result):
+            lifecycle_writes["dispose"] = write_status_summary(result)
         if result.get("reason") == "below_token_threshold":
             raise RuntimeError(f"source extraction below completion threshold: {sid}")
         if result.get("disposed") is True:
@@ -600,6 +649,11 @@ def flush_source(args, sid: str) -> dict:
     else:
         raise WriteObservationTimeout(f"source flush observation expired: {sid}", observations=observations)
     idle = wait_idle(args, sid, observations=observations, deadline=deadline)
+    if dispose_request_id and "dispose" not in lifecycle_writes:
+        outcome = wait_write_request(args, sid, dispose_request_id,
+                                     observations=observations, deadline=deadline)
+        if degraded_write_settled(outcome):
+            lifecycle_writes["dispose"] = write_status_summary(outcome)
     state = source_state(args, sid, observations=observations, deadline=deadline)
     archives = source_state(args, sid, context=True, observations=observations, deadline=deadline)
     if state.get("ok") is not True or state.get("pending_tokens") != 0:
@@ -611,6 +665,7 @@ def flush_source(args, sid: str) -> dict:
         "idle": write_status_summary(idle),
         "pending_tokens": 0,
         "archive_count": archives["archive_count"],
+        "degraded_writes": lifecycle_writes,
         "flush_seconds": time.monotonic() - started,
         "http_observations": observations,
     }

@@ -482,10 +482,31 @@ function buildAuthHeaders(authCfg = {}, params = {}, contentType = null) {
   return headers;
 }
 
+function degradedSourceArchived(result) {
+  const sourceIds = result?.source_message_ids;
+  const archivedIds = result?.archived_source_ids;
+  if (!Array.isArray(sourceIds) || !sourceIds.length || !Array.isArray(archivedIds)) return false;
+  const archived = new Set(archivedIds);
+  return Boolean(result.request_status === "DEGRADED" && !(result.httpStatus >= 400)
+    && result.semantic_status === "DEGRADED"
+    && ["ARCHIVED", "RAW_ARCHIVED"].includes(result.source_status)
+    && result.archive_id && new Set(sourceIds).size === archived.size
+    && sourceIds.every((id) => archived.has(id)));
+}
+
+function degradedWriteSettled(result) {
+  return degradedSourceArchived(result) && ["DONE", "NOT_REQUIRED"].includes(result.projection_status);
+}
+
+function writeRequestNeedsPoll(result) {
+  return result.retry_action === "poll"
+    || (degradedSourceArchived(result) && result.projection_status === "PENDING");
+}
+
 function writeReceiptSummary(result) {
   return Object.fromEntries([
     "request_id", "status", "request_status", "source_status", "semantic_status",
-    "projection_status", "retry_action", "error_code", "error_type",
+    "projection_status", "retry_action", "error_code", "error_type", "archive_id",
   ].filter((key) => result[key] != null).map((key) => [key, result[key]]));
 }
 
@@ -497,14 +518,15 @@ function writeHttpObservation(method, path, response, result, started) {
 }
 
 export async function pollWriteRequest(baseUrl, params, cfg, initial, deadline) {
-  let result = initial;
-  const requestId = result.request_id || params.clientRequestId;
+  const requestId = initial.request_id || params.clientRequestId;
   const sessionId = params.sessionId || params.session_id;
-  if (!requestId || !sessionId) return result;
+  if (!requestId || !sessionId) return initial;
   const path = `/api/v1/sessions/${encodeURIComponent(sessionId)}`
     + `/write-requests?clientRequestId=${encodeURIComponent(requestId)}`;
   const observations = [...(initial.http_observations || [])];
-  while (result.retry_action === "poll" && performance.now() + 1000 < deadline) {
+  let result = initial;
+  let interruption = { observation_status: "OBSERVATION_TIMEOUT" };
+  while (writeRequestNeedsPoll(result) && performance.now() + 1000 < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const started = performance.now();
     try {
@@ -514,31 +536,37 @@ export async function pollWriteRequest(baseUrl, params, cfg, initial, deadline) 
       });
       const outcome = await response.json();
       observations.push(writeHttpObservation("GET", path, response, outcome, started));
-      if (!response.ok && !["DEGRADED", "FAILED", "NEEDS_CONFIRMATION"].includes(outcome.request_status)) {
-        return { ...result, ok: false, retryable: false, http_observations: observations,
-          observation_status: "OBSERVATION_HTTP_ERROR", observation_http_status: response.status };
+      if (!response.ok && !["FAILED", "NEEDS_CONFIRMATION"].includes(outcome.request_status)) {
+        interruption = { observation_status: "OBSERVATION_HTTP_ERROR", observation_http_status: response.status };
+        break;
+      }
+      if (outcome.request_status === "DEGRADED" && outcome.request_id !== requestId) {
+        interruption = { observation_status: "OBSERVATION_RECEIPT_MISMATCH" };
+        break;
       }
       const state = outcome.request_status;
       const handled = state === "SUCCEEDED" || (state === "ACCEPTED" && outcome.retry_action === "none");
-      result = { ...initial, ...outcome, ok: handled && outcome.ok !== false };
-      delete result.observation_status;
-      delete result.observation_error_type;
-      delete result.observation_http_status;
+      result = state === "DEGRADED"
+        ? { compacted: initial.compacted, result: initial.result, ...outcome, ok: false }
+        : { ...initial, ...outcome, ok: handled && outcome.ok !== false };
     } catch (error) {
       observations.push({ method: "GET", path, request_id: requestId, at: new Date().toISOString(),
         duration_ms: performance.now() - started, http_status: null, error_type: error.name });
-      return { ...result, ok: false, retryable: false, http_observations: observations,
+      interruption = {
         observation_status: error.name === "TimeoutError" ? "OBSERVATION_TIMEOUT" : "OBSERVATION_ERROR",
-        observation_error_type: error.name };
+        observation_error_type: error.name,
+      };
+      break;
     }
   }
-  const polling = result.retry_action === "poll";
+  const polling = writeRequestNeedsPoll(result);
+  const { observation_status, observation_error_type, observation_http_status, ...receipt } = result;
   return {
-    ...result,
+    ...receipt,
     ok: !polling && result.ok,
     retryable: result.retry_action === "retry_same_request",
     http_observations: observations,
-    ...(polling ? { observation_status: "OBSERVATION_TIMEOUT" } : {}),
+    ...(polling ? { retry_action: "poll", ...interruption } : {}),
   };
 }
 
@@ -614,7 +642,7 @@ export async function callHttp(baseUrl, method, params, cfg = {}) {
       if (["DEGRADED", "FAILED", "NEEDS_CONFIRMATION"].includes(result.request_status)) result.ok = false;
       if (result.retry_action) result.retryable = result.retry_action === "retry_same_request";
     }
-    return method === "after_turn" && result.retry_action === "poll"
+    return (method === "after_turn" || method === "compact") && writeRequestNeedsPoll(result)
       ? pollWriteRequest(baseUrl, params, cfg, result, deadline) : result;
   } catch (err) {
     console.error(`[og-memory] HTTP ${method} error: ${err.name}`);
@@ -1314,7 +1342,7 @@ function requireSuccessfulTransportResult(method, result) {
   if (!result) {
     throw new Error(`og-memory ${method} failed: empty transport response`);
   }
-  if (result.error) {
+  if (result.error && !degradedWriteSettled(result)) {
     throw new Error(`og-memory ${method} failed: ${result.error}`);
   }
   return result;
@@ -1368,7 +1396,12 @@ export async function runCompactControlFlow({
     prepareToken: prepared.prepareToken,
   });
   const successfulResult = requireSuccessfulTransportResult("compact", result);
-  if (successfulResult.ok && successfulResult.compacted) {
+  const degraded = degradedWriteSettled(successfulResult);
+  const summary = successfulResult.result?.summary;
+  if (successfulResult.compacted && degraded && (typeof summary !== "string" || !summary.trim())) {
+    return delegateCompactionToRuntimeOrThrow({ params, runtimeDelegate, loadDelegate });
+  }
+  if ((successfulResult.ok || degraded) && successfulResult.compacted) {
     const boundary = await persistTakeoverCompactionBoundary({
       sessionFile: params?.sessionFile,
       summary: successfulResult.result?.summary,
@@ -1384,7 +1417,7 @@ export async function runCompactControlFlow({
       };
     }
   }
-  return successfulResult;
+  return degraded && successfulResult.compacted ? { ...successfulResult, ok: true } : successfulResult;
 }
 
 export function buildLayeredComposeMessages(result, fallbackMessages = []) {
@@ -2172,8 +2205,9 @@ export default {
         params.semanticTurnSourceNamespace,
         params.semanticTurnId,
       );
-      const lifecycleSucceeded = (result) => Boolean(result && result.ok !== false
-        && !["DEGRADED", "FAILED", "NEEDS_CONFIRMATION"].includes(result.request_status));
+      const lifecycleSucceeded = (result) => degradedWriteSettled(result)
+        || Boolean(result && result.ok !== false
+          && !["DEGRADED", "FAILED", "NEEDS_CONFIRMATION"].includes(result.request_status));
       const enqueuePendingAfterTurn = (params) => {
         const sessionKey = afterTurnSessionKey(params);
         if (!sessionKey) return false;

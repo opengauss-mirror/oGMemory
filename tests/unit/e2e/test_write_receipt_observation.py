@@ -37,15 +37,17 @@ def receipt_http():
                 result = {"ok": True, "request_id": "server-1", "request_status": "ACCEPTED",
                           "source_status": "BUFFERED", "retry_action": "none"}
             elif "/write-requests/" in path or path.endswith("/write-requests"):
-                result = {"ok": True, "request_id": request_id, "request_status": receipts["state"],
-                          "source_status": "BUFFERED" if receipts["buffered"] else "ARCHIVED",
-                          "retry_action": "none" if receipts["state"] == "SUCCEEDED" else "poll"}
+                result = receipts.get("settled") or {
+                    "ok": True, "request_id": request_id, "request_status": receipts["state"],
+                    "source_status": "BUFFERED" if receipts["buffered"] else "ARCHIVED",
+                    "retry_action": "none" if receipts["state"] == "SUCCEEDED" else "poll",
+                }
                 receipts["state"] = "SUCCEEDED"
             elif path.endswith("/wait_until_idle"):
                 result = {"ok": True, "idle": True, "outbox": {"pending": 0, "processing": 0, "total": 0}}
             elif path.endswith("/compact"):
                 receipts.update(state="SUCCEEDED", buffered=False)
-                result = {"ok": True, "compacted": True}
+                result = receipts.get("compacted") or {"ok": True, "compacted": True}
             elif path.endswith("/dispose"):
                 result = {"ok": True, "disposed": True}
             elif path.endswith("/context"):
@@ -100,6 +102,26 @@ def test_buffered_source_settles_through_compact_and_dispose(receipt_http):
     assert [row["path"].rsplit("/", 1)[1] for row in result["http_observations"]
             if row["method"] == "POST"] == ["wait_until_idle", "compact", "wait_until_idle", "dispose", "wait_until_idle"]
     assert len(result["http_observations"]) == len(receipt_http.calls)
+
+
+def test_source_only_compaction_records_degradation_after_projection(receipt_http):
+    degraded = {"ok": False, "request_id": "compact-1", "request_status": "DEGRADED",
+                "source_status": "ARCHIVED", "semantic_status": "DEGRADED", "archive_id": "archive-1",
+                "source_message_ids": ["msg-1"], "archived_source_ids": ["msg-1"],
+                "recovery_mode": "source_only", "error_detail": {"code": "EXTRACTION_OUTPUT_INVALID"}}
+    receipt_http.receipts.update(
+        compacted={**degraded, "compacted": True, "projection_status": "PENDING"},
+        settled={**degraded, "projection_status": "DONE"},
+    )
+
+    result = evaluation.flush_source(receipt_http.args, "session")
+
+    receipt = result["degraded_writes"]["compact"]
+    assert (receipt["request_id"], receipt["request_status"], receipt["projection_status"]) == (
+        "compact-1", "DEGRADED", "DONE")
+    assert receipt["error_code"] == "EXTRACTION_OUTPUT_INVALID"
+    assert result["archive_count"] == 1
+    assert [call["request_id"] for call in receipt_http.calls if call["path"].endswith("/write-requests")] == ["compact-1"]
 
 
 def test_proxy_preserves_server_and_client_receipt_identity(receipt_http):

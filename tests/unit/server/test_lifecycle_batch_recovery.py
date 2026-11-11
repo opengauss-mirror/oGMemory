@@ -181,6 +181,57 @@ def real_archives(fs, ctx, **kwargs):
     return service, writer, manager
 
 
+@pytest.mark.parametrize("repaired", [True, False], ids=["repaired", "source-only"])
+def test_http_compact_completes_after_missing_model_decision(ctx, monkeypatch, repaired):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from extraction.occurrence_qualification import _DECISION_SCHEMA
+    from providers.llm.openai_llm import OpenAILLM
+    from server import app as app_module
+
+    llm = OpenAILLM(api_key="local-test", json_mode=True)
+    llm._track_usage = Mock()
+    requests = []
+
+    def respond(**kwargs):
+        requests.append(kwargs)
+        content = "{}"
+        if repaired and len(requests) > 1:
+            content = json.dumps({"decision": "new", "target_index": None,
+                                  "identity_evidence": "", "snapshot": None})
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content), finish_reason="stop")])
+
+    llm._create_completion = respond
+
+    def extract(**kwargs):
+        llm.complete_json("Classify the draft's event identity.", _DECISION_SCHEMA)
+        return [replace(candidate(), provenance_ids=[f"prov:1:archive:{kwargs['archive_id']}:msg-one"])]
+
+    fs = MemoryFS()
+    service, _, manager = real_archives(fs, ctx, extract=extract)
+    seed(manager, ctx)
+    monkeypatch.setattr(app_module, "_service", service)
+    monkeypatch.setattr(app_module, "_build_authenticated_context", lambda _: ctx)
+    response = app_module.app.test_client().post(
+        "/api/v1/compact", json={"sessionId": ctx.session_id, "clientRequestId": "final-qa"})
+
+    body = response.get_json()
+    assert response.status_code == 200, body
+    assert body["compacted"] is True, body
+    assert body["result"]["summary"]
+    archive, = nodes(fs, "history")
+    assert [entry["id"] for entry in json.loads(archive.content)] == ["msg-one"]
+    assert len(requests) == (2 if repaired else 3)
+    assert all(request["response_format"] == {"type": "json_object"} for request in requests)
+    assert len(nodes(fs, "event")) == int(repaired)
+    assert not manager.get_or_create(ctx.session_id, ctx).messages
+    if not repaired:
+        assert body["semantic_status"] == "DEGRADED"
+        assert archive.metadata["memory_extraction_degraded"] is True
+
+
 @pytest.mark.parametrize("entry", ["public_commit", "manager_commit", "snapshot_and_clear"])
 @pytest.mark.parametrize("failure", ["extraction", "partial_write"])
 def test_ordinary_pending_batch_blocks_source_clear_until_recovered(ctx, entry, failure):

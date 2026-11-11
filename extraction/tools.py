@@ -40,6 +40,7 @@ from core.candidate_dedup import (
 from core.errors import (
     ExtractionBudgetError,
     LLMCallError,
+    ExtractionOutputError,
     LLMOutputTruncatedError,
     OperationDeadlineExceededError,
     ToolCallProtocolError,
@@ -129,7 +130,7 @@ _CONFIDENCE_THRESHOLD = 0.5
 _SPAN_WORKERS = 4
 
 
-class _CandidateValidationError(ToolCallProtocolError):
+class _CandidateValidationError(ExtractionOutputError):
     """A native batch containing a candidate that failed output validation."""
 
     def __init__(self, reason, calls, prefetch_result=None):
@@ -959,7 +960,7 @@ class Extractor:
             if not isinstance(snapshot, dict) or not all(
                 isinstance(snapshot.get(name), str) and snapshot[name].strip() for name in layers
             ):
-                raise ToolCallProtocolError(
+                raise ExtractionOutputError(
                     "span reconciliation requires a complete memory snapshot"
                 )
             reconciled = replace(
@@ -1179,7 +1180,7 @@ class Extractor:
                             errors=[validation_failure, repair_error],
                         )
                         if not candidates:
-                            raise ToolCallProtocolError("recovery cannot discard the failed batch")
+                            raise ExtractionOutputError("recovery cannot discard the failed batch")
                     except (ToolCallProtocolError, ValueError, TypeError) as fallback_error:
                         raise repair_error from fallback_error
                 # Qualification must use the same successful reads that authorized
@@ -1701,7 +1702,7 @@ class Extractor:
             error.prompt = prompt
             raise
         if not candidates:
-            raise ToolCallProtocolError(
+            raise ExtractionOutputError(
                 "native tool calls contained no schema-valid extraction operation",
                 tool_choice="required",
             )
@@ -1780,7 +1781,7 @@ class Extractor:
             )
             envelope = ExtractionEnvelope.model_validate(raw)
         except ValueError as exc:
-            raise ToolCallProtocolError(f"JSON fallback returned invalid JSON output: {exc}") from exc
+            raise ExtractionOutputError(f"JSON fallback returned invalid JSON output: {exc}") from exc
         check_deadline()
         calls = [{"tool": operation.tool, "input": operation.input} for operation in envelope.operations]
         if tools is not self._extraction_tools:
@@ -1792,7 +1793,7 @@ class Extractor:
             candidates = self._repair_native_candidate_batch(repair_prepared, calls, ctx, archive_id)
         else:
             if envelope.operations and not candidates:
-                raise ToolCallProtocolError(
+                raise ExtractionOutputError(
                     "JSON fallback contained no schema-valid extraction operation"
                 )
             self._assign_provenance(candidates, prepared.span, archive_id)
@@ -1816,10 +1817,10 @@ class Extractor:
         candidates = []
         for call in calls:
             if call.get("tool", "") in INCREMENTAL_TOOLS:
-                raise ToolCallProtocolError("native text repair cannot rewrite incremental operations")
+                raise ExtractionOutputError("native text repair cannot rewrite incremental operations")
             candidate = self._to_candidate(call)
             if candidate is None:
-                raise ToolCallProtocolError("native text repair requires a complete schema-valid batch")
+                raise ExtractionOutputError("native text repair requires a complete schema-valid batch")
             validate_read_target(candidate, prepared.span.prefetch_result.read_versions
                                  if prepared.span.prefetch_result else {},
                                  read_nodes=prepared.span.prefetch_result.read_nodes
@@ -2271,7 +2272,7 @@ class Extractor:
             if candidate is None:
                 if call.get("tool", "") not in self._tool_to_category and not incremental:
                     continue
-                raise ToolCallProtocolError(
+                raise ExtractionOutputError(
                     f"{output_label} contained no schema-valid extraction operation: "
                     f"tool={call.get('tool', '')}",
                 )

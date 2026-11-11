@@ -147,6 +147,10 @@ class ToolCallProtocolError(ContextEngineError, RuntimeError):
         super().__init__(message)
 
 
+class ExtractionOutputError(ToolCallProtocolError, ExtractionIncompleteError):
+    """Model output could not be parsed or did not match the requested schema."""
+
+
 class ConcurrentModificationError(ContextEngineError):
     """Optimistic lock failure during concurrent merge.
 
