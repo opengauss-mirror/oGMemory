@@ -16,8 +16,8 @@ from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from core.write_contract import (
-    OUTCOMES_KEY, error_fields, needs_projection_refresh, normalize_write_result, projection_outcome,
-    store_outcome, write_request_contract,
+    OUTCOMES_KEY, PUBLIC_FIELDS, error_fields, needs_projection_refresh, normalize_write_result,
+    projection_outcome, store_outcome, write_request_contract,
 )
 from dataclasses import asdict, replace
 from datetime import UTC
@@ -106,9 +106,11 @@ from service.extraction_checkpoint import (
     request_message_id,
 )
 from service.extraction_retry import (
+    MAX_ATTEMPTS,
     ExtractionRetryWorker,
     is_frozen_source_retry,
     retry_failed_source,
+    source_only_recovery,
 )
 from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
@@ -1767,6 +1769,8 @@ class MemoryService:
         guard = active_session_guard()
         if guard is not None:
             guard.ensure_owned()
+        if isinstance(extraction_journal, LifecycleBatchJournal):
+            return self._extract_lifecycle_source(write_api, ctx, session_id, extraction_journal)
         if extraction_journal is not None:
             return self._chunk_and_extract_recoverable(write_api, ctx, session_id, extraction_journal)
         with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api) as before_write:
@@ -1917,6 +1921,27 @@ class MemoryService:
         )
         return aggregated
 
+    def _extract_lifecycle_source(self, write_api, ctx, session_id, journal):
+        while True:
+            lifecycle = journal.batch["lifecycle"]
+            reason = lifecycle.get("source_only_reason")
+            if reason:
+                with source_only_recovery(ctx, journal.batch["archive_id"], reason):
+                    return self._chunk_and_extract_recoverable(write_api, ctx, session_id, journal)
+            try:
+                return self._chunk_and_extract_recoverable(write_api, ctx, session_id, journal)
+            except (LLMTransientError, OperationDeadlineExceededError):
+                raise
+            except ExtractionIncompleteError as exc:
+                failures = lifecycle.get("extraction_failures", 0) + 1
+                detail = error_fields(exc, journal.batch["client_request_id"])["error_detail"]
+                update = {"extraction_failures": failures, "extraction_error_detail": detail}
+                if failures > MAX_ATTEMPTS:
+                    update["source_only_reason"] = str(exc)[:1000] or type(exc).__name__
+                journal.mutate(lambda batch: batch["lifecycle"].update(update))
+                logger.warning("Lifecycle extraction recovery session=%s archive=%s attempt=%d error=%s",
+                               session_id, journal.batch["archive_id"], failures, exc)
+
     def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal):
         batch = journal.batch
         messages = batch["messages"]
@@ -1967,7 +1992,6 @@ class MemoryService:
         return aggregated
 
     def _complete_extraction_source(self, ctx, archive_id, reason):
-        from service.extraction_retry import source_only_recovery
         journal = self._extraction_retry._journal(ctx, archive_id)
         if journal is None:
             return {"ok": True, "status": "completed"}
@@ -5356,17 +5380,22 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         manager.get_or_create(session_id)
         manager.enable_extraction_recovery(session_id, ctx, fs, force_reload=force_reload)
 
-    def _queue_card_format_recovery(self, ctx, error, *, archive_id, client_request_id):
+    def _queue_extraction_recovery(self, ctx, error, *, archive_id, client_request_id):
         from service.extraction_retry import background_retry_running
-        if not isinstance(error, MemoryCardFormatError) or background_retry_running():
+        if (not isinstance(error, ExtractionIncompleteError) or isinstance(error, OperationDeadlineExceededError)
+                or background_retry_running()):
             return None
+        kind = ("memory_card_format" if isinstance(error, MemoryCardFormatError) else
+                "llm_transient" if isinstance(error, LLMTransientError) else "")
+        fields = error_fields(error, client_request_id)
         task = self._extraction_retry.register(
-            ctx, {"error": str(error), "failure_kind": "memory_card_format",
+            ctx, {"error": str(error), "failure_kind": kind, **fields,
                   "extraction_archive_id": archive_id, "client_request_id": client_request_id})
         if task is None or task.get("status") not in {"queued", "running"}:
             return None
-        return {"ok": True, "status": "queued", "reason": "memory_card_format", "request_id": client_request_id,
-                "recovery_task": task, "last_error": str(error), **error_fields(error, client_request_id)}
+        return {"ok": True, "status": "queued", "reason": kind or "extraction_incomplete",
+                "request_id": client_request_id, "source_status": "CHECKPOINTED", "semantic_status": "PENDING",
+                "recovery_task": task, "last_error": str(error), **fields}
 
     def _refresh_write_outcomes(self, ctx):
         """Persist completed projection receipts under the existing session fence."""
@@ -5905,6 +5934,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                            "writes_completed": write_result.get("writes_completed", 0),
                            "candidates_extracted": write_result.get("candidates_extracted", 0)}
                 if degraded:
+                    outcome["recovery_mode"] = "source_only"
                     outcome["error_detail"] = {"code": "EXTRACTION_SOURCE_ONLY", "component": "extraction",
                         "request_id": extraction_journal_request_id, "retry_action": "manual_review",
                         "cause": {"message": str(write_result.get("reason", "source preserved after recovery"))[:1000]}}
@@ -6123,8 +6153,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     )
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
-                self._queue_card_format_recovery(
-                    ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
                 logger.error(
                     "after_turn background extract failed for run=%s session=%s "
                     "rewound=%s: %s",
@@ -6267,7 +6295,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         and is_frozen_source_retry(ctx, extraction_journal.batch)):
                     return {"ok": False, "status": "processing", "retryable": True,
                             "error": str(exc), "extraction_run_id": extraction_run_id}
-                queued = self._queue_card_format_recovery(
+                queued = self._queue_extraction_recovery(
                     ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
                 if queued is not None:
                     return {**queued, "extraction_run_id": extraction_run_id}
@@ -6504,15 +6532,25 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Commit synchronously (wait=true)
         journal = prepared.get("_lifecycle_journal")
+        degraded_receipt = {}
         if journal is not None:
-            commit_result = mgr.commit_snapshot(session_id, journal.snapshot, ctx, wait=True,
-                                                 archive_id=journal.batch["archive_id"],
-                                                 archive_checkpoint=journal)
+            lifecycle = journal.batch["lifecycle"]
+            reason = lifecycle.get("source_only_reason")
+            scope = source_only_recovery(ctx, journal.batch["archive_id"], reason) if reason else nullcontext()
+            with scope:
+                commit_result = mgr.commit_snapshot(session_id, journal.snapshot, ctx, wait=True,
+                                                     archive_id=journal.batch["archive_id"],
+                                                     archive_checkpoint=journal)
             if commit_result.get("archived") and commit_result.get("status") == "completed":
                 try:
-                    semantic = journal.batch.get("lifecycle", {}).get("semantic_status", "COMPLETE")
-                    journal.finish(reset_window_state=True, outcome={"semantic_status": semantic},
-                                   resolve_outcome=self._resolve_write_outcome)
+                    outcome = self._lifecycle_extraction_outcome(lifecycle)
+                    receipt = journal.finish(reset_window_state=True, outcome=outcome,
+                                             resolve_outcome=self._resolve_write_outcome)
+                    if receipt.get("semantic_status") == "DEGRADED":
+                        receipt = normalize_write_result(receipt)
+                        fields = (*PUBLIC_FIELDS, "ok", "status", "recovery_mode",
+                                  "source_message_ids", "archived_source_ids")
+                        degraded_receipt = {key: receipt[key] for key in fields if key in receipt}
                 except Exception as exc:
                     return {"ok": False, "compacted": False, "status": "failed",
                             "retryable": True, "error": str(exc), "commit": commit_result}
@@ -6555,6 +6593,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         result = {
             "ok": True,
+            **degraded_receipt,
             "compacted": True,
             "result": {
                 "summary": summary,
@@ -6916,6 +6955,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return {"cleaned": True}
 
     @staticmethod
+    def _lifecycle_extraction_outcome(lifecycle):
+        if lifecycle.get("source_only_reason"):
+            return {"semantic_status": "DEGRADED", "recovery_mode": "source_only",
+                    "error_detail": lifecycle["extraction_error_detail"]}
+        return {"semantic_status": lifecycle.get("semantic_status", "COMPLETE")}
+
+    @staticmethod
     def _update_lifecycle_error(journal, exc=None, *, retryable=True):
         if exc is None:
             if journal.batch["lifecycle"].get("last_error"):
@@ -7037,7 +7083,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 if isinstance(write_api, _CheckpointWriteAPI):
                     ctx = ctx or self.build_context(params)
                     self._load_extraction_recovery_before_accumulation(buf.session_id, ctx)
-                    self._dispose_journal(mgr, buf, ctx, snapshot)
+                    journal = self._dispose_journal(mgr, buf, ctx, snapshot)
+                    return {"source_snapshot": snapshot, "request_id": journal.batch["client_request_id"]}
             return {"source_snapshot": snapshot}
 
     @capture_outbox_events
@@ -7141,8 +7188,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     raw_uris = [operation["plan"]["target_uri"]
                         for slot, record in journal.batch["slots"].items() if slot.startswith("raw:")
                         for operation in record["operations"].values() if operation.get("status") == "complete"]
-                    journal.finish(outcome={"semantic_status": "DEGRADED" if write_result.get("degraded") else "COMPLETE",
-                                             "source_status": "RAW_ARCHIVED", "raw_source_uris": raw_uris},
+                    outcome = self._lifecycle_extraction_outcome(journal.batch["lifecycle"])
+                    journal.finish(outcome={**outcome, "source_status": "RAW_ARCHIVED", "raw_source_uris": raw_uris},
                                    resolve_outcome=self._resolve_write_outcome)
                 else:
                     self._save_dispose_snapshot(mgr, params, buf, snapshot_ids)
@@ -7340,6 +7387,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "status": "dispose_deferred" if extraction_active else "background_flush_dispatched",
             "reason": reason,
         }
+        if source_state.get("request_id"):
+            result["request_id"] = source_state["request_id"]
         if pending_tokens is not None:
             result["pending_tokens"] = pending_tokens
         return result

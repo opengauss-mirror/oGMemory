@@ -5,7 +5,7 @@ from functools import wraps
 
 from core.errors import (
     ConcurrentModificationError, EmbeddingError, ExtractionBudgetError,
-    ExtractionIncompleteError, LLMTransientError, OperationDeadlineExceededError,
+    ExtractionIncompleteError, ExtractionOutputError, LLMTransientError, OperationDeadlineExceededError,
     ValidationError, VectorIndexError,
 )
 
@@ -29,6 +29,9 @@ def error_fields(exc, request_id=""):
         code, component, status, action = "MODEL_TEMPORARILY_UNAVAILABLE", "model", 503, "retry_same_request"
     elif isinstance(exc, OperationDeadlineExceededError):
         code, component, status, action = "WRITE_DEADLINE_EXCEEDED", "memory", 504, "retry_same_request"
+    elif isinstance(exc, ExtractionOutputError):
+        code, component, status = "EXTRACTION_OUTPUT_INVALID", "extraction", 503
+        action = "retry_same_request"
     elif isinstance(exc, ExtractionIncompleteError):
         code, component, status = "EXTRACTION_SEMANTIC_INCOMPLETE", "extraction", 500
     elif isinstance(exc, ConcurrentModificationError):

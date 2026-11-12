@@ -40,12 +40,15 @@ class LifecycleBatchJournal(ExtractionBatchJournal):
             actual = [asdict(message) for message in buffer.messages if message.id in source_ids]
             if len(source_ids) != len(snapshot) or actual != expected:
                 raise RecoveryNeedsConfirmationError("lifecycle source snapshot changed before checkpoint")
-        super().__init__(manager, buffer, ctx, snapshot,
+        request_id = f"{kind}-{kwargs['archive_id']}"
+        super().__init__(manager, buffer, ctx, snapshot, client_request_id=request_id,
                          lifecycle={"kind": kind, "source_digest": source_digest(
                              [asdict(message) for message in snapshot])}, **kwargs)
         lifecycle = self.batch["lifecycle"]
         if lifecycle.get("source_digest") != source_digest(self.batch["snapshot"]):
             raise RecoveryNeedsConfirmationError("pending lifecycle source digest changed")
+        if not self.batch.get("client_request_id"):
+            self.mutate(lambda batch: batch.update(client_request_id=request_id))
 
     @property
     def snapshot(self):

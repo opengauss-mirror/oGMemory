@@ -88,6 +88,7 @@ except ImportError:
     )
 
 from core.errors import (
+    ExtractionOutputError,
     LLMOutputTruncatedError,
     LLMTransientError,
     OperationDeadlineExceededError,
@@ -457,7 +458,7 @@ class OpenAILLM(LLM):
             result = self._extract_json_from_text(content or "")
             return self._validate_result(result, schema)
         except (ValueError, TypeError) as exc:
-            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
+            raise ExtractionOutputError(f"Invalid JSON response: {exc}") from exc
 
     def _complete_json_text_fallback(self, system_message: str, prompt: str, schema: dict) -> dict:
         enhanced_system = (
@@ -518,7 +519,7 @@ class OpenAILLM(LLM):
             assert first_error is not None
             raise first_error
         except (ValueError, TypeError) as exc:
-            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
+            raise ExtractionOutputError(f"Invalid JSON response: {exc}") from exc
 
     @staticmethod
     def _extract_json_from_text(text: str) -> Any:
@@ -709,7 +710,7 @@ class OpenAILLM(LLM):
                     return result
             except Exception:
                 pass
-        raise ToolCallProtocolError("Tool call arguments must contain a JSON object")
+        raise ExtractionOutputError("Tool call arguments must contain a JSON object")
 
     def complete_with_tools(
         self,
@@ -850,7 +851,7 @@ class OpenAILLM(LLM):
                             time.sleep(delay if remaining is None else min(delay, remaining))
                             check_deadline()
                             continue
-                        raise ToolCallProtocolError(
+                        raise ExtractionOutputError(
                             "Required tool call returned no tool_calls after "
                             f"{max_required_empty_attempts} attempts; "
                             f"model={self._model}, prompt_sha={prompt_sha}",
@@ -882,7 +883,7 @@ class OpenAILLM(LLM):
                     effective_tool_choice == "required"
                     and self._is_required_tool_output_parse_error(e)
                 ):
-                    raise ToolCallProtocolError(
+                    raise ExtractionOutputError(
                         "Server could not parse the generated required tool-call array",
                         tool_choice="required",
                     ) from e
@@ -1042,7 +1043,7 @@ class OpenAILLM(LLM):
                 tool_parameters.get("tool_choice") == "required"
                 and self._is_required_tool_output_parse_error(e)
             ):
-                raise ToolCallProtocolError(
+                raise ExtractionOutputError(
                     "Server could not parse the generated required tool-call array",
                     tool_choice="required",
                 ) from e
