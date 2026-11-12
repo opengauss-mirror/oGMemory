@@ -15,7 +15,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -39,6 +41,7 @@ from core.candidate_dedup import (
 )
 from core.errors import (
     ExtractionBudgetError,
+    ExtractionIncompleteError,
     LLMCallError,
     ExtractionOutputError,
     LLMOutputTruncatedError,
@@ -138,6 +141,37 @@ class _CandidateValidationError(ExtractionOutputError):
         self.calls = deepcopy(calls)
         self.prefetch_result = deepcopy(prefetch_result)
         self.prompt = None
+
+
+class _SpanProgrammingError(RuntimeError):
+    """An unexpected error inside the parsing/validation code itself.
+
+    Deliberately NOT a ToolCallProtocolError subclass: LLM-output problems
+    (protocol failures, schema violations) flow through the retry / JSON
+    fallback / span-drop machinery, but a bug in our own parsing code must
+    crash loudly instead of being silently degraded to a dropped span.
+    """
+
+
+# Span-parallelism / resilience defaults (WS 4). Under LLM saturation,
+# per-span extraction calls time out; the old behaviour aborted the whole
+# chunk on the first span failure (observed: 270 "Extractor failed" =
+# entire chunk extractions lost). These knobs bound the retry budget and
+# the straggler drop.
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r — using %d", name, raw, default)
+        return default
+
+
+_DEFAULT_SPAN_WORKERS = max(1, _env_int("OGMEM_EXTRACT_MAX_WORKERS", 4) or 4)
+_DEFAULT_SPAN_TIMEOUT = max(10.0, _env_int("OGMEM_EXTRACT_SPAN_TIMEOUT", 180) or 180.0)
+_DEFAULT_SPAN_RETRIES = max(0, _env_int("OGMEM_EXTRACT_SPAN_RETRIES", 1) or 1)
 
 _DEFAULT_SCHEMA_REGISTRY: SchemaRegistry | None = None
 EXTRACTION_TOOLS: list[dict] = []
@@ -489,6 +523,9 @@ class Extractor:
         mode: str = "eager",
         react_timeout_seconds: float = 180.0,
         internal_tool_usage_tracker: Any | None = None,
+        max_workers: int | None = None,
+        span_timeout_seconds: float | None = None,
+        span_retries: int | None = None,
         occurrence_update_eligible: Callable[[CandidateMemory], bool] | None = None,
         source_occurrence_reconciliation_enabled: bool = False,
         dual_pass_enabled: bool = True,
@@ -513,8 +550,25 @@ class Extractor:
             mode: Extraction mode — "eager" (prefetch + single-shot) or
                   "lazy" (ReAct loop with read tools). Defaults to "eager".
             react_timeout_seconds: Maximum seconds for ReAct loop before timeout. Defaults to 180.0.
+            max_workers: Phase-2 span parallelism (None ->
+                OGMEM_EXTRACT_MAX_WORKERS, default 4).
+            span_timeout_seconds: Per-completion budget for the span pool
+                before stragglers are dropped (None ->
+                OGMEM_EXTRACT_SPAN_TIMEOUT, default 180s).
+            span_retries: Extra attempts per span pass on transient LLM
+                failures (None -> OGMEM_EXTRACT_SPAN_RETRIES, default 1).
         """
         self._llm = llm
+        self._max_workers = (
+            _DEFAULT_SPAN_WORKERS if max_workers is None else max(1, max_workers)
+        )
+        self._span_timeout_seconds = (
+            _DEFAULT_SPAN_TIMEOUT if span_timeout_seconds is None
+            else max(0.001, float(span_timeout_seconds))
+        )
+        self._span_retries = (
+            _DEFAULT_SPAN_RETRIES if span_retries is None else max(0, span_retries)
+        )
         if prompt_manager is None:
             from extraction.prompts import PromptManager as _PM
             prompt_manager = _PM()
@@ -742,8 +796,14 @@ class Extractor:
                 logger.warning("Phase 1 returned 0 valid spans for %d messages", len(messages))
             return spans
         except Exception as exc:
-            logger.error("Phase 1 span identification FAILED: %s", exc, exc_info=True)
-            raise
+            # Degrade instead of abort: an empty Phase 1 lets extract()
+            # fall through to its full-conversation fallback span.
+            logger.warning(
+                "Phase 1 span identification failed (%s: %s) — falling back "
+                "to the full-conversation span",
+                type(exc).__name__, exc, exc_info=True,
+            )
+            return []
 
     # ------------------------------------------------------------------
     # Phase 2 — Span Structuring
@@ -768,23 +828,76 @@ class Extractor:
         if not prepared_spans:
             return []
 
-        # Single span → skip thread pool overhead
+        span_results: list[tuple[_Span, list[CandidateMemory]]] = []
+        failed: list[_Span] = []
+
+        # Single span → run the dual directly (no pool; retry logic inside
+        # still applies), then reconcile once — this is the only merge for
+        # the whole chunk.
         if len(prepared_spans) == 1:
             candidates = self._structure_prepared_span_dual(
                 prepared_spans[0], ctx, archive_id
             )
+            if candidates is None:
+                # Total failure must not look like "extraction completed,
+                # nothing found": an empty list is accepted as success by
+                # the write path, which then removes the source messages
+                # from the journal and marks the request complete. Raise
+                # the typed retryable signal instead (review item 1).
+                raise ExtractionIncompleteError(
+                    "extraction produced no successful span: the single "
+                    "span failed or was dropped after retries"
+                )
             if self._reconcile_source_occurrences_enabled():
-                return self._merge_span_results([(prepared_spans[0].span, candidates)], ctx, archive_id)
+                return self._merge_span_results(
+                    [(prepared_spans[0].span, candidates)], ctx, archive_id
+                )
             return candidates
 
         if _EXTRACTION_RUNTIME.get() is not None or self._storage_requires_owner_thread():
-            # Preserve both native attempts and their usage context on the storage owner.
-            return self._merge_span_results([
-                (prepared.span, self._structure_prepared_span_dual(prepared, ctx, archive_id))
-                for prepared in prepared_spans
-            ], ctx, archive_id)
+            # Preserve both native attempts and their usage context on the
+            # storage owner. A span whose dual degraded to None is dropped;
+            # the rest of the chunk keeps its candidates (review item 1).
+            # In dev's outcome architecture the dual raises on total
+            # failure; the None branch stays as defense.
+            for prepared in prepared_spans:
+                candidates = self._structure_prepared_span_dual(
+                    prepared, ctx, archive_id
+                )
+                if candidates is not None:
+                    span_results.append((prepared.span, candidates))
+                else:
+                    failed.append(prepared.span)
+            if failed:
+                logger.warning(
+                    "Phase 2 partial extraction: %d/%d spans succeeded, %d "
+                    "failed or dropped — keeping partial candidates",
+                    len(prepared_spans) - len(failed), len(prepared_spans),
+                    len(failed),
+                )
+            if not span_results:
+                # Every span failed: raising (not returning []) keeps the
+                # source batch retryable — the journal is preserved and the
+                # request is re-extracted instead of being marked complete
+                # with zero memories (review item 1).
+                raise ExtractionIncompleteError(
+                    f"extraction produced no successful span: "
+                    f"{len(failed)}/{len(prepared_spans)} spans failed "
+                    "or were dropped after retries"
+                )
+            return self._merge_span_results(span_results, ctx, archive_id)
 
-        with ThreadPoolExecutor(max_workers=_SPAN_WORKERS) as pool:
+        # dev (!341) outcome architecture: one future per (span, temperature)
+        # native pass, collected into _NativeSpanOutcome and finalized after
+        # the pool drains. Composed with our parallel-ingest hardening:
+        # - straggler budget: a span whose native passes hang is dropped
+        #   after span_timeout_seconds instead of blocking the whole chunk;
+        # - partial-chunk resilience: a span whose finalize fails is
+        #   dropped while the rest keeps its candidates, and a chunk where
+        #   every span failed raises the typed retryable signal instead of
+        #   returning [] as success (review item 1).
+        pool = ThreadPoolExecutor(max_workers=_SPAN_WORKERS)
+        try:
             futures = {}
             outcomes = [_NativeSpanOutcome(prepared=prepared) for prepared in prepared_spans]
             for span_index, prepared in enumerate(prepared_spans):
@@ -796,41 +909,92 @@ class Extractor:
                     )
                     futures[future] = (span_index, temperature)
 
-            for future in as_completed(futures):
-                span_index, temperature = futures[future]
-                outcome = outcomes[span_index]
-                span = outcome.prepared.span
-                try:
-                    result = future.result()
-                except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
-                    outcome.protocol_errors.append(exc)
-                    logger.warning(
-                        "Span %d-%d native extraction protocol failure: " "temperature=%s error=%s",
-                        span.start,
-                        span.end,
-                        temperature,
-                        exc,
-                    )
-                    continue
-                except Exception as exc:
-                    logger.error(
-                        "Span %d-%d structuring FAILED: %s",
-                        span.start,
-                        span.end,
-                        exc,
-                        exc_info=True,
-                    )
-                    raise
-                outcome.candidates.extend(result)
-                outcome.native_runs[temperature] = result
+            outstanding = set(futures)
+            dropped_stragglers = False
+            while outstanding:
+                done, outstanding = wait(
+                    outstanding,
+                    timeout=self._span_timeout_seconds,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    # Nothing completed within the budget: drop the
+                    # stragglers rather than blocking the chunk (the
+                    # explicit shutdown below does not wait for them).
+                    dropped_stragglers = True
+                    break
+                for future in done:
+                    span_index, temperature = futures[future]
+                    outcome = outcomes[span_index]
+                    span = outcome.prepared.span
+                    try:
+                        result = future.result()
+                    except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
+                        outcome.protocol_errors.append(exc)
+                        logger.warning(
+                            "Span %d-%d native extraction protocol failure: " "temperature=%s error=%s",
+                            span.start,
+                            span.end,
+                            temperature,
+                            exc,
+                        )
+                        continue
+                    except Exception as exc:
+                        logger.error(
+                            "Span %d-%d structuring FAILED: %s",
+                            span.start,
+                            span.end,
+                            exc,
+                            exc_info=True,
+                        )
+                        raise
+                    outcome.candidates.extend(result)
+                    outcome.native_runs[temperature] = result
+            if dropped_stragglers:
+                logger.warning(
+                    "Phase 2 dropped %d straggler span(s) after %.0fs "
+                    "without completion",
+                    len(outstanding), self._span_timeout_seconds,
+                )
+                for future in outstanding:
+                    failed.append(outcomes[futures[future][0]].prepared.span)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-        span_results = [
-            (
-                outcome.prepared.span,
-                self._finalize_span_outcome(outcome, ctx, archive_id),
+        for outcome in outcomes:
+            if outcome.prepared.span in failed:
+                continue
+            try:
+                candidates = self._finalize_span_outcome(outcome, ctx, archive_id)
+            except Exception as exc:
+                # Partial-chunk resilience: one span's total failure (all
+                # native passes failed and recovery raised) must not abort
+                # the whole chunk — log and keep the other spans.
+                logger.error(
+                    "Span %d-%d finalize FAILED: %s",
+                    outcome.prepared.span.start, outcome.prepared.span.end, exc,
+                    exc_info=True,
+                )
+                failed.append(outcome.prepared.span)
+                continue
+            span_results.append((outcome.prepared.span, candidates))
+
+        if failed:
+            logger.warning(
+                "Phase 2 partial extraction: %d/%d spans succeeded, %d "
+                "failed or dropped — keeping partial candidates",
+                len(prepared_spans) - len(failed), len(prepared_spans),
+                len(failed),
             )
-            for outcome in outcomes
-        ]
+        if not span_results:
+            # Every span failed or was dropped: raise the typed retryable
+            # signal so the source batch is re-extracted rather than being
+            # marked complete with zero memories (review item 1).
+            raise ExtractionIncompleteError(
+                f"extraction produced no successful span: "
+                f"{len(failed)}/{len(prepared_spans)} spans failed "
+                "or were dropped after retries"
+            )
         return self._merge_span_results(span_results, ctx, archive_id)
 
     def _merge_span_results(
@@ -1004,8 +1168,22 @@ class Extractor:
         prepared: _PreparedSpan,
         ctx: RequestContext,
         archive_id: str | None,
-    ) -> list[CandidateMemory]:
-        """Run configured native passes and finalize their extraction results."""
+    ) -> Optional[list[CandidateMemory]]:
+        """Run the dual native extraction with bounded retry; degrade on failure.
+
+        The dual run is a default pass plus a temperature=0 pass. On a
+        pass exception the retry budget (1 + span_retries) applies with
+        capped exponential backoff; when the default pass exhausts its
+        budget the span is dropped (``None`` — the caller keeps the other
+        spans), and when the temp=0 pass fails the default-pass output is
+        kept (a partial dual-run beats losing the span). Tool-call
+        protocol failures are not retried — the JSON fallback in
+        _resolve_native_span_outcome is their recovery path.
+
+        Returns the finalized candidate list for this span (unmerged
+        across spans — cross-span reconciliation happens in
+        _merge_span_results), or ``None`` when the span was dropped.
+        """
         runtime = _EXTRACTION_RUNTIME.get()
         checkpoint = runtime.checkpoint if runtime is not None and not self._use_lazy_mode() else None
         inputs = None
@@ -1029,24 +1207,66 @@ class Extractor:
                 return self._finalize_span_outcome(
                     _NativeSpanOutcome(prepared=prepared, candidates=candidates), ctx, archive_id)
         outcome = _NativeSpanOutcome(prepared=prepared)
+        attempts = 1 + self._span_retries
         for temperature in self._native_temperatures():
             check_deadline()
-            try:
-                result = self._structure_prepared_span(
-                    prepared, ctx, archive_id, temperature=temperature
-                )
-                outcome.candidates.extend(result)
-                outcome.native_runs[temperature] = result
-            except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
-                outcome.protocol_errors.append(exc)
-                logger.warning(
-                    "Span %d-%d native extraction protocol failure: "
-                    "temperature=%s error=%s",
-                    prepared.span.start,
-                    prepared.span.end,
-                    temperature,
-                    exc,
-                )
+            for attempt in range(1, attempts + 1):
+                try:
+                    result = self._structure_prepared_span(
+                        prepared, ctx, archive_id, temperature=temperature
+                    )
+                    outcome.candidates.extend(result)
+                    outcome.native_runs[temperature] = result
+                    break
+                except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
+                    outcome.protocol_errors.append(exc)
+                    logger.warning(
+                        "Span %d-%d native extraction protocol failure: "
+                        "temperature=%s error=%s",
+                        prepared.span.start, prepared.span.end, temperature,
+                        exc,
+                    )
+                    break
+                except OperationDeadlineExceededError:
+                    # Never burn the retry budget on an expired deadline.
+                    raise
+                except _SpanProgrammingError:
+                    # Bugs in our parsing code must crash loudly, not be
+                    # degraded to a dropped span (dev contract).
+                    logger.error(
+                        "Span %d-%d structuring hit a programming error — "
+                        "re-raising instead of degrading",
+                        prepared.span.start, prepared.span.end, exc_info=True,
+                    )
+                    raise
+                except Exception as exc:
+                    if attempt < attempts:
+                        delay = min(2.0 ** attempt, 8.0)
+                        logger.warning(
+                            "Span %d-%d pass (temperature=%s) failed "
+                            "(%s: %s) — retrying %d/%d in %.1fs",
+                            prepared.span.start, prepared.span.end, temperature,
+                            type(exc).__name__, exc, attempt, attempts - 1,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    if temperature is None:
+                        logger.error(
+                            "Span %d-%d extraction failed after %d attempts "
+                            "(%s: %s) — dropping the span, keeping others",
+                            prepared.span.start, prepared.span.end, attempts,
+                            type(exc).__name__, exc, exc_info=True,
+                        )
+                        return None
+                    # Partial dual-run: keep the default-pass output.
+                    logger.warning(
+                        "Span %d-%d temp=0 pass failed after %d attempts "
+                        "(%s: %s) — keeping default-pass output",
+                        prepared.span.start, prepared.span.end, attempts,
+                        type(exc).__name__, exc,
+                    )
+                    break
         if checkpoint is not None:
             candidates = self._resolve_native_span_outcome(outcome, ctx, archive_id)
             candidates = [validate_candidate(c) for c in candidates]
@@ -2245,6 +2465,19 @@ class Extractor:
                 c.provenance_ids.append(prov_id)
 
     def _parse_candidate_calls(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
+        try:
+            return self._parse_candidate_calls_checked(
+                calls, prefetch_result, ctx, output_label=output_label,
+            )
+        except (ToolCallProtocolError, ValidationError, ValueError, TypeError) as exc:
+            # LLM-output problems: keep the existing protocol / repair flow.
+            raise
+        except Exception as exc:
+            # A bug in parsing/validation code must not enter the retry or
+            # output-repair paths — surface it immediately.
+            raise _SpanProgrammingError(f"{type(exc).__name__}: {exc}") from exc
+
+    def _parse_candidate_calls_checked(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
         from extraction.relation_proposals import attach, parse_proposal
         contents = {}
         entries = []

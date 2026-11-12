@@ -34,27 +34,30 @@ def test_signature_includes_effective_endpoint_not_credentials(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("kind", ["voice_asr", "voice_segmentation", "speaker_embedding"])
-@pytest.mark.parametrize("failed,segments", [(1, 1), (1, 0), (0, 0), (0, 1)])
+@pytest.mark.parametrize("failed,segments", [(0, 1), (1, 0), (1, 1), (2, 0)])
 def test_stage_preserves_failures_and_valid_silence(tmp_path, monkeypatch, kind, failed, segments):
     import importlib
 
     module = importlib.import_module("m3." + kind)
 
+    # With attempted=10 the tolerance floor max(1, int(10*0.15)) = 1:
+    # a single failed clip is tolerated (the stage stays ok); two
+    # failures exceed the ratio and fail the stage.
     def driver(args, **kwargs):
         path = Path(args.output_jsonl)
         path.write_text("{}\n" * segments)
         path.with_suffix(".summary.json").write_text(
             json.dumps(
                 {
-                    "attempted_audio": 2,
-                    "completed_audio": 2 - failed,
+                    "attempted_audio": 10,
+                    "completed_audio": 10 - failed,
                     "cached_audio": 1,
-                    "executed_audio": 1,
+                    "executed_audio": 9,
                     "failed_audio": failed,
                 }
             )
         )
-        return 2 if failed else 0
+        return 2 if failed > 1 else 0
 
     monkeypatch.setattr(module, "run_" + kind, driver)
     ctx = PipelineContext(
@@ -79,9 +82,10 @@ def test_stage_preserves_failures_and_valid_silence(tmp_path, monkeypatch, kind,
             params={"output_jsonl": str(tmp_path / "out.jsonl")},
         ),
     )
-    assert result.ok is (not failed)
+    tolerated = failed <= 1
+    assert result.ok is tolerated
     assert result.counts["cached_audio"] == 1
-    assert bool(result.errors) == bool(failed)
+    assert bool(result.errors) is (not tolerated)
 
 
 @pytest.mark.parametrize(
