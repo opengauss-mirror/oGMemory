@@ -1,14 +1,14 @@
 """Successful owner-thread collection and parallel source-grounded model stages."""
 
+import threading
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
-import threading
 
 import pytest
 
-from extraction.tools import ExtractionRuntime, _Span
 from core.model_stage import stage_digest
+from extraction.tools import ExtractionRuntime, _Span
 from tests.unit.extraction.test_node_processing import card, node_payload, operation, setup
 from tests.unit.extraction.test_node_read_cache import record_storage_threads
 
@@ -187,7 +187,7 @@ def test_identification_and_native_stages_reuse_across_runtimes_then_refresh_sou
     def complete_json(prompt, schema):
         if "categories" in schema["properties"]:
             selected.append((prompt, schema))
-            return {"categories": ["entity"], "shared_tools": []}
+            return {"categories": ["entity"]}
         identified.append((prompt, schema))
         return {"spans": [{"start": 0, "end": 0, "reason": "A personal gift", "categories": ["entity"]}]}
 
@@ -216,7 +216,8 @@ def test_identification_and_native_stages_reuse_across_runtimes_then_refresh_sou
         assert spans[-1].message_ids == [source[0]["id"]]
     assert results[0] == results[1]
     assert spans[0] is not spans[1]
-    assert len(identified) == len(selected) == len(native) == 3
+    assert len(identified) == len(native) == 3
+    assert len(selected) == 4  # Selection is call-local; accepted native stages still replay.
     assert "heart charm" in results[-1][0].content
     identification_results = [value for (name, _), value in stages.values.items() if name == "span_identification"]
     assert len(identification_results) == 3

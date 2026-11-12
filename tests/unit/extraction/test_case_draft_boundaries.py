@@ -230,8 +230,8 @@ class CaseSourceLLM:
 
     def complete_json(self, prompt, schema):
         # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
-        if set(schema.get("properties", {})) == {"categories", "shared_tools"}:
-            return {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         self.json_calls.append(prompt)
         assert set(schema["properties"]) == {"spans"}
         return {"spans": [{"start": 0, "end": 0, "categories": ["case"]}]}

@@ -8,7 +8,6 @@ import pytest
 
 from core.errors import LLMOutputTruncatedError
 from core.models import RequestContext
-from extraction.node_processing import NodeProcessor
 from service.api import MemoryWriteAPI
 from tests.unit.commit.test_memory_identity import MemoryFS, memory
 
@@ -29,8 +28,8 @@ def operation(ids, *, target="", action="create", fact="Gift from Caroline's gra
 
 class NodeLLM:
     def complete_json(self, prompt, schema):
-        assert set(schema["properties"]) == {"categories", "shared_tools"}
-        return {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
+        assert set(schema["properties"]) == {"categories"}
+        return {"categories": schema["properties"]["categories"]["items"]["enum"]}
 
     def __init__(self, decide):
         self.decide, self.calls = decide, []
@@ -446,7 +445,6 @@ def test_checkpoint_revision_commits_against_refreshed_snapshot(category):
 
 @pytest.mark.parametrize("failure", ["defer", "truncated"])
 def test_stage_b_resume_reuses_saved_stage_a(failure):
-    from unittest.mock import Mock
 
     from tests.unit.server.test_extraction_batch_recovery import params, setup_service
     from tests.unit.server.test_extraction_retry_task import ready

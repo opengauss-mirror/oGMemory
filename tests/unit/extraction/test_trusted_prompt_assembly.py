@@ -3,6 +3,7 @@ from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
+import yaml
 
 from core.models import RequestContext
 from core.uri_resolver import URIResolver
@@ -18,7 +19,7 @@ CTX = RequestContext("acct", "user", "agent", "session", "trace")
 def prepared(categories=("entity",), mode="eager"):
     registry = SchemaRegistry()
     llm = Mock()
-    llm.complete_json.return_value = {"categories": list(categories), "shared_tools": []}
+    llm.complete_json.return_value = {"categories": list(categories)}
     extractor = Extractor(llm, mode=mode, fs=Mock(), schema_registry=registry,
                           uri_resolver=URIResolver(registry))
     task = extractor._prepare_span(
@@ -38,18 +39,19 @@ def test_eager_runtime_does_not_require_unoffered_profile():
 
 
 @pytest.mark.parametrize("section", ["examples", "system_prompt"])
-def test_lazy_invalid_components_restore_original_rule_and_tool_set(section):
+def test_invalid_injected_components_are_configuration_errors(section, tmp_path):
     registry = SchemaRegistry()
     manager = PromptManager()
     data = manager.load("extraction")
     data[section][1]["id"] = data[section][0]["id"]
+    (tmp_path / "extraction.yaml").write_text(yaml.safe_dump(data))
+    manager = PromptManager(tmp_path)
     llm = Mock()
     llm.complete_with_tools_messages.return_value = ([], "[]")
-    loop = ExtractionReActLoop(llm, Mock(), registry, URIResolver(registry), manager)
-    loop.run("Project Beacon uses PostgreSQL.", CTX, categories=frozenset({"entity"}))
-    request = llm.complete_with_tools_messages.call_args.kwargs
-    assert "extract_profile" in {t["name"] for t in request["tools"]}
-    assert manager.render("extraction", "system_prompt") in request["messages"][0]["content"]
+    from extraction.assembly_contract import UnsupportedAssemblyTemplateError
+
+    with pytest.raises(UnsupportedAssemblyTemplateError):
+        ExtractionReActLoop(llm, Mock(), registry, URIResolver(registry), manager)
 
 
 def test_unknown_category_template_restores_full_scope():
@@ -66,11 +68,11 @@ def test_unknown_category_template_restores_full_scope():
 
 @pytest.mark.parametrize("scope", ["scoped", "full"])
 def test_lazy_preserves_output_language_and_example_omission(scope):
-    extractor, task = prepared(mode="lazy")
+    extractor, task = prepared(
+        categories=("unknown",) if scope == "full" else ("entity",), mode="lazy"
+    )
     task.span.prompt_parts = replace(task.span.prompt_parts, include_examples=False)
     task.prompt = task.span.prompt_parts.render()
-    if scope == "full":
-        extractor._prompt_manager.load("extraction").pop("assembly_version")
     extractor._llm.complete_with_tools_messages.return_value = ([], "[]")
     extractor._structure_prepared_span(task, CTX)
     text = extractor._llm.complete_with_tools_messages.call_args.kwargs["messages"][0]["content"]
@@ -90,12 +92,18 @@ def test_lazy_reassembly_preserves_appended_feedback():
     assert "CORRECTION_FEEDBACK_123" in str(messages)
 
 
-def test_lazy_late_section_failure_publishes_full_contract_before_eager_recovery():
+def test_lazy_render_failure_publishes_full_contract_before_eager_recovery(monkeypatch):
     from core.errors import ToolCallProtocolError
 
     extractor, task = prepared(mode="lazy")
-    data = extractor._prompt_manager.load("extraction")
-    data["examples"][0]["requires_types"] = ["unknown_category"]
+    original = extractor._prompt_manager.render
+
+    def render(template, section, **variables):
+        if section == "examples" and variables.get("categories") is not None:
+            raise ValueError("caller rendering failure")
+        return original(template, section, **variables)
+
+    monkeypatch.setattr(extractor._prompt_manager, "render", render)
     extractor._llm.complete_with_tools_messages.side_effect = ToolCallProtocolError("mock failure")
     extractor._structure_span_eager = Mock(return_value=[])
     extractor._structure_prepared_span(task, CTX)
@@ -121,14 +129,16 @@ def test_preference_scope_keeps_original_eligibility_boundaries():
     ("examples", "requires_types", "entity"),
     ("examples", "requires_types", [{}]),
 ])
-def test_malformed_component_dependencies_restore_full_contract(section, key, invalid):
-    extractor, task = prepared()
-    extractor._prompt_manager.load("extraction")[section][0][key] = invalid
-    request = assemble_prepared(extractor, task, CTX)
-    prompt, tools = request.prompt, request.tools
-    assert task.assembly_state.contract.scope == "full"
-    assert "extract_profile" in {t["name"] for t in tools}
-    assert "── profile (" in prompt
+def test_malformed_component_dependencies_fail_at_injection(tmp_path, section, key, invalid):
+    from extraction.assembly_contract import UnsupportedAssemblyTemplateError
+
+    data = PromptManager().load("extraction")
+    data[section][0][key] = invalid
+    (tmp_path / "extraction.yaml").write_text(yaml.safe_dump(data))
+    llm = Mock()
+    with pytest.raises(UnsupportedAssemblyTemplateError):
+        Extractor(llm, prompt_manager=PromptManager(tmp_path))
+    llm.complete_json.assert_not_called()
 
 
 def test_node_processing_instruction_survives_compact_json_parts():
@@ -156,15 +166,3 @@ def test_custom_lazy_full_fallback_preserves_rendered_template_variables():
     extractor._structure_prepared_span(task, CTX)
     text = extractor._llm.complete_with_tools_messages.call_args.kwargs["messages"][0]["content"]
     assert "CUSTOM_REFERENCE saved reference" in text
-
-
-def test_omitted_examples_still_validate_components_before_scoping():
-    extractor, task = prepared()
-    task.span.prompt_parts = replace(task.span.prompt_parts, examples="", include_examples=False)
-    task.prompt = task.span.prompt_parts.render()
-    extractor._prompt_manager.load("extraction")["examples"][0]["requires_types"] = ["unknown_category"]
-    request = assemble_prepared(extractor, task, CTX)
-    prompt, tools = request.prompt, request.tools
-    assert task.assembly_state.contract.scope == "full"
-    assert "extract_profile" in {t["name"] for t in tools}
-    assert "## entity Example" not in prompt

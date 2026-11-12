@@ -25,7 +25,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from itertools import islice
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from providers.llm_observation import correlate_extraction_calls
 
@@ -48,6 +48,7 @@ from core.errors import (
 )
 from core.interfaces import LLM
 from core.memory_names import candidate_identity_key
+from core.model_stage import run_model_call
 from core.models import CandidateMemory, RequestContext
 from core.operation_deadline import check_deadline
 from core.validation import (
@@ -56,7 +57,6 @@ from core.validation import (
     validate_attribution,
     validate_candidate,
 )
-from core.model_stage import run_model_call
 from extraction.event_reconciliation import reconcile_event_drafts
 from extraction.incremental_edit import (
     INCREMENTAL_TOOLS,
@@ -516,8 +516,9 @@ class Extractor:
         """
         self._llm = llm
         if prompt_manager is None:
-            from extraction.prompts import PromptManager as _PM
-            prompt_manager = _PM()
+            from extraction.prompts import PromptManager
+
+            prompt_manager = PromptManager()
         self._prompt_manager = prompt_manager
         self._schema_registry = schema_registry or _get_default_schema_registry()
         self._fs = fs
@@ -539,7 +540,10 @@ class Extractor:
             self._dual_pass_enabled = False
         self._activation_enabled = activation_enabled
         self._extraction_template = "extraction_graph" if activation_enabled else "extraction"
-        self._prefetcher: Optional[MemoryPrefetcher] = None
+        from extraction.prompts.manager import validate_prompt_manager
+
+        validate_prompt_manager(self._prompt_manager, self._extraction_template)
+        self._prefetcher: MemoryPrefetcher | None = None
         if fs and vector_index and embedder and uri_resolver and self._schema_registry:
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
@@ -614,8 +618,8 @@ class Extractor:
                 len(m.get("content", "") or "")
                 for m in messages if m.get("role") != "assistant"
             )
-            _MIN_FALLBACK_LEN = 200
-            if user_content_len >= _MIN_FALLBACK_LEN:
+            minimum_fallback_len = 200
+            if user_content_len >= minimum_fallback_len:
                 spans = [_Span(
                     start=0,
                     end=len(messages) - 1,
@@ -630,7 +634,8 @@ class Extractor:
             else:
                 logger.info(
                     "Phase 1 empty, user content too short (%d chars < %d) → skip Phase 2",
-                    user_content_len, _MIN_FALLBACK_LEN,
+                    user_content_len,
+                    minimum_fallback_len,
                 )
                 return []
 
@@ -846,6 +851,7 @@ class Extractor:
         if runtime is not None and runtime.deferred:
             return [candidate for _, batch in span_results for candidate in batch]
         from extraction.relation_proposals import attach, take
+
         # Source-occurrence and bound-update reconciliation may choose another
         # draft's metadata too. Keep all accepted spans' proposals before either
         # path runs; rejected low-confidence spans must not donate relations.
@@ -1269,25 +1275,9 @@ class Extractor:
 
     @correlate_extraction_calls
     def _select_span(self, span, request, ctx):
-        from extraction.prompt_assembly import AssemblySelection, run_selection_request
-        from core.model_stage import model_signature
+        from extraction.prompt_assembly import run_selection_request
 
-        runtime = _EXTRACTION_RUNTIME.get()
-        checkpoint = runtime.checkpoint if runtime is not None and not self._use_lazy_mode() else None
-        cached = None
-        if checkpoint is not None:
-            inputs = {"prompt": request.prompt, "schema": request.schema,
-                      "message_ids": span.message_ids, "model": model_signature(self._llm)}
-            cached = checkpoint.load_stage("assembly_selection", inputs)
-        if cached is not None:
-            return AssemblySelection(frozenset(cached["categories"]), frozenset(cached["shared_tools"]),
-                                     cached["scope"], cached["reason"], cached["raw_output"])
-        result = run_selection_request(self._llm, request)
-        if checkpoint is not None and result.reason is None:
-            checkpoint.save_stage("assembly_selection", inputs, {
-                **asdict(result), "categories": sorted(result.categories),
-                "shared_tools": sorted(result.shared_tools)})
-        return result
+        return run_selection_request(self._llm, request)
 
     def _select_spans(self, spans, messages, session_time, tool_stats_text, ctx):
         from extraction.prompt_assembly import AssemblyState, selection_request_for
@@ -1573,6 +1563,7 @@ class Extractor:
                 prompt_parts=request.parts,
                 assembly_contract=request.contract,
                 assembly_state=prepared.assembly_state,
+                assembled_tools=request.tools,
             )
         return self._structure_span_eager(
             span, prompt, ctx, _prompt_sha(prompt), archive_id,
@@ -1728,8 +1719,15 @@ class Extractor:
             validate_offered_calls,
             validate_offered_candidate,
         )
+
         request = assemble_prepared(self, prepared, ctx)
-        prompt, tools = request.prompt, request.tools
+        prompt = request.prompt
+        extraction_names = {tool["name"] for tool in self._extraction_tools}
+        tools = (
+            self._extraction_tools
+            if request.contract.scope == "full"
+            else [tool for tool in request.tools if tool["name"] in extraction_names]
+        )
         if request.contract.scope == "no_task":
             return []
         check_deadline()
@@ -1848,6 +1846,7 @@ class Extractor:
         prompt_parts=None,
         assembly_contract=None,
         assembly_state=None,
+        assembled_tools=None,
     ) -> list[CandidateMemory]:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         check_deadline()
@@ -1856,8 +1855,12 @@ class Extractor:
             source_only_tools,
             tools_for_categories,
         )
-        tools = (self._extraction_tools if categories is None else
-                 tools_for_categories(self._extraction_tools, self._schema_registry, categories))
+
+        tools = (
+            self._extraction_tools
+            if categories is None
+            else tools_for_categories(self._extraction_tools, self._schema_registry, categories)
+        )
         try:
             from extraction.extraction_react_loop import ExtractionReActLoop
 
@@ -1879,11 +1882,20 @@ class Extractor:
                 activation_enabled=self._activation_enabled,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )
-            conversation = (prompt_parts.data_prompt
-                            if prompt_parts is not None and prompt_parts.data_prompt is not None
-                            else prompt)
-            result = loop.run(conversation, ctx, prefetch_result, categories=categories,
-                              prompt_parts=prompt_parts, assembly_contract=assembly_contract)
+            conversation = (
+                prompt_parts.data_prompt
+                if prompt_parts is not None and prompt_parts.data_prompt is not None
+                else prompt
+            )
+            result = loop.run(
+                conversation,
+                ctx,
+                prefetch_result,
+                categories=categories,
+                prompt_parts=prompt_parts,
+                assembly_contract=assembly_contract,
+                assembled_tools=assembled_tools,
+            )
             if result.finish_reason == "llm_error":
                 # ReactLoop returns failures as data. Do not turn a truncated
                 # or failed model call into a successful zero-memory ingest.
@@ -2046,10 +2058,19 @@ class Extractor:
                 self._extraction_template, "system_prompt", session_summary=session_summary)
             examples = self._prompt_manager.render(self._extraction_template, "examples") if include_examples else ""
         else:
-            system_prompt = self._prompt_manager.render_selected(
-                self._extraction_template, "system_prompt", decision=decision, session_summary=session_summary)
-            examples = self._prompt_manager.render_selected(
-                self._extraction_template, "examples", decision=decision) if include_examples else ""
+            system_prompt = self._prompt_manager.render(
+                self._extraction_template,
+                "system_prompt",
+                categories=decision.categories,
+                session_summary=session_summary,
+            )
+            examples = (
+                self._prompt_manager.render(
+                    self._extraction_template, "examples", categories=decision.categories
+                )
+                if include_examples
+                else ""
+            )
         output_instruction = self._prompt_manager.render(
             self._extraction_template, "output_instruction",
             output_language=language,

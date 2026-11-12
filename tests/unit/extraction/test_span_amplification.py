@@ -19,7 +19,7 @@ def make_extractor(*, reconcile=False):
     llm = Mock()
     llm.complete_with_tools.return_value = []
     llm.complete_json.side_effect = lambda prompt, schema: (
-        {"categories": schema["properties"]["categories"]["items"]["enum"], "shared_tools": []}
+        {"categories": schema["properties"]["categories"]["items"]["enum"]}
         if "categories" in schema.get("properties", {}) else {"operations": []}
     )
     extractor = Extractor(llm, source_occurrence_reconciliation_enabled=reconcile)

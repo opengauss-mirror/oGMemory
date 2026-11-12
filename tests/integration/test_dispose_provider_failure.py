@@ -22,6 +22,15 @@ from tests.integration.test_agfs_node_snapshot_reads import _runtime
 from tests.integration.test_agfs_node_snapshot_reads import native_agfs as native_agfs
 
 
+def requested_properties(request):
+    """Read the response schema carried by OpenAILLM's system message."""
+    system = next(
+        message["content"] for message in request["messages"] if message["role"] == "system"
+    )
+    schema, _ = json.JSONDecoder().raw_decode(system[system.index("{") :])
+    return set(schema.get("properties", {}))
+
+
 @contextmanager
 def model_provider(status):
     available = threading.Event()
@@ -50,10 +59,10 @@ def model_provider(status):
                     message["tool_calls"] = [{"id": "coffee-call", "type": "function", "function": {
                         "name": "extract_preference", "arguments": json.dumps(candidate)}}]
                 else:
-                    prompt = json.dumps(request["messages"])
-                    if "Select all memory categories" in prompt:
-                        result = {"categories": ["preference"], "shared_tools": []}
-                    elif "spans" in prompt:
+                    properties = requested_properties(request)
+                    if properties == {"categories"}:
+                        result = {"categories": ["preference"]}
+                    elif "spans" in properties:
                         result = {"spans": [{"start": 0, "end": 0, "reason": "coffee preference",
                                               "categories": ["preference"]}]}
                     else:
@@ -200,6 +209,26 @@ def test_dispose_provider_failure_recovers_via_dispose(native_agfs, monkeypatch,
                 assert result["error_detail"]["cause"] == failure["error_detail"]["cause"]
                 assert result["error_detail"]["retry_action"] == "retry_dispose"
             assert any(call["http_status"] == provider_status for call in calls)
+            selections = [
+                call
+                for call in calls
+                if not call["request"].get("tools")
+                and requested_properties(call["request"]) == {"categories"}
+            ]
+            assert selections
+            assert all(
+                json.loads(call["response"]["choices"][0]["message"]["content"])
+                == {"categories": ["preference"]}
+                for call in selections
+            )
+            for call in calls:
+                if call["request"].get("tools"):
+                    assert {tool["function"]["name"] for tool in call["request"]["tools"]} == {
+                        "extract_preference",
+                        "edit_memory",
+                        "append_memory",
+                    }
+
         finally:
             release.set()
             for dispose_thread in threading.enumerate():
@@ -213,3 +242,29 @@ def test_dispose_provider_failure_recovers_via_dispose(native_agfs, monkeypatch,
             http.close()
             llm._client.close()
             client.session.close()
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_provider_stub_returns_valid_selection_without_fallback(json_mode):
+    from extraction.prompt_assembly import select_assembly
+    from extraction.prompts import PromptManager
+    from extraction.schemas.registry import SchemaRegistry
+    from extraction.tool_builder import build_extraction_tools
+
+    registry = SchemaRegistry()
+    with model_provider(503) as (url, _available, _resumed, _release, calls):
+        llm = OpenAILLM(api_key="local-test", base_url=url, model="test-model", json_mode=json_mode)
+        try:
+            selection = select_assembly(
+                llm,
+                registry,
+                build_extraction_tools(registry),
+                "I prefer black coffee without sugar.",
+                "ben",
+                manager=PromptManager(),
+            )
+        finally:
+            llm._client.close()
+    assert selection.scope == "scoped"
+    assert selection.categories == frozenset({"preference"})
+    assert len(calls) == 1

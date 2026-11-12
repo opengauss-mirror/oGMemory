@@ -13,8 +13,6 @@ from core.errors import ExtractionIncompleteError
 from core.models import CandidateMemory, ContextNode, RequestContext
 from extraction.extraction_react_loop import (
     ExtractionReActLoop,
-    ExtractionReActResult,
-    ExtractionTrace,
 )
 from extraction.prefetch import PrefetchResult
 from server.internal_tool_usage import InternalToolUsageTracker
@@ -108,6 +106,9 @@ def _make_uri_resolver():
 def _make_loop(llm=None, fs=None, **kw):
     from unittest.mock import Mock
     pm = kw.pop("prompt_manager", Mock())
+    from extraction.prompts import PromptManager
+
+    pm.load.return_value = PromptManager().load("extraction")
     return ExtractionReActLoop(
         llm=llm or _make_llm(),
         fs=fs or _make_fs(),

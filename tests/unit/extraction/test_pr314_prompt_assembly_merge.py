@@ -60,8 +60,8 @@ def _provider(graph_enabled, *, recover=False):
         properties = set(schema["properties"])
         if properties == {"spans"}:
             return {"spans": [{"start": 0, "end": 0, "categories": ["profile"]}]}
-        if properties == {"categories", "shared_tools"}:
-            return {"categories": ["entity"], "shared_tools": []}
+        if properties == {"categories"}:
+            return {"categories": ["entity"]}
         assert properties == {"operations"}
         return {"operations": operations}
 
@@ -124,15 +124,18 @@ def test_public_extraction_graph_contract_survives_scoping_and_recovery(
     if graph_enabled:
         assert proposals[0]["from_routing_key"] == PROPOSAL["from_routing_key"]
 
-    selections = [call for call in llm.complete_json.call_args_list
-                  if set(call.kwargs["schema"]["properties"]) == {"categories", "shared_tools"}]
+    selections = [
+        call
+        for call in llm.complete_json.call_args_list
+        if set(call.kwargs["schema"]["properties"]) == {"categories"}
+    ]
     # Native Dev selection remains shared across its two passes and recovery;
     # graph-on keeps the measured full-category contract without a new gate.
     assert len(selections) == (0 if graph_enabled else 1)
     if selections:
-        selector_data = json.loads(selections[0].args[0].split("\n\n", 1)[1])
+        selector_data = json.loads(selections[0].args[0].split("Runtime input (JSON):\n", 1)[1])
         assert SOURCE in selector_data["source"]
-        assert "relation" not in {item["category"] for item in selector_data["catalog"]}
+        assert "relation" not in set(selector_data["catalog"])
 
     template = "extraction_graph" if graph_enabled else "extraction"
     graph_guidance = extractor._prompt_manager.render(
@@ -218,7 +221,8 @@ def test_prepared_prompt_crops_only_trusted_sections_and_renders_system_once(gra
 def test_lazy_loop_reuse_restores_full_tools_before_new_category_selection(graph_enabled):
     llm = Mock()
     llm.complete_json.side_effect = [
-        {"categories": ["entity"], "shared_tools": []}, {"categories": ["event"], "shared_tools": []},
+        {"categories": ["entity"]},
+        {"categories": ["event"]},
     ]
     llm.complete_with_tools_messages.return_value = ([], "[]")
     extractor = Extractor(llm, activation_enabled=graph_enabled)
@@ -243,4 +247,4 @@ def test_lazy_loop_reuse_restores_full_tools_before_new_category_selection(graph
     assert ("extract_relation" in first_names) is graph_enabled
     assert ("extract_relation" in second_names) is graph_enabled
     assert {"read", "list"} <= first_names & second_names
-    assert ({"get_relations", "get_access_stats"} <= first_names & second_names) is graph_enabled
+    assert {"get_relations", "get_access_stats"} <= first_names & second_names

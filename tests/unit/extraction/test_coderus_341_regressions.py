@@ -39,12 +39,16 @@ def test_full_lazy_preserves_runtime_suffix_in_provider_messages(path):
             return super().render(template_name, section, **kwargs)
 
     llm = Mock()
-    category = 'entity' if path == 'unmatched_boundary' else 'unknown'
-    llm.complete_json.return_value = {'categories': [category], 'shared_tools': []}
-    llm.complete_with_tools_messages.return_value = ([], '[]')
-    manager = LegacyManager() if path == 'legacy' else PromptManager()
-    extractor = make_extractor(llm, node_processing_enabled=True,
-                               activation_enabled=path == 'graph', prompt_manager=manager)
+    category = "entity" if path == "unmatched_boundary" else "unknown"
+    llm.complete_json.return_value = {"categories": [category]}
+    llm.complete_with_tools_messages.return_value = ([], "[]")
+    manager = LegacyManager() if path == "legacy" else PromptManager()
+    extractor = make_extractor(
+        llm,
+        node_processing_enabled=True,
+        activation_enabled=path == "graph",
+        prompt_manager=manager,
+    )
     prepared = prepare(extractor)
     prepared.prompt += '\nCorrection marker: keep the original source facts.'
     if path == 'unmatched_boundary':
@@ -55,22 +59,22 @@ def test_full_lazy_preserves_runtime_suffix_in_provider_messages(path):
     tools = tuple(tool['name'] for tool in request['tools'])
     assert prepared.assembly_state.contract.scope == 'full'
     assert prepared.assembly_state.contract.tool_names == tools
-    assert {'extract_profile', 'read', 'list', *SHARED_TOOLS} <= set(tools)
-    assert '── profile (' in request['messages'][0]['content']
-    text = '\n'.join(message['content'] for message in request['messages'])
-    assert text.count('TOPIC_DRAFTS:') == 1
-    assert text.count('Correction marker:') == 1
-    assert MESSAGES[0]['content'] in text
-    if path == 'unmatched_boundary':
-        assert 'Opaque input boundary' in text
-        assert text.count('Retained prefetch snapshot') == 1
-        assert prepared.assembly_state.contract.reason == 'unmatched_parts'
+    assert {"extract_profile", "read", "list", *SHARED_TOOLS} <= set(tools)
+    assert "── profile (" in request["messages"][0]["content"]
+    text = "\n".join(message["content"] for message in request["messages"])
+    assert text.count("TOPIC_DRAFTS:") == 1
+    assert text.count("Correction marker:") == 1
+    assert MESSAGES[0]["content"] in text
+    if path == "unmatched_boundary":
+        assert "Opaque input boundary" in text
+        assert text.count("Retained prefetch snapshot") == 1
+        assert prepared.assembly_state.contract.reason == "unsupported_template"
 
 
 def test_eager_recovery_does_not_replace_other_lazy_pass_tools(monkeypatch):
     llm = Mock()
-    llm.complete_json.return_value = {'categories': ['entity'], 'shared_tools': sorted(SHARED_TOOLS)}
-    llm.complete_with_tools_messages.return_value = ([], '[]')
+    llm.complete_json.return_value = {"categories": ["entity"]}
+    llm.complete_with_tools_messages.return_value = ([], "[]")
     extractor = make_extractor(llm)
     prepared = prepare(extractor)
     paused, released = Event(), Event()
@@ -144,7 +148,7 @@ def test_independent_span_selection_respects_storage_thread_boundary(thread_boun
             overlap.wait(1)
         with lock:
             active -= 1
-        return {'categories': ['entity'], 'shared_tools': []}
+        return {"categories": ["entity"]}
 
     def prepare_prefetch(span, prompt, ctx):
         prefetch_threads.append(get_ident())
@@ -181,12 +185,14 @@ def test_selector_transport_failure_stops_dispatching_later_spans():
 @pytest.mark.parametrize(
     'thread_bound, retain_ranges, tool_stats, categories, selection_calls, extraction_calls',
     [
-        pytest.param(False, False, '', ['preference'], 1, 2, id='same-window'),
-        pytest.param(True, False, '', ['preference'], 1, 2, id='owner-thread'),
-        pytest.param(False, True, '', ['preference'], 1, 4, id='separate-source-ranges'),
-        pytest.param(False, False, 'search: 2 calls', ['preference'], 2, 4, id='different-tool-stats'),
-        pytest.param(False, False, '', [], 1, 0, id='no-task'),
-        pytest.param(False, False, '', ['unknown'], 1, 2, id='full-fallback'),
+        pytest.param(False, False, "", ["preference"], 1, 2, id="same-window"),
+        pytest.param(True, False, "", ["preference"], 1, 2, id="owner-thread"),
+        pytest.param(False, True, "", ["preference"], 1, 4, id="separate-source-ranges"),
+        pytest.param(
+            False, False, "search: 2 calls", ["preference"], 2, 4, id="different-tool-stats"
+        ),
+        pytest.param(False, False, "", [], 1, 0, id="no-task"),
+        pytest.param(False, False, "", ["unknown"], 2, 2, id="full-fallback"),
     ],
 )
 def test_equal_selection_requests_across_distinct_spans(
@@ -217,7 +223,7 @@ def test_equal_selection_requests_across_distinct_spans(
             ]}
         assert 'categories' in schema['properties']
         requests.append(prompt)
-        return {'categories': categories, 'shared_tools': []}
+        return {"categories": categories}
 
     def complete_with_tools(**kwargs):
         assert not thread_bound or get_ident() == owner

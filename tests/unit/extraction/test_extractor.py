@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 
 from core.errors import LLMCallError, LLMOutputTruncatedError, ToolCallProtocolError
-from core.models import CandidateMemory, RequestContext
+from core.models import RequestContext
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import build_extraction_tools, build_tool_to_category
 from extraction.tools import _SPAN_SCHEMA, Extractor, _PreparedSpan, _Span
@@ -162,6 +162,9 @@ class TestExtractorPhase2PromptDedupe:
 
     def _make_prompt_manager(self):
         prompt_manager = Mock()
+        from extraction.prompts import PromptManager
+
+        prompt_manager.load.return_value = PromptManager().load("extraction")
         prompt_manager.render.side_effect = (
             lambda section, key, **kwargs: f"{section}:{key}:{kwargs.get('output_language', '')}"
         )
@@ -475,7 +478,7 @@ class TestExtractorToolCallFallback:
                     {"start": 0, "end": 0, "reason": "preference", "categories": ["preference"]}
                 ]
             },
-            {"categories": ["preference"], "shared_tools": []},
+            {"categories": ["preference"]},
             {"operations": [self._preference("coffee", confidence=0.3)]},
         ]
         llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")
@@ -815,7 +818,7 @@ class TestExtractorToolMapping:
 class TestExtractorUnknownTool:
     """Tests for unknown tool handling."""
 
-    def test_unknown_tool_is_ignored(self):
+    def test_unknown_tool_in_full_fallback_is_ignored(self):
         """Tool calls with unknown names are ignored (not converted)."""
         llm = MockLLM()
         llm._mock_tool_calls = [
@@ -838,6 +841,12 @@ class TestExtractorUnknownTool:
             },
         ]
 
+        complete_json = llm.complete_json
+        llm.complete_json = lambda prompt, schema: (
+            {"categories": ["unknown"]}
+            if set(schema.get("properties", {})) == {"categories"}
+            else complete_json(prompt, schema)
+        )
         extractor = Extractor(llm)
         ctx = RequestContext(
             account_id="test-account",
@@ -956,13 +965,16 @@ class TestExtractorLanguageDetection:
         ]
 
         # The MockLLM should receive a prompt containing the language
-        result = self.extractor.extract(messages, RequestContext(
-            account_id="test",
-            user_id="user",
-            agent_id="agent",
-            session_id="session",
-            trace_id="trace",
-        ))
+        self.extractor.extract(
+            messages,
+            RequestContext(
+                account_id="test",
+                user_id="user",
+                agent_id="agent",
+                session_id="session",
+                trace_id="trace",
+            ),
+        )
 
         # Verify the language was detected
         assert self.extractor._detect_language(messages) == "zh-CN"
