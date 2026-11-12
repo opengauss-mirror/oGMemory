@@ -391,6 +391,184 @@ def test_disk_audio_and_truthful_flags(tmp_path, audio_node, video_node, frame_n
         assert audio == []
 
 
+# ---------------------------------------------------------------------------
+# Video mode (video_url instead of sampled frames)
+# ---------------------------------------------------------------------------
+
+class TestVideoMode:
+    """``use_video=True`` sends one video_url part, no frames, no
+    input_audio; failures fall back to frame mode."""
+
+    @pytest.fixture
+    def video_llm(self):
+        llm = MockLLM()
+        llm._mock_multimodal_response = {
+            "description": "A woman hangs her coat on the coat rack.",
+            "characters": [{"name": "Woman", "role": "subject"}],
+            "events": [{"type": "action", "summary": "hangs coat", "ts_sec": 2}],
+            "entities": [{"name": "Coat rack", "type": "furniture"}],
+        }
+        return llm
+
+    def _patch_video(self, monkeypatch, fail=False):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+
+        calls = []
+
+        def fake_part(source_path, *, fps=10, width=512, include_audio=True):
+            calls.append((source_path, fps, width, include_audio))
+            if fail:
+                raise RuntimeError("ffmpeg exploded")
+            return {
+                "type": "video_url",
+                "video_url": {"url": f"data:video/mp4;base64,{fps}-{width}"},
+            }
+
+        monkeypatch.setattr(mod, "_video_part_from_source", fake_part)
+        return calls
+
+    def test_video_mode_sends_one_video_part_no_frames_no_audio(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        from core.graph_models import create_raw_node
+        self._patch_video(monkeypatch)
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True, video_fps=10)
+
+        result = gen.extract(
+            video_node, ctx, frame_nodes=frame_nodes, audio_node=audio,
+        )
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        video_parts = [p for p in parts if p.get("type") == "video_url"]
+        image_parts = [p for p in parts if p.get("type") == "image_url"]
+        audio_parts = [p for p in parts if p.get("type") == "input_audio"]
+        assert len(video_parts) == 1
+        assert image_parts == []
+        assert audio_parts == []
+        # Audio rides inside the video file in this mode.
+        assert result.extracted_content["audio_attached"] is True
+        assert result.extracted_content["video_input"] is True
+        assert result.extracted_content["frame_count"] == 0
+        assert result.extracted_content["video_fps"] == 10
+
+    def test_video_mode_uses_source_path_metadata(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        calls = self._patch_video(monkeypatch)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True, video_fps=5, video_width=256)
+
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes)
+
+        assert calls == [("/tmp/vid_a/0.mp4", 5, 256, True)]
+
+    def test_video_mode_error_falls_back_to_frames(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        self._patch_video(monkeypatch, fail=True)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        result = gen.extract(video_node, ctx, frame_nodes=frame_nodes)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "video_url"] == []
+        # All 5 frames went through (max_frames default 8 > 5).
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+        assert result.extracted_content["video_input"] is False
+
+    def test_video_mode_missing_source_path_falls_back(
+        self, monkeypatch, ctx, video_llm, frame_nodes,
+    ):
+        self._patch_video(monkeypatch)
+        from core.graph_models import create_raw_node
+        bare = create_raw_node(
+            raw_type=RawDataType.VIDEO, content=b"",
+            account_id="acct", metadata={"video_id": "v", "clip_id": 0},
+        )
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        result = gen.extract(bare, ctx, frame_nodes=frame_nodes)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "video_url"] == []
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+
+    def test_video_mode_no_frames_no_video_errors(
+        self, monkeypatch, ctx, video_llm, video_node,
+    ):
+        self._patch_video(monkeypatch, fail=True)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        result = gen.extract(video_node, ctx, frame_nodes=[])
+
+        assert result.error == "episodic_memory_generator requires frame_nodes"
+
+    def test_default_is_frame_mode(
+        self, ctx, video_llm, video_node, frame_nodes,
+    ):
+        gen = EpisodicMemoryGenerator(video_llm)
+        result = gen.extract(video_node, ctx, frame_nodes=frame_nodes)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "video_url"] == []
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+        assert result.extracted_content["video_input"] is False
+
+    def test_invalid_video_knobs_rejected(self, video_llm):
+        with pytest.raises(ValueError, match="video_fps"):
+            EpisodicMemoryGenerator(video_llm, use_video=True, video_fps=0)
+        with pytest.raises(ValueError, match="video_width"):
+            EpisodicMemoryGenerator(video_llm, use_video=True, video_width=0)
+
+    def test_video_mode_fallback_skips_input_audio(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        """Video mode implies an input_audio-rejecting backend; the frames
+        fallback must not attach the audio part (transcript still flows)."""
+        self._patch_video(monkeypatch, fail=True)
+        from core.graph_models import create_raw_node
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True)
+
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes, audio_node=audio)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert [p for p in parts if p.get("type") == "input_audio"] == []
+        assert len([p for p in parts if p.get("type") == "image_url"]) == 5
+
+    def test_non_video_mode_still_attaches_audio(
+        self, ctx, video_llm, video_node, frame_nodes,
+    ):
+        from core.graph_models import create_raw_node
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen = EpisodicMemoryGenerator(video_llm)  # use_video=False
+
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes, audio_node=audio)
+
+        msgs = video_llm._last_multimodal_messages
+        parts = [p for m in msgs if isinstance(m.get("content"), list)
+                 for p in m["content"]]
+        assert len([p for p in parts if p.get("type") == "input_audio"]) == 1
+
 @pytest.mark.parametrize("source", ["bytes", "file", "base64"])
 @pytest.mark.parametrize("samples", [0, 1600])
 @pytest.mark.parametrize("streaming_header", [False, True])
@@ -435,3 +613,97 @@ def test_wav_sample_count_not_container_size(
     assert any(p["type"] == "image_url" for p in parts)
     if samples:
         assert base64.b64decode(audio_parts[0]["input_audio"]["data"]) == payload
+
+
+class TestNoAudioVideoEncode:
+    """Review item 11: ``--use-video --no-audio`` must strip the audio
+    track from the re-encoded video (not silently upload it inside the
+    file while reporting audio_attached=False), and the audio setting
+    must be part of the sidecar cache key."""
+
+    @pytest.fixture
+    def clip_source(self, tmp_path):
+        src = tmp_path / "clip_0001.mp4"
+        src.write_bytes(b"fake-mp4-bytes")
+        return src
+
+    @staticmethod
+    def _fake_ffmpeg(monkeypatch, target_bytes=b"encoded"):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            out = cmd[-1]  # the output path is the final positional arg
+            if out.endswith(".mp4"):
+                from pathlib import Path
+                Path(out).write_bytes(target_bytes)
+            class _P:
+                returncode = 0
+                stderr = ""
+            return _P()
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(mod, "_ensure_video_stream", lambda *a, **k: None)
+        return commands
+
+    def test_include_audio_false_strips_track_and_keys_sidecar(
+        self, monkeypatch, clip_source,
+    ):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        commands = self._fake_ffmpeg(monkeypatch)
+
+        _, b64 = mod._prepare_llm_video(
+            str(clip_source), fps=10, width=512, include_audio=False,
+        )
+        assert b64
+        cmd = commands[0]
+        assert "-an" in cmd                      # audio track stripped
+        assert "-c:a" not in cmd and "-b:a" not in cmd
+        sidecar = clip_source.with_name("clip_0001.llm-f10-w512-na.mp4")
+        assert sidecar.exists()                  # audio setting in cache key
+
+    def test_include_audio_true_keeps_aac_track_and_keys_sidecar(
+        self, monkeypatch, clip_source,
+    ):
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        commands = self._fake_ffmpeg(monkeypatch)
+
+        mod._prepare_llm_video(str(clip_source), fps=10, width=512,
+                               include_audio=True)
+        cmd = commands[0]
+        assert "-an" not in cmd
+        assert "-c:a" in cmd and "aac" in cmd
+        assert clip_source.with_name("clip_0001.llm-f10-w512-a.mp4").exists()
+
+    @pytest.fixture
+    def video_llm(self):
+        llm = MockLLM()
+        llm._mock_multimodal_response = {
+            "description": "A woman hangs her coat on the coat rack.",
+            "characters": [{"name": "Woman", "role": "subject"}],
+            "events": [{"type": "action", "summary": "hangs coat", "ts_sec": 2}],
+            "entities": [{"name": "Coat rack", "type": "furniture"}],
+        }
+        return llm
+
+    def test_operator_threads_include_audio_into_video_part(
+        self, monkeypatch, ctx, video_llm, video_node, frame_nodes,
+    ):
+        from core.graph_models import create_raw_node
+        import extraction.operators.builtin.episodic_memory_generator as mod
+        calls = []
+
+        def fake_part(source_path, *, fps=10, width=512, include_audio=True):
+            calls.append(include_audio)
+            return {"type": "video_url",
+                    "video_url": {"url": "data:video/mp4;base64,x"}}
+
+        monkeypatch.setattr(mod, "_video_part_from_source", fake_part)
+        gen = EpisodicMemoryGenerator(video_llm, use_video=True, include_audio=False)
+        audio = create_raw_node(
+            raw_type=RawDataType.AUDIO, content=b"RIFFxxxx",
+            account_id="acct", metadata={"source_path": "/tmp/a.wav"},
+        )
+        gen.extract(video_node, ctx, frame_nodes=frame_nodes, audio_node=audio)
+        assert calls == [False]

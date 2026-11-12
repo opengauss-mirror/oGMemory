@@ -368,18 +368,34 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         finally:
             self._return_connection(conn)
 
-    def _get_connection(self):
-        """Get a connection from the pool or create a new one."""
-        while self._pool:
-            conn = self._pool.pop()
-            if is_connection_alive(conn):
-                return conn
+    def _create_connection(self):
+        """Open a connection using this module's psycopg2 reference.
 
+        Tests patch ``providers.vector_index.opengauss_index.psycopg2`` at
+        module level, so the mixin's pool-module reference would bypass
+        the mock. ``connect_timeout`` bounds hung connect() calls (dev:
+        recover MCP query connections after database restarts).
+        """
         return psycopg2.connect(self._connection_string, connect_timeout=10)
+
+    def _pooled_connection_alive(self, conn) -> bool:
+        """dev fix (!344): validate pooled connections with a round trip.
+
+        A pooled connection can be dead without ``closed`` being set
+        (server restart / network drop); ``is_connection_alive`` discards
+        such connections on borrow instead of handing them to the caller.
+        Fresh connections from ``_create_connection`` are not validated
+        (matching dev's class-local pool semantics).
+        """
+        return is_connection_alive(conn)
 
     @staticmethod
     def _reset_connection(conn):
         """End the index transaction before the connection becomes idle."""
+        # Pure reset only — must not reference self (staticmethod). Slot
+        # release for the bounded standalone pool happens in
+        # _return_connection after this reset; the shared pool releases
+        # its own slots in _return_shared_connection.
         if conn.closed != 0:
             return
         try:
@@ -395,14 +411,15 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             self._shared_pool.return_connection(conn)
 
     def _return_connection(self, conn):
-        """Return a connection to the pool, rolling back dirty transactions."""
+        """Return a connection to the pool, rolling back dirty transactions.
+
+        openGauss can leave a connection inside an open transaction after
+        errors; a dirty pooled connection would poison the next borrower,
+        so reset it first, then hand it to the bounded standalone pool
+        (lock + semaphore slot release live in the mixin).
+        """
         self._reset_connection(conn)
-        if conn.closed != 0:
-            return
-        if len(self._pool) < self._pool_size:
-            self._pool.append(conn)
-        else:
-            conn.close()
+        self._standalone_return_connection(conn)
 
     def _lock_projection(self, cur, ids):
         check = current_projection_owner()

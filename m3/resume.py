@@ -88,7 +88,12 @@ def build_graph_service(
             )
         from providers.graph_store import SQLGraphStore
 
-        return GraphService(SQLGraphStore(connection_string=dsn)), "sql"
+        # OGMEM_GRAPH_POOL_SIZE (default 32): keep >= the parallel-clip
+        # worker count or worker threads serialize on pool checkout.
+        graph_pool_size = int(os.environ.get("OGMEM_GRAPH_POOL_SIZE") or 32)
+        return GraphService(
+            SQLGraphStore(connection_string=dsn, pool_size=graph_pool_size)
+        ), "sql"
 
     raise ValueError(f"Unknown graph store: {graph_store!r}")
 
@@ -228,6 +233,28 @@ def video_fully_indexed(
 # ---------------------------------------------------------------------------
 
 
+def qa_params_argv(set_values: list[str] | None) -> list[str]:
+    """Map ``--set qa.params.<name>=<value>`` entries to m3.qa argv pairs.
+
+    ``qa.params.transcript_top_k=20`` → ``["--transcript-top-k", "20"]``;
+    non-``qa.params.*`` entries are ignored. Appended LAST to the qa argv
+    by :func:`run_qa_only` so explicit ``--set`` overrides win over the
+    driver's own defaults (argparse last-occurrence-wins).
+    """
+    argv: list[str] = []
+    for entry in set_values or []:
+        if "=" not in entry:
+            continue
+        key, _, value = entry.partition("=")
+        if not key.startswith("qa.params."):
+            continue
+        name = key[len("qa.params."):].strip()
+        if not name:
+            continue
+        argv.extend(["--" + name.replace("_", "-"), value])
+    return argv
+
+
 def run_qa_only(
     *,
     graph_store: str,
@@ -244,6 +271,7 @@ def run_qa_only(
     verbose: bool = False,
     temporal_policy: str = "current_clip",
     lookahead_seconds: float = 0.0,
+    qa_params: list[str] | None = None,
 ) -> dict[str, Any]:
     """Bypass :class:`PipelineRunner` and invoke ``m3.qa.run_react_qa`` directly.
 
@@ -300,6 +328,10 @@ def run_qa_only(
         argv.append("--resume")
     if verbose:
         argv.append("--verbose")
+    # Appended last: argparse last-occurrence wins, so explicit
+    # ``--set qa.params.*`` retrieval knobs override the defaults above
+    # (graph-aware QA-only resume used to silently ignore them).
+    argv.extend(qa_params or [])
 
     logger.info(
         "[%s] QA-only mode against %s graph store (resume=%s)",

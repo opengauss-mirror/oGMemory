@@ -52,8 +52,10 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
+import os
 import sys
 import uuid
 from collections.abc import Iterable
@@ -61,6 +63,7 @@ from pathlib import Path
 
 from core.graph_enums import RawDataType
 from core.models import RequestContext
+from m3._parallel import ThreadLocalModels, UnitError, parallel_clips
 from m3.audio_cache import AudioCache, signature
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
@@ -129,17 +132,22 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
     register_all_defaults(registry)
     op_service = OperatorService(graph, registry=registry)
 
-    extractor = VoiceASRExtractor(
-        backend=args.backend,
-        model=args.model,
-        language=args.language,
-        beam_size=args.beam_size,
-        word_timestamps=not args.no_word_timestamps,
-        vad_filter=not args.no_vad_filter,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        device=args.device,
-        timeout_sec=args.timeout_sec,
+    # faster-whisper's CTranslate2 model is not safe to share across
+    # threads: build one extractor per worker thread, lazily.
+    extractor_factory = ThreadLocalModels(
+        lambda: VoiceASRExtractor(
+            backend=args.backend,
+            model=args.model,
+            language=args.language,
+            beam_size=args.beam_size,
+            word_timestamps=not args.no_word_timestamps,
+            vad_filter=not args.no_vad_filter,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            device=args.device,
+            timeout_sec=args.timeout_sec,
+        ),
+        name="voice_asr_extractor",
     )
 
     ctx = RequestContext(
@@ -150,13 +158,21 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
         trace_id=f"m3-va-{uuid.uuid4().hex}",
     )
 
-    audio_nodes = (
-        graph.list_raw_nodes(RawDataType.AUDIO, ctx)
-        if hasattr(graph, "list_raw_nodes") else []
-    )
+    def _list_audio(raw_type):
+        # Bench-scale accounts hold >4096 AUDIO nodes; the default LIMIT
+        # silently drops late-created videos' nodes and voice_asr then
+        # aborts with "produced 0 segments without completed audio".
+        # ``limit=None`` -> LIMIT ALL on the SQL store; other backends may
+        # not accept the kwarg, so fall back to the plain call.
+        try:
+            return graph.list_raw_nodes(raw_type, ctx, limit=None)
+        except TypeError:
+            return graph.list_raw_nodes(raw_type, ctx)
+
+    audio_nodes = _list_audio(RawDataType.AUDIO) if hasattr(graph, "list_raw_nodes") else []
     if not audio_nodes and hasattr(graph, "list_raw_nodes"):
         # Fallback: list every RawNode and filter.
-        all_nodes = graph.list_raw_nodes(None, ctx) if hasattr(graph, "list_raw_nodes") else []
+        all_nodes = _list_audio(None)
         audio_nodes = [
             n for n in all_nodes
             if str(getattr(n, "raw_type", "")) == "audio"
@@ -181,94 +197,139 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
     resumed_segments = 0
     cached_audio = 0
     executed_audio = 0
+
+    def _unit(audio_node) -> dict:
+        """Transcribe one AUDIO node; return rows for the main thread.
+
+        The unit never writes the JSONL directly — the main thread
+        serialises writes in input order. Returns a dict with
+        ``rows``/``resumed``/``cached``/``executed``/``error`` keys; a
+        raised exception surfaces as a UnitError from parallel_clips.
+        """
+        meta = audio_node.metadata or {}
+        video_id = meta.get("video_id")
+        clip_id = meta.get("clip_id")
+        node_ctx = dataclasses.replace(
+            ctx, trace_id=f"{ctx.trace_id}-{audio_node.node_id}"
+        )
+
+        fingerprint = signature(audio_node, args, "voice_asr", ctx.account_id)
+        cached = None if args.force else cache.lookup(audio_node, fingerprint)
+        if cached is not None:
+            logger.info(
+                "voice_asr resume: %s already has %d cached segments; "
+                "skipping Whisper (pass --force to re-transcribe)",
+                audio_node.node_id, len(cached),
+            )
+            rows = []
+            for child in cached:
+                ec = child.extracted_content or {}
+                rows.append(segment_row(
+                    video_id=video_id,
+                    clip_id=clip_id,
+                    audio_node_id=audio_node.node_id,
+                    segment_node_id=child.node_id,
+                    asr_id=ec.get("asr_id", ""),
+                    language=ec.get("language"),
+                    start_sec=ec.get("start_sec", 0.0),
+                    end_sec=ec.get("end_sec", 0.0),
+                    text=ec.get("text", ""),
+                    word_count=len(ec.get("words") or []),
+                    no_speech_prob=ec.get("no_speech_prob", 0.0),
+                ))
+            return {
+                "rows": rows,
+                "resumed": len(rows),
+                "cached": True,
+                "executed": False,
+                "error": None,
+            }
+
+        cache.invalidate(audio_node)
+        # Extract segments BEFORE persist_extraction so
+        # lightweight_summary() doesn't strip the heavy
+        # ``segments`` payload out from under us.
+        extractor = extractor_factory.get()
+        extraction = extractor.extract(audio_node, node_ctx)
+        segments = list(
+            extraction.extracted_content.get("segments", [])
+        )
+        language = extraction.extracted_content.get("language")
+        # The materialization policy reads language per segment.
+        # Preserve it so regenerated cached manifests match fresh ones.
+        for segment in segments:
+            segment["language"] = language
+        result = op_service.persist_extraction(
+            raw_node=audio_node,
+            operator=extractor,
+            extraction=extraction,
+            ctx=node_ctx,
+            refresh_extracted_children=True,
+        )
+        cache.finish(audio_node, fingerprint, result, len(segments))
+        error = result.get("error")
+        if error:
+            return {
+                "rows": [], "resumed": 0, "cached": False,
+                "executed": True, "error": str(error),
+            }
+        materialized = result.get("materialized_children") or []
+        if len(materialized) != len(segments):
+            # Parallel path note (P3-3): the extractor normally materializes
+            # exactly one child node per ASR segment, so a length mismatch
+            # means the zip() below would silently drop rows — log it loudly
+            # instead of losing data quietly.
+            logger.warning(
+                "voice_asr: materialized %d child nodes for %d ASR segments "
+                "of clip %s — %d rows will be dropped",
+                len(materialized), len(segments), clip_id,
+                abs(len(segments) - len(materialized)),
+            )
+        rows = []
+        for m, seg in zip(materialized, segments):
+            rows.append(segment_row(
+                video_id=video_id,
+                clip_id=clip_id,
+                audio_node_id=audio_node.node_id,
+                segment_node_id=m["child_node_id"],
+                asr_id=seg.get("asr_id", ""),
+                language=language,
+                start_sec=seg.get("start_sec", 0.0),
+                end_sec=seg.get("end_sec", 0.0),
+                text=seg.get("text", ""),
+                word_count=len(seg.get("words") or []),
+                no_speech_prob=seg.get("no_speech_prob", 0.0),
+            ))
+        return {
+            "rows": rows, "resumed": 0, "cached": False,
+            "executed": True, "error": None,
+        }
+
     with output_path.open("w", encoding="utf-8") as f:
-        for audio_node in audio_nodes:
-            meta = audio_node.metadata or {}
-            video_id = meta.get("video_id")
-            clip_id = meta.get("clip_id")
-
-            fingerprint = signature(audio_node, args, "voice_asr", ctx.account_id)
-            cached = None if args.force else cache.lookup(audio_node, fingerprint)
-            if cached is not None:
-                cached_audio += 1
-                logger.info(
-                    "voice_asr resume: %s already has %d cached segments; "
-                    "skipping Whisper (pass --force to re-transcribe)",
-                    audio_node.node_id, len(cached),
-                )
-                for child in cached:
-                    ec = child.extracted_content or {}
-                    f.write(json.dumps(segment_row(
-                        video_id=video_id,
-                        clip_id=clip_id,
-                        audio_node_id=audio_node.node_id,
-                        segment_node_id=child.node_id,
-                        asr_id=ec.get("asr_id", ""),
-                        language=ec.get("language"),
-                        start_sec=ec.get("start_sec", 0.0),
-                        end_sec=ec.get("end_sec", 0.0),
-                        text=ec.get("text", ""),
-                        word_count=len(ec.get("words") or []),
-                        no_speech_prob=ec.get("no_speech_prob", 0.0),
-                    ), ensure_ascii=False) + "\n")
-                total_segments += len(cached)
-                resumed_segments += len(cached)
-                f.flush()
-                continue
-
-            try:
-                cache.invalidate(audio_node)
-                # Extract segments BEFORE persist_extraction so
-                # lightweight_summary() doesn't strip the heavy
-                # ``segments`` payload out from under us.
-                executed_audio += 1
-                extraction = extractor.extract(audio_node, ctx)
-                segments = list(
-                    extraction.extracted_content.get("segments", [])
-                )
-                language = extraction.extracted_content.get("language")
-                # The materialization policy reads language per segment.
-                # Preserve it so regenerated cached manifests match fresh ones.
-                for segment in segments:
-                    segment["language"] = language
-                result = op_service.persist_extraction(
-                    raw_node=audio_node,
-                    operator=extractor,
-                    extraction=extraction,
-                    ctx=ctx,
-                    refresh_extracted_children=True,
-                )
-                cache.finish(audio_node, fingerprint, result, len(segments))
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "voice_asr failed for %s",
-                    audio_node.node_id,
+        for audio_node, result in parallel_clips(audio_nodes, _unit):
+            if isinstance(result, UnitError):
+                logger.error(
+                    "voice_asr failed for %s: %s",
+                    audio_node.node_id, result,
+                    exc_info=result.exception,
                 )
                 failed += 1
                 continue
-            if result.get("error"):
+            if result["error"]:
                 logger.warning(
                     "voice_asr returned error for %s: %s",
                     audio_node.node_id, result["error"],
                 )
                 failed += 1
                 continue
-            materialized = result.get("materialized_children") or []
-            for m, seg in zip(materialized, segments):
-                f.write(json.dumps(segment_row(
-                    video_id=video_id,
-                    clip_id=clip_id,
-                    audio_node_id=audio_node.node_id,
-                    segment_node_id=m["child_node_id"],
-                    asr_id=seg.get("asr_id", ""),
-                    language=language,
-                    start_sec=seg.get("start_sec", 0.0),
-                    end_sec=seg.get("end_sec", 0.0),
-                    text=seg.get("text", ""),
-                    word_count=len(seg.get("words") or []),
-                    no_speech_prob=seg.get("no_speech_prob", 0.0),
-                ), ensure_ascii=False) + "\n")
-            total_segments += len(materialized)
+            if result["cached"]:
+                cached_audio += 1
+            if result["executed"]:
+                executed_audio += 1
+            for row in result["rows"]:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            total_segments += len(result["rows"])
+            resumed_segments += result["resumed"]
             f.flush()
 
     logger.info(
@@ -278,7 +339,23 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
     )
     cache.write_summary(output_path, video=args.video, attempted=len(audio_nodes),
                         cached=cached_audio, executed=executed_audio, failed=failed)
-    return 2 if failed else 0
+    # A few per-clip ASR failures (silent/corrupt segments tripping
+    # faster-whisper numpy bugs) must not kill the whole video: tolerate
+    # a bounded failure ratio instead of failing on the first error.
+    ratio = float(os.environ.get("OGMEM_ASR_FAIL_RATIO", "0.15"))
+    max_allowed = 0 if not audio_nodes else max(1, int(len(audio_nodes) * ratio))
+    if failed and failed > max_allowed:
+        logger.error(
+            "voice_asr: %d/%d AUDIO nodes failed (>%.0f%% tolerated) — failing run",
+            failed, len(audio_nodes), ratio * 100,
+        )
+        return 2
+    if failed:
+        logger.warning(
+            "voice_asr: %d/%d AUDIO nodes failed (within %.0f%% tolerance) — continuing",
+            failed, len(audio_nodes), ratio * 100,
+        )
+    return 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
