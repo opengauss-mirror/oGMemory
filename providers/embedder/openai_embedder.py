@@ -2,12 +2,27 @@
 
 Production-ready embedder using OpenAI-compatible API.
 Supports custom base_url for compatible services.
+
+Under a storm of concurrent requests (parallel M3 drivers) the embedding
+endpoint saturates and every query embed times out, emptying the working
+set for hours. Two defenses are built in:
+
+* a module-level semaphore (OGMEM_EMBED_MAX_CONCURRENCY, default 8)
+  bounds in-flight embed requests;
+* jittered exponential backoff retries (OGMEM_EMBED_RETRIES, default 2;
+  OGMEM_EMBED_BASE_DELAY, default 1.0s) on **transient** failures only —
+  timeouts / connection errors / rate limits / 5xx. Auth and other 4xx
+  fail fast. The SDK's own retries are disabled so our budget controls
+  the total attempt count.
 """
 
 import logging
 import math
+import random
+import threading
 import time
 import os
+from contextlib import contextmanager
 from typing import Final
 
 import httpx
@@ -22,6 +37,147 @@ from providers.token_tracker import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _embed_max_concurrency() -> int:
+    try:
+        return max(1, int(os.environ.get("OGMEM_EMBED_MAX_CONCURRENCY") or 8))
+    except ValueError:
+        logger.warning(
+            "Invalid OGMEM_EMBED_MAX_CONCURRENCY=%r — using 8",
+            os.environ.get("OGMEM_EMBED_MAX_CONCURRENCY"),
+        )
+        return 8
+
+
+# Bounded in-flight embed requests shared by ALL embedder instances in
+# this process (module-level: the endpoint, not the instance, saturates).
+# Frozen at import time (P3-1): the semaphore is constructed once when
+# this module is first imported, so changing OGMEM_EMBED_MAX_CONCURRENCY
+# later (e.g. in a long-lived process or via monkeypatch in tests) has
+# no effect. Set it in the environment before process start.
+_EMBED_SEMAPHORE = threading.BoundedSemaphore(_embed_max_concurrency())
+
+
+def _embed_retries() -> int:
+    try:
+        return max(0, int(os.environ.get("OGMEM_EMBED_RETRIES") or 2))
+    except ValueError:
+        return 2
+
+
+def _embed_base_delay() -> float:
+    try:
+        return max(0.0, float(os.environ.get("OGMEM_EMBED_BASE_DELAY") or 1.0))
+    except ValueError:
+        return 1.0
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for transient embed failures worth retrying.
+
+    Timeouts, connection errors, rate limits, and 5xx server errors.
+    Auth failures and other 4xx fail fast (retrying cannot help).
+    """
+    try:
+        from openai import (
+            APIConnectionError,
+            APIStatusError,
+            APITimeoutError,
+            RateLimitError,
+        )
+
+        if isinstance(exc, (APITimeoutError, APIConnectionError, RateLimitError)):
+            return True
+        if isinstance(exc, APIStatusError):
+            status = getattr(exc, "status_code", None)
+            return isinstance(status, int) and status >= 500
+    except ImportError:  # pragma: no cover - openai is a hard dep above
+        pass
+    # The multimodal path uses raw httpx.
+    try:
+        import httpx
+
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = getattr(exc.response, "status_code", None)
+            return isinstance(status, int) and status >= 500
+    except ImportError:  # pragma: no cover
+        pass
+    return False
+
+
+def _remaining_seconds(deadline: float | None) -> float | None:
+    """Remaining budget for an absolute monotonic deadline (None = unbounded).
+
+    Raises TimeoutError when the deadline has already elapsed — callers must
+    not start (or retry) an API call with no budget left (review item 6).
+    """
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        raise TimeoutError("embedding request deadline elapsed")
+    return remaining
+
+
+@contextmanager
+def _embed_slot(deadline: float | None):
+    """Acquire a concurrency slot, bounded by the caller's deadline.
+
+    The historical `with _EMBED_SEMAPHORE` waited unboundedly: a caller
+    computed its request timeout BEFORE queueing for a slot, so a long
+    queue wait silently exceeded the caller's deadline (review item 6).
+    """
+    if deadline is None:
+        with _EMBED_SEMAPHORE:
+            yield
+        return
+    wait = _remaining_seconds(deadline)
+    if not _EMBED_SEMAPHORE.acquire(timeout=wait):
+        raise TimeoutError(
+            "embedding deadline elapsed waiting for a concurrency slot"
+        )
+    try:
+        yield
+    finally:
+        _EMBED_SEMAPHORE.release()
+
+
+def _run_with_retry(fn, what: str, deadline: float | None = None):
+    """Run an embed call with jittered exponential backoff on transient errors.
+
+    Attempts = 1 + OGMEM_EMBED_RETRIES (default 2). Non-transient errors
+    (auth / 4xx) fail fast. The SDK's own retries are disabled, so this
+    budget is the total attempt count.
+
+    ``fn(remaining)`` receives the remaining deadline budget for THIS
+    attempt (None when unbounded) so per-request timeouts never outlive
+    the caller's deadline; backoff sleeps are truncated to the budget and
+    a retry is never started once the deadline has elapsed (review item 6).
+    """
+    attempts = 1 + _embed_retries()
+    base_delay = _embed_base_delay()
+    for attempt in range(1, attempts + 1):
+        remaining = _remaining_seconds(deadline)
+        try:
+            return fn(remaining)
+        except Exception as exc:
+            if attempt >= attempts or not _is_transient(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1)) * random.uniform(0.7, 1.3)
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+                if delay <= 0.0:
+                    raise TimeoutError("embedding request deadline elapsed")
+            logger.warning(
+                "Transient embed failure (%s) on attempt %d/%d: %s — "
+                "retrying in %.2fs",
+                what, attempt, attempts, type(exc).__name__, delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 # Set this env var to a truthy value to explicitly opt into running
 # against a keyless OpenAI-compatible endpoint (e.g. a local
@@ -143,7 +299,11 @@ class OpenAIEmbedder(Embedder):
             ),
             timeout=httpx.Timeout(120.0, pool=60.0),
         )
-        self._client = OpenAI(http_client=http_client, **client_kwargs)
+        # The SDK's own retries are disabled so _run_with_retry's budget
+        # controls the total attempt count (no doubled backoff windows).
+        self._client = OpenAI(
+            http_client=http_client, max_retries=0, **client_kwargs
+        )
         self.token_tracker = TokenTracker(model=self._model)
 
     @staticmethod
@@ -216,10 +376,21 @@ class OpenAIEmbedder(Embedder):
                 for start in range(0, len(truncated), self._batch_size):
                     batch = truncated[start:start + self._batch_size]
                     with embedding_input_scope(range(start, start + len(batch))):
-                        client = self._embedding_client(
-                            timeout_seconds=None if deadline is None else deadline - time.monotonic())
                         try:
-                            response = client.embeddings.create(input=batch, model=self._model)
+                            # Slot acquisition and every attempt are bounded
+                            # by the caller's absolute deadline; the request
+                            # timeout is recomputed per attempt (review item 6).
+                            with _embed_slot(deadline):
+                                client = self._embedding_client(
+                                    timeout_seconds=_remaining_seconds(deadline))
+                                response = _run_with_retry(
+                                    lambda remaining: client.embeddings.create(
+                                        input=batch, model=self._model,
+                                        **({} if remaining is None
+                                            else {"timeout": remaining}),
+                                    ),
+                                    "embeddings.create", deadline=deadline,
+                                )
                         except Exception:
                             self.token_tracker.record_failure('embedding', deadline=deadline)
                             raise
@@ -287,21 +458,30 @@ class OpenAIEmbedder(Embedder):
         )
         with httpx.Client(timeout=120.0) as client:
             for index, text in enumerate(texts):
-                request_timeout = 120.0
-                if call_deadline is not None:
-                    request_timeout = call_deadline - time.monotonic()
-                    if request_timeout <= 0.0:
-                        raise TimeoutError("embedding request deadline elapsed")
                 payload = {
                     "model": self._model,
                     "input": [{"type": "text", "text": text}],
                     "dimensions": self._dimension,
                 }
                 try:
-                    resp = client.post(
-                        url, json=payload, headers=headers, timeout=request_timeout,
-                    )
-                    resp.raise_for_status()
+                    def _do_post(remaining):
+                        resp = client.post(
+                            url, json=payload, headers=headers,
+                            # Per-attempt budget: never outlive the caller's
+                            # deadline, even after a queue wait or a retry
+                            # backoff (review item 6).
+                            timeout=120.0 if remaining is None else remaining,
+                        )
+                        # Include status validation inside the retry so a
+                        # 5xx response body is retried, not surfaced.
+                        resp.raise_for_status()
+                        return resp
+
+                    with _embed_slot(call_deadline):
+                        resp = _run_with_retry(
+                            _do_post, "embeddings.multimodal",
+                            deadline=call_deadline,
+                        )
                 except Exception:
                     with embedding_input_scope([index]):
                         self.token_tracker.record_failure('embedding', deadline=call_deadline)
