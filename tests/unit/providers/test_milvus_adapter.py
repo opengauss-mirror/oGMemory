@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from core.models import IndexRecord
+from index.activation_projection import ACTIVATION_LEVEL, ACTIVATION_VERSION
 from providers.vector_index.milvus_index import MilvusVectorIndex
 
 
@@ -96,6 +97,29 @@ def test_search_filters_before_top_k_and_preserves_hit(index):
     assert call["limit"] == 1 and call["consistency_level"] == "Strong"
     assert hits[0].metadata["grounding"] == [1]
     assert hits[0].abstract == "summary" and hits[0].score == 0.9
+
+
+def test_search_applies_activation_filters_in_milvus(index):
+    index._client.search.return_value = [[]]
+
+    index.search_by_vector(
+        [1.0, 0.0, 0.0],
+        {
+            "account_id": "a",
+            "owner_space": ["user:u"],
+            "level": ACTIVATION_LEVEL,
+            "record_kind": "update_activation",
+            "representation_version": ACTIVATION_VERSION,
+        },
+        25,
+    )
+
+    expression = index._client.search.call_args.kwargs["filter"]
+    assert '(account_id == "a")' in expression
+    assert '(owner_space in ["user:u"])' in expression
+    assert f"(level == {ACTIVATION_LEVEL})" in expression
+    assert '(metadata["record_kind"] == "update_activation")' in expression
+    assert f'(metadata["representation_version"] == "{ACTIVATION_VERSION}")' in expression
 
 
 def test_get_embeddings_text_guard_and_bounded_query(index):

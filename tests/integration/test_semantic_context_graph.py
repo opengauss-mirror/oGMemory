@@ -2,6 +2,7 @@
 
 Run with GRAPH_TEST_DSN pointing to a disposable SQL database.
 Set GRAPH_TEST_DIALECT=opengauss for an openGauss database.
+Set OGMEM_TEST_MILVUS_URI to exercise cross-batch discovery with Milvus.
 No external LLM or embedding service is called.
 """
 import os
@@ -30,18 +31,37 @@ from service.graph_service import GraphService
 
 
 @pytest.fixture
-def graph_db():
+def graph_db(request):
     dsn = os.environ.get("GRAPH_TEST_DSN")
     if not dsn:
         pytest.skip("GRAPH_TEST_DSN must point to a disposable database")
     dialect = os.environ.get("GRAPH_TEST_DIALECT", "postgresql")
     account = "graph-test-" + uuid4().hex[:12]
     ctx = RequestContext(account,"alice","agent","session","trace")
-    fs = SQLContextFS(dsn, dialect=dialect)
     profile = dict(profile_id="test",model="test-embedding",dimension=2,representation_version="relation-target-v2")
     embedder = Mock(model="test-embedding")
     embedder.embed_texts.side_effect = lambda texts: [[1.,0.] for _ in texts]
-    index = OpenGaussVectorIndex(dsn,dimension=2,table_name="graph_test_vectors",dialect=dialect)
+    if getattr(request, "param", "opengauss") == "milvus":
+        uri = os.environ.get("OGMEM_TEST_MILVUS_URI")
+        if not uri:
+            pytest.skip("OGMEM_TEST_MILVUS_URI required for Milvus graph acceptance")
+        pytest.importorskip("pymilvus")
+        from providers.vector_index.milvus_index import MilvusVectorIndex
+
+        collection = "ogmemory_graph_test_" + uuid4().hex
+        index = MilvusVectorIndex(uri=uri, token=os.environ.get("MILVUS_TOKEN", ""),
+                                  collection_name=collection, dimension=2)
+
+        def close_milvus():
+            try:
+                index._client.drop_collection(collection_name=collection)
+            finally:
+                index.close()
+
+        request.addfinalizer(close_milvus)
+    else:
+        index = OpenGaussVectorIndex(dsn,dimension=2,table_name="graph_test_vectors",dialect=dialect)
+    fs = SQLContextFS(dsn, dialect=dialect)
     store = SQLRelationStore(dsn,edge_projection_profile_id="test",dialect=dialect)
     projections = SQLEdgeProjectionStore(dsn,dialect=dialect)
     outbox = SQLOutboxStore(dsn,fs=fs,dialect=dialect)
@@ -143,6 +163,7 @@ def test_projection_failure_keeps_durable_wakeup_across_restart(graph_db):
     assert store.get_relation_neighbors(a.uri,ctx)[0].edge_projection is not None
 
 
+@pytest.mark.parametrize("graph_db", ["opengauss", "milvus"], indirect=True)
 def test_real_extraction_writer_and_index_pipeline_keeps_descriptors(graph_db):
     """Run upstream extraction/validation/writer with fake provider responses."""
     import json
@@ -162,10 +183,16 @@ def test_real_extraction_writer_and_index_pipeline_keeps_descriptors(graph_db):
             return {"spans":[dict(start=0,end=0,categories=["entity"],reason="Project facts")]}
         if "groups" in schema.get("properties",{}):
             return {"groups":[[0],[1]]}  # dev's native topic-identity review
-        block = prompt.split("NEWLY EXTRACTED MEMORY NODES:",1)[1].split("POTENTIALLY RELEVANT EXISTING MEMORY NODES:",1)[0]
-        new = json.loads(re.search(r"^(\[.*\])$",block,re.MULTILINE).group(1))
-        return {"relations":[dict(source_node_ref=new[0]["node_ref"],target_node_ref=new[1]["node_ref"],
-            relation="depends on",evidence_ids=new[0]["source_ids"]+new[1]["source_ids"])]}
+        block = prompt.split("NEWLY EXTRACTED MEMORY NODES:", 1)[1]
+        new_block, history_block = block.split("POTENTIALLY RELEVANT EXISTING MEMORY NODES:", 1)
+        new = json.loads(re.search(r"^(\[.*\])$", new_block, re.MULTILINE).group(1))
+        historical = json.loads(re.search(r"^(\[.*\])$", history_block, re.MULTILINE).group(1))
+        old = next(node for node in historical if node["node_ref"] == nodes[0].uri)
+        return {"relations": [
+            dict(source_node_ref=new[0]["node_ref"], target_node_ref=target["node_ref"],
+                 relation="depends on", evidence_ids=new[0]["source_ids"] + target["source_ids"])
+            for target in (new[1], old)
+        ]}
     llm.complete_json.side_effect = relation_response
     api = MemoryWriteAPI(fs,llm,outbox_store=outbox,vector_index=index,embedder=worker._embedder,
         directory_summary_enabled=False,graph_enabled=True,relation_store=store,
@@ -174,7 +201,7 @@ def test_real_extraction_writer_and_index_pipeline_keeps_descriptors(graph_db):
     result = api.commit_session([dict(id="turn",role="user",content="Projectx depends on Projecty.")],
                                 ctx,archive_id="graph-test-archive")
     assert result["writes_completed"] == 2
-    assert result["graph"]["relation_persisted"] == 1
+    assert result["graph"]["relation_persisted"] == 2, result["graph"]
     # dev's span identification and topic review plus one graph relation call;
     # both native extraction passes are retained.
     assert llm.complete_with_tools.call_count == 2
@@ -186,7 +213,8 @@ def test_real_extraction_writer_and_index_pipeline_keeps_descriptors(graph_db):
     stats = worker.run_once(outbox,[ctx.account_id])
     assert stats["failed"] == 0
     source = result["plans"][0]["target_uri"]
-    assert store.get_relation_neighbors(source,ctx)[0].edge_projection is not None
+    neighbors = {neighbor.uri: neighbor for neighbor in store.get_relation_neighbors(source, ctx)}
+    assert neighbors[nodes[0].uri].edge_projection is not None
     descriptor = index.get_record(IndexRecord.generate_id(source,3))
     assert descriptor.level == 3 and descriptor.metadata["record_kind"] == "update_activation"
 

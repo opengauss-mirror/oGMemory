@@ -32,7 +32,7 @@ _SCOPE_FIELDS = (
     "space_id",
     "extractor_type",
 )
-_JSON_FILTERS = {"node_status", "extracted_node_id"}
+_JSON_FILTERS = {"node_status", "extracted_node_id", "record_kind", "representation_version"}
 _BATCH_SIZE = 32
 _URI_BATCH_SIZE = 128
 _QUERY_PAGE_SIZE = 256
