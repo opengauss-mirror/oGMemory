@@ -75,9 +75,7 @@ def test_pipeline_adds_low_similarity_member_with_canonical_content(setup):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_pipeline_scene_switch_selects_expected_evidence(setup, enabled):
-    if not enabled:
-        setup.pipeline._scene_stage = None
-    result = search(setup)
+    result = search(setup, use_scene=enabled)
     expected = {setup.direct.uri, setup.related.uri} if enabled else {setup.direct.uri}
     assert evidence_uris(result) == expected
 
@@ -157,7 +155,7 @@ def test_mixed_queries_keep_route_local_limits_and_evidence(setup):
     setup.pipeline.seed_retriever = SimpleNamespace(search=lambda query, ctx, **kwargs:
         SeedResult(initial_candidates=[skill]) if query is skill_query else seed.search(query, ctx, **kwargs))
     setup.pipeline._context_reader = None
-    result = search(setup)
+    result = search(setup, final_top_k=3)
     assert evidence_uris(result) == {setup.direct.uri, setup.related.uri, skill.uri}
     assert sum(stage.stage == "scene_ranking" for stage in result.trace.stages) == 1
 
@@ -186,6 +184,28 @@ def test_legacy_search_port_expands_members_with_alias_owner(setup):
     result = stage.apply([LeafHit(setup.direct.uri, 0.8, owner_space="user:alice")],
                          TypedQuery("release", "MEMORY", []), [1, 0], setup.ctx, RetrievalTrace()).hits
     assert {hit.uri for hit in result} == {setup.direct.uri, setup.related.uri}
+
+
+@pytest.mark.parametrize("directory", ["tools", "tool_units"])
+def test_scene_expansion_selects_members_from_requested_type_directory(directory):
+    root = "ctx://acme/agents/worker/memories"
+    direct_uri = f"{root}/{directory}/direct"
+    member_uris = [f"{root}/{kind}/expanded" for kind in ("tools", "tool_units")]
+    source = SimpleNamespace(
+        search=lambda *args, **kwargs: [SceneHit(
+            "deploy", 1.0, "agent:worker", (direct_uri, *member_uris), routes=("member",))],
+        resolve_members=lambda *args, **kwargs: [
+            SeedHit(uri, 0.6, owner_space="agent:worker", category="tool") for uri in member_uris],
+    )
+    stage = SceneRetrievalStage(source, SceneRanker())
+    query = TypedQuery("deploy", "MEMORY", ["tool"], memory_directories=[directory])
+
+    result = stage.apply(
+        [LeafHit(direct_uri, 0.9, owner_space="agent:worker", category="tool")],
+        query, [1, 0], _scope_context("acme", "agent:worker"), RetrievalTrace(),
+    )
+
+    assert {hit.uri for hit in result.hits} == {direct_uri, f"{root}/{directory}/expanded"}
 
 
 def test_bounded_selection_preserves_direct_reserve_and_expansion_quota(setup):
@@ -264,7 +284,7 @@ def test_multiple_memory_queries_bind_once_and_keep_categories(setup, monkeypatc
         return bind(ctx, bound_queries)
 
     monkeypatch.setattr(setup.source, "for_request", counted)
-    result = search(setup)
+    result = search(setup, final_top_k=3)
     assert evidence_uris(result) == {setup.direct.uri, setup.related.uri, preference.uri}
     assert calls == [("events", "preferences")]
     assert sum(hit.category == "event" for hit in result.hits) == 2
@@ -355,8 +375,9 @@ def test_final_scene_quota_uses_temporal_order_in_both_evidence_groups(setup):
 @pytest.mark.parametrize("global_rerank", [False, True])
 @pytest.mark.parametrize("reserve", [0.5, 0.9])
 @pytest.mark.parametrize("repeat_query", [False, True])
+@pytest.mark.parametrize("final_top_k", [None, 5])
 def test_multiple_queries_preserve_scene_quota_after_global_ranking(
-    setup, global_rerank, reserve, repeat_query,
+    setup, global_rerank, reserve, repeat_query, final_top_k,
 ):
     config = replace(setup.pipeline.cfg, global_result_rerank_enabled=global_rerank)
     index = InMemoryVectorIndex(dimension=2)
@@ -383,15 +404,33 @@ def test_multiple_queries_preserve_scene_quota_after_global_ranking(
     setup.pipeline.seed_retriever = SeedRetriever(index, setup.source.embedder, config)
     setup.pipeline.planner = SimpleNamespace(plan=lambda *args, **kwargs: queries)
 
-    result = search(setup)
+    result = search(setup, final_top_k=final_top_k)
 
-    multiplier = 1 if global_rerank else 2
-    assert len(result.hits) == len(evidence_uris(result)) == 10 * multiplier
+    expected_limit = final_top_k or 10
+    assert len(result.hits) == len(evidence_uris(result)) == expected_limit
     assert sum(bool(hit.metadata.get("scene_expanded")) for hit in result.hits) == (
-        10 - ceil(10 * reserve)
-    ) * multiplier
+        expected_limit - ceil(expected_limit * reserve)
+    )
     for hit in result.hits:
         assert hit.content_excerpt == setup.source.fs.nodes[canonical_uri(hit.uri)].content
-    if global_rerank:
-        scores = [hit.ranking_score for hit in result.hits]
-        assert scores == sorted(scores, reverse=True)
+    scores = [hit.ranking_score for hit in result.hits]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_concurrent_scene_queries_keep_request_selection(setup):
+    from concurrent.futures import ThreadPoolExecutor
+
+    selections = [True, False] * 12
+    with ThreadPoolExecutor(max_workers=6) as callers:
+        results = list(callers.map(lambda enabled: search(setup, use_scene=enabled), selections))
+    for enabled, result in zip(selections, results):
+        expected = {setup.direct.uri, setup.related.uri} if enabled else {setup.direct.uri}
+        assert evidence_uris(result) == expected
+    assert evidence_uris(search(setup)) == {setup.direct.uri, setup.related.uri}
+
+
+def test_request_selection_overrides_retrieval_default(setup):
+    setup.pipeline._scene_enabled = False
+    assert evidence_uris(search(setup)) == {setup.direct.uri}
+    assert evidence_uris(search(setup, use_scene=True)) == {setup.direct.uri, setup.related.uri}
+    assert evidence_uris(search(setup)) == {setup.direct.uri}

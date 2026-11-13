@@ -8,6 +8,9 @@ for the retrieval pipeline.
 """
 
 import math
+from threading import RLock
+
+from core.projection_ownership import check_projection_owner
 from typing import Any
 
 from core.interfaces import VectorIndex
@@ -31,6 +34,7 @@ class InMemoryVectorIndex(VectorIndex):
         Args:
             dimension: Embedding dimension for new records
         """
+        self._write_lock = RLock()
         self._dimension = dimension
         self._records: dict[str, IndexRecord] = {}
         self._vectors: dict[str, list[float]] = {}
@@ -44,14 +48,16 @@ class InMemoryVectorIndex(VectorIndex):
         Note:
             Idempotent: duplicate IndexRecord.id overwrites existing record.
         """
-        for record in records:
-            self._records[record.id] = record
-            # Use real embedding if provided in metadata, otherwise fall back to mock
-            real_embedding = record.metadata.get("_embedding")
-            if real_embedding:
-                self._vectors[record.id] = real_embedding
-            else:
-                self._vectors[record.id] = self._mock_vector(record.text)
+        with self._write_lock:
+            check_projection_owner()
+            for record in records:
+                self._records[record.id] = record
+                # Use real embedding if provided in metadata, otherwise fall back to mock
+                real_embedding = record.metadata.get("_embedding")
+                if real_embedding:
+                    self._vectors[record.id] = real_embedding
+                else:
+                    self._vectors[record.id] = self._mock_vector(record.text)
 
     def delete(self, ids: list[str]) -> None:
         """Remove records from the index.
@@ -62,9 +68,11 @@ class InMemoryVectorIndex(VectorIndex):
         Note:
             No-op for non-existent IDs.
         """
-        for record_id in ids:
-            self._records.pop(record_id, None)
-            self._vectors.pop(record_id, None)
+        with self._write_lock:
+            check_projection_owner()
+            for record_id in ids:
+                self._records.pop(record_id, None)
+                self._vectors.pop(record_id, None)
 
     def _mock_vector(self, text: str) -> list[float]:
         """Generate a mock embedding vector for testing.

@@ -1,22 +1,34 @@
 """Complete span evidence survives node batching and checkpoint replay."""
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 
 import pytest
 
 from service.extraction_checkpoint import CandidateCheckpoint
+from core.model_stage import stage_digest
 from tests.unit.extraction.test_node_processing import card, node_payload, operation, setup
 
 
 class Journal:
     def __init__(self, ctx):
         self.ctx, self.batch = ctx, {"archive_id": "source-context", "slots": {}}
+        self.stages = {}
 
     def mutate(self, update):
         update(self.batch)
         self.batch = json.loads(json.dumps(self.batch))
+
+    def has_stage(self, name):
+        return any(stage == name for stage, _ in self.stages)
+
+    def load_stage(self, name, inputs):
+        return deepcopy(self.stages.get((name, stage_digest(inputs))))
+
+    def save_stage(self, name, inputs, result):
+        self.stages[name, stage_digest(inputs)] = deepcopy(result)
 
 
 def source_pipeline(mode="eager", same_target=False):
@@ -48,7 +60,7 @@ def source_pipeline(mode="eager", same_target=False):
         node_calls.append(call)
         assert len(call["prompt"]) <= 110000
         for draft in payload["drafts"]:
-            i = int(draft["routing_key"].rsplit("_", 1)[1])
+            i = int(draft["content"].splitlines()[0].rsplit(" ", 1)[1])
             assert any(f"MARKER_{i}:" in source for source in payload["source"])
             assert any(messages[positions[i]-3]["content"] in source for source in payload["source"])
         assert all("2026-10-10 10:00" in source for source in payload["source"])
@@ -59,7 +71,8 @@ def source_pipeline(mode="eager", same_target=False):
             op.update(routing_key=group[0]["routing_key"], object_name=group[0]["object_name"])
             op["sections"][0]["facts"] = [d["content"].splitlines()[-1][2:] for d in group]
             operations.append(op)
-        return [{"tool": "process_memory_nodes", "input": {"operations": operations}}]
+        return [{"tool": "process_memory_nodes", "input": {
+            "operations": operations, "related_reconciliations": []}}]
 
     llm.complete_with_tools = complete
 
@@ -78,7 +91,7 @@ def test_long_conversation_commits_complete_focused_sources(mode, occurrence_rec
     api._pipeline._extractors[0]._source_occurrence_reconciliation_enabled = occurrence_reconciliation
     result = api.commit_session(messages, ctx, session_time=datetime(2026, 10, 10, 10))
     assert len(json.dumps(messages)) > 110000
-    assert result["writes_completed"] == len(fs.nodes) == 4
+    assert result["writes_completed"] == sum(node.category == "entity" for node in fs.nodes.values()) == 4
     assert sorted(native) == list(range(4))
     assert len(processed) == 2
     assert all(any(f"{37+i} MHz" in n.content for n in fs.nodes.values()) for i in range(4))
@@ -103,12 +116,20 @@ def test_cas_replays_original_spans_after_combining_one_target():
                                 candidate_checkpoint=checkpoint)
     restored = CandidateCheckpoint(checkpoint.journal, "0")
     accepted = restored.load()[0][0]
-    assert result["writes_completed"] == len(fs.nodes) == 1
+    assert result["writes_completed"] == len([node for node in fs.nodes.values()
+                                              if node.context_type == "MEMORY" and node.category == "entity"]) == 1
     assert len(processed) == 4
     assert sorted(native) == list(range(4))
     assert accepted.node_draft_indices == list(range(4))
     assert len(accepted.source_contexts) == 4
     assert restored.record["revisions"]["0"] == 1
+    revisions = [node_payload(call) for call in processed if node_payload(call)["fixed_target"]]
+    assert len(revisions) == 2
+    assert all(payload["fixed_target"] == target and len(payload["drafts"]) == 2
+               and payload["nodes"][0]["version"] == 2 for payload in revisions)
+    assert all("workshop" in payload["nodes"][0]["content"] for payload in revisions)
+    assert all(f"{37+i} MHz" in revisions[1]["nodes"][0]["content"] for i in range(2))
+    assert accepted.expected_version == 2
     saved = fs.read_node(target, ctx)
     assert "workshop" in saved.content
     assert all(f"{37+i} MHz" in saved.content for i in range(4))
@@ -122,7 +143,8 @@ def test_saved_span_drafts_resume_node_processing():
     checkpoint.save_drafts([replace(c, node_draft_indices=[i]) for i, c in enumerate(drafts)], messages)
     restored = CandidateCheckpoint(checkpoint.journal, "0")
     result = api.commit_session(messages, ctx, candidate_checkpoint=restored)
-    assert result["writes_completed"] == len(fs.nodes) == 4
+    assert result["writes_completed"] == len([node for node in fs.nodes.values()
+                                              if node.context_type == "MEMORY" and node.category == "entity"]) == 4
     assert sorted(native) == list(range(4))
     assert len(processed) == 2
     assert all(len(c.source_contexts) == 1 for c in restored.load_drafts())

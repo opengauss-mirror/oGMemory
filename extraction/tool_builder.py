@@ -53,13 +53,21 @@ _UPDATE_INSTRUCTION = (
     "date. Different scopes need separate unbound facts, without old-scope facts."
 )
 _PROFILE_SNAPSHOT_INSTRUCTION = (
-    "Runtime storage contract: profile has ONE fixed file. Emit exactly ONE "
+    "Runtime storage contract: profile has ONE fixed file. When the input contains "
+    "eligible, source-supported profile attributes, emit exactly ONE "
     "extract_profile operation containing ALL supported profile attributes in this input, "
     "both at creation and update. This single-file contract takes precedence over the "
     "attribute-per-call and separate-node examples; preserve their fact eligibility "
-    "and attribution rules. For updates, read the existing profile and retain its "
-    "unchanged facts. Use its routing_key; for creation use 'identity'."
+    "and attribution rules. "
 )
+
+
+def _profile_snapshot_instruction(include_updates: bool) -> str:
+    return _PROFILE_SNAPSHOT_INSTRUCTION + (
+        "For updates, read the existing profile and retain its unchanged facts. "
+        "Use its routing_key; for creation use 'identity'." if include_updates
+        else "For creation use routing_key='identity'."
+    )
 
 
 def _supports_read_target(schema: MemoryTypeSchema) -> bool:
@@ -95,17 +103,19 @@ def _source_identity_properties(schema: MemoryTypeSchema) -> dict:
     return properties
 
 
-def build_update_instruction(registry: SchemaRegistry) -> str:
+def build_update_instruction(registry: SchemaRegistry, categories=None, *, include_updates: bool = True) -> str:
     """Describe runtime write units independently of persisted schema fields."""
     schemas = [schema for schema in registry.list_enabled()
-               if is_schema_version_compatible(schema) and _supports_read_target(schema)]
-    parts = [_UPDATE_INSTRUCTION] if schemas else []
+               if is_schema_version_compatible(schema) and _supports_read_target(schema)
+               and (categories is None or schema.memory_type in categories)]
+    parts = [_UPDATE_INSTRUCTION] if schemas and include_updates else []
     if any(schema.memory_type == "profile" and schema.is_single_file for schema in schemas):
-        parts.append(_PROFILE_SNAPSHOT_INSTRUCTION)
+        parts.append(_profile_snapshot_instruction(include_updates))
     return "\n\n".join(parts)
 
 
-def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
+def build_extraction_tools(registry: SchemaRegistry, *, include_updates: bool = True,
+                           topic_drafts: bool = False, activation_enabled: bool = False) -> list[dict]:
     """Generate OpenAI function calling tool definitions from enabled schemas.
 
     Each schema generates one tool definition with:
@@ -123,6 +133,9 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
 
     for schema in registry.list_enabled():
         if schema.memory_type in _INTERNAL_MEMORY_TYPES:
+            continue
+        # Relation proposals belong to graph-on ingestion, not memory storage.
+        if schema.memory_type == "relation" and not activation_enabled:
             continue
 
         if not is_schema_version_compatible(schema):
@@ -188,14 +201,40 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
                 "update that object without combining it with the unchanged object."
             )
         if _supports_read_target(schema):
-            properties.update({
-                "target_uri": {"type": "string", "description": "Existing memory URI read for this update."},
-                "expected_version": {"type": "integer", "minimum": 1,
-                                     "description": "Version from the memory read result."},
-            })
-            description += "\n" + _UPDATE_INSTRUCTION
+            if include_updates:
+                properties.update({
+                    "target_uri": {"type": "string", "description": "Existing memory URI read for this update."},
+                    "expected_version": {"type": "integer", "minimum": 1,
+                                         "description": "Version from the memory read result."},
+                })
+                description += "\n" + _UPDATE_INSTRUCTION
             if schema.memory_type == "profile" and schema.is_single_file:
-                description = _PROFILE_SNAPSHOT_INSTRUCTION + "\n\n" + description
+                description = _profile_snapshot_instruction(include_updates) + "\n\n" + description
+        if activation_enabled and schema.memory_type != "relation":
+            properties["update_activation"] = {
+                "type": "string", "minLength": 1,
+                "description": "One compact source-grounded declarative sentence describing this memory's explicit subject, concrete fact, and stated distinguishing context. Preserve uncertainty and negation. Generate alongside this candidate; do not invent scope, future queries, or links.",
+            }
+            required.append("update_activation")
+        if topic_drafts and schema.memory_type in {"entity", "preference"}:
+            properties.pop("overview", None)
+            required = [name for name in required if name != "overview"]
+            properties["abstract"]["description"] = (
+                "Brief identity and topic descriptor for retrieving this subject, at most 200 characters. "
+                "Preserve explicit plan/intent wording for intended or upcoming actions."
+            )
+            properties["content"]["description"] = (
+                "Source fact draft: one atomic fact per line. Retain every supported exact name, "
+                "relationship, date, number, condition, change and uncertainty once. "
+                "Keep each action's stated status: intended, upcoming, ongoing, or completed. "
+                "Preserve the holder and project identity of each fact. The node processor "
+                "will organize these facts into the final memory card."
+            )
+            description += (
+                "\nSource-draft output contract: abstract identifies the subject/topic for recall; "
+                "content carries its complete source facts once. Keep exact identity fields and "
+                "evidence_quote. Final card formatting and whole-node summaries belong to the later node processor."
+            )
 
         tools.append({
             "name": schema.tool_name,
@@ -214,9 +253,16 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
 
         logger.debug(f"Built tool definition: {schema.tool_name}")
 
-    if any(is_schema_version_compatible(schema) and _supports_read_target(schema)
-           for schema in registry.list_enabled()):
-        tools.extend(build_incremental_tools())
+    if include_updates and any(is_schema_version_compatible(schema) and _supports_read_target(schema)
+                               for schema in registry.list_enabled()):
+        incremental_tools = build_incremental_tools()
+        if activation_enabled:
+            descriptor = next(tool["input_schema"]["properties"]["update_activation"]
+                              for tool in tools if "update_activation" in tool["input_schema"]["properties"])
+            for tool in incremental_tools:
+                tool["input_schema"]["properties"]["update_activation"] = dict(descriptor)
+                tool["input_schema"]["required"].append("update_activation")
+        tools.extend(incremental_tools)
     return tools
 
 
@@ -232,7 +278,7 @@ def build_tool_to_category(registry: SchemaRegistry) -> dict[str, tuple[str, str
     return {
         schema.tool_name: (schema.memory_type, schema.owner_scope)
         for schema in registry.list_compatible_enabled()
-        if schema.memory_type not in _INTERNAL_MEMORY_TYPES
+        if schema.memory_type not in _INTERNAL_MEMORY_TYPES and schema.memory_type != "relation"
     }
 
 
@@ -244,6 +290,7 @@ def parse_tool_call(
     read_nodes: dict[str, ContextNode] | None = None,
     ctx: RequestContext | None = None,
     current_content: str | None = None,
+    activation_enabled: bool = False,
 ) -> tuple[str, str, CandidateMemory] | None:
     """Validate and parse a tool call using schema definitions.
 
@@ -257,10 +304,17 @@ def parse_tool_call(
         None if tool_name is unknown or validation fails
     """
     if tool_name in INCREMENTAL_TOOLS:
+        # Keep dev's strict edit validation unchanged: the graph-only descriptor
+        # is validated by the complete snapshot parser, not as an edit command.
+        incremental_input = dict(tool_input)
+        activation = incremental_input.pop("update_activation", None) if activation_enabled else None
         name, full_input = materialize_incremental_input(
-            tool_name, tool_input, registry, read_nodes, ctx, current_content,
+            tool_name, incremental_input, registry, read_nodes, ctx, current_content,
         )
-        parsed = parse_tool_call(name, full_input, registry)
+        if activation_enabled:
+            full_input["update_activation"] = activation
+        parsed = (parse_tool_call(name, full_input, registry, activation_enabled=True)
+                  if activation_enabled else parse_tool_call(name, full_input, registry))
         if parsed is None:
             raise ToolCallProtocolError("incremental update did not produce a schema-valid complete snapshot")
         category, owner, candidate = parsed
@@ -278,6 +332,8 @@ def parse_tool_call(
     for s in registry.list_compatible_enabled():
         if s.memory_type in _INTERNAL_MEMORY_TYPES:
             continue
+        if s.memory_type == "relation":
+            continue  # handled as a proposal, never a CandidateMemory
         if s.tool_name == tool_name:
             schema = s
             break
@@ -285,6 +341,14 @@ def parse_tool_call(
     if schema is None:
         logger.warning(f"Unknown tool name: {tool_name}")
         return None
+
+    activation = None
+    if activation_enabled:
+        value = tool_input.get("update_activation")
+        if not isinstance(value, str) or not value.strip() or "\n" in value.strip() or "\r" in value.strip():
+            logger.warning("Invalid or missing update_activation for %s", tool_name)
+            return None
+        activation = value.strip()
 
     # Pre-fill auto-generatable fields before validation so required checks pass
     tool_input = dict(tool_input)  # copy to avoid mutating caller's dict
@@ -457,6 +521,9 @@ def parse_tool_call(
             target_uri=target_uri,
             expected_version=expected_version,
             **identity_fields,
+            metadata={"update_activation": activation,
+                      "update_activation_version": "c1-integrated-activation-v1"}
+            if activation is not None else {},
         ),
     )
 

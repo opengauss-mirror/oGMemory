@@ -13,7 +13,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from judge_parallel import PROTOCOL_VERSION
@@ -405,10 +405,12 @@ def build_parser(
     parser.add_argument("--hermes-command", default="hermes")
     parser.add_argument("--dsh-command", default="dsh")
     parser.add_argument("--codex-command", default="codex")
+    parser.add_argument("--qwenpaw-command", default="qwenpaw")
+    parser.add_argument("--qwenpaw-port", type=int, default=18891)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--agent",
-        choices=(agent,) if agent else ("openclaw", "opencode", "claude-code", "hermes", "dsh", "codex"),
+        choices=(agent,) if agent else ("openclaw", "opencode", "claude-code", "hermes", "dsh", "codex", "qwenpaw"),
         default=default_agent,
     )
     parser.add_argument(
@@ -456,31 +458,155 @@ def memory_headers(args) -> dict[str, str]:
     }
 
 
-def memory_call(args, method: str, sid: str, **extra) -> dict:
-    response = requests.post(
-        f"{args.ogmemory_url}/api/v1/call/{method}",
-        headers=memory_headers(args),
-        json={
-            "sessionId": sid,
-            "accountId": args.account_id,
-            "userId": args.user_id,
-            "agentId": args.memory_agent_id,
-            **extra,
-        },
-        timeout=args.write_wait_timeout,
+def degraded_source_archived(outcome):
+    source_ids = outcome.get("source_message_ids")
+    archived_ids = outcome.get("archived_source_ids")
+    return bool(
+        outcome.get("request_status") == "DEGRADED"
+        and outcome.get("semantic_status") == "DEGRADED"
+        and outcome.get("source_status") in {"ARCHIVED", "RAW_ARCHIVED"}
+        and outcome.get("archive_id")
+        and isinstance(source_ids, list) and source_ids
+        and isinstance(archived_ids, list) and set(source_ids) == set(archived_ids)
     )
+
+
+def degraded_write_settled(outcome):
+    return (degraded_source_archived(outcome)
+            and outcome.get("projection_status") in {"DONE", "NOT_REQUIRED"})
+
+
+def memory_call(args, method: str, sid: str, *, observations=None, deadline=None, **extra) -> dict:
+    started, response = time.monotonic(), None
+    path = f"/api/v1/call/{method}"
+    try:
+        response = requests.post(
+            args.ogmemory_url.rstrip("/") + path,
+            headers=memory_headers(args),
+            json={"sessionId": sid, "accountId": args.account_id,
+                  "userId": args.user_id, "agentId": args.memory_agent_id, **extra},
+            timeout=max(0.1, deadline - started) if deadline else args.write_wait_timeout,
+        )
+        result = response.json()
+    except (requests.RequestException, ValueError) as error:
+        record_write_observation(observations, "POST", path, sid, None, started,
+                                 response=response, error=error)
+        if isinstance(error, requests.Timeout):
+            raise WriteObservationTimeout(f"{method} observation expired: {sid}", observations=observations) from error
+        raise
+    record_write_observation(observations, "POST", path, sid, None, started,
+                             response=response, outcome=result)
+    state = result.get("request_status")
+    if state in {"FAILED", "NEEDS_CONFIRMATION"}:
+        raise WriteRequestTerminal(result, observations)
     response.raise_for_status()
-    result = response.json()
-    if result.get("ok") is False or result.get("retryable") is False or result.get("status") == "failed":
-        raise RuntimeError(f"{method} rejected for {sid}: {result}")
+    if state == "DEGRADED":
+        if degraded_write_settled(result):
+            return result
+        if (result.get("request_id") and degraded_source_archived(result)
+                and result.get("projection_status") == "PENDING"):
+            settled = wait_write_request(args, sid, result["request_id"],
+                                         observations=observations, deadline=deadline)
+            return {**result, **settled}
+        raise WriteRequestTerminal(result, observations)
+    if result.get("ok") is False or (
+        result.get("status") == "failed" and state not in {"RUNNING", "RECOVERING", "PROJECTING"}
+    ):
+        raise RuntimeError(f"{method} rejected for {sid}: {write_status_summary(result)}")
     return result
 
 
-def wait_idle(args, sid: str) -> dict:
-    deadline = time.monotonic() + args.write_wait_timeout
+class WriteRequestTerminal(RuntimeError):
+    def __init__(self, outcome, observations=None):
+        self.request_status = outcome.get("request_status", "UNKNOWN")
+        self.status = "PRODUCT_TERMINAL"
+        self.outcome = write_status_summary(outcome)
+        self.http_observations = observations or []
+        super().__init__(f"write request {outcome.get('request_id') or outcome.get('client_request_id')}: "
+                         f"{self.request_status}")
+
+
+class WriteObservationTimeout(TimeoutError):
+    status = "OBSERVATION_TIMEOUT"
+    request_status = "UNKNOWN"
+
+    def __init__(self, message, *, request_status="UNKNOWN", observations=None):
+        self.request_status = request_status
+        self.http_observations = observations or []
+        super().__init__(message)
+
+
+def write_status_summary(outcome):
+    summary = {key: outcome[key] for key in (
+        "request_id", "client_request_id", "request_status", "source_status",
+        "semantic_status", "projection_status", "retry_action", "error_code", "error_type",
+        "ok", "idle", "compacted", "disposed", "archive_id", "message_count",
+        "commit_count", "archive_count", "pending_tokens", "source_message_ids",
+        "archived_source_ids", "recovery_mode",
+    ) if key in outcome}
+    error_code = (outcome.get("error_detail") or {}).get("code")
+    if error_code:
+        summary.setdefault("error_code", error_code)
+    return summary
+
+
+def record_write_observation(observations, method, path, sid, request_id, started,
+                             *, response=None, outcome=None, error=None):
+    if observations is not None:
+        observations.append({
+            "method": method, "path": urlsplit(path).path, "session_id": sid,
+            "request_id": (outcome or {}).get("request_id") or request_id,
+            "at": time.time(), "duration_seconds": time.monotonic() - started,
+            "http_status": response.status_code if response is not None else None,
+            "outcome": write_status_summary(outcome or {}),
+            **({"error_type": type(error).__name__} if error is not None else {}),
+        })
+
+
+def wait_write_request(args, sid, request_id, *, observations=None, deadline=None):
+    deadline = deadline if deadline is not None else time.monotonic() + args.write_wait_timeout
+    url = (f"{args.ogmemory_url.rstrip('/')}/api/v1/sessions/{quote(sid, safe='')}"
+           f"/write-requests?clientRequestId={quote(request_id, safe='')}")
+    state = "UNKNOWN"
+    while time.monotonic() < deadline:
+        started = time.monotonic()
+        response = None
+        try:
+            response = requests.get(url, headers=memory_headers(args),
+                                    timeout=max(0.1, min(30, deadline - started)))
+            outcome = response.json()
+        except (requests.RequestException, ValueError) as error:
+            record_write_observation(observations, "GET", url, sid, request_id, started,
+                                     response=response, error=error)
+            if isinstance(error, requests.Timeout):
+                continue
+            raise
+        record_write_observation(observations, "GET", url, sid, request_id, started,
+                                 response=response, outcome=outcome)
+        state = outcome.get("request_status", "UNKNOWN")
+        if state in {"FAILED", "NEEDS_CONFIRMATION"}:
+            raise WriteRequestTerminal(outcome, observations)
+        response.raise_for_status()
+        if state == "SUCCEEDED":
+            return outcome
+        if state == "DEGRADED":
+            if outcome.get("request_id") != request_id or not degraded_source_archived(outcome):
+                raise WriteRequestTerminal(outcome, observations)
+            if degraded_write_settled(outcome):
+                return outcome
+            if outcome.get("projection_status") != "PENDING":
+                raise WriteRequestTerminal(outcome, observations)
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise WriteObservationTimeout(f"write request observation expired: {sid}/{request_id}",
+                                  request_status=state, observations=observations)
+
+
+def wait_idle(args, sid: str, *, observations=None, deadline=None) -> dict:
+    deadline = deadline if deadline is not None else time.monotonic() + args.write_wait_timeout
     while time.monotonic() < deadline:
         result = memory_call(
-            args, "wait_until_idle", sid, timeoutSeconds=5, drainOutbox=False, waitOutbox=True
+            args, "wait_until_idle", sid, timeoutSeconds=5, drainOutbox=False, waitOutbox=True,
+            observations=observations, deadline=deadline,
         )
         if result.get("idle") is True:
             outbox = result.get("outbox", {})
@@ -489,61 +615,82 @@ def wait_idle(args, sid: str) -> dict:
                 raise RuntimeError(f"outbox completion unavailable: {outbox}")
             return result
         time.sleep(1)
-    raise TimeoutError(f"source settlement timed out: {sid}")
+    raise WriteObservationTimeout(f"source settlement observation expired: {sid}", observations=observations)
 
 
 def flush_source(args, sid: str) -> dict:
     started = time.monotonic()
-    wait_idle(args, sid)
-    state = source_state(args, sid)
+    deadline = started + args.write_wait_timeout
+    observations = []
+    lifecycle_writes = {}
+    wait_idle(args, sid, observations=observations, deadline=deadline)
+    state = source_state(args, sid, observations=observations, deadline=deadline)
     if not (state.get("message_count", 0) or state.get("commit_count", 0)
-            or source_state(args, sid, context=True).get("archive_count", 0)):
+            or source_state(args, sid, context=True, observations=observations, deadline=deadline).get("archive_count", 0)):
         raise RuntimeError(f"source write evidence unavailable: {sid}")
     if state.get("message_count", 0):
-        compacted = memory_call(args, "compact", sid)
+        compacted = memory_call(args, "compact", sid, observations=observations, deadline=deadline)
         if compacted.get("compacted") is not True:
-            raise RuntimeError(f"source compaction incomplete: {sid}: {compacted}")
-        wait_idle(args, sid)
-    deadline = started + args.write_wait_timeout
+            raise RuntimeError(f"source compaction incomplete: {sid}: {write_status_summary(compacted)}")
+        if degraded_write_settled(compacted):
+            lifecycle_writes["compact"] = write_status_summary(compacted)
+        wait_idle(args, sid, observations=observations, deadline=deadline)
+    dispose_request_id = None
     while time.monotonic() < deadline:
-        result = memory_call(args, "dispose", sid)
+        result = memory_call(args, "dispose", sid, observations=observations, deadline=deadline)
+        dispose_request_id = result.get("request_id") or dispose_request_id
+        if degraded_write_settled(result):
+            lifecycle_writes["dispose"] = write_status_summary(result)
         if result.get("reason") == "below_token_threshold":
             raise RuntimeError(f"source extraction below completion threshold: {sid}")
         if result.get("disposed") is True:
             break
         time.sleep(1)
     else:
-        raise TimeoutError(f"source flush timed out: {sid}")
-    idle = wait_idle(args, sid)
-    state = source_state(args, sid)
-    archives = source_state(args, sid, context=True)
+        raise WriteObservationTimeout(f"source flush observation expired: {sid}", observations=observations)
+    idle = wait_idle(args, sid, observations=observations, deadline=deadline)
+    if dispose_request_id and "dispose" not in lifecycle_writes:
+        outcome = wait_write_request(args, sid, dispose_request_id,
+                                     observations=observations, deadline=deadline)
+        if degraded_write_settled(outcome):
+            lifecycle_writes["dispose"] = write_status_summary(outcome)
+    state = source_state(args, sid, observations=observations, deadline=deadline)
+    archives = source_state(args, sid, context=True, observations=observations, deadline=deadline)
     if state.get("ok") is not True or state.get("pending_tokens") != 0:
-        raise RuntimeError(f"source buffer remains after dispose: {sid}: {state}")
+        raise RuntimeError(f"source buffer remains after dispose: {sid}: {write_status_summary(state)}")
     if not archives.get("archive_count", 0):
         raise RuntimeError(f"source archive unavailable after dispose: {sid}")
     return {
         "session_id": sid,
-        "idle": idle,
+        "idle": write_status_summary(idle),
         "pending_tokens": 0,
         "archive_count": archives["archive_count"],
+        "degraded_writes": lifecycle_writes,
         "flush_seconds": time.monotonic() - started,
+        "http_observations": observations,
     }
 
 
-def source_state(args, sid: str, *, context=False) -> dict:
-    response = requests.get(
-        f"{args.ogmemory_url}/api/v1/sessions/{quote(sid, safe='')}"
-        + ("/context" if context else ""),
-        params={
-            "accountId": args.account_id,
-            "userId": args.user_id,
-            "agentId": args.memory_agent_id,
-        },
-        headers=memory_headers(args),
-        timeout=30,
-    )
+def source_state(args, sid: str, *, context=False, observations=None, deadline=None) -> dict:
+    started, response = time.monotonic(), None
+    path = f"/api/v1/sessions/{quote(sid, safe='')}" + ("/context" if context else "")
+    try:
+        response = requests.get(
+            args.ogmemory_url.rstrip("/") + path,
+            params={"accountId": args.account_id, "userId": args.user_id, "agentId": args.memory_agent_id},
+            headers=memory_headers(args),
+            timeout=max(0.1, min(30, deadline - started)) if deadline else 30,
+        )
+        result = response.json()
+    except (requests.RequestException, ValueError) as error:
+        record_write_observation(observations, "GET", path, sid, None, started,
+                                 response=response, error=error)
+        if isinstance(error, requests.Timeout):
+            raise WriteObservationTimeout(f"source state observation expired: {sid}", observations=observations) from error
+        raise
+    record_write_observation(observations, "GET", path, sid, None, started, response=response, outcome=result)
     response.raise_for_status()
-    return response.json()
+    return result
 
 
 def create_adapter(args):
@@ -746,6 +893,10 @@ def ingest(args, samples, adapter):
             if not args.force_ingest and (
                 prior.get("success") or (args.verify_writes and prior.get("write_verified"))
             ):
+                if prior.get("adapter", adapter.description) != adapter.description:
+                    raise RuntimeError(
+                        f"Ingest adapter changed for {sid}/{name}; use a fresh identity and ingest record"
+                    )
                 if args.verify_writes and (
                     not prior.get("write_verified") or not prior.get("source_ids")
                     or prior.get("source_sha256") != source_sha256 or prior.get("session_key") != key
@@ -770,6 +921,7 @@ def ingest(args, samples, adapter):
                     "success": not args.verify_writes, "session_key": key, "source_ids": source_ids,
                     "write_verified": args.verify_writes,
                     "source_sha256": source_sha256,
+                    "adapter": adapter.description,
                 }
                 selected_source_ids.update(source_ids)
             except Exception as error:
@@ -787,6 +939,10 @@ def ingest(args, samples, adapter):
                 "reply": reply,
                 "usage": usage,
                 "write_seconds": time.monotonic() - before,
+                "observation_status": getattr(failure, "status", "ERROR") if failure else (
+                    "AWAITING_SETTLEMENT" if args.verify_writes else "COMPLETED"),
+                "request_status": getattr(failure, "request_status", None),
+                "http_observations": getattr(failure, "http_observations", []) if failure else [],
             }
             previous = next(
                 (i for i, prior in enumerate(rows)
@@ -803,11 +959,26 @@ def ingest(args, samples, adapter):
     if args.verify_writes:
         if not selected_source_ids:
             raise RuntimeError("Write verification requires at least one source session")
-        checks = [adapter.settle(sid) for sid in sorted(selected_source_ids)]
-        write_json(args.output_dir / "source-completion.json", {"sources": checks})
+        checks = []
+        try:
+            for sid in sorted(selected_source_ids):
+                checks.append(adapter.settle(sid))
+        except Exception as error:
+            write_json(args.output_dir / "source-completion.json", {
+                "complete": False, "sources": checks,
+                "observation_status": getattr(error, "status", "ERROR"),
+                "request_status": getattr(error, "request_status", None),
+                "http_observations": getattr(error, "http_observations", []),
+            })
+            raise
+        write_json(args.output_dir / "source-completion.json", {"complete": True, "sources": checks})
         for key in selected_record_keys:
             record[key]["success"] = True
         write_json(record_path, record)
+        for row in rows:
+            if set(row.get("source_ids", [])) & selected_source_ids:
+                row["observation_status"] = "COMPLETED"
+        write_json(args.output_dir / "ingest.json", rows)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
@@ -891,8 +1062,9 @@ def run(args, adapter_factory=None, judge_fn=judge):
         adapter.close()
 
 
-def main(argv=None, *, agent=None, transports=None):
-    parser = build_parser(agent, transports=transports)
+def main(argv=None, *, agent=None, transports=None, parser=None, adapter_factory=None):
+    if parser is None:
+        parser = build_parser(agent, transports=transports)
     args = parser.parse_args(argv)
     args.dataset = args.dataset.resolve()
     args.output = args.output.resolve() if args.output else None
@@ -911,7 +1083,7 @@ def main(argv=None, *, agent=None, transports=None):
     args.llm_api_key = os.environ.get(args.llm_api_key_env, "")
     if args.transport in ("ce", "mcp", "gateway") and args.agent != "openclaw":
         raise ValueError("CE/MCP/gateway require OpenClaw")
-    return run(args)
+    return run(args, adapter_factory=adapter_factory)
 
 
 if __name__ == "__main__":

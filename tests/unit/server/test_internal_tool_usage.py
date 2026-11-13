@@ -280,6 +280,7 @@ def test_model_usage_metrics_combines_llm_and_embedding_trackers():
     assert metrics["models"] == {
         "llm": "qwen-plus",
         "embedding": "text-embedding-v3",
+        "decision": "",
     }
     assert metrics["today"]["total"] == 200
     assert metrics["cumulative"]["llm"]["calls"] == 1

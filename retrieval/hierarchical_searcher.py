@@ -92,6 +92,8 @@ class HierarchicalSearcher:
         base_filters: dict[str, Any] = {"account_id": ctx.account_id}
         if typed_query.context_type:
             base_filters["context_type"] = typed_query.context_type
+        if typed_query.categories:
+            base_filters["category"] = typed_query.categories
         if typed_query.memory_directories is not None:
             base_filters["memory_directory"] = typed_query.memory_directories
         owner_space = allowed_owner_space_filter(

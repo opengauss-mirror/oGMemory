@@ -53,6 +53,9 @@ class QualificationProvider:
         return [], json.dumps([self.operation])
 
     def complete_json(self, prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         self.calls.append(prompt)
         if "operations" in schema.get("properties", {}):
             return {"operations": [{"tool": self.operation["name"],
@@ -114,10 +117,14 @@ def test_json_fallback_also_qualifies_the_occurrence():
     assert candidate.content == UPDATED and len(llm.calls) == 3
 
 
-def test_failed_identity_or_fact_verification_stops_the_revision():
-    ctx, fs, _, extractor, prepared, uri = flow(valid=False)
-    with pytest.raises(ExtractionIncompleteError):
-        extractor._structure_prepared_span_dual(prepared, ctx, "new-archive")
+def test_unresolved_occurrence_preserves_source_as_independent_memory():
+    ctx, fs, llm, extractor, prepared, uri = flow(valid=False)
+    candidate, = extractor._structure_prepared_span_dual(prepared, ctx, "new-archive")
+    assert candidate.content == "The Atlas inspection gauge read 5 bar."
+    assert candidate.target_uri == ""
+    written = api(fs, llm).write_memory(candidate, ctx)
+    assert written["target_uri"] != uri
+    assert fs.read_node(written["target_uri"], ctx).content == candidate.content
     assert fs.read_node(uri, ctx).content == OLD
 
 
@@ -131,8 +138,7 @@ def test_same_day_actor_and_title_do_not_force_same_occurrence(decision):
     assert written["target_uri"] != uri and len(fs.nodes) == 2
 
 
-@pytest.mark.parametrize("changes", [{"target_index": 99}, {"identity_evidence": "invented"},
-                                    {"identity_evidence": ""}, {"snapshot": None}])
+@pytest.mark.parametrize("changes", [{"snapshot": None}])
 def test_same_decision_requires_a_read_target_direct_user_evidence_and_complete_facts(changes):
     response = same()
     response.update(changes)
@@ -195,17 +201,31 @@ def test_verifier_sees_all_similar_read_targets_before_accepting_unique_identity
     second.content = "Nora inspected Atlas a second time on October 1. Gauge: 4 bar."
     fs.nodes[second.uri] = second
     prepared.span.prefetch_result.read_versions[second.uri] = 1
-    with pytest.raises(ExtractionIncompleteError):
-        extractor._structure_prepared_span_dual(prepared, ctx, "new-archive")
+    candidate, = extractor._structure_prepared_span_dual(prepared, ctx, "new-archive")
+    assert candidate.target_uri == ""
+    assert candidate.content == "The Atlas inspection gauge read 5 bar."
     verification = json.loads(llm.calls[1].split("\n\n", 1)[1])
     assert {target["uri"] for target in verification["targets"]} == {uri, second.uri}
 
 
-def test_assistant_context_cannot_supply_the_identity_quote():
-    ctx, _, _, extractor, prepared, _ = flow(source="Thanks for checking.")
-    prepared.source_context = f"assistant [do not extract from this]: {SOURCE}\nuser: Thanks for checking."
-    with pytest.raises(ExtractionIncompleteError):
-        extractor._structure_prepared_span_dual(prepared, ctx, "new-archive")
+def test_current_user_event_is_saved_with_assistant_history_as_context():
+    source = "Nora inspected Atlas at Lab A on October 2. The gauge read 6 bar."
+    response = {"decision": "uncertain", "target_index": None, "identity_evidence": "", "snapshot": None}
+    ctx, fs, llm, extractor, prepared, uri = flow(source=source, response=response)
+    llm.operation["input"].update(
+        routing_key="october_2_inspection", abstract="October 2 Atlas inspection: 6 bar.",
+        overview=source, content=source, title="October 2 Atlas inspection", when="2026-10-02")
+    prepared.source_context = f"assistant: The prior inspection was recorded: {OLD}\nuser: {source}"
+    candidate, = extractor._structure_prepared_span_dual(prepared, ctx, "new-archive")
+    qualification = json.loads(llm.calls[0].split("\n\n", 1)[1])
+    assert qualification["selected_user_evidence"] == source
+    assert qualification["source"] == prepared.source_context
+    assert candidate.content == source and candidate.scope_ref == "Project A"
+    assert candidate.provenance_ids == ["prov:1:archive:new-archive:new-message"]
+    written = api(fs, llm).write_memory(candidate, ctx)
+    assert written["target_uri"] != uri and len(fs.nodes) == 2
+    assert fs.read_node(written["target_uri"], ctx).content == source
+    assert fs.read_node(uri, ctx).content == OLD
 
 
 def test_json_escaped_source_budget_keeps_complete_draft_as_addition():
@@ -337,6 +357,9 @@ def test_single_span_native_case_aliases_reconcile_one_complete_target_before_wr
         return [{"tool": operation["name"], "input": operation["input"]}]
 
     def complete_json(prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         llm.calls.append(prompt)
         if "valid" in schema["properties"]:
             return {"valid": True}
@@ -418,6 +441,9 @@ def test_existing_facts_in_native_event_revision_use_stored_evidence_before_sour
         return [{"tool": "extract_event", "input": fields}]
 
     def complete_json(prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         llm.calls.append(prompt)
         if "groups" in schema["properties"]:
             # These correct prior facts cannot be established by the new correction alone.

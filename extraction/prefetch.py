@@ -109,6 +109,20 @@ class MemoryPrefetcher:
         self._embedder = embedder
         self._registry = registry
         self._uri_resolver = uri_resolver
+
+    def prefetch_node_snapshots(self, categories, ctx, conversation_text, *, read_nodes=None):
+        """Read bounded semantic candidates with one shared embedding batch."""
+        vectors = self._prefetch_vectors(conversation_text)
+        if not vectors:
+            return {}
+        nodes = {}
+        for category in categories:
+            result = self._prefetch_multi_file(category, ctx, conversation_text=conversation_text,
+                                               query_vectors=vectors, read_nodes=read_nodes,
+                                               include_messages=False)
+            nodes.update(result.read_nodes)
+        return nodes
+
     def _prefetch(
         self,
         memory_type: str,
@@ -184,11 +198,7 @@ class MemoryPrefetcher:
                                  and schema.operation_mode == "add_only"}
         query_vectors = None
         if conversation_text and vector_categories:
-            try:
-                query_vectors = self._embed_queries(conversation_text)
-            except Exception as exc:
-                logger.warning("Prefetch embedding failed: %s", exc)
-                query_vectors = []
+            query_vectors = self._prefetch_vectors(conversation_text)
         results: dict[str, PrefetchResult] = {}
         budget = None
         # Existing upsert behavior stays intact; account for its actual context
@@ -216,6 +226,13 @@ class MemoryPrefetcher:
                 combined.listed_uris.update(result.listed_uris)
                 combined.uri_hints.extend(result.uri_hints)
         return combined
+
+    def _prefetch_vectors(self, text: str) -> list[list[float]]:
+        try:
+            return self._embed_queries(text)
+        except Exception as exc:
+            logger.warning("Prefetch embedding failed: %s", exc)
+            return []
 
     def _embed_queries(self, text: str) -> list[list[float]]:
         """Bound query count/length while retaining windows across the whole source."""
@@ -318,6 +335,8 @@ class MemoryPrefetcher:
         conversation_text: str | None = None,
         lazy: bool = False,
         query_vectors: list[list[float]] | None = None,
+        read_nodes: dict[str, ContextNode] | None = None,
+        include_messages: bool = True,
     ) -> PrefetchResult:
         """Prefetch for multi-file schemas using vector search."""
         result = PrefetchResult(is_lazy=lazy)
@@ -347,10 +366,13 @@ class MemoryPrefetcher:
                 else:
                     # Eager: read full content
                     try:
-                        node = self._fs.read_node(node_uri, ctx)
+                        node = ((read_nodes or {}).get(node_uri)
+                                or self._fs.read_node(node_uri, ctx))
                         result.read_uris.add(node_uri)
                         result.read_versions[node_uri] = node.metadata.get("version", 0)
                         result.read_nodes[node_uri] = deepcopy(node)
+                        if not include_messages:
+                            continue
                         result.messages.append(
                             f"[{memory_type}] URI: {node_uri}\n"
                             f"Version: {node.metadata.get('version', 0)}\n"
@@ -367,11 +389,12 @@ class MemoryPrefetcher:
                         )
                     except Exception as e:
                         logger.warning(f"Failed to read {hit.uri}: {e}")
-                        result.messages.append(
-                            f"[{memory_type}] URI: {hit.uri}\n"
-                            f"Abstract: {hit.abstract}\n"
-                            f"(similarity: {hit.score:.2f}, read failed)"
-                        )
+                        if include_messages:
+                            result.messages.append(
+                                f"[{memory_type}] URI: {hit.uri}\n"
+                                f"Abstract: {hit.abstract}\n"
+                                f"(similarity: {hit.score:.2f}, read failed)"
+                            )
 
             count = len(result.uri_hints) if lazy else len(result.read_uris)
             logger.info(f"{'Lazy prefetch' if lazy else 'Prefetched'} {memory_type}: {count} items")

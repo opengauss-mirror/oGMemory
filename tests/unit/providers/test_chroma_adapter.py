@@ -103,6 +103,31 @@ def test_upsert_and_delete_respect_provider_batch_limit():
     assert index.count() == 0
 
 
+def test_graph_projection_metadata_and_filters_are_preserved():
+    record = _record('activation')
+    record.metadata.update(record_kind='update_activation', representation_version='v1',
+        memory_revision='revision-hash', canonical_revision=2,
+        embedding_model='embedder', embedding_dimension=3)
+    meta = ChromaVectorIndex._record_to_meta(record)
+    for key in ('record_kind','representation_version','memory_revision',
+                'canonical_revision','embedding_model','embedding_dimension'):
+        assert meta[key] == record.metadata[key]
+    assert ChromaVectorIndex._build_where({'record_kind':'update_activation'}) == {
+        'record_kind':'update_activation'}
+
+
+def test_get_record_accepts_numpy_embeddings():
+    import numpy as np
+    index = ChromaVectorIndex.__new__(ChromaVectorIndex)
+    index._collection = Mock()
+    index._collection.get.return_value = dict(ids=['node'], documents=['fact'],
+        metadatas=[dict(uri='ctx://acct/node',level=0,embedding_model='model')],
+        embeddings=np.array([[1.,0.,0.]]))
+    record = index.get_record('node')
+    assert record.metadata['_embedding'] == [1.,0.,0.]
+    assert record.metadata['embedding_model'] == 'model'
+
+
 def test_scope_delete_is_tenant_and_owner_isolated():
     index = _index()
     index.upsert(

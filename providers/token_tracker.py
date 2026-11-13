@@ -131,12 +131,14 @@ def distributed_usage_scope(weights, *, inputs=None):
 
 
 @contextmanager
-def embedding_input_scope(indices):
+def embedding_input_scope(indices, *, weights=None):
     inputs = _embedding_inputs.get()
     if inputs is None:
         yield
         return
     selected = [inputs[i] for i in indices]
+    if weights is not None:
+        selected = [(item[0], weight) for item, weight in zip(selected, weights, strict=True)]
     with distributed_usage_scope(embedding_scope_weights(selected), inputs=selected):
         yield
 
@@ -830,6 +832,9 @@ class TokenTracker(UsageTracker):
             raise UsagePersistenceError('Model usage persistence failed') from exc
 
     def record_failure(self, kind, *, deadline=None):
+        if kind == 'llm':
+            from providers.llm_observation import record_observed_usage
+            record_observed_usage(model=self._model, failed=True, usage_known=False)
         self._persist(kind, {'failed_calls': 1}, deadline=deadline)
 
     def record_cache_hit(self, kind, *, deadline=None):
@@ -862,6 +867,9 @@ class TokenTracker(UsageTracker):
         usage_known: bool = True,
         model: str | None = None,
     ) -> str:
+        from providers.llm_observation import record_observed_usage
+        record_observed_usage(input_tokens=input_tokens, output_tokens=output_tokens,
+                              model=model or self._model, usage_known=usage_known, event_id=event_id)
         self._persist('llm', dict(input_tokens=input_tokens, output_tokens=output_tokens,
                                  cache_read=cache_read, cache_write=cache_write, llm_calls=1,
                                  missing_usage_calls=int(not usage_known)),

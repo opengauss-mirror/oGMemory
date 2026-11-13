@@ -121,3 +121,13 @@ __all__ = [
     "ReactTaskContext",
     "ReactTrace",
 ]
+
+
+def __getattr__(name):
+    if name in {"ReactLoop", "ReactLoopResult", "ReactIterationTrace", "ReactTaskContext", "ReactTrace"}:
+        from importlib import import_module
+
+        value = getattr(import_module("core.react_loop"), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

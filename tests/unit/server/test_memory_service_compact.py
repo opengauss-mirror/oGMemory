@@ -8,6 +8,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("service_threading")
+
 from core.models import RequestContext
 from providers import unified_config
 from providers.unified_config import OgMemConfig
@@ -160,11 +162,11 @@ def test_after_turn_deduplicates_completed_client_request(service: MemoryService
 
     assert first["status"] == "accumulating"
     assert first["client_request_id"] == "pending-1"
-    assert replay == {
+    assert {
         "ok": True,
         "status": "duplicate",
         "client_request_id": "pending-1",
-    }
+    }.items() <= replay.items()
     assert len(manager.get_or_create("sess-idempotent").messages) == 1
     assert manager.save_session_state.call_count == 2
 
@@ -187,18 +189,20 @@ def test_after_turn_retries_until_idempotency_state_is_durable(
     first = service.after_turn(params)
     replay = service.after_turn(params)
 
-    assert first == {
+    assert {
         "ok": False,
         "status": "failed",
         "error": "idempotency state unavailable",
         "retryable": True,
         "client_request_id": "pending-save-1",
-    }
-    assert replay == {
+    }.items() <= first.items()
+    assert {
         "ok": True,
-        "status": "duplicate",
+        "status": "accumulating",
+        "request_status": "ACCEPTED",
+        "source_status": "BUFFERED",
         "client_request_id": "pending-save-1",
-    }
+    }.items() <= replay.items()
     assert len(manager.get_or_create("sess-idempotent-save").messages) == 1
 
 
@@ -224,13 +228,13 @@ def test_after_turn_does_not_complete_replay_while_original_request_is_processin
         "_ctx": ctx,
     })
 
-    assert replay == {
+    assert {
         "ok": False,
         "status": "processing",
         "retryable": True,
         "pending_tokens": buffer.pending_tokens,
         "client_request_id": "pending-overlap-1",
-    }
+    }.items() <= replay.items()
     assert buffer.request_completed("pending-overlap-1") is False
     manager.save_session_state.assert_not_called()
 
@@ -266,12 +270,13 @@ def test_after_turn_claims_client_request_before_processing(
     release_save.set()
     first.join(timeout=2)
 
-    assert replay == {
+    assert {
         "ok": False,
-        "status": "processing",
-        "retryable": True,
-        "client_request_id": "pending-claim-1",
-    }
+        "status": "request_in_progress",
+        "retry_action": "retry_same_request",
+        "http_status": 409,
+        "request_id": "pending-claim-1",
+    }.items() <= replay.items()
     assert first_result[0]["status"] == "accumulating"
     assert len(manager.get_or_create("sess-idempotent-claim").messages) == 1
 
@@ -294,11 +299,11 @@ def test_after_turn_uses_in_memory_idempotency_when_state_bridge_is_disabled(
     replay = service.after_turn(params)
 
     assert first["status"] == "accumulating"
-    assert replay == {
+    assert {
         "ok": True,
         "status": "duplicate",
         "client_request_id": "pending-memory-only-1",
-    }
+    }.items() <= replay.items()
     assert len(manager.get_or_create("sess-idempotent-memory-only").messages) == 1
     manager.save_session_state.assert_not_called()
 

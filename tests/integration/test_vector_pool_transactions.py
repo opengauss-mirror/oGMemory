@@ -159,7 +159,7 @@ def test_cold_service_connectivity_recovery(vector_pool, method):
             service._sql_pool.close_all()
 
 
-@pytest.mark.parametrize("schema_kind", ["current", "legacy_node_id"])
+@pytest.mark.parametrize("schema_kind", ["current", "legacy_node_id", "legacy_node_id_after_v1"])
 def test_legacy_vector_backfill_completes_with_canonical_schema(vector_pool, schema_kind):
     from fs.sql_adapter import SQLContextFS
 
@@ -173,16 +173,50 @@ def test_legacy_vector_backfill_completes_with_canonical_schema(vector_pool, sch
             cur.execute("INSERT INTO context_nodes "
                         "(uri, account_id, owner_space, category, context_type) "
                         "VALUES (%s, 'acct', 'user:alice', 'events', 'MEMORY')", (uri,))
-            if schema_kind == "legacy_node_id":
+            if schema_kind != "current":
                 cur.execute("ALTER TABLE context_nodes ADD COLUMN node_id UUID")
                 cur.execute("UPDATE context_nodes SET node_id=%s WHERE uri=%s", (node_id, uri))
-            cur.execute("UPDATE vectors SET account_id=NULL, owner_space=NULL, node_uri=NULL")
+            if schema_kind == "legacy_node_id_after_v1":
+                cur.execute("""CREATE TABLE ogmem_vector_migrations (
+                    table_name TEXT NOT NULL, migration TEXT NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (table_name, migration))""")
+                cur.execute("INSERT INTO ogmem_vector_migrations (table_name, migration) "
+                            "VALUES ('vectors', 'legacy_columns_v1')")
+            else:
+                cur.execute("UPDATE vectors SET account_id=NULL, owner_space=NULL, node_uri=NULL")
         conn.commit()
     finally:
         pool.return_connection(conn)
     assert index.migrate_legacy_rows() is True
     assert index.count({"account_id": "acct", "owner_space": "user:alice"}) == 1
-    assert index.search_by_vector([1, 0, 0], {"account_id": "acct"}, 1)[0].uri == uri
-    if schema_kind == "legacy_node_id":
-        assert index.search_by_vector([1, 0, 0], {"account_id": "acct"}, 1)[0].metadata["node_id"] == node_id
+    hit, = index.search_by_vector([1, 0, 0], {"account_id": "acct"}, 1)
+    assert hit.uri == uri
+    if schema_kind != "current":
+        assert hit.metadata["node_id"] == node_id
     assert index.migrate_legacy_rows() is False
+
+
+@pytest.mark.parametrize('shared', [True, False])
+def test_first_vector_query_recovers_after_idle_backend_termination(vector_pool, shared):
+    pool, index, control, _, uri = vector_pool
+    if not shared:
+        index = OpenGaussVectorIndex(connection_string=pool.connection_string,
+                                    dialect=pool.dialect, dimension=3, table_name='vectors')
+    filters = {'account_id': 'acct', 'owner_space': 'user:alice'}
+    try:
+        assert index.search_by_vector([1, 0, 0], filters, 2)
+        idle = pool._pool[-1] if shared else index._pool[-1]
+        with idle.cursor() as cursor:
+            cursor.execute('SELECT pg_backend_pid()')
+            backend_pid = cursor.fetchone()[0]
+        idle.rollback()
+        with control.cursor() as cursor:
+            cursor.execute('SELECT pg_terminate_backend(%s)', (backend_pid,))
+            assert cursor.fetchone()[0]
+        assert [hit.uri for hit in index.search_by_vector([1, 0, 0], filters, 2)] == [uri]
+        assert idle.closed
+    finally:
+        if not shared:
+            for conn in index._pool:
+                conn.close()

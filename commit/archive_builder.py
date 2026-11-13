@@ -120,6 +120,8 @@ class ArchiveBuilder:
         # Add expected_version for optimistic locking (from merge policies)
         if "expected_version" in plan.merged_fields:
             metadata["expected_version"] = plan.merged_fields["expected_version"]
+            if plan.action == "create" and metadata["expected_version"] == 0:
+                metadata["_expected_version"] = 0
 
         # Add any merged metadata
         if "usage_count" in plan.merged_fields:
@@ -177,6 +179,14 @@ class ArchiveBuilder:
                 if (self._card_format_enabled and candidate.category in {"entity", "preference"}
                         and "existing_overview" in plan.merged_fields):
                     abstract = " ".join(abstract.splitlines()).strip()
+
+        # Apply the validated incoming descriptor AFTER existing identity
+        # metadata; otherwise an update silently restores the old descriptor.
+        from index.activation_projection import ACTIVATION_VERSION, candidate_activation
+        descriptor = candidate_activation(candidate)
+        if descriptor is not None:
+            metadata["update_activation"] = descriptor
+            metadata["update_activation_version"] = ACTIVATION_VERSION
 
         if self._card_format_enabled:
             from extraction.card_format import validate_memory_card
@@ -434,4 +444,3 @@ class ArchiveBuilder:
                 seen.add(key)
                 paragraphs.append(cleaned)
         return "\n\n".join(paragraphs)
-

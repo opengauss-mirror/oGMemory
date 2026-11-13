@@ -112,6 +112,7 @@ def test_expand_walks_hierarchy_and_returns_sorted_leaf_hits():
         "account_id": "acct-1",
         "context_type": "MEMORY",
         "owner_space": "user:u1",
+        "category": ["preferences"],
     }
 
 

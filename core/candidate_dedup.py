@@ -10,15 +10,29 @@ from core.models import CandidateMemory
 def candidate_draft_fields(candidate: CandidateMemory) -> dict:
     """Preserve legacy serialization when optional internal partition identity is absent."""
     fields = asdict(candidate)
-    for name in ("source_occurrence_id", "source_contexts", "node_draft_indices"):
+    from extraction.relation_proposals import KEY
+    metadata = dict(fields.get("metadata") or {})
+    metadata.pop(KEY, None)
+    fields["metadata"] = metadata
+    fields.pop("node_reconciliation_role", None)
+    fields.pop("node_reconciliation_group", None)
+    for name in ("source_occurrence_id", "source_contexts", "node_draft_indices", "metadata"):
         if not fields.get(name):
             fields.pop(name, None)
     return fields
 
 
-def occurrence_replay_fields(candidate: CandidateMemory) -> dict:
+def occurrence_replay_fields(candidate: CandidateMemory, *, include_graph_annotations=False) -> dict:
     """Complete occurrence facts and partition identity used for exact replay."""
     fields = candidate_draft_fields(candidate)
+    if not include_graph_annotations:
+        metadata = dict(fields.get("metadata") or {})
+        for key in ("update_activation", "update_activation_version"):
+            metadata.pop(key, None)
+        if metadata:
+            fields["metadata"] = metadata
+        else:
+            fields.pop("metadata", None)
     for name in ("routing_key", "legacy_routing_key", "target_uri", "expected_version",
                  "confidence", "provenance_ids", "complete_occurrence_context", "write_operation_id",
                  "verified_routing_aliases", "verified_object_aliases"):

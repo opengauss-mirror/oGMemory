@@ -84,6 +84,13 @@ storage:
 # STORAGE_DB_HOST_PORT above.
 vector_db:
   type: opengauss
+  # Manual Milvus setup: set type: milvus and install .[milvus].
+  # Docker onboarding/quickstart also supports Milvus. Embedding dimension must match.
+  # milvus_uri: "http://localhost:19530"    # MILVUS_URI
+  # milvus_collection: "contextengine"     # MILVUS_COLLECTION
+  # milvus_db_name: "default"              # MILVUS_DB_NAME
+  # milvus_timeout: 30                     # MILVUS_TIMEOUT (seconds)
+  # Supply credentials via MILVUS_TOKEN instead of committing them to YAML.
   connection_string: "host=${VECTOR_DB_HOST} port=${VECTOR_DB_HOST_PORT} dbname=${VECTOR_DB_NAME} user=${VECTOR_DB_USER} password=${VECTOR_DB_PASSWORD}"
   dimension: 1024
   table_name: vector_index
@@ -145,7 +152,7 @@ sharing:
 
 # ---- 记忆提取 ----
 memory:
-  # after_turn_threshold: 200
+  # after_turn_threshold: 400
   # rolling_compress_enabled: true
   # rolling_compress_fallback_enabled: false
   # compact_prepare_token_ttl: 300

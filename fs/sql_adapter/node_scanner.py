@@ -33,7 +33,7 @@ class SQLCanonicalNodeScanner:
         )
 
     def projection_is_quiescent(self, *, account_id: str) -> bool:
-        """Return whether no canonical projection work can still change reads."""
+        """Return whether canonical lexical projection work has settled."""
         conn = self._pool.get_connection(validate=False)
         try:
             PoolAdapterMixin.bind_tenant(conn, account_id)
@@ -44,10 +44,10 @@ class SQLCanonicalNodeScanner:
                     SELECT 1 FROM outbox_events
                     WHERE account_id=%s
                       AND status IN ('PENDING','PROCESSING')
-                      AND event_type <> %s
+                      AND event_type NOT IN (%s, %s)
                     LIMIT 1
                     """,
-                    (account_id, EventType.EXTRACT_AGENT_MEMORY.value),
+                    (account_id, EventType.EXTRACT_AGENT_MEMORY.value, "PROJECT_GRAPH"),
                 )
                 pending = cur.fetchone()
             conn.rollback()

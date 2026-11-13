@@ -5,7 +5,7 @@ readonly ENV_FILE="${OGMEMORY_ENV_FILE:-$HOME/ogmemory.env}"
 readonly STACK_ROOT="${OGMEMORY_STACK_ROOT:-$HOME}"
 readonly PUBLISH_IP="127.0.0.1"
 readonly OPENGAUSS_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328"
-readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013"
+readonly DEFAULT_OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013"
 readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0903"
 
 fail() {
@@ -50,16 +50,39 @@ wait_http() {
   local name="$1"
   local url="$2"
   local container="$3"
-  local attempt
-  for attempt in $(seq 1 120); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
+  local deadline=$((SECONDS + ${OGMEM_DEPLOY_WAIT_SECONDS:-360}))
+  local remaining request_timeout connect_timeout pause
+  while ((SECONDS < deadline)); do
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || break
+    request_timeout=$((remaining < 10 ? remaining : 10))
+    connect_timeout=$((remaining < 3 ? remaining : 3))
+    if curl -fsS --connect-timeout "$connect_timeout" --max-time "$request_timeout" \
+      "$url" >/dev/null 2>&1; then
       echo "$name 已就绪"
       return 0
     fi
-    sleep 3
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || break
+    pause=$((remaining < 3 ? remaining : 3))
+    sleep "$pause"
   done
   docker logs --tail 100 "$container" >&2 || true
   fail "$name 启动超时"
+}
+
+milvus_proxy_host() {
+  local authority="${1#*://}"
+  local host
+  authority="${authority%%[/?#]*}"
+  authority="${authority##*@}"
+  if [[ "$authority" == \[* ]]; then
+    authority="${authority#\[}"
+    host="${authority%%\]*}"
+  else
+    host="${authority%%:*}"
+  fi
+  printf '%s' "${host,,}"
 }
 
 show_upstream_error() {
@@ -248,6 +271,32 @@ external_after_turn_threshold_value="${OGMEM_AFTER_TURN_THRESHOLD-}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+OGMEM_DEPLOY_WAIT_SECONDS="${OGMEM_DEPLOY_WAIT_SECONDS:-360}"
+[[ "$OGMEM_DEPLOY_WAIT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] && \
+  ((OGMEM_DEPLOY_WAIT_SECONDS <= 86400)) || fail "OGMEM_DEPLOY_WAIT_SECONDS 必须是 1-86400 的整数"
+
+VECTOR_DB_TYPE="${VECTOR_DB_TYPE:-opengauss}"
+case "$VECTOR_DB_TYPE" in
+  opengauss|milvus) ;;
+  *) fail "VECTOR_DB_TYPE 仅支持 opengauss 或 milvus（Chroma 请使用 local/headless 模式）" ;;
+esac
+MILVUS_URI="${MILVUS_URI:-http://host.docker.internal:19530}"
+MILVUS_COLLECTION="${MILVUS_COLLECTION:-contextengine}"
+MILVUS_DB_NAME="${MILVUS_DB_NAME:-default}"
+MILVUS_TIMEOUT="${MILVUS_TIMEOUT:-30}"
+if [[ "$VECTOR_DB_TYPE" == milvus ]]; then
+  [[ "$MILVUS_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] && \
+    awk -v t="$MILVUS_TIMEOUT" 'BEGIN {exit !(t > 0)}' || fail "MILVUS_TIMEOUT 必须是正数"
+  [[ "$MILVUS_URI" == http://* || "$MILVUS_URI" == https://* ]] || fail "MILVUS_URI 必须是外部服务 HTTP(S) 地址"
+  [[ "$MILVUS_URI" != *://localhost* && "$MILVUS_URI" != *://127.0.0.1* ]] || \
+    fail "MILVUS_URI 必须从容器可达；宿主机服务可使用 host.docker.internal"
+  milvus_host="$(milvus_proxy_host "$MILVUS_URI")"
+  [[ -n "$milvus_host" ]] || fail "MILVUS_URI 缺少服务主机"
+  # gRPC does not treat no_proxy='*' as a universal bypass. Use the target
+  # hostname, while preserving an explicit operator override (including empty).
+  MILVUS_NO_GRPC_PROXY="${MILVUS_NO_GRPC_PROXY-${no_grpc_proxy-$milvus_host}}"
+fi
+
 if [[ -n "$external_reset_openclaw_config_set" ]]; then
   RESET_OPENCLAW_CONFIG="$external_reset_openclaw_config_value"
 fi
@@ -313,12 +362,14 @@ done
   fail "EMBEDDING_BASE_URL 应填写 Base URL，不能包含具体的 /embeddings 接口"
 
 port_names=(
-  OPENGAUSS_HOST_PORT
   OGMEM_HTTP_HOST_PORT
   OGMEM_MCP_HOST_PORT
   OPENCLAW_CE_HOST_PORT
   OPENCLAW_MCP_HOST_PORT
 )
+if [[ "$VECTOR_DB_TYPE" == opengauss ]]; then
+  port_names+=(OPENGAUSS_HOST_PORT)
+fi
 declare -A seen_ports=()
 for name in "${port_names[@]}"; do
   require_value "$name"
@@ -385,6 +436,17 @@ elif [[ -d "$STACK_DIR/opengauss" ]] && compgen -G "$STACK_DIR/opengauss/*" >/de
   fail "检测到未记录 Embedding 配置的 openGauss 数据；为避免损坏索引，未继续部署"
 fi
 
+# A backend switch requires reindexing; never silently start an empty index.
+vector_fingerprint="$(printf '%s\n' "$VECTOR_DB_TYPE" \
+  "$([[ "$VECTOR_DB_TYPE" == milvus ]] && printf '%s|%s|%s' "$MILVUS_URI" "$MILVUS_COLLECTION" "$MILVUS_DB_NAME" || true)" \
+  | sha256sum | awk '{print $1}')"
+if [[ -s "$STACK_DIR/vector.state" ]]; then
+  [[ "$(state_value "$STACK_DIR/vector.state" fingerprint)" == "$vector_fingerprint" ]] || \
+    fail "已有实例不能直接切换向量后端或 Milvus 集合；请使用新的 INSTANCE_NAME 并重建索引"
+elif [[ -s "$EMBEDDING_STATE_FILE" && "$VECTOR_DB_TYPE" != opengauss ]]; then
+  fail "已有实例使用 openGauss；请使用新的 INSTANCE_NAME 并重建索引"
+fi
+
 # 在创建或删除任何容器之前验证外部模型服务，避免服务启动后才发现上游不可用。
 validate_llm_connectivity
 validate_embedding_connectivity
@@ -437,8 +499,31 @@ umask 077
 } > "$RUNTIME_ENV_FILE"
 chmod 600 "$RUNTIME_ENV_FILE"
 
-ensure_image "$OPENGAUSS_IMAGE"
+if [[ "$VECTOR_DB_TYPE" == opengauss ]]; then
+  ensure_image "$OPENGAUSS_IMAGE"
+  OGMEM_IMAGE="${OGMEM_IMAGE:-$DEFAULT_OGMEM_IMAGE}"
+elif [[ -z "${OGMEM_IMAGE:-}" ]]; then
+  source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  [[ -f "$source_root/docker/Dockerfile.standalone" ]] || \
+    fail "请从源码仓运行，或通过 OGMEM_IMAGE 指定包含所选后端依赖的镜像"
+  OGMEM_IMAGE="ogmemory:quickstart-$VECTOR_DB_TYPE"
+  docker build --target standalone-agfs --build-arg "VECTOR_DB_EXTRA=$VECTOR_DB_TYPE" \
+    -f "$source_root/docker/Dockerfile.standalone" -t "$OGMEM_IMAGE" "$source_root"
+fi
 ensure_image "$OGMEM_IMAGE"
+if [[ "$VECTOR_DB_TYPE" == milvus ]]; then
+  # Probe on the final runtime network before removing any existing service.
+  docker network inspect "$OGMEM_NETWORK" >/dev/null 2>&1 || \
+    docker network create "$OGMEM_NETWORK" >/dev/null
+  MILVUS_TOKEN="${MILVUS_TOKEN:-}" docker run --rm \
+    --network "$OGMEM_NETWORK" --add-host host.docker.internal:host-gateway \
+    -e "no_grpc_proxy=$MILVUS_NO_GRPC_PROXY" \
+    -e "MILVUS_URI=$MILVUS_URI" -e MILVUS_TOKEN \
+    -e "MILVUS_COLLECTION=$MILVUS_COLLECTION" -e "MILVUS_DB_NAME=$MILVUS_DB_NAME" \
+    -e "MILVUS_TIMEOUT=$MILVUS_TIMEOUT" -e "VECTOR_DB_DIMENSION=$EMBEDDING_DIMENSION" \
+    --entrypoint python "$OGMEM_IMAGE" -m scripts.check_milvus \
+    || fail "Milvus 预检失败，未替换现有容器；请检查网络、认证、数据库、集合 schema/索引及读写权限"
+fi
 ensure_image "$OPENCLAW_IMAGE"
 
 declare -A own_containers=(
@@ -505,6 +590,7 @@ fi
 docker network inspect "$OGMEM_NETWORK" >/dev/null 2>&1 || \
   docker network create "$OGMEM_NETWORK" >/dev/null
 
+if [[ "$VECTOR_DB_TYPE" == opengauss ]]; then
 echo "创建 openGauss..."
 docker run -d \
   --name "$OPENGAUSS_CONTAINER" \
@@ -534,6 +620,8 @@ for attempt in $(seq 1 120); do
   sleep 5
 done
 
+fi
+
 cat > "$STACK_DIR/ogmemory.yaml" <<'YAML'
 llm:
   provider: "openai"
@@ -548,7 +636,11 @@ embedding:
   model: "${EMBEDDING_MODEL}"
 
 vector_db:
-  type: opengauss
+  type: "${VECTOR_DB_TYPE}"
+  milvus_uri: "${MILVUS_URI}"
+  milvus_collection: "${MILVUS_COLLECTION}"
+  milvus_db_name: "${MILVUS_DB_NAME}"
+  milvus_timeout: "${MILVUS_TIMEOUT}"
   connection_string: "host=opengauss port=5432 dbname=postgres user=gaussdb password=${OG_DB_PASSWORD}"
   dimension: "${EMBEDDING_DIMENSION}"
   table_name: vector_index
@@ -597,6 +689,7 @@ agent_memory:
 YAML
 chmod 644 "$STACK_DIR/ogmemory.yaml"
 
+
 echo "创建 oGMemory..."
 docker run -d \
   --name "$OGMEM_CONTAINER" \
@@ -610,6 +703,12 @@ docker run -d \
   -p "${PUBLISH_IP}:${OGMEM_HTTP_HOST_PORT}:8090" \
   -p "${PUBLISH_IP}:${OGMEM_MCP_HOST_PORT}:8091" \
   -e OGMEM_CONFIG=/etc/ogmem/config.yaml \
+  -e "VECTOR_DB_TYPE=${VECTOR_DB_TYPE}" \
+  -e "MILVUS_URI=${MILVUS_URI}" \
+  -e "MILVUS_COLLECTION=${MILVUS_COLLECTION}" \
+  -e "MILVUS_DB_NAME=${MILVUS_DB_NAME}" \
+  -e "MILVUS_TIMEOUT=${MILVUS_TIMEOUT}" \
+  -e "MILVUS_TOKEN=${MILVUS_TOKEN:-}" \
   -e "LLM_API_KEY=${LLM_API_KEY}" \
   -e "LLM_BASE_URL=${LLM_BASE_URL}" \
   -e "LLM_MODEL=${LLM_MODEL}" \
@@ -626,6 +725,7 @@ docker run -d \
   -e "OG_API_AGENT_ID=${OG_API_AGENT_ID}" \
   -e "OG_ADMIN_API_KEYS=${OG_ACCOUNT_ID}:${OG_TENANT_API_KEY}" \
   -e NO_PROXY='*' -e no_proxy='*' \
+  -e "no_grpc_proxy=${MILVUS_NO_GRPC_PROXY-${no_grpc_proxy-}}" \
   -v "$STACK_DIR/ogmemory.yaml:/etc/ogmem/config.yaml:ro" \
   -v "$STACK_DIR/agfs:/data/agfs" \
   "$OGMEM_IMAGE" >/dev/null
@@ -655,6 +755,8 @@ model=$EMBEDDING_MODEL
 dimension=$EMBEDDING_DIMENSION
 EOF
 chmod 600 "$EMBEDDING_STATE_FILE"
+printf 'fingerprint=%s\nbackend=%s\n' "$vector_fingerprint" "$VECTOR_DB_TYPE" > "$STACK_DIR/vector.state"
+chmod 600 "$STACK_DIR/vector.state"
 
 for agent_id in "$OG_API_AGENT_ID" "$OG_CE_AGENT_ID" "$OG_MCP_AGENT_ID"; do
   agents_json="$(curl -fsS \

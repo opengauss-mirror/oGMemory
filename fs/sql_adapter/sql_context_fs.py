@@ -19,6 +19,7 @@ import re
 from datetime import UTC, datetime
 from urllib.parse import unquote
 
+from commit.outbox_scope import is_capturing_outbox_events, record_persisted_event
 from core.enums import NodeStatus
 from core.errors import (
     AccessDeniedError,
@@ -69,6 +70,15 @@ _SESSION_HISTORY_PATTERN = re.compile(
 )
 _SESSION_STATE_PATTERN = re.compile(
     r"^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$"
+)
+_SESSION_STAGE_PATTERN = re.compile(
+    r"^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/stage_results/(?P<stage_id>[0-9a-f]{64})$"
+)
+_READ_NODE_SQL = (
+    "SELECT uri, context_type, category, level, owner_space, "
+    "abstract, overview, content, relations, metadata, "
+    "status, created_at, updated_at, version "
+    "FROM context_nodes WHERE account_id=%s"
 )
 
 
@@ -177,6 +187,12 @@ def parse_uri(uri: str) -> dict:
             "category": "history",
             "slug": "",
         }
+
+    match = _SESSION_STAGE_PATTERN.fullmatch(uri)
+    if match:
+        g = match.groupdict()
+        return {"account": g["account"], "owner_type": "sessions", "owner_id": g["session_id"],
+                "category": "stage_result", "slug": g["stage_id"]}
 
     match = _SESSION_STATE_PATTERN.match(uri)
     if match:
@@ -427,8 +443,11 @@ class SQLContextFS(PoolAdapterMixin):
         if uri != SessionState.state_uri(ctx.account_id, ctx.session_id):
             raise ValueError("session mutation lock requires its canonical state URI")
         self._ensure_accessible(uri, ctx)
+        slots = (self._shared_pool.session_mutation_slots if self._shared_pool is not None
+                 else _MEMORY_MUTATION_LOCK_CONNECTION_SLOTS)
         with self.configured_session_mutation_lock(
             self._connection_string, ctx, timeout_seconds=timeout_seconds, dialect=self._sql_dialect,
+            slots=slots,
         ) as guard:
             yield guard
 
@@ -439,14 +458,13 @@ class SQLContextFS(PoolAdapterMixin):
 
     @staticmethod
     @contextmanager
-    def configured_session_mutation_lock(dsn, ctx, *, timeout_seconds=1.0, dialect="postgresql"):
+    def configured_session_mutation_lock(dsn, ctx, *, slots, timeout_seconds=1.0, dialect="postgresql"):
         """Acquire before constructing stores, which otherwise borrow from their pool."""
         from fs.sql_adapter.session_mutation import session_mutation_scope
         from session.session_state import SessionState
         uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
         with session_mutation_scope(dsn, ctx, _resource_mutation_lock_key(ctx.account_id, uri),
-                                    _MEMORY_MUTATION_LOCK_CONNECTION_SLOTS, timeout_seconds,
-                                    dialect=dialect) as guard:
+                                    slots, timeout_seconds, dialect=dialect) as guard:
             yield guard
 
     @contextmanager
@@ -546,7 +564,13 @@ class SQLContextFS(PoolAdapterMixin):
         if guard is not None:
             self._ensure_accessible(directory, ctx)
             guard.check_database(self._connection_string, self.sql_dialect.name)
-            with guard.identity_lock(key, ctx, 1.0 if active else _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS):
+            timeout = 1.0 if active else _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS
+            if active and getattr(active, "wait_for_identity_lock", False):
+                from core.operation_deadline import remaining_seconds
+                remaining = remaining_seconds()
+                timeout = (_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS if remaining is None
+                           else min(_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS, remaining))
+            with guard.identity_lock(key, ctx, timeout):
                 yield
             return
         with self._memory_mutation_lock(
@@ -641,6 +665,19 @@ class SQLContextFS(PoolAdapterMixin):
             row = cur.fetchone()
             raise ConcurrentModificationError(node.uri, 0, row[0] if row else 0)
 
+    @contextmanager
+    def _capture_node_trigger_events(self, cur, node, create_only):
+        references = []
+        capture = not create_only and is_capturing_outbox_events()
+        if capture:
+            cur.execute("SELECT set_config('ogmemory.node_write_events', '', true)")
+        yield references
+        if capture:
+            cur.execute("SELECT current_setting('ogmemory.node_write_events')")
+            result = json.loads(cur.fetchone()[0] or "{}")
+            if result.get("uri") == node.uri:
+                references.extend((node.uri, event_id) for event_id in result["event_ids"])
+
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None:
         """Write a node — atomic upsert with optimistic locking.
 
@@ -668,7 +705,10 @@ class SQLContextFS(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
+            with (
+                conn.cursor() as cur,
+                self._capture_node_trigger_events(cur, node, create_only) as references,
+            ):
                 self._execute_write(
                     cur,
                     node,
@@ -681,6 +721,8 @@ class SQLContextFS(PoolAdapterMixin):
                     now,
                 )
             conn.commit()
+            for uri, event_id in references:
+                record_persisted_event(uri, event_id)
         except ConcurrentModificationError:
             conn.rollback()
             raise
@@ -723,8 +765,11 @@ class SQLContextFS(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                # Step 1: Write the node (shared logic)
+            with (
+                conn.cursor() as cur,
+                self._capture_node_trigger_events(cur, node, create_only) as references,
+            ):
+                # Step 1: Write the node.
                 self._execute_write(
                     cur,
                     node,
@@ -771,6 +816,8 @@ class SQLContextFS(PoolAdapterMixin):
                     ),
                 )
             conn.commit()
+            for uri, event_id in references:
+                record_persisted_event(uri, event_id)
         except ConcurrentModificationError:
             conn.rollback()
             raise
@@ -804,13 +851,46 @@ class SQLContextFS(PoolAdapterMixin):
         """Read canonical evidence inside the caller's tenant-bound transaction."""
         cls._ensure_accessible(uri, ctx)
         cursor.execute(
-            "SELECT uri, context_type, category, level, owner_space, "
-            "abstract, overview, content, relations, metadata, "
-            "status, created_at, updated_at, version "
-            "FROM context_nodes WHERE account_id=%s AND uri=%s",
+            _READ_NODE_SQL + " AND uri=%s",
             (ctx.account_id, uri),
         )
-        row = cursor.fetchone()
+        return cls._decode_node(uri, cursor.fetchone())
+
+    def read_nodes(
+        self, uris: list[str], ctx: RequestContext,
+    ) -> dict[str, ContextNode | Exception]:
+        """Read canonical nodes in one tenant-bound transaction."""
+        results = {}
+        allowed = []
+        for uri in dict.fromkeys(uris):
+            try:
+                self._ensure_accessible(uri, ctx)
+            except Exception as exc:
+                results[uri] = exc
+            else:
+                allowed.append(uri)
+        if not allowed:
+            return results
+
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(_READ_NODE_SQL + " AND uri = ANY(%s)", (ctx.account_id, allowed))
+                rows = {row[0]: row for row in cur.fetchall()}
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        for uri in allowed:
+            try:
+                results[uri] = self._decode_node(uri, rows.get(uri))
+            except Exception as exc:
+                results[uri] = exc
+        return results
+
+    @staticmethod
+    def _decode_node(uri: str, row) -> ContextNode:
         if row is None:
             raise NodeNotFoundError(uri)
 
@@ -1173,7 +1253,7 @@ class SQLContextFS(PoolAdapterMixin):
                            abstract, metadata, created_at, updated_at, version,
                            COALESCE(content <> '', false) AS has_content
                     FROM context_nodes
-                    WHERE LEFT(uri, CHAR_LENGTH(%s)) = %s
+                    WHERE SUBSTRING(uri FROM 1 FOR CHAR_LENGTH(%s)) = %s
                       AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
                       AND account_id = %s
                       AND (%s IS NULL OR owner_space = %s)
@@ -1260,6 +1340,18 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
+                # Same write order as projection workers: nodes, jobs, edges.
+                cur.execute("""SELECT uri FROM context_nodes WHERE account_id=%s
+                    AND (uri=%s OR uri LIKE %s OR relations::text LIKE %s)
+                    ORDER BY uri FOR UPDATE""",
+                    (account_id,from_uri,from_prefix+"%","%"+from_uri+"%"))
+                cur.fetchall()
+                cur.execute("""SELECT edge_id,source_uri,target_uri,relation_type
+                    FROM edge_projection_jobs WHERE account_id=%s
+                    AND (source_uri=%s OR source_uri LIKE %s OR target_uri=%s OR target_uri LIKE %s)
+                    ORDER BY edge_id FOR UPDATE""",
+                    (account_id,from_uri,from_prefix+"%",from_uri,from_prefix+"%"))
+                projection_jobs = cur.fetchall()
                 # 1) Move the node itself
                 cur.execute(
                     "UPDATE context_nodes SET uri = %s, updated_at = NOW() WHERE uri = %s",
@@ -1315,32 +1407,37 @@ class SQLContextFS(PoolAdapterMixin):
                     to_prefix=to_prefix,
                     json_wrapper=Json,
                 )
+                from uuid import uuid4
+
+                from providers.relation_store.projection_identity import canonical_edge_id
+                def moved(uri):
+                    if uri == from_uri:
+                        return to_uri
+                    return to_prefix+uri[len(from_prefix):] if uri.startswith(from_prefix) else uri
+                for old_id,source,target,relation in projection_jobs:
+                    source,target=moved(source),moved(target)
+                    new_id=canonical_edge_id(account_id,source,target,relation)
+                    cur.execute("""UPDATE edge_projection_jobs SET edge_id=%s,source_uri=%s,target_uri=%s,
+                        status='PENDING',claim_token=NULL,last_error=NULL,next_retry_at=NULL,updated_at=NOW()
+                        WHERE account_id=%s AND edge_id=%s""",(new_id,source,target,account_id,old_id))
+                    cur.execute("""UPDATE relation_edges SET projection_edge_id=%s,edge_projection=NULL,updated_at=NOW()
+                        WHERE account_id=%s AND projection_edge_id=%s""",(new_id,account_id,old_id))
+                    cur.execute("""INSERT INTO outbox_events
+                        (event_id,event_type,uri,account_id,payload,status,retry_count)
+                        VALUES (%s,'PROJECT_GRAPH',%s,%s,%s,'PENDING',0)""",
+                        (str(uuid4()),source,account_id,Json({"edge_id":new_id})))
 
                 # 5) Cascade: update outbox_events (only if table exists)
                 if self.sql_dialect.table_exists(cur, "outbox_events"):
                     import uuid as _uuid
 
-                    # --- 5a) Delete PENDING and PROCESSING events for old URIs.
-                    #
-                    # We delete both PENDING and PROCESSING events.  The
-                    # PROCESSING events may have been claimed by a worker that
-                    # has read the payload into memory.  However, if we leave
-                    # them, the worker will upsert stale records at the old URI
-                    # *after* our DELETE_CONTEXT runs, undoing the move.
-                    #
-                    # By deleting the rows, the worker's final mark_done DELETE
-                    # matches 0 rows (harmless), and we rely on the tombstone
-                    # check in _process_upsert_context to catch the rare case
-                    # where the worker has already started processing.
+                    # Preserve cancellation receipts for workers and write-status queries.
                     cur.execute(
-                        "DELETE FROM outbox_events "
-                        "WHERE uri = %s AND status IN ('PENDING', 'PROCESSING')",
-                        (from_uri,),
-                    )
-                    cur.execute(
-                        "DELETE FROM outbox_events "
-                        "WHERE uri LIKE %s AND status IN ('PENDING', 'PROCESSING')",
-                        (from_prefix + "%",),
+                        "UPDATE outbox_events SET status = 'CANCELLED', payload = %s, "
+                        "worker_id = NULL, locked_at = NULL, next_retry_at = NULL "
+                        "WHERE account_id = %s AND (uri = %s OR uri LIKE %s) "
+                        "AND status IN ('PENDING', 'PROCESSING')",
+                        (Json({"cancel_reason": "node_moved"}), account_id, from_uri, from_prefix + "%"),
                     )
 
                     # --- 5b) Emit DELETE_CONTEXT for old URIs.
@@ -1350,13 +1447,6 @@ class SQLContextFS(PoolAdapterMixin):
 
                     def _record_id(uri: str, level: int) -> str:
                         return _IndexRecord.generate_id(uri, level)
-
-                    def _parent_uri(uri: str) -> str:
-                        """Derive parent URI (same logic as ContextNode.parent_uri)."""
-                        s = uri.rstrip("/")
-                        if "/" not in s:
-                            return ""
-                        return s.rsplit("/", 1)[0] + "/"
 
                     # Collect ALL descendants (not just immediate children).
                     # The context_nodes UPDATE already moved every row whose
@@ -1398,14 +1488,11 @@ class SQLContextFS(PoolAdapterMixin):
 
                     # --- 5c) Emit UPSERT_CONTEXT for new URIs.
                     #
-                    # Build IndexRecords directly from context_nodes data
-                    # using hashlib (no index-package dependency).  The
-                    # outbox worker embeds the text and upserts to the
-                    # vector index, making the node immediately searchable
-                    # at its new URI without waiting for a next write.
+                    # Reuse the complete builder, including L3 descriptors and
+                    # canonical revisions. Keep the move path's existing L1.
                     cur.execute(
                         "SELECT uri, abstract, overview, content, "
-                        "owner_space, category, context_type "
+                        "owner_space, category, context_type, metadata, version "
                         "FROM context_nodes "
                         "WHERE uri = %s OR uri LIKE %s",
                         (to_uri, to_prefix + "%"),
@@ -1413,63 +1500,22 @@ class SQLContextFS(PoolAdapterMixin):
                     moved_rows = cur.fetchall()
 
                     for row in moved_rows:
-                        r_uri, r_abstract, r_overview, r_content, r_owner, r_cat, r_ct = row
-
-                        records = []
-                        base_filters = {
-                            "account_id": account_id,
-                            "owner_space": r_owner,
-                            "category": r_cat,
-                            "context_type": r_ct,
-                        }
-                        # Shared metadata — must match build_index_records()
-                        base_meta = {
-                            "category": r_cat,
-                            "context_type": r_ct,
-                            "parent_uri": _parent_uri(r_uri),
-                            "has_overview": bool(r_overview),
-                            "has_content": bool(r_content),
-                        }
-                        # L0: abstract (always present)
-                        records.append(
-                            {
-                                "id": _record_id(r_uri, 0),
-                                "uri": r_uri,
-                                "level": 0,
-                                "text": r_abstract or "",
-                                "filters": dict(base_filters),
-                                "metadata": {"level": "abstract", **base_meta},
-                            }
-                        )
-                        # L1: overview
-                        if r_overview:
-                            records.append(
-                                {
-                                    "id": _record_id(r_uri, 1),
-                                    "uri": r_uri,
-                                    "level": 1,
-                                    "text": r_overview,
-                                    "filters": dict(base_filters),
-                                    "metadata": {"level": "overview", **base_meta},
-                                }
-                            )
-                        # L2: content (id uses /content.md suffix)
-                        l2_uri = r_uri.rstrip("/") + "/content.md"
-                        if r_content:
-                            records.append(
-                                {
-                                    "id": _record_id(l2_uri, 2),
-                                    "uri": l2_uri,
-                                    "level": 2,
-                                    "text": r_content,
-                                    "filters": dict(base_filters),
-                                    "metadata": {
-                                        "level": "content",
-                                        **base_meta,
-                                        "parent_uri": r_uri,
-                                    },
-                                }
-                            )
+                        r_uri, r_abstract, r_overview, r_content, r_owner, r_cat, r_ct, metadata, version = row
+                        from index.index_record_builder import build_index_records
+                        metadata = dict(metadata or {})
+                        metadata.pop("_expected_version", None)
+                        metadata.pop("expected_version", None)
+                        metadata["version"] = version
+                        node = ContextNode(uri=r_uri, context_type=r_ct, category=r_cat, level=2,
+                            owner_space=r_owner, abstract=r_abstract or "", overview=r_overview or "",
+                            content=r_content or "", metadata=metadata)
+                        built = build_index_records(node)
+                        if r_overview and built and not any(record.level == 1 for record in built):
+                            built.append(_IndexRecord(id=_record_id(r_uri, 1), uri=r_uri, level=1,
+                                text=r_overview, filters=dict(built[0].filters),
+                                metadata={**built[0].metadata, "level":"overview", "record_kind":"node_overview"}))
+                        from dataclasses import asdict
+                        records = [asdict(record) for record in built]
 
                         if records:
                             cur.execute(

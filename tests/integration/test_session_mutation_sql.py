@@ -39,7 +39,10 @@ def database():
     created = []
 
     def make():
-        pool = SharedConnectionPool(dsn, pool_size=1)
+        pool = SharedConnectionPool(
+            dsn, pool_size=1,
+            dialect=os.environ.get("OGMEM_IDENTITY_TEST_DIALECT", "postgresql"),
+        )
         fs = SQLContextFS(pool=pool)
         outbox = SQLOutboxStore(pool=pool, fs=fs)
         archive = SQLSessionArchiveStore(pool=pool)
@@ -153,13 +156,13 @@ def test_background_topic_directory_contention_recovers_after_repeated_waits(dat
                 return [self.extraction()]
             calls.append((self.key, "node_processing"))
             if self.key == "receiver_red":
-                active_session_guard().ensure_owned()
+                assert active_session_guard() is not None
                 started.set()
                 assert release.wait(55)
             payload = node_payload(kwargs)
             item = operation([draft["id"] for draft in payload["drafts"]], fact="Operates at 37 MHz.")
             item.update(routing_key=self.key, object_name=self.key, abstract=f"Receiver {self.key}.")
-            return [{"tool": "process_memory_nodes", "input": {"operations": [item]}}]
+            return [{"tool": "process_memory_nodes", "input": {"operations": [item], "related_reconciliations": []}}]
 
     def build(request_ctx, key):
         service, old_writer, manager, archive, outbox = service_pair(make, request_ctx)
@@ -439,6 +442,7 @@ def test_sql_bootstrap_uses_owning_connection_without_model_or_pool_wait(databas
     from providers.unified_config import OgMemConfig
     from server.memory_service import MemoryService
     service = MemoryService(config=OgMemConfig(storage_backend="sql", sql_connection_string=dsn,
+                                              sql_dialect=os.environ.get("OGMEM_IDENTITY_TEST_DIALECT", "postgresql"),
                                               session_state_bridge_enabled=False, after_turn_threshold=10000))
     service.get_write_api = Mock(side_effect=AssertionError("bootstrap initialized a writer"))
     service.get_llm = Mock(side_effect=AssertionError("bootstrap initialized a model"))
@@ -682,12 +686,14 @@ def test_dispose_checkpoint_recovers_after_storage_returns(database, ctx, conten
         return write_node(node, request_ctx)
 
     fs.write_node = recoverable_write
-    service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
-    settled = idle_lifecycle(service, ctx)
-    if len(content) // 4 >= 200:
-        assert settled["reason"] == "lifecycle_recovery_pending"
+    if len(content) // 4 < 200:
+        from service.extraction_checkpoint import RecoveryPersistenceError
+        with pytest.raises(RecoveryPersistenceError):
+            service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
     else:
-        assert settled["idle"]
+        service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
+    settled = idle_lifecycle(service, ctx)
+    assert settled["reason"] == "lifecycle_recovery_pending"
     assert failed
     assert [message.id for message in manager.get_or_create(ctx.session_id, ctx).messages] == ["fixed-source"]
     service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
@@ -733,7 +739,7 @@ def test_idle_eviction_preserves_another_workers_new_source(database, ctx, pendi
     if pending_batch:
         second._cfg.after_turn_threshold = 1
         second._write_api._pipeline.extract.side_effect = OSError("temporary model outage")
-        assert second.after_turn(params(ctx))["ok"] is False
+        assert second.after_turn(params(ctx))["request_status"] == "RECOVERING"
     uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
     persisted = writer._fs.read_node(uri, ctx).content
     manager.evict_idle_sessions(60, "2026-01-01T00:02:00+00:00", ctx)
@@ -756,9 +762,9 @@ def test_idle_observer_sees_another_worker_complete_recovery(database, ctx):
 
     worker, _, manager, _, _ = service_pair(make, ctx, extract=extract)
     request = params(ctx)
-    assert worker.after_turn(request)["ok"] is False
+    assert worker.after_turn(request)["request_status"] == "RECOVERING"
     observer, _, _, _, _ = service_pair(make, ctx)
-    assert idle_lifecycle(observer, ctx)["reason"] == "extraction_recovery_pending"
+    assert idle_lifecycle(observer, ctx)["reason"] == "extraction_retry_task"
     assert worker.after_turn(request)["ok"]
     assert idle_lifecycle(observer, ctx)["idle"]
 

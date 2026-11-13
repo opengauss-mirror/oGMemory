@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
 from copy import deepcopy
 from dataclasses import asdict, replace
 
+from commit.outbox_scope import current_outbox_events, restore_outbox_events
 from commit.write_receipts import operation_digest
-from core.models import CandidateMemory
+from core.models import CandidateMemory, ContextNode
+from core.model_stage import stage_digest
+from core.write_contract import OUTCOMES_KEY, store_outcome, merge_source_outcome
 
 EXTENSION_KEY = "memory_extraction_recovery"
+logger = logging.getLogger(__name__)
 
 
 class RecoveryNeedsConfirmationError(RuntimeError):
@@ -42,12 +48,17 @@ class ExtractionBatchJournal:
         journal = cls.__new__(cls)
         journal.manager, journal.buffer, journal.ctx = manager, buffer, ctx
         journal._archive_id = batch["archive_id"]
+        restore_outbox_events(batch, ctx.account_id)
+        journal._stage_owner = threading.get_ident()
+        journal._verified_stage_results = set()
         return journal
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
-                 request_messages=None, lifecycle=None):
+                 request_messages=None, lifecycle=None, request_source_ids=None):
         self.manager, self.buffer, self.ctx = manager, buffer, ctx
+        self._stage_owner = threading.get_ident()
+        self._verified_stage_results = set()
         extension = buffer.runtime_extensions.get(EXTENSION_KEY, {})
         batch = extension.get("batch")
         if batch is not None:
@@ -67,16 +78,19 @@ class ExtractionBatchJournal:
             batch = {"owner": recovery_owner(ctx), "archive_id": archive_id,
                      "client_request_id": client_request_id,
                      "request_messages": deepcopy(request_messages or []),
+                     "request_source_ids": list(request_source_ids) if request_source_ids is not None else [message.id for message in snapshot],
                      "message_ids": [message.id for message in snapshot],
                      "snapshot": [asdict(message) for message in snapshot],
                      "messages": deepcopy(messages),
                      "session_time": session_time.isoformat() if hasattr(session_time, "isoformat") else session_time,
                      "session_summary": session_summary, "tool_stats_text": tool_stats_text,
-                     "chunks": None, "slots": {}}
+                     "chunks": None, "slots": {}, "outbox_tracking_version": 1,
+                     "outbox_events": []}
             if lifecycle is not None:
                 batch["lifecycle"] = deepcopy(lifecycle)
             self._replace(batch)
         self._archive_id = batch["archive_id"]
+        restore_outbox_events(batch, ctx.account_id)
 
     @property
     def batch(self):
@@ -88,8 +102,16 @@ class ExtractionBatchJournal:
 
     def _replace(self, batch):
         with self.buffer.session_state_save_lock:
+            if batch is not None:
+                batch = dict(batch)
+                references = [tuple(item) for item in batch.get("outbox_events", [])]
+                current = current_outbox_events(self.ctx.account_id)
+                if current is None:
+                    batch.pop("outbox_tracking_version", None)
+                references.extend(current or [])
+                batch["outbox_events"] = [list(item) for item in dict.fromkeys(references)]
             with self.buffer.extraction_lock:
-                prior = deepcopy(self.buffer.runtime_extensions.get(EXTENSION_KEY))
+                prior = self.buffer.runtime_extensions.get(EXTENSION_KEY)
                 if batch is None:
                     self.buffer.runtime_extensions.pop(EXTENSION_KEY, None)
                 else:
@@ -118,6 +140,94 @@ class ExtractionBatchJournal:
     def checkpoint(self, slot):
         return CandidateCheckpoint(self, str(slot))
 
+    def _stage_fs(self):
+        if threading.get_ident() != self._stage_owner:
+            raise RecoveryPersistenceError("stage persistence requires its owning thread")
+        fs = self.manager._get_context_fs()
+        self.manager._require_sql_mutation(self.ctx, fs)
+        return fs
+
+    def _stage_uri(self, name, input_digest, output_digest):
+        identity = stage_digest({"owner": recovery_owner(self.ctx), "archive_id": self._archive_id,
+                                 "stage": name, "input": input_digest, "output": output_digest})
+        return f"ctx://{self.ctx.account_id}/sessions/{self.ctx.session_id}/stage_results/{identity}"
+
+    def load_stage(self, name, inputs):
+        input_digest = stage_digest(inputs)
+        record = self.batch.get("stage_results", {}).get(name, {}).get(input_digest)
+        if record is None:
+            return None
+        if (record.get("version") != 1 or record.get("status") != "complete"
+                or record.get("input_sha256") != input_digest
+                or record.get("uri") != self._stage_uri(name, input_digest, record.get("output_sha256"))):
+            raise RecoveryNeedsConfirmationError("model stage reference requires verification")
+        from core.errors import NodeNotFoundError
+        try:
+            node = self._stage_fs().read_node(record["uri"], self.ctx)
+        except (NodeNotFoundError, FileNotFoundError):
+            self._verified_stage_results.discard((name, input_digest, record["output_sha256"]))
+            return None
+        try:
+            saved = json.loads(node.content)
+            if (saved["version"] != 1 or saved["owner"] != recovery_owner(self.ctx)
+                    or saved["archive_id"] != self._archive_id or saved["stage"] != name
+                    or saved["input_sha256"] != input_digest
+                    or stage_digest(saved["result"]) != record["output_sha256"]):
+                raise ValueError("stage identity changed")
+            self._verified_stage_results.add((name, input_digest, record["output_sha256"]))
+            return saved["result"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RecoveryNeedsConfirmationError("model stage result requires verification") from exc
+
+    def has_stage(self, name):
+        return bool(self.batch.get("stage_results", {}).get(name))
+
+    def save_stage(self, name, inputs, result):
+        """Persist one immutable result and keep a compact reference in the batch."""
+        input_digest, output_digest = stage_digest(inputs), stage_digest(result)
+        fs = self._stage_fs()
+        identity = (name, input_digest, output_digest)
+        if identity in self._verified_stage_results:
+            return
+        uri = self._stage_uri(name, input_digest, output_digest)
+        saved = {"version": 1, "owner": recovery_owner(self.ctx), "archive_id": self._archive_id,
+                 "stage": name, "input_sha256": input_digest, "result": result}
+        node = ContextNode(uri=uri, context_type="RESOURCE", category="stage_result", level=0,
+                           owner_space=f"session:{self.ctx.session_id}", abstract="Prepared model stage",
+                           overview="Prepared model stage", content=json.dumps(saved, ensure_ascii=False,
+                                                                              separators=(",", ":")),
+                           metadata={"session_id": self.ctx.session_id, "owner_user_id": self.ctx.user_id,
+                                     "owner_agent_id": self.ctx.agent_id, "archive_id": self._archive_id})
+        fs.write_node(node, self.ctx)
+        def update(batch):
+            batch.setdefault("stage_results", {}).setdefault(name, {})[input_digest] = {
+                "version": 1, "status": "complete", "input_sha256": input_digest,
+                "output_sha256": output_digest, "uri": uri}
+            uris = batch.setdefault("stage_result_uris", [])
+            if uri not in uris:
+                uris.append(uri)
+        self.mutate(update)
+        self._verified_stage_results.add(identity)
+
+    def _release_stage_results(self, uris):
+        from core.errors import NodeNotFoundError
+        if not uris:
+            return
+        fs = self._stage_fs()
+        prefix = f"ctx://{self.ctx.account_id}/sessions/{self.ctx.session_id}/stage_results/"
+        for uri in uris:
+            if (not isinstance(uri, str) or not uri.startswith(prefix)
+                    or len(uri[len(prefix):]) != 64
+                    or any(char not in "0123456789abcdef" for char in uri[len(prefix):])):
+                logger.warning("stage cleanup requires an owned artifact reference")
+                continue
+            try:
+                fs.delete_node(uri, self.ctx)
+            except (NodeNotFoundError, FileNotFoundError):
+                pass
+            except Exception as exc:
+                logger.warning("completed stage cleanup deferred: uri=%s error=%s", uri, type(exc).__name__)
+
     def has_retryable_write_failure(self):
         with self.buffer.session_state_save_lock:
             statuses = {operation.get("status")
@@ -126,16 +236,33 @@ class ExtractionBatchJournal:
             return ("rejected_before_write" in statuses
                     and statuses <= {"complete", "rejected_before_write"})
 
-    def finish(self, *, reset_window_state=False):
+    def finish(self, *, reset_window_state=False, outcome=None, resolve_outcome=None,
+               current_request_id="", current_source_ids=()):
         """Clear source claim, pending drafts and request ID in one durable state."""
         with self.buffer.session_state_save_lock:
             with self.buffer.extraction_lock:
                 batch = self.batch
+                stage_uris = list(batch.get("stage_result_uris", []))
                 rollback = self.buffer.capture_rollback_state()
                 old_completed = list(self.buffer.completed_request_ids)
-                old_extension = deepcopy(self.buffer.runtime_extensions[EXTENSION_KEY])
+                old_extension = self.buffer.runtime_extensions[EXTENSION_KEY]
+                old_outcomes = deepcopy(self.buffer.runtime_extensions.get(OUTCOMES_KEY))
                 client_request_id = batch.get("client_request_id", "")
-                self.buffer.remove_messages_by_id(set(batch["message_ids"]))
+                receipt = deepcopy(outcome or {})
+                references = [tuple(item) for item in batch.get("outbox_events", [])]
+                references.extend(current_outbox_events(self.ctx.account_id) or [])
+                receipt.update(request_id=client_request_id, archive_id=batch["archive_id"],
+                               source_sha256=stage_digest(batch["messages"]),
+                               outbox_events=[list(item) for item in dict.fromkeys(references)],
+                               outbox_tracking_complete=batch.get("outbox_tracking_version") == 1)
+                receipt.setdefault("source_status", "ARCHIVED")
+                if batch.get("lifecycle", {}).get("source_digest"):
+                    receipt["source_snapshot_sha256"] = batch["lifecycle"]["source_digest"]
+                receipt.setdefault("semantic_status", "UNKNOWN")
+                receipt.setdefault("projection_status", "UNKNOWN")
+                receipt.setdefault("request_status", "PROJECTING")
+                batch_ids = set(batch["message_ids"])
+                self.buffer.remove_messages_by_id(batch_ids)
                 if (batch.get("lifecycle", {}).get("kind") == "compaction"
                         and self.buffer.compaction_prepare_archive_id == batch["archive_id"]):
                     self.buffer.compaction_prepare_archive_id = ""
@@ -144,18 +271,71 @@ class ExtractionBatchJournal:
                     self.buffer.window_state = SessionWindowState()
                 if client_request_id:
                     self.buffer.mark_request_completed(client_request_id)
+                pending_receipts = dict(self.buffer.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {}))
+                batch_receipt = receipt
+                if client_request_id not in pending_receipts and client_request_id:
+                    pending_receipts[client_request_id] = {"source_status": "BUFFERED",
+                        "source_message_ids": batch.get("request_source_ids", batch["message_ids"])}
+                if (current_request_id and current_request_id not in pending_receipts
+                        and not batch_ids.isdisjoint(current_source_ids)):
+                    pending_receipts[current_request_id] = {"source_status": "BUFFERED",
+                        "source_message_ids": sorted(current_source_ids)}
+                for request_id, pending_receipt in pending_receipts.items():
+                    source_ids = set(pending_receipt.get("source_message_ids", []))
+                    if (pending_receipt.get("source_status") == "BUFFERED" and source_ids
+                            and not batch_ids.isdisjoint(source_ids)) or request_id == client_request_id:
+                        merged = merge_source_outcome(pending_receipt, {**batch_receipt, "request_id": request_id}, batch["message_ids"])
+                        if request_id == current_request_id and request_id != client_request_id:
+                            self.buffer.mark_request_completed(request_id)
+                        merged = store_outcome(self.buffer, request_id, merged,
+                                               resolve_outcome=resolve_outcome)
+                        if request_id == client_request_id:
+                            receipt = merged
                 self.buffer.runtime_extensions.pop(EXTENSION_KEY)
             if not self.manager.save_session_state(self.buffer.session_id, self.ctx):
                 with self.buffer.extraction_lock:
                     self.buffer.restore_rollback_state(rollback)
                     self.buffer.completed_request_ids = old_completed
                     self.buffer.runtime_extensions[EXTENSION_KEY] = old_extension
+                    if old_outcomes is None:
+                        self.buffer.runtime_extensions.pop(OUTCOMES_KEY, None)
+                    else:
+                        self.buffer.runtime_extensions[OUTCOMES_KEY] = old_outcomes
                 raise RecoveryPersistenceError("completed extraction checkpoint could not be saved")
+            self._release_stage_results(stage_uris)
+            return receipt
 
 
 class CandidateCheckpoint:
     def __init__(self, journal, slot):
         self.journal, self.slot = journal, slot
+
+    def load_stage(self, name, inputs):
+        return self.journal.load_stage(f"slot:{self.slot}/{name}", inputs)
+
+    def has_stage(self, name):
+        return self.journal.has_stage(f"slot:{self.slot}/{name}")
+
+    def save_stage(self, name, inputs, result):
+        return self.journal.save_stage(f"slot:{self.slot}/{name}", inputs, result)
+
+    def invalidate_unaccepted_preparation(self):
+        """Prepare this slot again after its generated identity needs correction."""
+        prefix = f"slot:{self.slot}/"
+
+        def invalidate(batch):
+            if self.slot in batch["slots"]:
+                raise RecoveryNeedsConfirmationError("identity correction requires an unaccepted slot")
+            stages = batch.get("stage_results", {})
+            for name in list(stages):
+                if name.startswith(prefix):
+                    del stages[name]
+            batch.get("node_drafts", {}).pop(self.slot, None)
+
+        self.journal.mutate(invalidate)
+        self.journal._verified_stage_results = {
+            identity for identity in self.journal._verified_stage_results
+            if not identity[0].startswith(prefix)}
 
     @property
     def record(self):
@@ -172,6 +352,12 @@ class CandidateCheckpoint:
                 suffix = f":revision:{revision}" if revision else ""
                 expected = hashlib.sha256(
                     f"{self.journal.batch['archive_id']}:{self.slot}:{index}{suffix}".encode()).hexdigest()
+                identity_version = record.get("operation_id_versions", {}).get(
+                    str(index), record.get("operation_id_version", 1))
+                if identity_version == 2:
+                    expected = "receipt-v2:" + expected
+                elif identity_version != 1:
+                    raise ValueError("operation identity version is unsupported")
                 if candidate.write_operation_id != expected:
                     raise ValueError("operation identity changed")
                 if operation_digest(candidate, self.journal.ctx) != record["candidate_digests"][index]:
@@ -184,14 +370,31 @@ class CandidateCheckpoint:
         if self.record is not None:
             raise RecoveryNeedsConfirmationError("accepted extraction candidates cannot be replaced")
         batch = self.journal.batch
-        accepted = [replace(candidate, write_operation_id=hashlib.sha256(
+        accepted = [replace(candidate, write_operation_id="receipt-v2:" + hashlib.sha256(
             f"{batch['archive_id']}:{self.slot}:{index}".encode()).hexdigest())
                     for index, candidate in enumerate(candidates)]
         record = {"candidates": [asdict(candidate) for candidate in accepted],
                   "candidate_digests": [operation_digest(candidate, self.journal.ctx) for candidate in accepted],
-                  "extracted": extracted, "filtered": filtered, "operations": {}}
+                  "extracted": extracted, "filtered": filtered, "operations": {},
+                  "operation_id_version": 2, "relation_tracking": True}
         self.journal.mutate(lambda value: value["slots"].update({self.slot: record}))
         return accepted
+
+    def restore_relation_tracking(self):
+        record = self.record
+        if ("relation_tracking" not in record and record["operations"]
+                and len(record["operations"]) == len(record["candidates"])
+                and self.journal.batch.get("outbox_tracking_version") == 1):
+            self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=0))
+
+    def begin_relation_write(self):
+        if self.journal.batch.get("outbox_tracking_version") != 1:
+            return False
+        self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=0))
+        return True
+
+    def complete_relation_write(self):
+        self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=1))
 
     def load_drafts(self):
         record = self.journal.batch.get("node_drafts", {}).get(self.slot)
@@ -223,12 +426,13 @@ class CandidateCheckpoint:
             raise RecoveryNeedsConfirmationError("node revision requires confirmed pre-write rejection")
         revision = self.record.get("revisions", {}).get(str(index), 0) + 1
         identity = f"{self.journal.batch['archive_id']}:{self.slot}:{index}:revision:{revision}"
-        candidate = replace(candidate, write_operation_id=hashlib.sha256(identity.encode()).hexdigest())
+        candidate = replace(candidate, write_operation_id="receipt-v2:" + hashlib.sha256(identity.encode()).hexdigest())
         def revise(batch):
             record = batch["slots"][self.slot]
             record.setdefault("revision_history", []).append({"index": index,
                 "candidate": record["candidates"][index], "operation": record["operations"][str(index)]})
             record.setdefault("revisions", {})[str(index)] = revision
+            record.setdefault("operation_id_versions", {})[str(index)] = 2
             record["candidates"][index] = asdict(candidate)
             record["candidate_digests"][index] = operation_digest(candidate, self.journal.ctx)
             record["operations"].pop(str(index))
@@ -259,6 +463,9 @@ class CandidateCheckpoint:
         # Recovery needs the acknowledged action and target, not another copy of
         # full memory bodies and accumulated identity metadata in session state.
         saved = {"action": plan.action, "target_uri": plan.target_uri,
-                 "merged_fields": {"status": plan.merged_fields["status"]}
-                 if "status" in plan.merged_fields else {}, "relation_edges": []}
+                 "merged_fields": {key: deepcopy(plan.merged_fields[key])
+                                   for key in ("status", "outbox_events", "projection_evidence_known")
+                                   if key in plan.merged_fields}, "relation_edges": []}
+        if plan.merged_fields.get("projection_evidence_known") is False:
+            self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=0))
         self._set_operation(index, {"status": "complete", "plan": saved})

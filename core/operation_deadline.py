@@ -30,6 +30,16 @@ def check_deadline():
 
 
 @contextmanager
+def write_outcome_confirmation():
+    """Give an already-started write ten seconds to confirm its durable receipt."""
+    token = _deadline.set(monotonic() + 10.0)
+    try:
+        yield
+    finally:
+        _deadline.reset(token)
+
+
+@contextmanager
 def operation_deadline(timeout_seconds=None):
     """Inherit the current deadline, optionally shortening it with a new budget."""
     end = _deadline.get()

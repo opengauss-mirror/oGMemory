@@ -49,6 +49,8 @@ def replay_lazy_summary(make, ctx, operations, snapshots, source, *, recovery=Fa
 
         def complete_json(self, prompt, schema=None, **kwargs):
             properties = (schema or {}).get("properties", {})
+            if "categories" in properties:
+                return {"categories": ["entity", "event"]}
             if "spans" in properties:
                 self.calls.append("spans")
                 return {"spans": [{"start": 0, "end": 0, "categories": ["entity", "event"]}]}
@@ -100,7 +102,7 @@ def replay_lazy_summary(make, ctx, operations, snapshots, source, *, recovery=Fa
                                   "edits": [{"search": reads[target]["content"], "replacement": content}] if target else [],
                                   "sections": [] if target else [{"heading": "Recorded facts", "facts": [
                                       line[2:] for line in content.splitlines() if line.startswith("- ")]}]})
-            return [{"tool": "process_memory_nodes", "input": {"operations": decisions}}]
+            return [{"tool": "process_memory_nodes", "input": {"operations": decisions, "related_reconciliations": []}}]
 
     model, registry = Model(), SchemaRegistry()
     index = FakeVectorIndex()

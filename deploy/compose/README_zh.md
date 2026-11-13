@@ -186,7 +186,7 @@ OG_USER_ID=ogmemory-user
 OG_AGENT_ID=ogmemory-api-agent
 
 # 自动提取的待处理 token 阈值；短对话实验可显式设置为 1。
-OGMEM_AFTER_TURN_THRESHOLD=800
+OGMEM_AFTER_TURN_THRESHOLD=400
 OGMEM_MCP_ENABLED=true
 OGMEM_MCP_ALLOWED_HOSTS=localhost,127.0.0.1,ogmemory,host.docker.internal
 ```

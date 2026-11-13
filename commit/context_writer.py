@@ -17,6 +17,7 @@ from commit.write_receipts import (
     WriteNotStartedError,
     WriteOutcomeUnknownError,
     attach_receipt,
+    bind_operation_target,
     receipt_plan,
     validate_receipt_target,
 )
@@ -24,7 +25,7 @@ from core.errors import ConcurrentModificationError, OperationDeadlineExceededEr
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
-from core.operation_deadline import check_deadline, remaining_seconds
+from core.operation_deadline import check_deadline, remaining_seconds, write_outcome_confirmation
 
 logger = get_logger(__name__)
 
@@ -160,8 +161,10 @@ class ContextWriter:
             )
 
         def recover_receipt():
-            committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
-            if committed is not None and self._require_index_event:
+            committed = receipt_plan(self._fs, resolver.uris, candidate, ctx,
+                                     outbox_store=self._outbox_store)
+            if (committed is not None and self._require_index_event
+                    and not committed.merged_fields.get("outbox_events")):
                 node = self._fs.read_node(committed.target_uri, ctx)
                 self._outbox_store.register_write(node, ctx)
             return committed
@@ -171,10 +174,10 @@ class ContextWriter:
                 if resolver is None:
                     raise WriteNotStartedError("durable operations require an authorized URI resolver")
                 candidate = resolver._normalize_subject(candidate, ctx)
+            if candidate.write_operation_id and candidate.target_uri:
                 committed = recover_receipt()
                 if committed is not None:
                     return committed
-            if candidate.write_operation_id and candidate.target_uri:
                 current = self._fs.read_node(candidate.target_uri, ctx)
                 owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
                 if (not resolver.uris.validate_uri(candidate.target_uri, ctx)
@@ -184,14 +187,16 @@ class ContextWriter:
                 if candidate.expected_version != actual_version:
                     raise ConcurrentModificationError(candidate.target_uri, candidate.expected_version, actual_version)
             if resolver is not None and resolver.handles(candidate):
-                return resolver.write(candidate, ctx, commit)
+                return resolver.write(candidate, ctx, commit, recover_receipt=recover_receipt)
             if candidate.write_operation_id:
                 directory = resolver.uris.get_directory_uri(candidate.category, ctx).rstrip("/")
                 with resolver._lock(directory, ctx):
                     committed = recover_receipt()
                     return committed or commit(candidate, ctx)
             return commit(candidate, ctx)
-        except OperationDeadlineExceededError:
+        except OperationDeadlineExceededError as exc:
+            if not persistence_started:
+                raise WriteDeadlineExceededError(str(exc)) from exc
             raise
         except Exception as exc:
             if not candidate.write_operation_id:
@@ -200,7 +205,11 @@ class ContextWriter:
                           or isinstance(exc, WriteOutcomeUnknownError) else WriteNotStartedError)
             if resolver is not None:
                 try:
-                    committed = recover_receipt()
+                    if persistence_started:
+                        with write_outcome_confirmation():
+                            committed = recover_receipt()
+                    else:
+                        committed = recover_receipt()
                 except Exception as read_exc:
                     raise error_type(str(exc)) from read_exc
                 if committed is not None:
@@ -266,7 +275,17 @@ class ContextWriter:
                 persist_action = "merge" if receipt_only else plan.action
 
                 # Step 1.5: Idempotency check - prevent duplicate operations
-                content_hash = hashlib.sha256((candidate.content or "").encode()).hexdigest()[:16]
+                fingerprint_content = candidate.content or ""
+                from index.activation_projection import ACTIVATION_VERSION
+                descriptor = candidate.metadata.get("update_activation")
+                if (candidate.metadata.get("update_activation_version") == ACTIVATION_VERSION
+                        and isinstance(descriptor,str) and descriptor.strip()
+                        and "\n" not in descriptor.strip() and "\r" not in descriptor.strip()):
+                    # A changed connection key is a real graph projection
+                    # update, even when ordinary content stays identical.
+                    import json
+                    fingerprint_content = json.dumps([fingerprint_content,descriptor.strip(),ACTIVATION_VERSION])
+                content_hash = hashlib.sha256(fingerprint_content.encode()).hexdigest()[:16]
                 fp = self._operation_fingerprint(plan, ctx, content_hash)
                 cache_operation = (not candidate.write_operation_id and identity_plan is None
                                    and candidate.category != "profile")
@@ -315,6 +334,13 @@ class ContextWriter:
                     supports_atomic_write is None
                     or bool(supports_atomic_write(node))
                 )
+                register_once = self._get_real_method(self._outbox_store, "register_once")
+                event = (build_write_event(node) if build_write_event is not None
+                         and persist_action in ("create", "merge") else None)
+                if candidate.write_operation_id and event is not None and (atomic_write_allowed or register_once):
+                    from commit.write_receipts import PROJECTION_RECEIPTS_KEY
+                    node.metadata.setdefault(PROJECTION_RECEIPTS_KEY, {})[candidate.write_operation_id] = {
+                        "event_id": event.event_id}
                 if (
                     atomic_write is not None
                     and atomic_write_allowed
@@ -323,16 +349,23 @@ class ContextWriter:
                 ):
                     use_atomic = True
                     persist = atomic_write
-                    write_args: tuple[object, ...] = (node, ctx, build_write_event(node))
+                    write_args: tuple[object, ...] = (node, ctx, event)
                 else:
                     use_atomic = False
                     persist = self._fs.write_node
                     write_args = (node, ctx)
                 _check_prewrite_deadline()
+                if candidate.write_operation_id:
+                    bind_operation_target(self._fs, self._identity_resolver.uris, candidate, ctx, node.uri)
                 try:
                     if on_persistence is not None:
                         on_persistence(True)
                     persist(*write_args)
+                    if event is not None and (
+                        use_atomic or (candidate.write_operation_id and register_once is not None)
+                    ):
+                        from commit.outbox_scope import record_persisted_event
+                        record_persisted_event(node.uri, event.event_id)
                 except ConcurrentModificationError:
                     if on_persistence is not None:
                         on_persistence(False)
@@ -350,8 +383,13 @@ class ContextWriter:
                 # Skip when atomic path already inserted the event in the same txn
                 if not use_atomic and self._outbox_store and persist_action in ("create", "merge"):
                     try:
-                        self._outbox_store.register_write(node, ctx)
+                        if candidate.write_operation_id and event is not None and register_once is not None:
+                            register_once(event, ctx)
+                        else:
+                            self._outbox_store.register_write(node, ctx)
                     except Exception as e:
+                        if candidate.write_operation_id and event is not None:
+                            raise WriteOutcomeUnknownError(str(e)) from e
                         if self._require_index_event:
                             raise
                         # Log error but don't fail the write

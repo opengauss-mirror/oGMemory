@@ -49,6 +49,9 @@ class SourceLLM:
         self.json_calls, self.native_calls = [], []
 
     def complete_json(self, prompt, schema):
+        # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+        if set(schema.get("properties", {})) == {"categories"}:
+            return {"categories": schema["properties"]["categories"]["items"]["enum"]}
         properties = set(schema["properties"])
         self.json_calls.append((properties, prompt, schema))
         if properties == {"spans"}:
@@ -218,6 +221,9 @@ def test_real_lazy_react_path_with_explicit_flag_makes_no_new_source_group_calls
 def test_identical_extraction_prompts_from_distinct_ranges_do_not_suppress_two_occurrences(ranges):
     class RepeatedPromptLLM(SourceLLM):
         def complete_json(self, prompt, schema):
+            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+            if set(schema.get("properties", {})) == {"categories"}:
+                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             if set(schema["properties"]) == {"spans"}:
                 self.json_calls.append(({"spans"}, prompt, schema))
                 return {"spans": [{"start": i, "end": i, "categories": ["event"]} for i in ranges]}
@@ -276,6 +282,9 @@ def test_actual_prompt_collision_comparison_preserves_distinct_text_and_gate_com
 def test_same_span_case_complementary_steps_and_full_fallback_origin_are_reconciled():
     class FallbackCaseLLM(SourceLLM):
         def complete_json(self, prompt, schema):
+            # Assembly is a separate model stage; leave this fake's write/reconciliation queue intact.
+            if set(schema.get("properties", {})) == {"categories"}:
+                return {"categories": schema["properties"]["categories"]["items"]["enum"]}
             if set(schema["properties"]) == {"spans"}:
                 self.json_calls.append(({"spans"}, prompt, schema))
                 return {"spans": []}
@@ -408,22 +417,28 @@ def test_bound_accepted_and_partitioned_drafts_never_enter_a_new_partition():
 def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints():
     candidate = event()
     old = asdict(candidate)
+    old.pop("metadata")  # absent from the pre-graph CandidateMemory contract
     old.pop("source_occurrence_id")
     old.pop("verified_routing_aliases")
     old.pop("verified_object_aliases")
     old.pop("source_contexts")
     old.pop("node_draft_indices")
+    old.pop("node_reconciliation_role")
+    old.pop("node_reconciliation_group")
     for name in ("routing_key", "legacy_routing_key", "target_uri", "expected_version", "confidence",
                  "provenance_ids", "complete_occurrence_context", "write_operation_id"):
         old.pop(name)
     assert occurrence_replay_id(candidate) == hashlib.sha256(
         json.dumps(old, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     old = asdict(candidate)
+    old.pop("metadata")
     old.pop("source_occurrence_id")
     old.pop("verified_routing_aliases")
     old.pop("verified_object_aliases")
     old.pop("source_contexts")
     old.pop("node_draft_indices")
+    old.pop("node_reconciliation_role")
+    old.pop("node_reconciliation_group")
     old.pop("write_operation_id")
     evidence = {"candidate": old, "account_id": CTX.account_id, "user_id": CTX.user_id,
                 "agent_id": CTX.agent_id, "session_id": CTX.session_id}
@@ -444,11 +459,14 @@ def test_old_field_checkpoint_and_old_receipt_upgrade_retry_without_model_or_new
     accepted = replace(event(attributed_speaker=None, attribution_basis=None),
                        write_operation_id=hashlib.sha256(b"legacy-archive:structured:0").hexdigest())
     legacy_candidate = asdict(accepted)
+    legacy_candidate.pop("metadata")
     legacy_candidate.pop("source_occurrence_id")
     legacy_candidate.pop("verified_routing_aliases")
     legacy_candidate.pop("verified_object_aliases")
     legacy_candidate.pop("source_contexts")
     legacy_candidate.pop("node_draft_indices")
+    legacy_candidate.pop("node_reconciliation_role")
+    legacy_candidate.pop("node_reconciliation_group")
     legacy_payload = {key: value for key, value in legacy_candidate.items() if key != "write_operation_id"}
     legacy_digest = hashlib.sha256(json.dumps(
         {"candidate": legacy_payload, "account_id": CTX.account_id, "user_id": CTX.user_id,

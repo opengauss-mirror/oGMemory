@@ -71,6 +71,7 @@ class RecordingWriteAPI:
 
     def write_raw_chunk(self, **kwargs):
         self.raw_chunks.append(kwargs)
+        return {"target_uri": "ctx://acct-e2e/sessions/raw/source", "action": "create"}
 
     def write_memory(self, candidate, ctx):
         return None

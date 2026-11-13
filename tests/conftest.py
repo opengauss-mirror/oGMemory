@@ -197,3 +197,10 @@ def mock_llm():
     """Create a mock LLM for testing."""
     from providers.llm import MockLLM
     return MockLLM()
+
+
+@pytest.fixture
+def service_threading(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    monkeypatch.setattr("server.memory_service.threading", SimpleNamespace(**vars(threading)))

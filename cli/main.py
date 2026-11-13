@@ -68,8 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument("--embedding-dimension", type=int, help="Embedding output dimension")
     p_onboard.add_argument(
         "--vector-db",
-        choices=["chroma", "opengauss"],
-        help="Vector DB type (local mode defaults to opengauss)",
+        choices=["chroma", "opengauss", "milvus"],
+        help="Vector DB type (default: opengauss; external milvus supported; chroma requires local/headless mode)",
     )
     p_onboard.add_argument("--port", type=int, default=8090, action=ExplicitStore, help="HTTP port")
     p_onboard.add_argument("--instance-name", default="ogmem", help="Docker quickstart instance name")
@@ -84,6 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Storage backend (default: sql)",
     )
     p_onboard.add_argument("--db-connection", help="SQL storage connection string")
+    p_onboard.add_argument("--milvus-uri", help="Milvus URI accessible from the selected runtime")
+    p_onboard.add_argument("--milvus-collection", help="Milvus collection name")
+    p_onboard.add_argument("--milvus-db-name", help="Existing Milvus database name")
+    p_onboard.add_argument("--milvus-timeout", type=float, help="Milvus RPC timeout in seconds")
     p_onboard.add_argument("--vector-db-connection", help="Vector database connection string (defaults to SQL connection on first setup)")
     p_onboard.add_argument(
         "--sql-dialect",

@@ -1,0 +1,17 @@
+{
+  "parquet": "/absolute/path/to/BEAM-100K.parquet",
+  "output_root": "/absolute/path/to/beam-results/unique-task1-run",
+  "conversation_index": 0,
+  "run_id": "beam-t1-unique-1234",
+  "database": "beam_eval_t1_unique_1234",
+  "postgres_container": "beam-eval-postgres",
+  "memory_container": "beam-eval-memory",
+  "agent_container": "beam-eval-agent",
+  "account": "beam-eval",
+  "user": "beam-100k-conv1",
+  "memory_url": "http://127.0.0.1:18800",
+  "base_url": "http://127.0.0.1:20800",
+  "variant": "baseline",
+  "judge_model": "deepseek-chat",
+  "judge_base_url": "https://api.deepseek.com"
+}

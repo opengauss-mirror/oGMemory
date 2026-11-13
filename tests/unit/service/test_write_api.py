@@ -377,12 +377,14 @@ class TestWriteMemory:
 
         class AtomicEventBuilder:
             def build_write_event(self, node):
+                from commit.write_events import build_write_event
                 self.built_nodes.append(node)
+                self.event = build_write_event(node)
                 return self.event
 
         class AtomicOutbox(AtomicEventBuilder):
             def __init__(self):
-                self.event = object()
+                self.event = None
                 self.built_nodes = []
                 self.registered_writes = []
 
@@ -474,7 +476,7 @@ class TestWriteMemory:
         assert result["action"] == "create"
         assert fs.atomic_writes == []
         assert len(fs.fallback_writes) == 1
-        assert outbox.built_nodes == []
+        assert outbox.built_nodes == [fs.fallback_writes[0][0]]
         assert outbox.registered_writes == [fs.fallback_writes[0]]
 
     def test_write_memory_skipped_candidate(self):

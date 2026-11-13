@@ -16,7 +16,7 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, RelationEdge, RequestContext
-from fs.sql_adapter.sql_context_fs import parse_uri
+from fs.sql_adapter.sql_context_fs import parse_uri, _resource_mutation_lock_key
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -96,6 +96,28 @@ def test_memory_identity_lock_holds_a_session_advisory_lock(mock_sql_fs):
 
     assert any("pg_advisory_unlock" in sql for sql in _sql_calls(cursor))
     conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize("remaining, expected", [(None, 120.0), (3.0, 3.0)])
+def test_guarded_memory_identity_wait_uses_caller_deadline(mock_sql_fs, remaining, expected):
+    from contextlib import nullcontext
+
+    fs, _, _ = mock_sql_fs
+    guard = MagicMock()
+    guard.wait_for_identity_lock = True
+    guard.identity_lock.return_value = nullcontext()
+    directory = "ctx://acme/users/alice/memories/preferences"
+
+    with (
+        patch("fs.sql_adapter.session_mutation.active_session_guard", return_value=guard),
+        patch("core.operation_deadline.remaining_seconds", return_value=remaining),
+        fs.memory_identity_lock(directory, _ctx()),
+    ):
+        pass
+
+    guard.identity_lock.assert_called_once_with(
+        _resource_mutation_lock_key("acme", directory), _ctx(), expected,
+    )
 
 
 @pytest.fixture
@@ -586,8 +608,10 @@ class TestSQLContextFSMoveNode:
         # 1) SELECT uri ... for DELETE events (all moved nodes)
         # 2) SELECT uri,abstract,... for UPSERT events (re-index)
         cursor.fetchall.side_effect = [
+            [(old_uri,)],  # ordered endpoint lock
+            [],  # no graph jobs on this legacy move
             [(new_uri,)],  # all_new_uris — just the moved node
-            [(new_uri, "abs", "ov", "content", "user:alice", "preference", "MEMORY")],  # moved_rows
+            [(new_uri, "abs", "ov", "content", "user:alice", "preference", "MEMORY", {}, 1)],  # moved_rows
         ]
 
         fs.move_node(old_uri, new_uri, ctx)
@@ -658,8 +682,10 @@ class TestSQLContextFSMoveNode:
         ]
         new_uri = "ctx://acme/users/alice/memories/preferences/latte"
         cursor.fetchall.side_effect = [
+            [],  # endpoint lock result
+            [],  # no graph jobs
             [(new_uri,)],
-            [(new_uri, "a", "o", "c", "user:alice", "preference", "MEMORY")],
+            [(new_uri, "a", "o", "c", "user:alice", "preference", "MEMORY", {}, 1)],
         ]
 
         fs.move_node(

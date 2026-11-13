@@ -72,6 +72,8 @@ _FORBIDDEN_WRITE_FIELDS = {
     "verified_object_aliases",
     "source_contexts",
     "node_draft_indices",
+    "node_reconciliation_group",
+    "node_reconciliation_role",
 }
 _WRITE_ARGUMENT_FIELDS = {
     "session_id", "text", "messages", "agent_id", "client_request_id", "force_extract", "wait",
@@ -601,6 +603,7 @@ def query_memory(
     types: list[str] | None = None,
     top_k: int = 5,
     score_threshold: float | None = None,
+    use_scene: bool | None = None,
     session_id: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
@@ -614,7 +617,9 @@ def query_memory(
     if top_k < 1 or top_k > 20:
         raise ValueError("top_k must be between 1 and 20")
 
-    requested_types = types or []
+    if use_scene is not None and not isinstance(use_scene, bool):
+        raise ValueError("use_scene must be boolean")
+    requested_types = list(dict.fromkeys(types or MEMORY_TYPES))
     unknown = sorted(t for t in requested_types if t not in MEMORY_TYPES)
     if unknown:
         raise ValueError(f"Unknown memory types: {', '.join(unknown)}")
@@ -638,7 +643,7 @@ def query_memory(
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
     )
-    categories = [MEMORY_TYPES[t].internal_category for t in requested_types] or None
+    categories = list(dict.fromkeys(MEMORY_TYPES[t].internal_category for t in requested_types))
     search_top_k = _internal_search_top_k(service, query, top_k)
     type_filters = {}
     if categories and any(
@@ -648,17 +653,38 @@ def query_memory(
         type_filters["memory_directories"] = sorted({MEMORY_TYPES[t].directory for t in requested_types})
 
     try:
-        with request_usage_scope(ctx):
-            result = service.get_read_api().search_memory(
-                query.strip(),
-                ctx,
-                top_k=search_top_k,
-                categories=categories,
-                score_threshold=score_threshold,
-                include_debug=False,
-                fill_content_for_top_k=min(top_k, 3),
-                **type_filters,
-            )
+        from fs.sql_adapter.pool import psycopg2
+        from fs.sql_adapter.session_mutation import active_session_guard
+        for attempt in range(2):
+            try:
+                with request_usage_scope(ctx):
+                    result = service.get_read_api().search_memory(
+                        query.strip(),
+                        ctx,
+                        top_k=search_top_k,
+                        final_top_k=top_k,
+                        categories=categories,
+                        score_threshold=score_threshold,
+                        include_debug=False,
+                        fill_content_for_top_k=min(top_k, 3),
+                        **type_filters,
+                        **({"use_scene": use_scene} if use_scene is not None else {}),
+                    )
+                break
+            except Exception as exc:
+                connection_error = psycopg2 is not None and isinstance(
+                    exc, (psycopg2.InterfaceError, psycopg2.OperationalError)
+                ) and (not getattr(exc, "pgcode", None) or exc.pgcode.startswith("08")
+                       or exc.pgcode in {"57P01", "57P02", "57P03"})
+                if not connection_error or active_session_guard() is not None:
+                    raise
+                if attempt:
+                    raise RuntimeError(
+                        "Memory query failed: database connection unavailable after one retry; "
+                        "this does not mean the memory is absent."
+                    ) from exc
+                logger.warning("MCP memory query lost its database connection; retrying once")
+
     except Exception as exc:
         recorder = getattr(service, "record_retrieval_metric", None)
         if callable(recorder):
@@ -1109,6 +1135,7 @@ def write_memory(
     if client_request_id:
         params["clientRequestId"] = client_request_id
         params["client_request_id"] = client_request_id
+        params["retryInBackground"] = True
     if force_extract:
         params["forceExtract"] = True
     if wait:
@@ -1117,19 +1144,21 @@ def write_memory(
     try:
         result = service.after_turn(params)
     except Exception as exc:
-        _record_mcp_write_audit(
-            service,
-            ctx,
-            session_id=session_id,
-            agent_id=agent_id,
-            client_request_id=client_request_id,
-            result="failed",
-            details={"error": f"{type(exc).__name__}: {exc}"},
-        )
-        raise
+        from core.write_contract import error_fields, normalize_write_result
+        fields = error_fields(exc, client_request_id)
+        if fields["error_detail"]["code"] == "WRITE_INTERNAL_ERROR":
+            _record_mcp_write_audit(
+                service, ctx, session_id=session_id, agent_id=agent_id,
+                client_request_id=client_request_id, result="failed",
+                details={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
+        result = normalize_write_result({"ok": False, "accepted": False,
+                                         "status": "failed", **fields}, client_request_id)
 
+    from core.write_contract import PUBLIC_FIELDS
     raw_status = result.get("status")
-    accepted = not (
+    accepted = bool(result.get("accepted")) if "accepted" in result else not (
         result.get("ok") is False
         or result.get("retryable") is True
         or (isinstance(raw_status, int) and 400 <= raw_status <= 599)
@@ -1157,7 +1186,7 @@ def write_memory(
             session_id=session_id, client_request_id=client_request_id,
         )
     return {
-        "ok": accepted,
+        "ok": result.get("ok", accepted),
         "status": result.get("status", "accepted"),
         "retryable": bool(result.get("retryable", False)),
         "session_id": session_id,
@@ -1166,7 +1195,19 @@ def write_memory(
         "submitted_messages": len(normalized_messages),
         "accepted_messages": accepted_messages,
         "stats": _public_write_stats(result),
+        **{key: result[key] for key in PUBLIC_FIELDS if key in result},
     }
+
+
+def get_write_request_status(service, *, session_id, client_request_id, agent_id=None,
+                             transport_headers=None, allow_stdio_env_auth=True,
+                             resolved_identity=None, request_context=None):
+    ctx = request_context or build_mcp_context(
+        service, {"session_id": session_id, "agent_id": agent_id},
+        transport_headers=transport_headers, allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity)
+    return service.get_write_request_status({"sessionId": session_id,
+        "clientRequestId": client_request_id, "_ctx": ctx})
 
 
 def validate_write_arguments(arguments: Mapping[str, Any]) -> None:

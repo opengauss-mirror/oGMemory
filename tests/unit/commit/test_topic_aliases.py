@@ -133,7 +133,7 @@ def test_preference_holders_keep_their_own_alias_groups(setup):
     for candidate in result:
         writer.write_memory(candidate, ctx)
     assert len(fs.nodes) == 2
-    assert {node.metadata["who"] for node in fs.nodes.values()} == {"Rae", "Noor"}
+    assert {node.metadata["who"] for node in fs.nodes.values()} == {ctx.user_id, "Noor"}
 
 
 @pytest.mark.parametrize("change", [dict(who="Noor"), dict(scope_ref="work"),

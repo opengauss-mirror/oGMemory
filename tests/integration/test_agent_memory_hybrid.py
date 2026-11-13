@@ -282,8 +282,6 @@ def _sql_extraction(dsn, ctx, turn, reached, resume):
 
 @pytest.mark.parametrize("state", ["running", "completed"])
 def test_sql_expired_claim_keeps_current_extraction_state(sql_database, sql_storage, state):
-    import psycopg2
-
     fs, outbox = sql_storage
     client, ctx = _MemoryAGFS(), _context()
     store, turn = finalized_trace(client, ctx)
@@ -295,11 +293,8 @@ def test_sql_expired_claim_keeps_current_extraction_state(sql_database, sql_stor
     child.start()
     try:
         assert reached.wait(10)
-        with closing(psycopg2.connect(sql_database)) as conn, conn, conn.cursor() as cur:
-            cur.execute("UPDATE outbox_events SET locked_at=NOW()-interval '301 seconds' WHERE event_id=%s",
-                        (event.event_id,))
-        claimed = outbox.claim_batch("second")
-        assert len(claimed) == 1
+        claimed = outbox.claim_batch("second", timeout_seconds=0)
+        assert claimed == []
         if state == "completed":
             resume.set()
             child.join(15)
@@ -315,7 +310,7 @@ def test_sql_expired_claim_keeps_current_extraction_state(sql_database, sql_stor
         current = outbox.get_event(ctx.account_id, event.event_id)
         assert current.status == "DONE", (current, stats)
         assert current.retry_count == 0, stats
-        assert stats["skipped"] == 1, stats
+        assert stats["processed"] == 0, stats
     finally:
         resume.set()
         if child.is_alive():

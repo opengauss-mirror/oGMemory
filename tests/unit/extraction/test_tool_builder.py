@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from extraction.schemas.models import MemoryTypeSchema, SchemaField, FieldType
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
@@ -57,6 +59,32 @@ def test_build_tool_to_category_maps_owner_scope():
     assert mapping["extract_skill"] == ("skill", "agent")
     assert "extract_session_archive" not in mapping
     assert "extract_session_summary" not in mapping
+
+
+@pytest.mark.parametrize("topic_drafts", [False, True], ids=["complete-cards", "topic-drafts"])
+@pytest.mark.parametrize("activation_enabled", [False, True], ids=["standard", "graph"])
+def test_source_only_tools_preserve_enabled_fact_and_identity_contracts(topic_drafts, activation_enabled):
+    registry = SchemaRegistry()
+    native = {tool["name"]: tool for tool in build_extraction_tools(
+        registry, topic_drafts=topic_drafts, activation_enabled=activation_enabled)}
+    source = {tool["name"]: tool for tool in build_extraction_tools(
+        registry, include_updates=False, topic_drafts=topic_drafts, activation_enabled=activation_enabled,
+    )}
+    assert set(source) == {schema.tool_name for schema in registry.list_compatible_enabled()
+                           if schema.memory_type not in {"session_archive", "session_summary"}
+                           and (activation_enabled or schema.memory_type != "relation")}
+    for name, tool in source.items():
+        expected = {key: value for key, value in native[name]["input_schema"]["properties"].items()
+                    if key not in {"target_uri", "expected_version"}}
+        assert tool["input_schema"]["properties"] == expected
+        assert tool["input_schema"]["required"] == native[name]["input_schema"]["required"]
+        assert tool["schema_version"] == native[name]["schema_version"]
+        assert tool["metadata"] == native[name]["metadata"]
+    profile = source["extract_profile"]
+    assert "eligible, source-supported profile attributes" in profile["description"]
+    assert "containing ALL supported profile attributes" in profile["description"]
+    assert "evidence_quote" in profile["input_schema"]["required"]
+    assert "attribution_basis" in profile["input_schema"]["required"]
 
 
 def test_parse_tool_call_rejects_internal_storage_schemas():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import logging
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -12,19 +13,27 @@ from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 
 
-@pytest.mark.parametrize("archive_failed", [False, True])
-def test_background_completion_marker_waits_for_snapshot_commit(caplog, archive_failed):
-    caplog.set_level(logging.INFO, logger="ogmem.service")
+@pytest.fixture
+def after_turn_service():
     service = MemoryService(config=OgMemConfig(
         after_turn_threshold=1, session_state_bridge_enabled=False,
     ))
-    session_id = "archive-completion-barrier"
-    ctx = _threaded_ctx(session_id)
     service._write_api = Mock()
     service._async_drain = Mock()
-    service._chunk_and_extract = Mock(return_value=_successful_write_result())
     mgr = service.get_session_manager()
     mgr.save_session_state = Mock(return_value=True)
+    mgr.parallel_archive_compression = Mock(return_value=nullcontext())
+    mgr.commit_snapshot = Mock(return_value={"ok": True, "archived": True, "status": "completed"})
+    return service, mgr
+
+
+@pytest.mark.parametrize("archive_failed", [False, True])
+def test_background_completion_marker_waits_for_snapshot_commit(caplog, archive_failed, after_turn_service):
+    caplog.set_level(logging.INFO, logger="ogmem.service")
+    service, mgr = after_turn_service
+    session_id = "archive-completion-barrier"
+    ctx = _threaded_ctx(session_id)
+    service._chunk_and_extract = Mock(return_value=_successful_write_result())
 
     def commit(*args, **kwargs):
         assert "after_turn background extract done:" not in caplog.text
@@ -32,7 +41,7 @@ def test_background_completion_marker_waits_for_snapshot_commit(caplog, archive_
             "status": "completed", "archived": True,
         }
 
-    mgr.commit_snapshot = Mock(side_effect=commit)
+    mgr.commit_snapshot.side_effect = commit
     service.after_turn({
         "sessionId": session_id,
         "messages": [{"role": "user", "content": "a" * 100}],
@@ -62,13 +71,8 @@ def test_session_manager_lazy_initialization_is_thread_safe():
     assert len({id(manager) for manager in managers}) == 1
 
 
-def test_concurrent_after_turn_claims_each_message_once():
-    service = MemoryService(
-        config=OgMemConfig(
-            after_turn_threshold=1,
-            session_state_bridge_enabled=False,
-        )
-    )
+def test_concurrent_after_turn_claims_each_message_once(after_turn_service):
+    service, mgr = after_turn_service
     ctx = RequestContext(
         account_id="acct-test",
         user_id="user-test",
@@ -76,11 +80,6 @@ def test_concurrent_after_turn_claims_each_message_once():
         session_id="session-threaded",
         trace_id="trace-threaded",
     )
-    service._write_api = Mock()
-    service._async_drain = Mock()
-    mgr = service.get_session_manager()
-    mgr.save_session_state = Mock(return_value=True)
-
     claim_barrier = threading.Barrier(2)
     buf = mgr.get_or_create("session-threaded", ctx=ctx)
     real_claim = buf.claim_incremental_extraction
@@ -110,9 +109,6 @@ def test_concurrent_after_turn_claims_each_message_once():
         }
 
     service._chunk_and_extract = fake_extract
-    mgr.commit_snapshot = Mock(
-        return_value={"ok": True, "archived": True, "status": "completed"}
-    )
 
     results = []
 
@@ -145,22 +141,10 @@ def test_concurrent_after_turn_claims_each_message_once():
     mgr.commit_snapshot.assert_called_once()
 
 
-def test_after_turn_returns_retryable_while_session_extraction_active():
-    service = MemoryService(
-        config=OgMemConfig(
-            after_turn_threshold=1,
-            session_state_bridge_enabled=False,
-        )
-    )
+def test_after_turn_returns_retryable_while_session_extraction_active(after_turn_service):
+    service, mgr = after_turn_service
     session_id = "session-single-flight"
     ctx = _threaded_ctx(session_id)
-    service._write_api = Mock()
-    service._async_drain = Mock()
-    mgr = service.get_session_manager()
-    mgr.save_session_state = Mock(return_value=True)
-    mgr.commit_snapshot = Mock(
-        return_value={"ok": True, "archived": True, "status": "completed"}
-    )
 
     extract_started = threading.Event()
     release_extract = threading.Event()
@@ -221,7 +205,10 @@ def _successful_write_result() -> dict:
 
 def test_dispose_preserves_messages_added_after_its_snapshot():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
-    service._get_context_fs = Mock(return_value=None)
+    from tests.unit.commit.test_memory_identity import MemoryFS
+    fs = MemoryFS()
+    service._get_context_fs = Mock(return_value=fs)
+    service._get_archive_store = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-race"
     ctx = _threaded_ctx(session_id)
@@ -237,12 +224,20 @@ def test_dispose_preserves_messages_added_after_its_snapshot():
     def blocked_write_api():
         write_api_requested.set()
         release_write_api.wait(timeout=3)
-        return object()
+        return writer
 
     def fake_extract(**kwargs):
         flushed_contents.extend(message["content"] for message in kwargs["messages"])
-        return _successful_write_result()
+        archived = writer.write_raw_chunk(messages=kwargs["messages"], ctx=ctx,
+                                          session_id=kwargs["archive_id"], chunk_index=0,
+                                          candidate_checkpoint=kwargs["extraction_journal"].checkpoint("raw:source"))
+        return {**_successful_write_result(), "raw_source_uris": [archived["target_uri"]],
+                "source_status": "RAW_ARCHIVED"}
 
+    from service.api import MemoryWriteAPI
+    from providers.llm import MockLLM
+    writer = MemoryWriteAPI(fs, MockLLM(), directory_summary_enabled=False)
+    service._write_api = writer
     service.get_write_api = blocked_write_api
     service._chunk_and_extract = fake_extract
     service.drain_outbox_sync = Mock(return_value={"processed": 0})
@@ -269,7 +264,10 @@ def test_dispose_preserves_messages_added_after_its_snapshot():
 
 def test_dispose_fast_path_preserves_messages_added_during_cleanup():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
-    service._get_context_fs = Mock(return_value=None)
+    from tests.unit.commit.test_memory_identity import MemoryFS
+    fs = MemoryFS()
+    service._get_context_fs = Mock(return_value=fs)
+    service._get_archive_store = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-fast-race"
     ctx = _threaded_ctx(session_id)
@@ -280,11 +278,17 @@ def test_dispose_fast_path_preserves_messages_added_during_cleanup():
     save_started = threading.Event()
     release_save = threading.Event()
 
+    save = service._save_dispose_snapshot
+    from service.api import MemoryWriteAPI
+    from providers.llm import MockLLM
+    service._write_api = MemoryWriteAPI(fs, MockLLM(), directory_summary_enabled=False)
+
     def blocked_save(*_args, **_kwargs):
         save_started.set()
         release_save.wait(timeout=3)
+        return save(*_args, **_kwargs)
 
-    service._save_session_state_best_effort = blocked_save
+    service._save_dispose_snapshot = blocked_save
     result_holder = []
     dispose_thread = threading.Thread(
         target=lambda: result_holder.append(
