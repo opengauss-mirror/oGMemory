@@ -17,12 +17,17 @@ from extraction.event_reconciliation import (
     _GROUP_SCHEMA,
     _LAYERS,
     _LIMITS,
+    _SINGLETON_SCHEMA,
     _normalize_empty_context,
     _repair_group_summaries,
+    _singleton_reference,
     _valid_partition,
+    _verified_partition,
     _verify_occurrence_groups,
 )
 from extraction.occurrence_qualification import prompt_fits
+from providers.llm_observation import observe_call
+from core.model_stage import model_signature, run_model_call, stage_digest
 
 _EVIDENCE_SCHEMA = {
     "type": "object", "properties": {
@@ -33,12 +38,12 @@ _EVIDENCE_SCHEMA = {
 }
 _SCHEMA = {
     "type": "object", "properties": {"groups": {
-        "type": "array", "minItems": 1, "items": {
+        "type": "array", "minItems": 1, "items": {"oneOf": [_SINGLETON_SCHEMA, {
             **_GROUP_SCHEMA,
             "properties": {**_GROUP_SCHEMA["properties"], "identity_evidence": {
                 "type": "array", "items": _EVIDENCE_SCHEMA}},
             "required": [*_GROUP_SCHEMA["required"], "identity_evidence"],
-        },
+        }]},
     }}, "required": ["groups"], "additionalProperties": False,
 }
 _QUOTE_REPAIR_SCHEMA = {
@@ -68,11 +73,12 @@ _PARTITION = (
     "resolved problem, including all performed steps and outcomes. Different wording "
     "and complementary facts may describe the same occurrence. Use singleton groups "
     "whenever identity is ambiguous. Include every zero-based draft index exactly once. "
+    'For each singleton return only {"members": [i]}, referencing the original draft. '
     "For each merged group provide identity_evidence covering EVERY member: its member "
     "index, its own source_index, one selected user's original message_index, and an exact "
     "continuous quote from that message supporting this occurrence link. Explain links "
-    "through source quotes, never through candidate labels. Singleton evidence must be []. "
-    "Return complete abstract, overview, content, title, when, who, where and scope_ref "
+    "through source quotes, never through candidate labels. "
+    "For each merged group return complete abstract, overview, content, title, when, who, where and scope_ref "
     "preserving ALL supported facts, qualifications, attribution, source scope, dates "
     "and roles from every member, in the original language. Do not invent facts or "
     "discard complementary details; an omission is not a correction. " + _RULES
@@ -102,6 +108,8 @@ def _prompt(instruction, payload):
 
 
 def _valid_evidence(group, drafts, sources):
+    if _singleton_reference(group):
+        return True
     evidence = group.get("identity_evidence")
     if not isinstance(evidence, list):
         return False
@@ -165,7 +173,7 @@ def _repair_quote_contract(groups, drafts, sources, llm):
     )
     if not prompt_fits(prompt, _QUOTE_REPAIR_SCHEMA):
         raise ExtractionIncompleteError("Source evidence repair exceeds the complete context budget")
-    response = llm.complete_json(prompt, schema=_QUOTE_REPAIR_SCHEMA)
+    response = run_model_call(observe_call, "postprocess", llm.complete_json, prompt, schema=_QUOTE_REPAIR_SCHEMA)
     repairs = response.get("repairs") if isinstance(response, dict) and set(response) == {"repairs"} else None
     if not isinstance(repairs, list) or len(repairs) != len(indices):
         return groups
@@ -183,7 +191,7 @@ def _repair_quote_contract(groups, drafts, sources, llm):
     return [replacements.get(index, group) for index, group in enumerate(groups)]
 
 
-def reconcile_source_occurrences(entries, ctx, archive_id, llm):
+def reconcile_source_occurrences(entries, ctx, archive_id, llm, *, checkpoint=None):
     """Partition only this extraction's new additions, retaining singleton multiplicity.
 
     Unknown origin stays singleton. The internal source partition ID is also retained
@@ -230,12 +238,20 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
         prompt = _prompt(_PARTITION, payload)
         if not prompt_fits(prompt, _SCHEMA):
             raise ExtractionIncompleteError("Source occurrence partition exceeds the complete context budget")
-        response = llm.complete_json(prompt, schema=_SCHEMA)
+        inputs = ({"prompt": prompt, "schema": _SCHEMA, "model": model_signature(llm)}
+                  if checkpoint is not None else None)
+        stage = "source_occurrence:" + stage_digest(inputs) if checkpoint is not None else None
+        cached = checkpoint.load_stage(stage, inputs) if checkpoint is not None else None
+        response = cached if cached is not None else run_model_call(observe_call, "postprocess", llm.complete_json, prompt, schema=_SCHEMA)
         groups = response.get("groups") if isinstance(response, dict) and set(response) == {"groups"} else None
-        groups, repaired = _normalize_empty_context(groups)
-        if (isinstance(groups, list) and groups
+        repaired = set()
+        if cached is None:
+            groups, repaired = _normalize_empty_context(groups)
+        if (cached is None and isinstance(groups, list) and groups
                 and all(isinstance(group, dict)
-                        and set(group) == {*_GROUP_SCHEMA["required"], "identity_evidence"} for group in groups)
+                        and (_singleton_reference(group)
+                             or set(group) == {*_GROUP_SCHEMA["required"], "identity_evidence"})
+                        for group in groups)
                 and not _valid_partition(groups, len(drafts))):
             # Before spending a repair call, require every non-summary field and
             # original USER quotation to be valid. Never repair identity here.
@@ -247,18 +263,21 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
                     and all(_valid_evidence(group, drafts, local_sources) for group in shape)):
                 groups, summary_repaired = _repair_group_summaries(groups, len(drafts), llm)
                 repaired.update(summary_repaired)
-        if (_valid_partition(groups, len(drafts))
-                and all(set(group) == {*_GROUP_SCHEMA["required"], "identity_evidence"} for group in groups)):
+        if (cached is None and _valid_partition(groups, len(drafts))
+                and all(_singleton_reference(group)
+                        or set(group) == {*_GROUP_SCHEMA["required"], "identity_evidence"} for group in groups)):
             groups = _repair_quote_contract(groups, drafts, local_sources, llm)
         if (not _valid_partition(groups, len(drafts))
-                or any(set(group) != {*_GROUP_SCHEMA["required"], "identity_evidence"}
+                or any((not _singleton_reference(group)
+                        and set(group) != {*_GROUP_SCHEMA["required"], "identity_evidence"})
                        or not _valid_evidence(group, drafts, local_sources) for group in groups)):
             raise ExtractionIncompleteError("Source occurrence reconciliation requires a complete evidenced partition")
+        if cached is not None:
+            repaired = {index for index, group in enumerate(groups) if not _singleton_reference(group)}
         merged_groups = [group for index, group in enumerate(groups)
                          if len(group["members"]) > 1 or index in repaired]
-        if not merged_groups:
-            continue
-        merged_groups = _verify_occurrence_groups(payload, merged_groups, llm, prompt_fits)
+        if cached is None:
+            merged_groups = _verify_occurrence_groups(payload, merged_groups, llm, prompt_fits)
         for group in merged_groups:
             members = [indices[index] for index in sorted(group["members"])]
             first = members[0]
@@ -280,6 +299,8 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
                 raise ExtractionIncompleteError("Source occurrence reconciliation produced invalid complete facts") from exc
             partitions[first] = members
             removed.update(members[1:])
+        if checkpoint is not None and cached is None:
+            checkpoint.save_stage(stage, inputs, _verified_partition(groups, merged_groups))
 
     nonce = uuid.uuid4().hex
     # Rendered source context includes the extraction clock; original evidence

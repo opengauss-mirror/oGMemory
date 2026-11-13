@@ -61,7 +61,11 @@ def test_record_usage_without_admin_lock_timeout(dialect, use_deadline, monkeypa
     assert len(inserts) == 1
     assert inserts[0].startswith(b"INSERT INTO model_usage_events ")
     assert cursor.mogrify.call_args.args[1][:5] == (
-        "event-1", "acct-1", "user:alice", "test-model", "llm",
+        "event-1",
+        "acct-1",
+        "user:alice",
+        "test-model",
+        "llm",
     )
     if use_deadline:
         pool.deadline_connection.assert_called_once_with(deadline)
@@ -74,3 +78,54 @@ def test_record_usage_without_admin_lock_timeout(dialect, use_deadline, monkeypa
         connection.commit.assert_called_once()
         pool.return_connection.assert_called_once_with(connection)
         wait.assert_not_called()
+
+
+def test_decision_usage_is_separate_and_included_once_in_totals():
+    today = datetime.now(UTC).date()
+
+    def row(day, model, kind, **counts):
+        return (day, model, kind, *(counts.get(key, 0) for key in store_module.COUNTERS))
+
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        row(day, model, kind, **counts)
+        for day in (None, today)
+        for model, kind, counts in (
+            ("generator", "llm", dict(input_tokens=10, output_tokens=5, llm_calls=1)),
+            ("embedder", "embedding", dict(embed_tokens=7, embed_calls=1)),
+            (
+                "jev",
+                "decision",
+                dict(
+                    input_tokens=20,
+                    output_tokens=3,
+                    llm_calls=2,
+                    failed_calls=1,
+                    missing_usage_calls=1,
+                ),
+            ),
+        )
+    ]
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = SQLModelUsageStore.__new__(SQLModelUsageStore)
+    store.pool = SimpleNamespace(
+        get_connection=Mock(return_value=connection), return_connection=Mock()
+    )
+    result = store.metrics(1, "account", ("user:alice",))
+    assert result["cumulative"]["llm"]["total_tokens"] == 15
+    assert result["cumulative"]["llm"]["calls"] == 1
+    assert result["cumulative"]["decision"] == dict(
+        input_tokens=20,
+        output_tokens=3,
+        total_tokens=23,
+        calls=2,
+        failed_calls=1,
+        missing_usage_calls=1,
+    )
+    assert result["cumulative"]["total_tokens"] == result["today"]["total"] == 45
+    assert result["today"]["decision_input"] == 20
+    assert result["today"]["llm_input"] == 10
+    assert result["models"]["decision"] == "jev"
+    assert result["cumulative"]["missing_usage_calls"] == 1
+    assert cursor.execute.call_args.args[1] == ["account", ["user:alice"]]

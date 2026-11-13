@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from logging import getLogger
 from typing import Any
 
@@ -30,6 +30,7 @@ from core.react_loop import (
 )
 from core.uri_resolver import URIResolver
 from core.validation import validate_candidate
+from extraction.assembly_contract import AssemblyContract, UnsupportedAssemblyTemplateError
 from extraction.incremental_edit import (
     INCREMENTAL_TOOLS,
     coalesce_incremental_edits,
@@ -111,6 +112,7 @@ class ExtractionTaskContext(ReactTaskContext):
     """Task context for extraction ReAct loop."""
     conversation_text: str
     prefetch_result: PrefetchResult | None = None
+    selected_sections: tuple[str, str, str] | None = None
 
 
 @dataclass
@@ -159,6 +161,8 @@ class ExtractionReActLoop(ReactLoop):
     - Single safety re-read: prevent infinite loops
     """
 
+    _llm_observation_stage = "extraction"
+
     def __init__(
         self,
         llm: LLM,
@@ -170,6 +174,7 @@ class ExtractionReActLoop(ReactLoop):
         max_iterations: int = 3,
         timeout_seconds: float = 30.0,
         internal_tool_usage_tracker: Any | None = None,
+        activation_enabled: bool = False,
     ):
         super().__init__(
             llm, max_iterations, timeout_seconds,
@@ -181,8 +186,19 @@ class ExtractionReActLoop(ReactLoop):
         self._uri_resolver = uri_resolver
         self._prefetcher = prefetcher
         self._prompt_manager = prompt_manager
+        from extraction.prompts.manager import validate_prompt_manager
 
-        self._extraction_tools = build_extraction_tools(registry)
+        validate_prompt_manager(
+            self._prompt_manager, "extraction_graph" if activation_enabled else "extraction"
+        )
+        self._activation_enabled = activation_enabled
+
+        self._extraction_tools = (build_extraction_tools(registry, activation_enabled=True)
+                                  if activation_enabled else build_extraction_tools(registry))
+        self._base_extraction_tools = self._extraction_tools
+        self._prompt_parts = None
+        self._assembly_categories: frozenset[str] | None = None
+        self._offered_extraction_tools: list[dict] | None = None
         self._update_instruction = build_update_instruction(registry)
 
         # All available tools: read, list, relations, access_stats, and extraction tools
@@ -203,8 +219,75 @@ class ExtractionReActLoop(ReactLoop):
         conversation_text: str,
         ctx: RequestContext,
         prefetch_result: PrefetchResult | None = None,
+        *,
+        categories: frozenset[str] | None = None,
+        prompt_parts=None,
+        assembly_contract=None,
+        assembled_tools=None,
     ) -> ExtractionReActResult:
         check_deadline()
+        from extraction.prompt_assembly import (
+            category_catalog,
+            lazy_tools_for_contract,
+            select_assembly,
+            supports_assembly,
+            tools_for_categories,
+        )
+
+        available = frozenset(
+            item["category"]
+            for item in category_catalog(self._registry, self._base_extraction_tools)
+        )
+        selected_sections = None
+        if self._activation_enabled or not supports_assembly(self._prompt_manager):
+            assembly_contract = AssemblyContract(available, (), "lazy", "full", "unsupported_template")
+        elif assembly_contract is None:
+            if categories is None:
+                selection = select_assembly(
+                    self._llm,
+                    self._registry,
+                    self._base_extraction_tools,
+                    conversation_text,
+                    ctx.user_id,
+                    manager=self._prompt_manager,
+                )
+                categories = selection.categories
+                scope, reason = selection.scope, selection.reason
+            else:
+                scope, reason = "scoped" if categories else "no_task", None
+            assembly_contract = AssemblyContract(categories, (), "lazy", scope, reason)
+            if scope == "scoped":
+                variables = prompt_parts.template_variables if prompt_parts is not None else {}
+                try:
+                    selected_sections = self._render_selected_sections(
+                        "extraction", assembly_contract, variables)
+                except UnsupportedAssemblyTemplateError:
+                    assembly_contract = AssemblyContract(
+                        available, (), "lazy", "full", "unsupported_template")
+        self._assembly_categories = (None if assembly_contract.scope == "full"
+                                     else assembly_contract.categories)
+        self._extraction_tools = (self._base_extraction_tools if self._assembly_categories is None
+            else tools_for_categories(self._base_extraction_tools, self._registry, self._assembly_categories))
+        self._prompt_parts = prompt_parts
+        self._update_instruction = build_update_instruction(
+            self._registry, self._assembly_categories
+        )
+        self._offered_extraction_tools = (
+            self._extraction_tools
+            if category_catalog(self._registry, self._base_extraction_tools)
+            else None
+        )
+        self._all_tools = (
+            list(assembled_tools)
+            if assembled_tools is not None
+            else lazy_tools_for_contract(self._extraction_tools, self._fs, assembly_contract)
+        )
+        assembly_contract = replace(
+            assembly_contract, tool_names=tuple(tool["name"] for tool in self._all_tools)
+        )
+        self._assembly_contract = assembly_contract
+        if assembly_contract.scope == "no_task":
+            return ExtractionReActResult(finish_reason="no_task", completed=True)
         # Reset runtime state
         self._did_safety_reread = False
         self._read_versions = dict(prefetch_result.read_versions) if prefetch_result else {}
@@ -219,6 +302,7 @@ class ExtractionReActLoop(ReactLoop):
         task_ctx = ExtractionTaskContext(
             conversation_text=conversation_text,
             prefetch_result=prefetch_result,
+            selected_sections=selected_sections,
         )
 
         loop_result = super().run(ctx, task_ctx)
@@ -248,6 +332,14 @@ class ExtractionReActLoop(ReactLoop):
             content_length=content_length,
         )
 
+    def _render_selected_sections(self, template, contract, variables):
+        render = self._prompt_manager.render
+        return (
+            render(template, "system_prompt", categories=contract.categories, **variables),
+            render(template, "examples", categories=contract.categories),
+            render(template, "lazy_tools_instruction", categories=contract.categories),
+        )
+
     def _build_messages(
         self,
         ctx: RequestContext,
@@ -259,13 +351,26 @@ class ExtractionReActLoop(ReactLoop):
 
         messages = []
 
-        system_prompt = self._prompt_manager.render("extraction", "system_prompt")
-        lazy_tools = self._prompt_manager.render("extraction", "lazy_tools_instruction")
-        identity_block = self._prompt_manager.render("extraction", "identity_block", user_id=ctx.user_id)
-        examples = self._prompt_manager.render("extraction", "examples")
-        output_instruction = self._prompt_manager.render("extraction", "output_instruction")
-
-        # Build system prompt: system_prompt + identity + lazy_tools + examples + output
+        template = "extraction_graph" if self._activation_enabled else "extraction"
+        variables = self._prompt_parts.template_variables if self._prompt_parts is not None else {}
+        identity_block = self._prompt_manager.render(template, "identity_block", user_id=ctx.user_id)
+        output_instruction = self._prompt_manager.render(template, "output_instruction")
+        if self._assembly_categories is None:
+            system_prompt = self._prompt_manager.render(template, "system_prompt", **variables)
+            examples = self._prompt_manager.render(template, "examples")
+            lazy_tools = self._prompt_manager.render(template, "lazy_tools_instruction")
+        else:
+            system_prompt, examples, lazy_tools = (
+                task_ctx.selected_sections or self._render_selected_sections(
+                    template, self._assembly_contract, variables)
+            )
+            if self._prompt_parts is not None:
+                system_prompt = self._prompt_parts.system_prompt
+                examples = self._prompt_parts.examples if self._prompt_parts.include_examples else ""
+        if self._prompt_parts is not None and not self._prompt_parts.include_examples:
+            examples = ""
+        if self._prompt_parts is not None and self._prompt_parts.output_instruction:
+            output_instruction = self._prompt_parts.output_instruction
         system_content = f"{system_prompt}\n\n{identity_block}\n\n{lazy_tools}\n\n{examples}\n\n{output_instruction}"
         system_content += "\n\n" + self._update_instruction
 
@@ -316,6 +421,8 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
     ) -> dict | str:
         check_deadline()
+        if getattr(self, "_offered_extraction_tools", None) is not None and name not in {tool["name"] for tool in self._all_tools}:
+            raise ToolCallProtocolError("Extraction returned a tool outside the assembled schemas")
         try:
             if name == "read":
                 uri = input.get("uri", "")
@@ -352,6 +459,12 @@ class ExtractionReActLoop(ReactLoop):
                 uri = input.get("uri", "")
                 return self._execute_get_stats(uri, ctx)
 
+            elif self._activation_enabled and name == "extract_relation":
+                from extraction.relation_proposals import parse_proposal
+                if parse_proposal(input) is None:
+                    raise ToolCallProtocolError("extract_relation contains an invalid proposal")
+                return {"status": "recorded"}
+
             elif name in INCREMENTAL_TOOLS:
                 candidate = self._to_candidate(name, input)
                 operation_id = len(self._materialized_edits)
@@ -386,13 +499,20 @@ class ExtractionReActLoop(ReactLoop):
 
         Unified parsing used by both _parse_output and _to_extraction_react_result.
         """
+        if self._offered_extraction_tools is not None:
+            from extraction.prompt_assembly import validate_offered_calls
+            validate_offered_calls([{"tool": tool_name}], self._offered_extraction_tools)
         if tool_name in INCREMENTAL_TOOLS:
             key = incremental_read_key(tool_input)
             parsed = parse_tool_call(
                 tool_name, tool_input, self._registry, read_nodes=self._read_nodes, ctx=self._ctx,
                 current_content=self._edit_contents.get(key),
+                **({"activation_enabled": True} if self._activation_enabled else {}),
             )
             candidate = parsed[2]
+            if self._offered_extraction_tools is not None:
+                from extraction.prompt_assembly import validate_offered_candidate
+                validate_offered_candidate(candidate, self._offered_extraction_tools)
             self._edit_contents[key] = candidate.content
             self._edit_candidates[id(candidate)] = candidate
             return candidate
@@ -404,7 +524,8 @@ class ExtractionReActLoop(ReactLoop):
                 tool_name, tool_input["raw"],
             )
             return None
-        parsed = parse_tool_call(tool_name, tool_input, self._registry)
+        parsed = (parse_tool_call(tool_name, tool_input, self._registry, activation_enabled=True)
+                  if self._activation_enabled else parse_tool_call(tool_name, tool_input, self._registry))
         if parsed:
             memory_type, owner_scope, candidate = parsed
             logger.info(f"Parsed candidate from {tool_name}: {memory_type}/{candidate.routing_key}")
@@ -471,6 +592,8 @@ class ExtractionReActLoop(ReactLoop):
             return []
 
         candidates = []
+        proposals = []
+        from extraction.relation_proposals import attach, parse_proposal
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -484,9 +607,15 @@ class ExtractionReActLoop(ReactLoop):
                         tool_input = item[key]
                         break
 
+            if self._activation_enabled and tool_name == "extract_relation":
+                proposal = parse_proposal(tool_input)
+                if proposal is not None:
+                    proposals.append(proposal)
+                continue
             candidate = self._to_candidate(tool_name, tool_input)
             if candidate:
                 candidates.append(candidate)
+        attach(candidates, proposals)
         return candidates
 
     def _should_continue_after_output(
@@ -776,6 +905,8 @@ class ExtractionReActLoop(ReactLoop):
         # Materialized edits have already bound their snapshot at execution time.
         entries = [(id(item) in self._edit_candidates, item) for item in loop_result.output
                    if isinstance(item, CandidateMemory)]
+        proposals = []
+        from extraction.relation_proposals import attach, parse_proposal
 
         # Also extract candidates from tools_used (extract_* tool calls)
         # This handles cases where LLM used tool calling instead of outputting JSON
@@ -790,6 +921,11 @@ class ExtractionReActLoop(ReactLoop):
             tool_result = tool_record.get("result", {})
             # Use params (original input) with unified _to_candidate method
             if tool_result.get("status") == "recorded":
+                if self._activation_enabled and tool_name == "extract_relation":
+                    proposal = parse_proposal(tool_params)
+                    if proposal is not None:
+                        proposals.append(proposal)
+                    continue
                 incremental = tool_name in INCREMENTAL_TOOLS
                 if incremental:
                     candidate = self._materialized_edits[tool_result["operation_id"]]
@@ -809,6 +945,8 @@ class ExtractionReActLoop(ReactLoop):
                 validate_read_target(candidate, self._read_versions, read_nodes=self._read_nodes, ctx=ctx)
         candidates = coalesce_incremental_edits(entries)
 
+        from extraction.relation_proposals import take
+        attach(candidates, take(candidates) + proposals)
         # Validate URIs before returning
         errors = self._validate_operations_uris(candidates, ctx)
         if errors:

@@ -80,13 +80,17 @@ class SQLNotifyListener:
         if self._stop_event.is_set():
             return self._empty_stats()
 
-        ready, _, _ = select.select([conn], [], [], self._idle_sweep_seconds)
-        if not ready:
-            return self._drain_ready_events()
-
-        conn.poll()
-        while getattr(conn, "notifies", []):
-            conn.notifies.pop(0)
+        delay = self._outbox_store.future_pending_delay(
+            None, exclude_event_types=self._worker.excluded_event_types(),
+        )
+        timeout = self._idle_sweep_seconds
+        if delay is not None:
+            # An overdue retry may still be locked by another worker.
+            timeout = min(timeout, max(0.1, delay))
+        ready, _, _ = select.select([conn], [], [], timeout)
+        if ready:
+            conn.poll()
+            conn.notifies.clear()
 
         return self._drain_ready_events()
 

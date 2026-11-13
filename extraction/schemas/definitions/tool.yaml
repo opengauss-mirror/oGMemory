@@ -4,7 +4,8 @@ description: |
   Extract tool usage insights from the conversation.
   Reports best scenarios, optimal parameters, common failures,
   and recommendations for a specific tool.
-  Call once per distinct tool used in the conversation.
+  Call once per distinct tool with a source-grounded insight worth retaining.
+  Do not extract trivial calls without learning value or invent insights from usage counts.
 directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/memories/tools"
 filename_template: "{{ routing_key }}.md"
 operation_mode: upsert

@@ -67,12 +67,13 @@ class SQLModelUsageStore:
                     event["at"],
                     *(counters.get(k, 0) for k in COUNTERS),
                 )
-                rows.append(cur.mogrify('(' + ','.join(['%s'] * len(values)) + ')', values))
+                rows.append(cur.mogrify("(" + ",".join(["%s"] * len(values)) + ")", values))
         execute(
             b"INSERT INTO model_usage_events "
             b"(event_id,account_id,owner_space,model,kind,occurred_at,"
             + ",".join(COUNTERS).encode()
-            + b") VALUES " + b','.join(rows)
+            + b") VALUES "
+            + b",".join(rows)
         )
 
     def record(self, event, *, deadline=None):
@@ -153,13 +154,15 @@ class SQLModelUsageStore:
         daily = {d: dict.fromkeys(COUNTERS, 0) for d in dates}
         total = dict.fromkeys(COUNTERS, 0)
         models = []
+        decision_total = dict.fromkeys(COUNTERS, 0)
+        decision_daily = {d: dict.fromkeys(COUNTERS, 0) for d in dates}
         for day, model, kind, *values in rows:
             counters = dict(zip(COUNTERS, (int(v or 0) for v in values)))
             if day is None:
                 models.append({"model": model, "kind": kind, **counters})
-                target = total
+                target = decision_total if kind == "decision" else total
             else:
-                target = daily.get(day.isoformat())
+                target = (decision_daily if kind == "decision" else daily).get(day.isoformat())
             if target is not None:
                 for k, value in counters.items():
                     target[k] += value
@@ -169,7 +172,13 @@ class SQLModelUsageStore:
                 llm_input=c["input_tokens"],
                 llm_output=c["output_tokens"],
                 embedding_input=c["embed_tokens"],
-                total=c["input_tokens"] + c["output_tokens"] + c["embed_tokens"],
+                decision_input=decision_daily[d]["input_tokens"],
+                decision_output=decision_daily[d]["output_tokens"],
+                total=c["input_tokens"]
+                + c["output_tokens"]
+                + c["embed_tokens"]
+                + decision_daily[d]["input_tokens"]
+                + decision_daily[d]["output_tokens"],
                 llm_calls=c["llm_calls"],
                 embedding_calls=c["embed_calls"],
             )
@@ -182,6 +191,9 @@ class SQLModelUsageStore:
             "scope": {"account_id": account_id, "owner_spaces": list(owner_spaces)},
             "models": {
                 "llm": ", ".join(sorted({m["model"] for m in models if m["kind"] == "llm"})),
+                "decision": ", ".join(
+                    sorted({m["model"] for m in models if m["kind"] == "decision"})
+                ),
                 "embedding": ", ".join(
                     sorted({m["model"] for m in models if m["kind"] == "embedding"})
                 ),
@@ -192,7 +204,9 @@ class SQLModelUsageStore:
             "cumulative": {
                 "total_tokens": total["input_tokens"]
                 + total["output_tokens"]
-                + total["embed_tokens"],
+                + total["embed_tokens"]
+                + decision_total["input_tokens"]
+                + decision_total["output_tokens"],
                 "llm": {
                     **{
                         k: total[k]
@@ -202,8 +216,18 @@ class SQLModelUsageStore:
                     "calls": total["llm_calls"],
                 },
                 "embedding": {"total_tokens": total["embed_tokens"], "calls": total["embed_calls"]},
-                "failed_calls": total["failed_calls"],
-                "missing_usage_calls": total["missing_usage_calls"],
+                "decision": {
+                    "input_tokens": decision_total["input_tokens"],
+                    "output_tokens": decision_total["output_tokens"],
+                    "total_tokens": decision_total["input_tokens"]
+                    + decision_total["output_tokens"],
+                    "calls": decision_total["llm_calls"],
+                    "failed_calls": decision_total["failed_calls"],
+                    "missing_usage_calls": decision_total["missing_usage_calls"],
+                },
+                "failed_calls": total["failed_calls"] + decision_total["failed_calls"],
+                "missing_usage_calls": total["missing_usage_calls"]
+                + decision_total["missing_usage_calls"],
                 "local_cache_hits": total["local_cache_hits"],
             },
         }

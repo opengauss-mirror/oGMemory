@@ -110,7 +110,38 @@ def test_factory_rejects_unknown_provider():
         ValueError,
         match=(
             "Unknown vector_db_type: 'missing'; available providers: "
-            "chroma, memory, opengauss"
+            "chroma, memory, milvus, opengauss"
         ),
     ):
         factory.create_vector_index(_config("missing"))
+
+
+@pytest.mark.parametrize(
+    "provider,class_name",
+    [
+        ("chroma", "ChromaVectorIndex"),
+        ("milvus", "MilvusVectorIndex"),
+    ],
+)
+def test_yaml_type_selects_backend_through_shared_factory(
+    tmp_path, monkeypatch, provider, class_name
+):
+    from unittest.mock import MagicMock
+
+    from providers.unified_config import OgMemConfig
+
+    monkeypatch.setenv("VECTOR_DB_TYPE", "opengauss")
+    path = tmp_path / "ogmem.yaml"
+    path.write_text(
+        f"vector_db:\n  type: {provider}\n  dimension: 3\n"
+        "  milvus_uri: http://vectors:19530\n  milvus_collection: memories\n"
+    )
+    constructor = MagicMock()
+    monkeypatch.setattr(f"providers.vector_index.{provider}_index.{class_name}", constructor)
+    config = OgMemConfig.load(str(path))
+    assert config.vector_db_type == provider  # Explicit YAML wins over environment.
+    assert config.to_provider_config().create_vector_index() is constructor.return_value
+    assert constructor.call_args.kwargs["dimension"] == 3
+    if provider == "milvus":
+        assert constructor.call_args.kwargs["uri"] == "http://vectors:19530"
+        assert constructor.call_args.kwargs["collection_name"] == "memories"

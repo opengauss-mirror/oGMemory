@@ -9,8 +9,10 @@ from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError, V
 from core.interfaces import ContextFS
 from core.models import RequestContext, RetrievedBlock
 from retrieval.identity import canonical_uri
+from core.uri_parser import strip_l2_suffix
 
 logger = logging.getLogger(__name__)
+_READ_ERRORS = (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError)
 
 
 def canonical_agent_node(node):
@@ -82,31 +84,87 @@ class ContextReader:
         try:
             # Strip file suffix from L2 URIs (e.g. "/content.md") — read_node
             # expects the directory URI, not the file URI stored in the vector index.
-            read_uri = uri
-            if read_uri.endswith("/content.md"):
-                read_uri = read_uri[: -len("/content.md")]
-            node = self._fs.read_node(read_uri, ctx)
-        except (AccessDeniedError, PermissionError, NodeNotFoundError, NodeBrokenError, FileNotFoundError):
+            node = self._fs.read_node(uri.removesuffix("/content.md"), ctx)
+        except _READ_ERRORS:
             raise
         except Exception as exc:
             logger.warning("[ContextReader] read_node failed for %s: %s", uri, exc, exc_info=True)
             return block
 
-        if unit_key is not None:
-            node = project_memory_unit(node, unit_key)
-        else:
-            node = canonical_agent_node(node)
+        return self._project(uri, node, unit_key)
 
-        block.category = node.category
-        block.owner_space = node.owner_space
-        block.abstract = node.abstract
-        block.overview = node.overview
-        block.content_excerpt = node.content
-        block.metadata = dict(node.metadata)
-        block.has_overview = bool(node.overview)
-        block.has_content = bool(node.content)
+    def read_many(
+        self, requests: list[tuple[str, str | None]], ctx: RequestContext,
+    ) -> dict[tuple[str, str | None], RetrievedBlock | Exception]:
+        results = {}
+        read_nodes = getattr(self._fs, "read_nodes", None)
+        if self._storage_backend == "sql" and callable(read_nodes):
+            read_uris = {}
+            for uri, unit_key in requests:
+                key = (uri, unit_key)
+                try:
+                    self._check_acl(uri, ctx)
+                    read_uris[key] = uri.removesuffix("/content.md")
+                except Exception as exc:
+                    results[key] = exc
+            if not read_uris:
+                return results
+            try:
+                nodes = read_nodes(list(dict.fromkeys(read_uris.values())), ctx)
+            except Exception as exc:
+                logger.warning("[ContextReader] read_nodes failed: %s", exc)
+            else:
+                for (uri, unit_key), read_uri in read_uris.items():
+                    try:
+                        node = nodes[read_uri]
+                        if isinstance(node, _READ_ERRORS):
+                            raise node
+                        if isinstance(node, Exception):
+                            logger.warning("[ContextReader] read_node failed for %s: %s", uri, node)
+                            results[uri, unit_key] = RetrievedBlock(uri=uri, level_hit="L2")
+                        else:
+                            results[uri, unit_key] = self._project(uri, node, unit_key)
+                    except Exception as exc:
+                        results[uri, unit_key] = exc
+                return results
 
-        return block
+        for uri, unit_key in requests:
+            try:
+                results[uri, unit_key] = self.read(uri, ctx, unit_key=unit_key)
+            except Exception as exc:
+                results[uri, unit_key] = exc
+        return results
+
+    def _project(self, uri, node, unit_key):
+        node = project_memory_unit(node, unit_key) if unit_key is not None else canonical_agent_node(node)
+        return self._hydrate(uri, node)
+
+    @staticmethod
+    def _hydrate(uri, node):
+        """Share dev's complete canonical fields across public and graph reads."""
+        return RetrievedBlock(uri=uri, level_hit="L2", category=node.category,
+            context_type=getattr(node, "context_type", ""),
+            owner_space=node.owner_space, abstract=node.abstract, overview=node.overview,
+            content_excerpt=node.content, metadata=dict(node.metadata or {}),
+            has_overview=bool(node.overview), has_content=bool(node.content))
+
+    def read_authorized(self, uri: str, ctx: RequestContext) -> RetrievedBlock:
+        """Strict graph hydration: failed/unauthorized reads never yield evidence.
+
+        Reuse dev's canonical ContextFS authorization and Agent body rendering;
+        unavailable nodes must fail closed before traversal or injection.
+        """
+        self._check_acl(uri, ctx)
+        if self._fs is None:
+            raise NodeNotFoundError(uri)
+        node = self._fs.read_node(strip_l2_suffix(uri), ctx)
+        if node is None:
+            raise NodeNotFoundError(uri)
+        metadata = dict(node.metadata or {})
+        state = metadata.get("status") or metadata.get("lifecycle_status") or metadata.get("visibility") or ""
+        if str(state).lower() in {"archived", "deleted", "broken", "retired", "inactive"}:
+            raise NodeNotFoundError(uri)
+        return self._hydrate(uri, canonical_agent_node(node))
 
     def _check_acl(self, uri: str, ctx: RequestContext) -> None:
         # SECURITY: RequestContext is mandatory for all read operations

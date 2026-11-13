@@ -86,6 +86,200 @@ CREATE TABLE IF NOT EXISTS relation_edges (
 CREATE INDEX IF NOT EXISTS idx_re_from ON relation_edges (from_uri);
 CREATE INDEX IF NOT EXISTS idx_re_to   ON relation_edges (to_uri);
 
+-- Keep canonical relation labels consistent with edge_projection_jobs.
+-- CREATE TABLE IF NOT EXISTS alone does not widen existing installations.
+-- Do not narrow databases that already use a wider or unbounded type.
+DO $widen_relation_type$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'relation_edges'
+          AND column_name = 'relation_type'
+          AND data_type = 'character varying'
+          AND character_maximum_length < 256
+    ) THEN
+        ALTER TABLE relation_edges ALTER COLUMN relation_type TYPE VARCHAR(256);
+    END IF;
+END $widen_relation_type$;
+
+-- S8R-03P durable semantic-search projection for accepted relation edges.
+-- JSONB keeps the disposable embedding projection backend-portable; canonical
+-- relation identity and lifecycle remain owned by relation_edges.
+ALTER TABLE relation_edges ADD COLUMN IF NOT EXISTS projection_edge_id VARCHAR(64);
+ALTER TABLE relation_edges ADD COLUMN IF NOT EXISTS edge_projection JSONB;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_re_projection_edge_id
+    ON relation_edges (account_id, projection_edge_id)
+    WHERE projection_edge_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS edge_projection_jobs (
+    account_id VARCHAR(128) NOT NULL,
+    edge_id VARCHAR(64) NOT NULL,
+    source_uri VARCHAR(512) NOT NULL,
+    target_uri VARCHAR(512) NOT NULL,
+    relation_type VARCHAR(256) NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    target_text TEXT NOT NULL DEFAULT '',
+    source_revision INTEGER NOT NULL,
+    target_revision INTEGER NOT NULL,
+    representation_version VARCHAR(64) NOT NULL,
+    embedding_profile VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING','PROCESSING','COMPLETE','FAILED')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    claim_token VARCHAR(64),
+    mutation_batch_key BIGINT,
+    next_retry_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, edge_id)
+);
+CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_pending
+    ON edge_projection_jobs (account_id, status, next_retry_at)
+    WHERE status IN ('PENDING','FAILED');
+ALTER TABLE edge_projection_jobs ADD COLUMN IF NOT EXISTS claim_token VARCHAR(64);
+ALTER TABLE edge_projection_jobs ADD COLUMN IF NOT EXISTS mutation_batch_key BIGINT;
+CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_source
+    ON edge_projection_jobs (account_id, source_uri);
+CREATE INDEX IF NOT EXISTS idx_edge_projection_jobs_target
+    ON edge_projection_jobs (account_id, target_uri);
+ALTER TABLE edge_projection_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE edge_projection_jobs FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON edge_projection_jobs
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION ogmem_graph_projection_batch_key()
+RETURNS BIGINT AS $$
+BEGIN
+    RETURN NULLIF(current_setting('app.graph_projection_batch_key'), '')::bigint;
+EXCEPTION WHEN undefined_object THEN
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION invalidate_edge_projections_for_node_update()
+RETURNS TRIGGER AS $$
+DECLARE
+    job RECORD;
+    refreshed_edges TEXT[] := ARRAY[]::TEXT[];
+    active_batch_key BIGINT := ogmem_graph_projection_batch_key();
+    wakeup_id TEXT;
+    wakeup_ids TEXT[] := ARRAY[]::TEXT[];
+BEGIN
+    IF (OLD.version, OLD.content, OLD.abstract, OLD.overview)
+       IS DISTINCT FROM
+       (NEW.version, NEW.content, NEW.abstract, NEW.overview) THEN
+        FOR job IN SELECT * FROM edge_projection_jobs
+                    WHERE account_id = NEW.account_id
+                      AND (source_uri = NEW.uri OR target_uri = NEW.uri)
+                    ORDER BY edge_id FOR UPDATE
+        LOOP
+            -- Target-based encodings reuse vectors when the source version advances.
+            -- A completed projection can follow a source-only revision in place.
+            IF job.source_uri = NEW.uri AND job.target_uri <> NEW.uri
+               AND job.status = 'COMPLETE' AND job.claim_token IS NULL
+               AND job.source_revision = OLD.version
+               AND job.representation_version IN (
+                   'relation-target-v2', 'relation-target-factorized-full-v1'
+               ) THEN
+                UPDATE relation_edges
+                   SET edge_projection = jsonb_set(
+                           edge_projection, '{source_revision}', NEW.version::text::jsonb),
+                       updated_at = NOW()
+                 WHERE account_id = NEW.account_id AND projection_edge_id = job.edge_id
+                   AND from_uri = job.source_uri AND to_uri = job.target_uri
+                   AND relation_type = job.relation_type
+                   AND edge_projection->>'edge_id' = job.edge_id
+                   AND edge_projection->>'representation_version' = job.representation_version
+                   AND edge_projection->>'embedding_profile' = job.embedding_profile
+                   AND edge_projection->'source_revision' = job.source_revision::text::jsonb
+                   AND edge_projection->'target_revision' = job.target_revision::text::jsonb;
+                IF FOUND THEN
+                    UPDATE edge_projection_jobs
+                       SET source_revision = NEW.version, updated_at = NOW()
+                     WHERE account_id = NEW.account_id AND edge_id = job.edge_id;
+                    refreshed_edges := array_append(refreshed_edges, job.edge_id::text);
+                    CONTINUE;
+                END IF;
+            END IF;
+        UPDATE edge_projection_jobs
+           SET source_revision = CASE WHEN source_uri = NEW.uri THEN NEW.version ELSE source_revision END,
+               target_revision = CASE WHEN target_uri = NEW.uri THEN NEW.version ELSE target_revision END,
+               target_text = CASE WHEN target_uri = NEW.uri
+                                  THEN concat_ws(E'\n', NEW.abstract, NEW.overview, NEW.content)
+                                  ELSE target_text END,
+               status = 'PENDING', last_error = NULL,
+               mutation_batch_key = active_batch_key,
+               next_retry_at = CASE
+                   WHEN status = 'PENDING' AND next_retry_at IS NOT NULL THEN next_retry_at
+                   WHEN active_batch_key IS NULL THEN NULL
+                   ELSE NOW() + INTERVAL '30 seconds'
+               END,
+               claim_token = NULL,
+               updated_at = NOW()
+         WHERE account_id = NEW.account_id
+           AND edge_id = job.edge_id;
+            -- Same transaction as invalidation: restart cannot lose discovery
+            -- even after the ordinary node event was acknowledged.
+            wakeup_id := md5(NEW.account_id || job.edge_id || clock_timestamp()::text || random()::text);
+            INSERT INTO outbox_events
+                (event_id,event_type,uri,account_id,payload,status,retry_count)
+            VALUES (wakeup_id,
+                    'PROJECT_GRAPH',NEW.uri,NEW.account_id,
+                    ('{"edge_id":"' || job.edge_id || '"}')::jsonb,'PENDING',0);
+            wakeup_ids := array_append(wakeup_ids, wakeup_id);
+        END LOOP;
+        UPDATE relation_edges
+           SET edge_projection = NULL, updated_at = NOW()
+         WHERE account_id = NEW.account_id
+           AND (from_uri = NEW.uri OR to_uri = NEW.uri)
+           AND projection_edge_id IS NOT NULL
+           AND NOT (projection_edge_id = ANY(refreshed_edges));
+    END IF;
+    IF array_length(wakeup_ids, 1) > 0 THEN
+        PERFORM set_config('ogmemory.node_write_events',
+            '{"uri":' || to_json(NEW.uri)::text || ',"event_ids":' || array_to_json(wakeup_ids)::text || '}', true);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_invalidate_edge_projections ON context_nodes;
+CREATE TRIGGER trg_invalidate_edge_projections
+AFTER UPDATE OF version, content, abstract, overview ON context_nodes
+FOR EACH ROW EXECUTE PROCEDURE invalidate_edge_projections_for_node_update();
+
+-- Physical deletion must erase copied target text and revoke worker leases in
+-- the same transaction. Recreating a URI at version 1 must not revive an old
+-- relation/vector. Match the node -> jobs -> relations write lock order.
+CREATE OR REPLACE FUNCTION remove_edge_projections_for_node_delete()
+RETURNS TRIGGER AS $$
+DECLARE
+    job RECORD;
+BEGIN
+    FOR job IN SELECT edge_id FROM edge_projection_jobs
+                WHERE account_id = OLD.account_id
+                  AND (source_uri = OLD.uri OR target_uri = OLD.uri)
+                ORDER BY edge_id FOR UPDATE
+    LOOP
+        DELETE FROM edge_projection_jobs
+         WHERE account_id = OLD.account_id AND edge_id = job.edge_id;
+    END LOOP;
+    DELETE FROM relation_edges
+     WHERE account_id = OLD.account_id
+       AND (from_uri = OLD.uri OR to_uri = OLD.uri);
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_remove_edge_projections ON context_nodes;
+CREATE TRIGGER trg_remove_edge_projections
+BEFORE DELETE ON context_nodes
+FOR EACH ROW EXECUTE PROCEDURE remove_edge_projections_for_node_delete();
+
 -- Session archives
 CREATE TABLE IF NOT EXISTS session_archives (
     archive_id    VARCHAR(64)  NOT NULL,

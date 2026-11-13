@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, replace
 
+from core.memory_names import memory_directory
 from core.models import LeafHit, RequestContext, SeedHit, TypedQuery
 from retrieval.identity import memory_identity
 from retrieval.owner_scope import allowed_owner_space_filter, expand_owner_space_aliases
@@ -94,6 +95,8 @@ class SceneRetrievalStage:
                     and member.uri.startswith(f"ctx://{ctx.account_id}/")
                     and set(expand_owner_space_aliases([member.owner_space])) & owners
                     and (not query.categories or member.category in query.categories)
+                    and (query.memory_directories is None
+                         or memory_directory(member.uri) in query.memory_directories)
                 ):
                     direct.append(replace(member, metadata={**member.metadata, "scene_expanded": True}))
                     known.add(identity)

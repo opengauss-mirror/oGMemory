@@ -4,6 +4,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("service_threading")
+
 from core.lexical import HybridLexicalIndex
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
@@ -84,12 +86,15 @@ def test_shared_sql_pool_receives_configured_dialect(monkeypatch):
 
 
 @pytest.mark.parametrize("dialect", ["opengauss", "postgresql"])
-def test_vector_index_shares_configured_sql_pool(monkeypatch, dialect):
+@pytest.mark.parametrize("vector_dsn", ["host=storage dbname=memory",
+    "dbname=memory host=storage connect_timeout=10",
+    "host=storage dbname=memory application_name=mcp"])
+def test_vector_index_shares_configured_sql_pool(monkeypatch, dialect, vector_dsn):
     dsn = "host=storage dbname=memory"
     service = MemoryService(config=OgMemConfig(
         provider="mock", vector_db_type="opengauss", storage_backend="sql",
         sql_dialect=dialect, sql_connection_string=dsn,
-        opengauss_connection_string=dsn,
+        opengauss_connection_string=vector_dsn,
     ))
     pool = Mock()
     index = Mock()
@@ -100,6 +105,32 @@ def test_vector_index_shares_configured_sql_pool(monkeypatch, dialect):
     assert service._get_shared_vector_index() is index
     assert service._get_shared_vector_index() is index
     factory.assert_called_once_with(pool=pool)
+
+
+@pytest.mark.parametrize("vector_dsn,dialect", [
+    ("host=other dbname=memory", "postgresql"),
+    ("", "postgresql"),
+    ("host=storage dbname=memory", "unsupported"),
+])
+def test_vector_index_does_not_share_incompatible_sql_pool(monkeypatch, vector_dsn, dialect):
+    dsn = "host=storage dbname=memory"
+    service = MemoryService(config=OgMemConfig(
+        provider="mock", vector_db_type="opengauss", storage_backend="sql",
+        sql_connection_string=dsn, opengauss_connection_string=dsn,
+    ))
+    # Also exercise the defensive guard if runtime configuration is modified
+    # after OgMemConfig's normal dialect validation.
+    monkeypatch.setattr(service._cfg, "sql_dialect", dialect)
+    monkeypatch.setattr(service._provider_cfg, "opengauss_connection_string", vector_dsn)
+    pool_getter = Mock(side_effect=AssertionError("must not reuse the SQL pool"))
+    monkeypatch.setattr(service, "_get_shared_sql_pool", pool_getter)
+    index = Mock()
+    factory = Mock(return_value=index)
+    monkeypatch.setattr(service._provider_cfg, "create_vector_index", factory)
+
+    assert service._get_shared_vector_index() is index
+    factory.assert_called_once_with()
+    pool_getter.assert_not_called()
 
 
 def test_instance_can_disable_class_batch_claim_capability():

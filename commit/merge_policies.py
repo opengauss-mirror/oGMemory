@@ -227,17 +227,21 @@ class AppendOnlyPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" and unique event ID
         """
-        timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        unique_id = uuid_lib.uuid4().hex[:8]
-        fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
+        from commit.write_receipts import LOCATED_OPERATION_PREFIX, located_target
 
-        target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
+        target_uri = located_target(self._fs, self._uri_resolver, candidate, ctx)
+        if target_uri is None:
+            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+            unique_id = uuid_lib.uuid4().hex[:8]
+            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
+            target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 
         # Always create new event nodes (never merge)
         return WritePlan(
             action="create",
             target_uri=target_uri,
-            merged_fields={},
+            merged_fields=({"expected_version": 0}
+                           if candidate.write_operation_id.startswith(LOCATED_OPERATION_PREFIX) else {}),
             relation_edges=[],
         )
 

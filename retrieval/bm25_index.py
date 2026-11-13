@@ -16,6 +16,7 @@ from rank_bm25 import BM25Okapi
 
 from core.memory_names import memory_directory
 from core.models import IndexRecord
+from core.projection_ownership import check_projection_owner
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,7 @@ class Bm25Index:
             all_metas.extend(results["metadatas"] or [])
 
         with self._lock:
+            check_projection_owner()
             self._ids = all_ids
             self._texts = all_texts
             self._metas = [dict(m or {}) for m in all_metas]
@@ -143,6 +145,7 @@ class Bm25Index:
     def upsert(self, doc_id: str, text: str, metadata: dict) -> None:
         """Insert or update a single document."""
         with self._lock:
+            check_projection_owner()
             # Check if ID exists
             for i, existing_id in enumerate(self._ids):
                 if existing_id == doc_id:
@@ -164,6 +167,7 @@ class Bm25Index:
         if not prepared:
             return
         with self._lock:
+            check_projection_owner()
             positions = {doc_id: i for i, doc_id in enumerate(self._ids)}
             for document in prepared:
                 position = positions.get(document.id)
@@ -181,6 +185,7 @@ class Bm25Index:
         """Remove documents by ID."""
         id_set = set(doc_ids)
         with self._lock:
+            check_projection_owner()
             keep = [(i, t, m) for i, t, m in zip(self._ids, self._texts, self._metas)
                     if i not in id_set]
             if len(keep) == len(self._ids):
@@ -209,6 +214,7 @@ class Bm25Index:
             List of Bm25Hit sorted by BM25 score descending
         """
         with self._lock:
+            check_projection_owner()
             if self._bm25 is None or not self._ids:
                 return []
 

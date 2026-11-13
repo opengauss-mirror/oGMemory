@@ -26,6 +26,7 @@ from flask import Flask, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
+from core.write_contract import error_fields, normalize_write_result, write_http_status
 from core.logging_config import configure_third_party_loggers
 from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
@@ -156,14 +157,7 @@ app.register_blueprint(
 
 def _lifecycle_result_status(result: dict) -> int:
     """Map structured service acknowledgements to transport retry semantics."""
-    raw_status = result.get("status") if isinstance(result, dict) else None
-    if isinstance(result, dict) and result.get("retryable") is True:
-        return 503
-    if isinstance(raw_status, int) and 400 <= raw_status <= 599:
-        return raw_status
-    if isinstance(result, dict) and result.get("ok") is False:
-        return 400
-    return 200
+    return write_http_status(result)
 
 
 def _lifecycle_result_ok(result: dict) -> bool:
@@ -172,6 +166,17 @@ def _lifecycle_result_ok(result: dict) -> bool:
 
 def _lifecycle_result_response(result: dict):
     return jsonify(result), _lifecycle_result_status(result)
+
+
+def _lifecycle_error_response(exc: Exception, params: dict):
+    response, status = _error_response(exc)
+    fields = error_fields(exc, str(params.get("clientRequestId") or params.get("client_request_id") or ""))
+    if fields["error_detail"]["code"] != "WRITE_INTERNAL_ERROR":
+        status = fields["http_status"]
+    result = normalize_write_result({**response.get_json(), **fields, "ok": False,
+                                     "accepted": False, "http_status": status},
+                                    fields["error_detail"]["request_id"])
+    return jsonify(result), status
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -442,8 +447,9 @@ def handle_after_turn():
                 client_request_id=str(params.get("clientRequestId") or params.get("client_request_id") or "").strip(),
             )
             result["trace_captured"] = captured
+            result["trace_status"] = "CAPTURED" if captured else "PENDING"
             if not captured:
-                result.update(ok=False, retryable=True, status="trace_capture_pending")
+                result["trace_error"] = {"code": "TRACE_CAPTURE_PENDING", "retry_action": "retry_trace"}
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
@@ -456,6 +462,25 @@ def handle_after_turn():
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
             _emit_perf_stage("after_turn", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
+        return _lifecycle_error_response(exc, params)
+
+
+@app.route("/api/v1/sessions/<session_id>/write-requests", methods=["GET"])
+@app.route("/api/v1/sessions/<session_id>/write-requests/<path:client_request_id>", methods=["GET"])
+def handle_write_request_status(session_id, client_request_id=None):
+    params = {**request.args.to_dict(), "sessionId": session_id}
+    if client_request_id is not None:
+        params["clientRequestId"] = client_request_id
+    for camel, snake, header in (
+        ("accountId", "account_id", "X-Account-ID"),
+        ("userId", "user_id", "X-User-ID"),
+        ("agentId", "agent_id", "X-Agent-ID"),
+    ):
+        params[camel] = params.get(camel) or params.get(snake) or request.headers.get(header)
+    try:
+        params["_ctx"] = _build_authenticated_context(params)
+        return jsonify(_get_service().get_write_request_status(params))
+    except Exception as exc:
         return _error_response(exc)
 
 
@@ -488,6 +513,7 @@ def handle_query_memory():
                 types=params.get("types"),
                 top_k=_memory_tool_integer(params, "top_k", 5),
                 score_threshold=params.get("score_threshold"),
+                use_scene=params.get("use_scene", params.get("useScene")),
                 session_id=params.get("sessionId") or params.get("session_id"),
                 agent_id=ctx.agent_id,
                 request_context=ctx,
@@ -649,7 +675,7 @@ def handle_compact():
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
             _emit_perf_stage("compact", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
-        return _error_response(exc)
+        return _lifecycle_error_response(exc, params)
 
 
 @app.route("/api/v1/prepare_compaction", methods=["POST"])
@@ -684,7 +710,7 @@ def handle_prepare_compaction():
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
             _emit_perf_stage("prepare_compaction", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
-        return _error_response(exc)
+        return _lifecycle_error_response(exc, params)
 
 
 @app.route("/api/v1/bootstrap", methods=["POST"])
@@ -733,7 +759,7 @@ def handle_dispose():
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
             _emit_perf_stage("dispose", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
-        return _error_response(exc)
+        return _lifecycle_error_response(exc, params)
 
 
 @app.route("/api/v1/prepare_subagent_spawn", methods=["POST"])

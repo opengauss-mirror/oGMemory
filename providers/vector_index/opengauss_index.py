@@ -9,8 +9,9 @@ from typing import Any
 
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
-from fs.sql_adapter.pool import PoolAdapterMixin, resolve_connection_dialect
+from core.projection_ownership import current_projection_owner
 from fs.sql_adapter.dialect import normalize_sql_dialect
+from fs.sql_adapter.pool import PoolAdapterMixin, is_connection_alive, resolve_connection_dialect
 
 try:
     import psycopg2
@@ -230,7 +231,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (table_name, migration))""")
                 cur.execute("LOCK TABLE ogmem_vector_migrations IN EXCLUSIVE MODE")
-                key = (tbl, "legacy_columns_v1")
+                key = (tbl, "legacy_columns_v2")
                 cur.execute("""SELECT 1 FROM ogmem_vector_migrations
                     WHERE table_name = %s AND migration = %s""", key)
                 if cur.fetchone() is not None:
@@ -250,19 +251,26 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                       AND column_name = 'node_id'""")
                 if cur.fetchone() is not None:
                     cur.execute(f"""
-                        UPDATE {tbl} vi SET node_id = cn.node_id
-                        FROM context_nodes cn
-                        WHERE vi.node_uri = cn.uri AND vi.node_id IS NULL
-                          AND vi.account_id = cn.account_id
+                        SELECT DISTINCT account_id FROM {tbl}
+                        WHERE node_id IS NULL AND account_id IS NOT NULL AND node_uri IS NOT NULL
                     """)
-                    cur.execute(f"""
-                        UPDATE {tbl} vi SET node_id = cn.node_id
-                        FROM context_nodes cn
-                        WHERE vi.node_id IS NULL
-                          AND vi.node_uri LIKE '%%/content.md'
-                          AND cn.uri = substring(vi.node_uri from '^(.+)/content[.]md')
-                          AND vi.account_id = cn.account_id
-                    """)
+                    # Legacy context nodes are visible only within their tenant's RLS scope.
+                    for (account_id,) in cur.fetchall():
+                        self.bind_tenant(conn, account_id)
+                        cur.execute(f"""
+                            UPDATE {tbl} vi SET node_id = cn.node_id
+                            FROM context_nodes cn
+                            WHERE vi.node_uri = cn.uri AND vi.node_id IS NULL
+                              AND vi.account_id = %s AND vi.account_id = cn.account_id
+                        """, (account_id,))
+                        cur.execute(f"""
+                            UPDATE {tbl} vi SET node_id = cn.node_id
+                            FROM context_nodes cn
+                            WHERE vi.node_id IS NULL
+                              AND vi.node_uri LIKE '%%/content.md'
+                              AND cn.uri = substring(vi.node_uri from '^(.+)/content[.]md')
+                              AND vi.account_id = %s AND vi.account_id = cn.account_id
+                        """, (account_id,))
                 cur.execute("""INSERT INTO ogmem_vector_migrations (table_name, migration)
                     VALUES (%s, %s)""", key)
             conn.commit()
@@ -275,12 +283,12 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
     def _get_connection(self):
         """Get a connection from the pool or create a new one."""
-        if self._pool:
+        while self._pool:
             conn = self._pool.pop()
-            if conn.closed == 0:
+            if is_connection_alive(conn):
                 return conn
 
-        return psycopg2.connect(self._connection_string)
+        return psycopg2.connect(self._connection_string, connect_timeout=10)
 
     @staticmethod
     def _reset_connection(conn):
@@ -308,6 +316,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             self._pool.append(conn)
         else:
             conn.close()
+
+    def _lock_projection(self, cur, ids):
+        check = current_projection_owner()
+        if check is not None:
+            for record_id in sorted(set(ids)):
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+                            (self._table_name, record_id))
+            check()
 
     def upsert(self, records: list[IndexRecord]) -> None:
         """Add or update records in the index.
@@ -339,6 +355,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 try:
                     with conn.cursor() as cur:
+                        self._lock_projection(cur, [record.id])
                         # IDs should already be account-scoped. Fail closed on
                         # a legacy/global ID collision: it must hit the unique
                         # constraint, never overwrite another tenant's row.
@@ -383,6 +400,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                         record.id, record.uri, exc,
                     )
                     conn.rollback()
+                    if current_projection_owner() is not None:
+                        raise
         finally:
             self._return_connection(conn)
 
@@ -395,6 +414,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
+                self._lock_projection(cur, ids)
                 cur.execute(
                     f"DELETE FROM {self._table_name} WHERE id = ANY(%s)",
                     (ids,)
@@ -551,6 +571,10 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             else:
                 clauses.append("level = %(f_level)s")
             params["f_level"] = lvl
+        for key in ("record_kind", "representation_version"):
+            if key in f:
+                clauses.append(f"metadata->>'{key}' = %(f_{key})s")
+                params[f"f_{key}"] = f[key]
         if "space_id" in f:
             sid = f["space_id"]
             if isinstance(sid, list):
@@ -700,4 +724,77 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             query_vector=query_vector,
             filters=filters,
             top_k=top_k or query.top_k,
+        )
+
+    def get_record(self, record_id: str) -> IndexRecord | None:
+        """Fetch a complete stored index record by its identifier."""
+        if not record_id:
+            return None
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, uri, level, text, filters, metadata, embedding
+                    FROM   {self._table_name}
+                    WHERE  id = %(rid)s
+                    """,
+                    {"rid": record_id},
+                )
+                row = cur.fetchone()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        if row is None:
+            return None
+        return self._row_to_record(row)
+
+
+    def get_records(self, record_ids: list[str]) -> list[IndexRecord | None]:
+        """Read stored vectors in one round-trip, preserving input order."""
+        if not record_ids:
+            return []
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"SELECT id,uri,level,text,filters,metadata,embedding FROM {self._table_name} WHERE id=ANY(%s)",
+                            (record_ids,))
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        records = {str(row["id"]):self._row_to_record(row) for row in rows}
+        return [records.get(record_id) for record_id in record_ids]
+
+    @staticmethod
+    def _row_to_record(row):
+        meta = _ensure_dict(row.get("metadata"))
+        filt = _ensure_dict(row.get("filters"))
+        embedding = row.get("embedding")
+        # ``embedding`` comes back as a pgvector string like
+        # ``[0.1,0.2,...]``; round-trip through the literal parser so
+        # callers get a plain list[float]. The OpenGaussVectorIndex
+        # stores it via ``_vec_literal`` which produces the same
+        # format.
+        emb_list: list[float] | None = None
+        if isinstance(embedding, str):
+            try:
+                emb_list = [float(x) for x in embedding.strip("[]").split(",") if x.strip()]
+            except ValueError:
+                emb_list = None
+        elif isinstance(embedding, (list, tuple)):
+            emb_list = [float(x) for x in embedding]
+        # Embedding lives in ``metadata["_embedding"]`` from the writer
+        # — surface it there so callers see what they upserted. The
+        # top-level ``embedding`` field on IndexRecord is reserved
+        # for whatever the VectorIndex Protocol adds later.
+        if emb_list is not None and "_embedding" not in meta:
+            meta["_embedding"] = emb_list
+        return IndexRecord(
+            id=str(row["id"]),
+            uri=str(row["uri"]),
+            level=int(row["level"]),
+            text=str(row["text"]),
+            filters=filt,
+            metadata=meta,
         )

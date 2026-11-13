@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 
 from core.candidate_dedup import candidate_draft_fields
-from core.errors import ExtractionIncompleteError, ValidationError
+from core.errors import ExtractionIncompleteError, ExtractionBudgetError, ExtractionSemanticError, ValidationError
 from core.memory_names import canonical_scope
 from core.models import CandidateMemory
 from core.validation import (
@@ -17,6 +17,8 @@ from core.validation import (
     validate_utf8,
 )
 from extraction.prefetch import _CONTEXT_CHARS, _OUTPUT_CHARS, _PREFETCH_NODES
+from providers.llm_observation import observe_call
+from core.model_stage import model_signature, run_model_call
 
 _LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
            "content": MAX_CONTENT_LEN, "title": MAX_ABSTRACT_LEN}
@@ -161,7 +163,7 @@ def _read_targets(candidate, read_versions, fs, uris, ctx):
 
 
 def qualify_occurrence_drafts(candidates, source, selected_user_evidence, read_versions,
-                             fs, uris, schemas, ctx, llm, eligible=None):
+                             fs, uris, schemas, ctx, llm, eligible=None, checkpoint=None):
     """Keep additions unless source-supported identity and complete facts both verify."""
     if not fs or not uris or not ctx or not source.strip() or not selected_user_evidence.strip():
         return candidates
@@ -189,24 +191,43 @@ def qualify_occurrence_drafts(candidates, source, selected_user_evidence, read_v
                 or not prompt_fits(verification, _VALIDATION_SCHEMA)):
             results.append(candidate)
             continue
-        response = llm.complete_json(prompt, schema=_DECISION_SCHEMA)
+        cached = None
+        if checkpoint:
+            inputs = {"prompt": prompt, "schema": _DECISION_SCHEMA,
+                      "verification_prompt": _VERIFY_PROMPT, "verification_schema": _VALIDATION_SCHEMA,
+                      "model": model_signature(llm)}
+            cached = checkpoint.load_stage("occurrence_qualification", inputs)
+        response = cached if cached is not None else run_model_call(
+            observe_call, "postprocess", llm.complete_json, prompt, schema=_DECISION_SCHEMA)
         if not isinstance(response, dict) or response.get("decision") not in {"same", "new", "uncertain"}:
             raise ExtractionIncompleteError("Occurrence qualification requires a valid decision")
+        index, quote = response.get("target_index"), response.get("identity_evidence")
+        if response["decision"] == "same" and (
+                type(index) is not int or not 0 <= index < len(targets)
+                or not isinstance(quote, str) or not quote.strip() or quote not in selected_user_evidence):
+            response = {"decision": "uncertain", "target_index": None,
+                        "identity_evidence": "", "snapshot": None}
         if response["decision"] != "same":
+            if checkpoint and cached is None:
+                checkpoint.save_stage("occurrence_qualification", inputs, response)
             results.append(candidate)
             continue
-        index, quote = response.get("target_index"), response.get("identity_evidence")
-        if (type(index) is not int or not 0 <= index < len(targets)
-                or not isinstance(quote, str) or not quote.strip() or quote not in selected_user_evidence):
-            raise ExtractionIncompleteError("Occurrence identity requires a read target and direct user evidence")
         validate_snapshot(response.get("snapshot"))
         target = targets[index]
         verification = _prompt(_VERIFY_PROMPT, {**payload, "proposal": response})
         if not prompt_fits(verification, _VALIDATION_SCHEMA):
-            raise ExtractionIncompleteError("Occurrence verification exceeds the complete context budget")
-        validation = llm.complete_json(verification, schema=_VALIDATION_SCHEMA)
-        if not isinstance(validation, dict) or validation.get("valid") is not True:
-            raise ExtractionIncompleteError("Occurrence identity and complete facts could not be verified")
+            raise ExtractionBudgetError("Occurrence verification exceeds the complete context budget")
+        if cached is None:
+            validation = run_model_call(observe_call, "postprocess", llm.complete_json, verification, schema=_VALIDATION_SCHEMA)
+            if isinstance(validation, dict) and validation.get("valid") is False:
+                unresolved = {"decision": "uncertain", "target_index": None,
+                              "identity_evidence": "", "snapshot": None}
+                if checkpoint:
+                    checkpoint.save_stage("occurrence_qualification", inputs, unresolved)
+                results.append(candidate)
+                continue
+            if not isinstance(validation, dict) or validation.get("valid") is not True:
+                raise ExtractionSemanticError("Occurrence identity and complete facts could not be verified")
         try:
             result = validate_candidate(replace(
                 candidate, **response["snapshot"], target_uri=target["uri"],
@@ -215,6 +236,8 @@ def qualify_occurrence_drafts(candidates, source, selected_user_evidence, read_v
             ))
         except ValidationError as exc:
             raise ExtractionIncompleteError("Occurrence qualification produced an invalid revision") from exc
+        if checkpoint and cached is None:
+            checkpoint.save_stage("occurrence_qualification", inputs, response)
         results.append(result)
     return results
 
@@ -223,7 +246,7 @@ def _snapshot_for_candidate(candidate: CandidateMemory):
     return {name: getattr(candidate, name) for name in (*_LIMITS, *_CONTEXT)}
 
 
-def reconcile_occurrence_updates(entries, existing, ctx, uris, llm):
+def reconcile_occurrence_updates(entries, existing, ctx, uris, llm, checkpoint=None):
     """Combine qualified spans only while their target snapshot remains current."""
     latest = entries[-1][1]
     owner = ctx.agent_space_name() if latest.owner_scope == "agent" else ctx.user_space_name()
@@ -257,21 +280,31 @@ def reconcile_occurrence_updates(entries, existing, ctx, uris, llm):
     )
     prompt = _prompt(instruction, payload)
     if not prompt_fits(prompt, SNAPSHOT_SCHEMA):
-        raise ExtractionIncompleteError("Occurrence span reconciliation exceeds the complete context budget")
-    snapshot = llm.complete_json(prompt, schema=SNAPSHOT_SCHEMA)
+        raise ExtractionBudgetError("Occurrence span reconciliation exceeds the complete context budget")
+    cached = None
+    if checkpoint:
+        inputs = {"prompt": prompt, "schema": SNAPSHOT_SCHEMA, "model": model_signature(llm),
+                  "verification_prompt": _VERIFY_PROMPT, "verification_schema": _VALIDATION_SCHEMA}
+        cached = checkpoint.load_stage("occurrence_reconciliation", inputs)
+    snapshot = cached if cached is not None else run_model_call(
+        observe_call, "postprocess", llm.complete_json, prompt, schema=SNAPSHOT_SCHEMA)
     validate_snapshot(snapshot)
     verification = _prompt(_VERIFY_PROMPT + "Verify ALL ordered revisions jointly. ",
                            {**payload, "proposal": snapshot})
     if not prompt_fits(verification, _VALIDATION_SCHEMA):
-        raise ExtractionIncompleteError("Occurrence span verification exceeds the complete context budget")
-    validation = llm.complete_json(verification, schema=_VALIDATION_SCHEMA)
-    if not isinstance(validation, dict) or validation.get("valid") is not True:
-        raise ExtractionIncompleteError("Occurrence span identity and complete facts could not be verified")
+        raise ExtractionBudgetError("Occurrence span verification exceeds the complete context budget")
+    if cached is None:
+        validation = run_model_call(observe_call, "postprocess", llm.complete_json, verification, schema=_VALIDATION_SCHEMA)
+        if not isinstance(validation, dict) or validation.get("valid") is not True:
+            raise ExtractionSemanticError("Occurrence span identity and complete facts could not be verified")
     try:
-        return validate_candidate(replace(
+        result = validate_candidate(replace(
             latest, **snapshot, confidence=min(candidate.confidence for _, candidate in entries),
             provenance_ids=list(dict.fromkeys(source for _, candidate in entries
                                              for source in candidate.provenance_ids)),
         ))
     except ValidationError as exc:
         raise ExtractionIncompleteError("Occurrence span reconciliation produced an invalid revision") from exc
+    if checkpoint and cached is None:
+        checkpoint.save_stage("occurrence_reconciliation", inputs, snapshot)
+    return result

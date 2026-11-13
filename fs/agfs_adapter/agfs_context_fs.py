@@ -11,11 +11,12 @@ Phase 1 implementation:
 """
 
 import time
+import hashlib
 import json
 import logging
 import re
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
@@ -35,6 +36,7 @@ from core.errors import (
 )
 from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.operation_deadline import check_deadline
 from fs.access_control import check_uri_access
 
 logger = logging.getLogger(__name__)
@@ -85,7 +87,7 @@ class _ResourceMutationLease:
 
 def _is_not_found_error(exc: AGFSClientError) -> bool:
     message = str(exc).lower()
-    return "no such file" in message or "not found" in message
+    return any(marker in message for marker in ("no such file", "no such directory", "not found"))
 
 from core.interfaces import ContextFS
 
@@ -150,6 +152,10 @@ _SESSION_HISTORY_PATTERN = re.compile(
 # ctx://{account}/sessions/{session_id}/state
 _SESSION_STATE_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$'
+)
+
+_SESSION_STAGE_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/stage_results/(?P<stage_id>[0-9a-f]{64})$'
 )
 
 
@@ -257,6 +263,13 @@ def uri_to_path(uri: str) -> str:
     if match:
         groups = match.groupdict()
         path = PurePosixPath('/accounts') / groups['account'] / 'sessions' / groups['session_id'] / 'history'
+        return str(path) + '/'
+
+    match = _SESSION_STAGE_PATTERN.fullmatch(uri)
+    if match:
+        groups = match.groupdict()
+        path = (PurePosixPath('/accounts') / groups['account'] / 'sessions'
+                / groups['session_id'] / 'stage_results' / groups['stage_id'])
         return str(path) + '/'
 
     # Try session state pattern
@@ -394,6 +407,13 @@ def parse_uri(uri: str) -> dict:
             'category': 'history',
             'slug': '',
         }
+
+    match = _SESSION_STAGE_PATTERN.fullmatch(uri)
+    if match:
+        groups = match.groupdict()
+        return {'account': groups['account'], 'owner_type': 'sessions',
+                'owner_id': groups['session_id'], 'category': 'stage_result',
+                'slug': groups['stage_id']}
 
     # Try session state pattern
     match = _SESSION_STATE_PATTERN.match(uri)
@@ -712,8 +732,7 @@ class AGFSContextFS:
 
     @staticmethod
     def _is_not_found_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return "no such file" in message or "not found" in message
+        return _is_not_found_error(exc)
 
     def _resource_mutation_lock_path(self, node_path: str) -> str:
         final_path = PurePosixPath(node_path.rstrip("/"))
@@ -1367,31 +1386,93 @@ class AGFSContextFS:
         overview_path = node_path + self.FILE_OVERVIEW
         meta_path = meta_path or node_path + self.FILE_META
 
+        relations = node.metadata.get('_relations', [])
+        relations_json = json.dumps(
+            [self._relation_edge_to_dict(r) for r in relations], ensure_ascii=False, indent=2,
+        )
+        layout = self._session_state_layout(node, relations_json)
+        reuse_static = False
+        stored_meta = {}
+        if _SESSION_STATE_PATTERN.fullmatch(node.uri):
+            try:
+                stored_meta = json.loads(self._read_file(node_path + self.FILE_META))
+            except (NodeNotFoundError, json.JSONDecodeError):
+                stored_meta = {}
+            reuse_static = (layout is not None and mutation_lease is not None
+                            and isinstance(stored_meta, dict)
+                            and stored_meta.get("status") == NodeStatus.ACTIVE.value
+                            and stored_meta.get("uri") == node.uri
+                            and stored_meta.get("session_state_layout") == layout)
+
         # Step ①: Write content.md (largest file, do first)
         # If this fails, no .meta.json exists, node doesn't exist → skip in repair
         write_file(content_path, node.content)
 
-        # Step ②: Write .relations.json
-        # Get relations from node metadata if available
-        relations = node.metadata.get('_relations', [])
-        relations_json = json.dumps(
-            [self._relation_edge_to_dict(r) for r in relations],
-            ensure_ascii=False,
-            indent=2
-        )
-        write_file(relations_path, relations_json)
-
-        # Step ③: Write .abstract.md and .overview.md (parallel safe)
-        write_file(abstract_path, node.abstract)
-        write_file(overview_path, node.overview)
+        if not reuse_static:
+            if isinstance(stored_meta, dict) and "session_state_layout" in stored_meta:
+                # Retire the committed fingerprint before replacing its static files.
+                stored_meta.pop("session_state_layout")
+                write_file(node_path + self.FILE_META,
+                           json.dumps(stored_meta, ensure_ascii=False, indent=2))
+            write_file(relations_path, relations_json)
+            write_file(abstract_path, node.abstract)
+            write_file(overview_path, node.overview)
 
         # Step ④: Write status=ACTIVE metadata. Versioned updates pass a
         # temporary path and publish it with one atomic file rename.
         meta = self._build_node_metadata(node, expected_version)
+        if layout is not None:
+            meta["session_state_layout"] = layout
         meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
         write_file(meta_path, meta_json)
 
+    @staticmethod
+    def _session_state_layout(node: ContextNode, relations_json: str) -> dict | None:
+        """Bind reusable session files to their canonical identity and contents."""
+        match = _SESSION_STATE_PATTERN.fullmatch(node.uri)
+        if (match is None or node.context_type != "RESOURCE" or node.category != "state"
+                or node.owner_space != "session:" + match["session_id"]
+                or node.metadata.get("session_id") != match["session_id"]
+                or any(not isinstance(node.metadata.get(key), str)
+                       for key in ("owner_user_id", "owner_agent_id"))):
+            return None
+        static = [node.uri, node.context_type, node.category, node.level, node.owner_space,
+                  node.metadata["owner_user_id"], node.metadata["owner_agent_id"],
+                  node.abstract, node.overview, relations_json]
+        encoded = json.dumps(static, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return {"version": 1, "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+    def _read_node_snapshot(
+        self, uri: str, ctx: RequestContext, read: Callable[[], tuple[ContextNode, str]],
+    ) -> ContextNode:
+        """Read payload fields from one completed node publication."""
+        self._ensure_accessible(uri, ctx)
+        node_path = self._uri_to_agfs_path(uri)
+        final_path = PurePosixPath(node_path.rstrip("/"))
+        lock_path = str(final_path.parent) + f"/.{final_path.name}.update-lock"
+        marker_path = lock_path + "/transaction.json"
+        deadline = time.monotonic() + _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS
+        observed_version = 0
+        while True:
+            check_deadline()
+            marker = self._read_update_marker(marker_path)
+            expected = marker.get("expected_version") if marker is not None else None
+            if (marker is None or type(expected) is int
+                    and self._read_node_version(node_path) > expected):
+                node, metadata = read()
+                observed_version = node.metadata.get("version", 0)
+                if (self._read_update_marker(marker_path) == marker
+                        and self._read_file(node_path + self.FILE_META) == metadata):
+                    return node
+            if time.monotonic() >= deadline:
+                raise ConcurrentModificationError(uri, observed_version, self._read_node_version(node_path))
+            time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
+
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
+        return self._read_node_snapshot(uri, ctx, lambda: self._read_node_once(uri, ctx))
+
+    def _read_node_once(self, uri: str, ctx: RequestContext) -> tuple[ContextNode, str]:
         """Read a node from AGFS.
 
         Args:
@@ -1477,19 +1558,23 @@ class AGFSContextFS:
             overview=overview,
             content=content,
             metadata=metadata,
-        )
+        ), meta_content
 
     def read_node_fields(self, uri: str, ctx: RequestContext, level: str) -> ContextNode:
         """Read only the MCP-requested detail fields for a node."""
 
         if level not in {"abstract", "overview", "content", "all"}:
             raise ValueError("level must be one of: abstract, overview, content, all")
+        return self._read_node_snapshot(uri, ctx, lambda: self._read_node_fields_once(uri, ctx, level))
+
+    def _read_node_fields_once(self, uri: str, ctx: RequestContext, level: str) -> tuple[ContextNode, str]:
         self._ensure_accessible(uri, ctx)
 
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
         try:
-            meta = json.loads(self._read_file(meta_path))
+            meta_content = self._read_file(meta_path)
+            meta = json.loads(meta_content)
         except NodeNotFoundError:
             raise NodeNotFoundError(uri)
 
@@ -1535,7 +1620,7 @@ class AGFSContextFS:
             overview=overview,
             content=content,
             metadata=metadata,
-        )
+        ), meta_content
 
     def exists(self, uri: str, ctx: RequestContext) -> bool:
         """Check if node exists and is ACTIVE.
@@ -1573,7 +1658,7 @@ class AGFSContextFS:
 
 
     _WRITE_RESERVED_META_FIELDS = _STRUCTURAL_META_FIELDS | {
-        "status", "created_at", "updated_at", "version",
+        "status", "created_at", "updated_at", "version", "session_state_layout",
     }
 
     @classmethod

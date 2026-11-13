@@ -49,8 +49,14 @@ def test_compose_http_recovers_after_session_ownership_is_available(monkeypatch,
     service.busy = False
     ready = client.post("/api/v1/compose", json=params)
 
-    assert busy.status_code == 503
-    assert busy.get_json() == {"ok": False, "status": "processing", "retryable": True}
+    assert busy.status_code == 409
+    result = busy.get_json()
+    assert {key: result[key] for key in ("ok", "status", "retryable")} == {
+        "ok": False, "status": "processing", "retryable": True}
+    assert result["accepted"] is False
+    assert result["http_status"] == 409
+    assert result["error_detail"]["code"] == "SESSION_WRITE_BUSY"
+    assert result["error_detail"]["retry_action"] == "retry_same_request"
     assert ready.status_code == 200
     assert ready.get_json() == {"retrievedEvidence": "verified memory", "messages": []}
     assert service.composed == ["recall the event"]

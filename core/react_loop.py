@@ -382,7 +382,9 @@ class ReactLoop(ABC):
             tool_choice = "auto"
 
         try:
-            result = self._llm.complete_with_tools_messages(
+            from providers.llm_observation import observe_call
+            result = observe_call(
+                getattr(self, "_llm_observation_stage", "other"), self._llm.complete_with_tools_messages,
                 messages=messages,
                 tools=tools,
                 tool_choice=tool_choice,

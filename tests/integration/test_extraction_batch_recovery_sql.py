@@ -216,7 +216,7 @@ def test_sql_commit_result_checkpoint_recovery_preserves_receipt_and_outbox(ctx,
                 result = service._complete_extraction_source(ctx, archive_id, "model budget exhausted")
         else:
             result = service.after_turn(params(ctx))
-        assert result["status"] == "completed"
+        assert result["status"] == ("degraded" if source_only else "completed")
         assert len(category_nodes(writer, "event", ctx)) == 1
         assert len(outbox.list_pending(ctx.account_id)) == 2
         assert writer._pipeline.extract.call_count == 0

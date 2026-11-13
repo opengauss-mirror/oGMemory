@@ -55,22 +55,13 @@ class SessionCompressor:
 
         return self._llm_compress(messages, prev_overview, prev_abstract)
 
-    def _llm_compress(
-        self,
+    @staticmethod
+    def compression_request(
         messages: list[dict],
         prev_overview: str = "",
         prev_abstract: str = "",
-    ) -> tuple[str, str]:
-        """Use LLM to generate compressed summaries, fusing with previous archive context.
-
-        Args:
-            messages: List of message dicts
-            prev_overview: Overview from the previous archive (L0)
-            prev_abstract: Abstract from the previous archive (L1)
-
-        Returns:
-            Tuple of (overview, abstract)
-        """
+    ) -> tuple[str, dict]:
+        """Build the exact model request and dependency fingerprint inputs."""
         conversation = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}" for msg in messages
         )
@@ -112,6 +103,12 @@ IMPORTANT: The overview MUST use the four markdown sections (Main Topics, Decisi
             "required": ["overview", "abstract"],
         }
 
+        return prompt, schema
+
+    def _llm_compress(
+        self, messages: list[dict], prev_overview: str = "", prev_abstract: str = "",
+    ) -> tuple[str, str]:
+        prompt, schema = self.compression_request(messages, prev_overview, prev_abstract)
         try:
             result = self.llm.complete_json(prompt, schema)
             overview = result.get("overview", "")

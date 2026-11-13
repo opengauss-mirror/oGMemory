@@ -49,10 +49,12 @@ def test_duplicate_operation_receipt_survives_later_update(store, schema_databas
     if category == "profile":
         accepted = replace(accepted, target_uri=uri, expected_version=initial.metadata["version"])
 
-    skipped = writer.write_memory(accepted, ctx)
+    duplicate = writer.write_memory(accepted, ctx)
     stored = fs.read_node(uri, ctx)
-    assert skipped["action"] == "skip" and skipped["target_uri"] == uri
-    assert accepted.write_operation_id in stored.metadata[RECEIPTS_KEY]
+    assert duplicate["action"] == ("merge" if category in {"event", "case"} else "skip")
+    assert duplicate["target_uri"] == uri
+    assert set(stored.metadata[RECEIPTS_KEY]) == {accepted.write_operation_id}
+    assert stored.metadata["version"] == initial.metadata["version"] + 1
     assert (stored.abstract, stored.overview, stored.content) == (
         initial.abstract, initial.overview, initial.content)
 
@@ -106,30 +108,21 @@ def test_receipt_discovery_reads_only_matching_bodies(store, bound, monkeypatch)
 
 @pytest.mark.parametrize("category", ["event", "case"])
 @pytest.mark.parametrize("sources", [[], ["source-message"]])
-def test_concurrent_operation_has_one_committed_receipt(store, schema_database, category, sources, monkeypatch):
-    import commit.context_writer as module
-
+def test_concurrent_operation_has_one_committed_receipt(store, schema_database, category, sources):
     fs, ctx = store
     accepted = replace(candidate(category), provenance_ids=sources)
     outbox = SQLOutboxStore(pool=schema_database[2], fs=fs)
     barrier = threading.Barrier(2)
-    original = module.receipt_plan
-    local = threading.local()
 
-    def synchronized_lookup(*args):
-        result = original(*args)
-        if not getattr(local, "checked", False):
-            local.checked = True
-            barrier.wait(timeout=10)
-        return result
+    def write(writer):
+        barrier.wait(timeout=10)
+        return writer.write_memory(accepted, ctx)
 
-    monkeypatch.setattr(module, "receipt_plan", synchronized_lookup)
     writers = [MemoryWriteAPI(fs, NoModel(), outbox, directory_summary_enabled=False) for _ in range(2)]
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(writer.write_memory, accepted, ctx) for writer in writers]
+        futures = [executor.submit(write, writer) for writer in writers]
         results = [future.result(timeout=15) for future in futures]
     assert len({result["target_uri"] for result in results}) == 1
-    monkeypatch.setattr(module, "receipt_plan", original)
     assert writers[0].write_memory(accepted, ctx)["merged_fields"]["status"] == "operation_committed"
     uri = results[0]["target_uri"]
     assert fs.list_children(uri.rsplit("/", 1)[0], ctx) == [uri]

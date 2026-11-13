@@ -18,7 +18,10 @@ MESSAGES = [{"id": "source-1", "role": "user", "content": "I like coffee and fin
 def make_extractor(*, reconcile=False):
     llm = Mock()
     llm.complete_with_tools.return_value = []
-    llm.complete_json.return_value = {"operations": []}
+    llm.complete_json.side_effect = lambda prompt, schema: (
+        {"categories": schema["properties"]["categories"]["items"]["enum"]}
+        if "categories" in schema.get("properties", {}) else {"operations": []}
+    )
     extractor = Extractor(llm, source_occurrence_reconciliation_enabled=reconcile)
     extractor._prefetcher = Mock()
     extractor._prefetcher.prefetch_for_span.side_effect = lambda categories, ctx, **kwargs: PrefetchResult(
@@ -45,7 +48,7 @@ def test_identical_ranges_prefetch_union_once_before_native_attempts(reconcile):
         assert "Existing preferences context" in call.kwargs["prompt"]
         assert "Existing event context" in call.kwargs["prompt"]
         assert MESSAGES[0]["content"] in call.kwargs["prompt"]
-    assert llm.complete_json.call_count == 1  # One shared JSON fallback after both failures.
+    assert llm.complete_json.call_count == 2  # One selection and one shared JSON fallback.
 
 
 def test_range_union_retains_source_ids_and_custom_template():
@@ -68,7 +71,7 @@ def test_range_union_retains_source_ids_and_custom_template():
 
 
 def test_distinct_overlapping_ranges_keep_their_own_provenance():
-    extractor, _ = make_extractor(reconcile=True)
+    extractor, llm = make_extractor(reconcile=True)
     messages = [*MESSAGES, {"id": "source-2", "role": "user", "content": "I finished another workshop."}]
     prepared = extractor._prepare_unique_spans([
         _Span(0, 0, categories=["event"]),
@@ -77,6 +80,10 @@ def test_distinct_overlapping_ranges_keep_their_own_provenance():
     assert len(prepared) == 2
     assert [item.span.message_ids for item in prepared] == [["source-1"], ["source-1", "source-2"]]
     assert [(item.span.start, item.span.end) for item in prepared] == [(0, 0), (0, 1)]
+    first, second = (item.assembly_state for item in prepared)
+    assert first is not second and first.attempts is not second.attempts
+    assert first.selection is second.selection
+    llm.complete_json.assert_called_once()
 
 
 @pytest.mark.parametrize("metadata", [

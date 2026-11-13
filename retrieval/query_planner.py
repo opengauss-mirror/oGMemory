@@ -34,7 +34,8 @@ _SKILL_PATTERNS: list[re.Pattern[str]] = [
 _RESOURCE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"文档|资料|规范|链接|document|spec|reference|link|paper|article",
+        # ASCII word boundaries allow adjacent Chinese while rejecting English substrings.
+        r"文档|资料|规范|链接|(?a:\b(?:document|spec|reference|link|paper|article)s?\b)",
     ]
 ]
 
@@ -108,10 +109,23 @@ class QueryPlanner:
             groups = [(ContextType.MEMORY.value, [c for c in categories if c != "skill"])]
             # ArchiveBuilder stores legacy tools and patterns as SKILL nodes.
             groups.append((ContextType.SKILL.value,
-                           [c for c in categories if c in {"skill", "tool", "pattern"}]))
+                           [c for c in categories if c in {"skill", "tool"}]))
+            groups.append((ContextType.SKILL.value,
+                           [c for c in categories if c == "pattern"]))
             return [self._make_query(query, kind, ctx, categories=selected,
                                      top_k=effective_top_k)
                     for kind, selected in groups if selected]
+
+        if not context_type_override and (hints or {}).get("include_all_memories") is True:
+            return [
+                self._make_query(query, kind, ctx, categories=selected,
+                                 top_k=effective_top_k)
+                for kind, selected in (
+                    (ContextType.MEMORY.value, None),
+                    (ContextType.SKILL.value, None),
+                    (ContextType.SKILL.value, ["pattern"]),
+                )
+            ]
 
         # Try semantic decomposition for complex queries
         sub_queries = self._decompose(query)
@@ -215,13 +229,16 @@ class QueryPlanner:
         top_k: int,
     ) -> TypedQuery:
         visible_spaces = list(ctx.visible_owner_spaces) if getattr(ctx, "visible_owner_spaces", ()) else []
-        # Determine owner_space based on context_type:
-        # - SKILL: agent space (skills/patterns/cases are agent-scoped), but
-        #   if the visible scope list is provided and excludes agent space,
-        #   fall back to an impossible filter to return no results.
-        # - MEMORY / RESOURCE: use visible scope list when provided;
-        #   otherwise preserve historical behavior.
-        if context_type == ContextType.SKILL.value:
+        owner_space: str | list[str] | None
+        # Pattern compatibility queries use authenticated user and agent spaces.
+        if context_type == ContextType.SKILL.value and categories == ["pattern"]:
+            owner_space = visible_spaces or [
+                space for space in (
+                    ctx.user_space_name() if ctx.user_id else "",
+                    ctx.agent_space_name() if ctx.agent_id else "",
+                ) if space
+            ] or "__inaccessible__"
+        elif context_type == ContextType.SKILL.value:
             visible_agent_spaces = [space for space in visible_spaces if str(space).startswith("agent:")]
             agent_space = ctx.agent_space_name() if ctx.agent_id else ""
             if agent_space and (not visible_spaces or agent_space in visible_spaces):

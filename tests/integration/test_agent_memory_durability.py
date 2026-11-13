@@ -28,15 +28,15 @@ def test_receipt_retry_publishes_index_before_checkpoint(agfs_server_info, monke
     llm, index = ExtractionLLM(), InMemoryVectorIndex()
     worker = OutboxWorker(index, SameEmbedding(), fs=fs,
                           agent_memory_handler=lambda job: _process(job, store, fs, outbox, llm))
-    register = outbox.register_write
+    register = outbox.register_once
 
-    def interrupted(node, ctx):
-        if node.category == "tool":
+    def interrupted(job, ctx):
+        if job.event_type == "UPSERT_CONTEXT" and fs.read_node(job.uri, ctx).category == "tool":
             raise OSError("index event publication interrupted")
-        return register(node, ctx)
+        return register(job, ctx)
 
     with monkeypatch.context() as patch:
-        patch.setattr(outbox, "register_write", interrupted)
+        patch.setattr(outbox, "register_once", interrupted)
         first = worker.process_event(event)
     saved = next(job for _, job in outbox.list_pending(ctx.account_id) if job.event_id == event.event_id)
     before = saved.payload["committed_count"]

@@ -9,12 +9,15 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 
 import threading
 import uuid
+from contextlib import nullcontext
 from dataclasses import replace
+from providers.llm_observation import correlate_extraction_calls
+
 from typing import Optional
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
 from commit.write_receipts import WriteDeadlineExceededError, WriteNotStartedError, receipt_plan
-from core.errors import ConcurrentModificationError, ExtractionIncompleteError
+from core.errors import ConcurrentModificationError, ExtractionIncompleteError, MemoryCardFormatError
 from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
@@ -53,6 +56,9 @@ internal_tool_usage_tracker=None,
         card_format_enabled: bool = False,
         dual_pass_enabled: bool = True,
         node_processing_enabled: bool = False,
+        graph_enabled: bool = False,
+        relation_store=None,
+        relation_candidate_service=None,
     ):
         """Initialize the API with required dependencies.
 
@@ -82,6 +88,11 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._card_format_enabled = card_format_enabled
         self._dual_pass_enabled = dual_pass_enabled
         self._node_processing_enabled = node_processing_enabled
+        self._graph_enabled = graph_enabled
+        self._relation_store = relation_store
+        self._relation_candidate_service = relation_candidate_service
+        if graph_enabled and relation_store is None:
+            raise ValueError("Graph ingestion requires canonical relation storage")
 
         # Auto-create SchemaRegistry if not provided
         if schema_registry is None:
@@ -140,6 +151,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     self._writer._identity_resolver
                     and self._writer._identity_resolver.handles(candidate)
                 ),
+                activation_enabled=self._graph_enabled,
             )]
         except Exception:
             # Fall back to default prompt construction if the template system is unavailable.
@@ -159,9 +171,11 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     self._writer._identity_resolver
                     and self._writer._identity_resolver.handles(candidate)
                 ),
+                activation_enabled=self._graph_enabled,
             )]
 
     @serialized_topics
+    @correlate_extraction_calls
     def commit_session(
         self,
         messages: list[dict],
@@ -173,6 +187,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         tool_stats_text: str = "",
         archive_id: str | None = None,
         candidate_checkpoint=None,
+        before_write=None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -219,7 +234,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         def extract():
             thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
             execution_options = {"parallel": False} if (
-                remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
+                self._node_processing_enabled or remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
             return self._pipeline.extract(
                 messages, ctx, session_time=session_time,
                 session_summary=session_summary,
@@ -240,19 +255,40 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
         if accepted is None:
             # Extraction must finish before the first accepted candidate is written.
+            from extraction.tools import ExtractionRuntime
+            runtime = ExtractionRuntime(candidate_checkpoint)
             candidates = (candidate_checkpoint.load_drafts() if self._node_processing_enabled
-                          and candidate_checkpoint is not None else None)
+                          and candidate_checkpoint is not None
+                          and not candidate_checkpoint.has_stage("native_extraction") else None)
             if candidates is None:
-                candidates = extract()
-                if self._node_processing_enabled and candidate_checkpoint is not None:
+                if self._node_processing_enabled:
+                    with runtime.activate():
+                        candidates = extract()
+                    candidates = sorted(candidates, key=lambda c: c.category not in {"entity", "preference"})
                     candidates = [replace(c, node_draft_indices=[i]) if c.category in {"entity", "preference"}
                                   else c for i, c in enumerate(candidates)]
+                else:
+                    candidates = extract()
+                if self._node_processing_enabled and candidate_checkpoint is not None and not runtime.entries:
                     candidate_checkpoint.save_drafts(candidates, messages)
             check_deadline()
             filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
             extracted_count, filtered_count = len(candidates), len(candidates) - len(filtered)
             if self._node_processing_enabled:
-                filtered = self._node_processor().process(filtered, messages, ctx)
+                def reconcile():
+                    nonlocal extracted_count, filtered_count
+                    others = runtime.reconcile(messages, ctx, archive_id)
+                    drafts = [c for c in candidates if c.category in {"entity", "preference"}]
+                    complete = self._pipeline._validate_candidates([*drafts, *others], ctx)
+                    selected = self._pipeline.filter_by_confidence(complete, confidence_threshold)
+                    extracted_count, filtered_count = len(complete), len(complete) - len(selected)
+                    if candidate_checkpoint is not None:
+                        candidate_checkpoint.save_drafts(complete, messages)
+                    return [c for c in selected if c.category not in {"entity", "preference"}]
+
+                filtered = self._node_processor().process(
+                    filtered, messages, ctx, checkpoint=candidate_checkpoint,
+                    reconcile=reconcile if runtime.entries else None)
             else:
                 from commit.topic_aliases import reconcile_topic_aliases
                 filtered = reconcile_topic_aliases(
@@ -265,24 +301,93 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 from extraction.card_format import validate_memory_card
                 for candidate in filtered:
                     validate_memory_card(candidate)
+            if self._node_processing_enabled:
+                targets = [c.target_uri for c in filtered if c.target_uri]
+                if len(targets) != len(set(targets)):
+                    raise ExtractionIncompleteError("memory decisions require one update per target")
+                for candidate in filtered:
+                    if candidate.target_uri:
+                        current = self._fs.read_node(candidate.target_uri, ctx)
+                        version = current.metadata.get("version", 0)
+                        if version != candidate.expected_version:
+                            raise ConcurrentModificationError(candidate.target_uri, candidate.expected_version, version)
+            if before_write is not None:
+                before_write()
             if candidate_checkpoint is not None:
                 resolver = self._writer._identity_resolver
                 if resolver is not None:
-                    resolver.preflight_new_batch(
-                        [candidate for candidate in filtered
-                         if self._writer.prewrite_skip(candidate, ctx) is None], ctx)
+                    prepared = [candidate for candidate in filtered
+                                if self._writer.prewrite_skip(candidate, ctx) is None]
+                    try:
+                        resolver.preflight_new_batch(prepared, ctx)
+                    except ExtractionIncompleteError as exc:
+                        candidate_checkpoint.invalidate_unaccepted_preparation()
+                        raise MemoryCardFormatError(str(exc)) from exc
                 check_deadline()
                 filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
         else:
             filtered, extracted_count, filtered_count = accepted
+            if self._graph_enabled:
+                candidate_checkpoint.restore_relation_tracking()
+            if before_write is not None:
+                before_write()
 
         # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
         deduplicated = filtered
 
+        # Proposals are transient ingestion inputs, never persisted as node metadata.
+        from extraction.relation_proposals import take
+        extraction_proposals = take(deduplicated)
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
-        plans = (self._write_checkpointed_candidates(
-                     deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
-                 if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
+        graph_batch = nullcontext()
+        if self._graph_enabled:
+            from fs.sql_adapter.session_mutation import active_session_guard
+            from providers.relation_store.projection_batch import graph_projection_batch
+
+            graph_batch = graph_projection_batch(active_session_guard())
+        with graph_batch:
+            plans = (self._write_checkpointed_candidates(
+                         deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
+                     if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
+
+        graph_diagnostics = None
+        if self._graph_enabled:
+            from extraction.cross_prompt_relations import run_integrated_relations
+            from extraction.relation_proposals import resolve_edges, union_edges
+            native_edges, native_rejections = resolve_edges(
+                extraction_proposals, deduplicated, plans, ctx, fs=self._fs,
+                uri_resolver=self._uri_resolver)
+            historical, diagnostics = [], None
+            lookup_error = None
+            if len(deduplicated) == len(plans) and self._relation_candidate_service is not None:
+                try:
+                    historical, diagnostics = self._relation_candidate_service.recommend(deduplicated, plans, ctx)
+                except Exception as exc:
+                    lookup_error = type(exc).__name__
+            edges, graph_diagnostics = run_integrated_relations(
+                messages,deduplicated,plans,ctx,fs=self._fs,vector_index=self._vector_index,
+                embedder=self._embedder,llm=self._llm,historical_candidates=historical,
+                historical_diagnostics=diagnostics)
+            edges = union_edges(native_edges, edges)
+            graph_diagnostics.update(node_extraction_relation_proposals=len(extraction_proposals),
+                                     native_relation_accepted=len(native_edges),
+                                     native_relation_rejections=native_rejections)
+            if lookup_error:
+                graph_diagnostics["historical_recommendation_failure"] = lookup_error
+            tracking_relation_write = (
+                bool(edges) and candidate_checkpoint is not None
+                and candidate_checkpoint.begin_relation_write()
+            )
+            try:
+                self._relation_store.upsert_edges(edges,ctx)
+            except Exception as exc:
+                graph_diagnostics.update(status="persistence_failed",relation_persisted=0,
+                                         persistence_error=type(exc).__name__)
+                logger.exception("Graph relation persistence failed")
+            else:
+                if tracking_relation_write:
+                    candidate_checkpoint.complete_relation_write()
+                graph_diagnostics["relation_persisted"] = len(edges)
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")
@@ -305,6 +410,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 for p in plans
             ],
         }
+
+        if graph_diagnostics is not None:
+            result["graph"] = graph_diagnostics
 
         # For async mode, return task_id
         if not wait:
@@ -345,7 +453,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             if checkpoint.outcome_uncertain(index):
                 resolver = self._writer._identity_resolver
                 normalized = resolver._normalize_subject(candidate, ctx)
-                committed = receipt_plan(self._fs, resolver.uris, normalized, ctx)
+                committed = receipt_plan(self._fs, resolver.uris, normalized, ctx,
+                                         outbox_store=self._outbox_store)
                 if committed is None:
                     raise RecoveryNeedsConfirmationError(
                         f"write outcome needs confirmation for operation {candidate.write_operation_id}")
@@ -383,7 +492,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                             and isinstance(exc.__cause__, ConcurrentModificationError)):
                         revised = self._node_processor().process(
                             checkpoint.reprocessing_drafts(candidate),
-                            checkpoint.draft_source(), ctx)
+                            checkpoint.draft_source(), ctx, target_candidate=candidate)
                         if (len(revised) != 1 or candidate.target_uri
                                 and revised[0].target_uri != candidate.target_uri):
                             raise MemoryCardFormatError(
@@ -720,6 +829,18 @@ class ReadAPI:
         self._read_service = read_service
         self._cfg = config or RetrievalConfig()
 
+    def append_graph_supplement(self, items, query, stats, ctx, budget, formatter):
+        supplement = getattr(self._pipeline,"_graph_supplement",None)
+        if not (self._cfg.enable_graph_expansion and self._cfg.graph_supplement_enabled and supplement):
+            return items
+        try:
+            return supplement.deliver(items,query,stats,ctx,budget,formatter)
+        except Exception as exc:
+            logger.warning("Graph delivery failed; preserving baseline: %s",exc)
+            stats["graph_supplement_delivery"] = dict(error=type(exc).__name__,added_uris=[],
+                                                      baseline_prefix_unchanged=True)
+            return items
+
     def search_memory(
         self,
         query: str,
@@ -735,6 +856,10 @@ class ReadAPI:
         fill_content_for_top_k: int = 0,
         context_type: str | None = None,
         memory_directories: list[str] | None = None,
+        collect_graph_supplement: bool = False,
+        use_scene: bool | None = None,
+        final_top_k: int | None = None,
+        hints: dict | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -757,6 +882,10 @@ class ReadAPI:
             fill_content_for_top_k=fill_content_for_top_k,
             context_type=context_type,
             memory_directories=memory_directories,
+            **({"collect_graph_supplement": True} if collect_graph_supplement else {}),
+            **({"use_scene": use_scene} if use_scene is not None else {}),
+            final_top_k=final_top_k,
+            hints=hints,
         )
 
         if not include_debug:
@@ -777,3 +906,8 @@ class ReadAPI:
         read_memory only reads the actual md file content.
         """
         return self._read_service.read(uri, ctx=ctx, **({"unit_key": unit_key} if unit_key is not None else {}))
+
+    def read_memories(
+        self, requests: list[tuple[str, str | None]], ctx: RequestContext,
+    ) -> dict[tuple[str, str | None], RetrievedBlock | Exception]:
+        return self._read_service.read_many(requests, ctx)

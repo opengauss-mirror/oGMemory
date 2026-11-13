@@ -34,6 +34,38 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _dns_slots = threading.BoundedSemaphore(4)
+DEFAULT_SESSION_MUTATION_LIMIT = 8
+
+
+def sql_connection_identity(dsn):
+    """Conservative identity for sharing an authenticated SQL session.
+
+    Ignore only transport/diagnostic settings. Credentials, options (including
+    search_path), endpoints and all unknown settings must still match.
+    """
+    values = psycopg2.extensions.parse_dsn(dsn)
+    for key in ("connect_timeout", "application_name", "fallback_application_name"):
+        values.pop(key, None)
+    return tuple(sorted(values.items()))
+
+
+def is_connection_alive(conn):
+    """Validate an idle session without leaving a transaction open."""
+    if conn.closed != 0:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 3000")
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        conn.rollback()
+        return True
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
 
 
 def remaining_seconds(deadline):
@@ -195,6 +227,10 @@ class SharedConnectionPool:
         self._lock = threading.Lock()
         # Semaphore limits total concurrent connections to pool_size
         self._semaphore = threading.Semaphore(pool_size)
+        # Session mutations reserve dedicated connections alongside the shared pool.
+        self.session_mutation_slots = threading.BoundedSemaphore(
+            max(DEFAULT_SESSION_MUTATION_LIMIT, pool_size)
+        )
 
     @property
     def connection_string(self) -> str:
@@ -210,20 +246,7 @@ class SharedConnectionPool:
 
     def _is_connection_alive(self, conn) -> bool:
         """Check that an idle connection is still usable."""
-        if conn.closed != 0:
-            return False
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-            conn.rollback()
-            return True
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return False
+        return is_connection_alive(conn)
 
     def get_connection(
         self,

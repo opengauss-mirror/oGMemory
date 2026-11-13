@@ -368,6 +368,15 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 
 ---
 
+## oGMemory Evaluation Results
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/tau2-benchmark-dark.svg">
+  <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
+</picture>
+
+---
+
 ## Quick Start
 
 ### Prerequisites
@@ -590,7 +599,7 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 | `SQL_CONNECTION_STRING` | — | SQL database DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
 | `OGMEM_CONFIG` | `ogmem.yaml` | Path to YAML config file |
-| `OGMEM_AFTER_TURN_THRESHOLD` | `200` | Pending token threshold before automatic after-turn extraction |
+| `OGMEM_AFTER_TURN_THRESHOLD` | `400` | Pending token threshold before automatic after-turn extraction |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | Enable Layer 2 rolling session compression |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | Use rule-based rolling fallback when LLM compression is unavailable |
 | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | One-time prepare token TTL in seconds |
@@ -704,13 +713,7 @@ The plugin can run in `remote` mode against an already-running oG-Memory service
 
 ### Benchmark Results (LoCoMo10)
 
-| Run | Accuracy | Key Changes |
-|-----|----------|-------------|
-| Run76 | **88.2%** (1358/1540) | L0 structured summary + BM25 hybrid retrieval + extraction prompt optimization |
-| Run69 | 88.2% | L0 summary injection + prompt optimization (+6.6% over run68) |
-| Run68 | 81.6% | session_time fix (baseline) |
-
-Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversational memory benchmark (10 sessions, 4 categories, 1540 questions).
+**LoCoMo benchmark: 92.21% accuracy across 1,540 questions (1,420 correct)** (LLM: DeepSeek-V4.1-Flash-1017; embedding model: `BAAI/bge-m3`). The evaluation framework is in [`tests/e2e/`](tests/e2e/).
 
 **Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + compose, ④ afterTurn, ⑤ prepare_compaction + compact, and the session-state persistence portion of ⑥ session_end + dispose.
 
@@ -721,6 +724,8 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 **Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](plugins/openclaw/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
 
 **MCP:** [Protocol compatibility](docs/integrations/mcp-protocol-compatibility.md)
+
+**Optional ContextNode graph:** [Semantic graph ingestion and retrieval](docs/semantic-context-graph.md) (opt-in SQL storage; no retrieval-time LLM)
 
 **Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
 

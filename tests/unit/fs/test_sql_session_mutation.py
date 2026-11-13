@@ -178,3 +178,19 @@ def test_optional_non_sql_and_mock_spec_archive_rejection_retains_legacy_fallbac
     manager = SessionManager(get_archive_store=lambda: store)
     result = manager._write_archive(CTX.session_id, "archive", "overview", "abstract", [], CTX)
     assert result == {"success": True, "uri": f"memory://{CTX.session_id}/archive", "archive_id": "archive"}
+
+
+@pytest.mark.parametrize('extra', [' connect_timeout=10', ' application_name=mcp', ' fallback_application_name=client'])
+def test_guard_accepts_only_nonsemantic_connection_options(extra):
+    guard = SQLSessionGuard(Raw(), DSN, CTX, 7)
+    conn = guard.borrow('host=localhost dbname=test' + extra)
+    guard.give_back(conn)
+    assert guard.poison_reason is None
+
+
+@pytest.mark.parametrize('extra', [' user=other', ' password=other', ' port=5433',
+                                  " options='-c search_path=other'", ' sslmode=disable'])
+def test_guard_still_rejects_security_and_namespace_changes(extra):
+    guard = SQLSessionGuard(Raw(), DSN, CTX, 7)
+    with pytest.raises(SessionMutationLostError):
+        guard.borrow(DSN + extra)

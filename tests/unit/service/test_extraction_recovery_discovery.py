@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from core.models import ContextNode, RequestContext
+from core.write_contract import OUTCOMES_KEY
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from service.extraction_recovery_discovery import (
     DISCOVERY_KEY,
@@ -122,6 +123,53 @@ def test_metadata_only_legacy_projection_reuses_unchanged_state_version(monkeypa
     clock[0] = 220
     assert discover()[0][1]["status"] == "running"
     assert fs.read_node.call_count == 2
+
+
+@pytest.mark.parametrize("legacy_hint", ["missing", "null", "old"])
+def test_metadata_only_projection_receipts_use_versioned_legacy_hint(monkeypatch, legacy_hint):
+    class MetadataOnlyFS(AGFSContextFS):
+        def scan_session_recovery(self, account_id, **kwargs):
+            rows, cursor = super().scan_session_recovery(account_id, **kwargs)
+            for row in rows:
+                row.pop("content", None)
+            return rows, cursor
+
+    ctx = RequestContext("legacy", "reader", "agent", "source", "trace")
+    fs = MetadataOnlyFS(_MemoryAGFSClient())
+    node = state(ctx, legacy=True)
+    payload = json.loads(node.content)
+    payload["runtime_extensions"][OUTCOMES_KEY] = {"version": 1, "entries": {"write-one": {
+        "request_id": "write-one", "source_status": "ARCHIVED", "semantic_status": "COMPLETE",
+        "request_status": "PROJECTING", "projection_status": "PENDING",
+        "outbox_tracking_complete": True, "outbox_events": [["ctx://legacy/memory", "event-one"]]}}}
+    metadata = dict(node.metadata)
+    if legacy_hint == "null":
+        metadata[DISCOVERY_KEY] = None
+    elif legacy_hint == "old":
+        metadata[DISCOVERY_KEY] = {key: value for key, value in recovery_discovery_hint(payload).items()
+                                   if key != "projection_pending"}
+    node = replace(node, content=json.dumps(payload), metadata=metadata)
+    fs.write_node(node, ctx)
+    fs.read_node = Mock(wraps=fs.read_node)
+    clock = [100]
+    monkeypatch.setattr("service.extraction_recovery_discovery.time.monotonic", lambda: clock[0])
+    refreshes = []
+    discover = ExtractionRecoveryDiscovery(lambda: fs, lambda: [ctx.account_id],
+                                            projection_handler=refreshes.append)
+
+    assert discover()[0][1]["id"] == "archive-source"
+    clock[0] = 160
+    assert discover()[0][1]["id"] == "archive-source"
+    assert fs.read_node.call_count == 1
+    assert refreshes == [replace(ctx, trace_id="extraction-recovery-discovery")] * 2
+
+    payload["runtime_extensions"][OUTCOMES_KEY]["entries"]["write-one"].update(
+        request_status="SUCCEEDED", projection_status="DONE")
+    fs.write_node(replace(node, content=json.dumps(payload)), ctx)
+    clock[0] = 220
+    assert discover()[0][1]["id"] == "archive-source"
+    assert fs.read_node.call_count == 2
+    assert len(refreshes) == 2
 
 
 def test_later_account_recovers_while_first_account_reconnects():

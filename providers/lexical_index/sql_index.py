@@ -17,6 +17,7 @@ from core.lexical import (
     LexicalAnalyzer,
     LexicalRecord,
 )
+from core.projection_ownership import check_projection_owner
 from providers.lexical_index.connection_pool import LexicalConnectionPool
 
 try:
@@ -222,6 +223,7 @@ class SQLNativeProjectionStore:
                     account_ids=(item.record.account_id for item in prepared),
                     record_ids=(item.record.id for item in prepared),
                 )
+                check_projection_owner()
                 generation = self._next_generation(cur)
                 record_count_delta = 0
                 for prepared_record in prepared:
@@ -266,6 +268,7 @@ class SQLNativeProjectionStore:
                     account_ids=accounts,
                     record_ids=ids,
                 )
+                check_projection_owner()
                 generation = self._next_generation(cur)
                 record_count_delta = 0
                 for record_id in ids:

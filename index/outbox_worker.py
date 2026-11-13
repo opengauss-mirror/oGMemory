@@ -19,9 +19,11 @@ import logging
 import re
 import uuid
 from contextlib import ExitStack, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 
+from core.projection_ownership import projection_owner
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
 from core.models import IndexRecord, OutboxEvent, RequestContext
@@ -54,6 +56,7 @@ class WorkerResult:
     records_upserted: int = 0
     error_message: str = ""
     moved_to_dlq: bool = False
+    deferred: bool = False
 
 
 @dataclass
@@ -63,6 +66,7 @@ class WorkerConfig:
     max_retry: int = DEFAULT_MAX_RETRY
     base_delay_ms: int = DEFAULT_BASE_DELAY_MS
     max_delay_ms: int = DEFAULT_MAX_DELAY_MS
+    processing_batch_size: int = 16
 
 
 class OutboxWorker:
@@ -88,6 +92,7 @@ class OutboxWorker:
         directory_summary_enabled: bool = True,
         agent_memory_handler=None,
         memory_projection_handler=None,
+        edge_projection_components=None,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -107,6 +112,36 @@ class OutboxWorker:
         self._directory_summary_enabled = directory_summary_enabled
         self._agent_memory_handler = agent_memory_handler
         self._memory_projection_handler = memory_projection_handler
+        self._edge_projection_store, self._edge_projection_profile = edge_projection_components or (None,None)
+        self._graph_poll_accounts = ContextVar("graph_projection_poll_accounts", default=None)
+
+    def _project_graph_account(self, account):
+        """Bound work to one due drain per account in this polling context.
+
+        Durable PROJECT_GRAPH events retain retry/restart discovery; there is
+        no lifetime cache of tenants. Standalone process_event calls also work.
+        """
+        polled = self._graph_poll_accounts.get()
+        if polled is not None:
+            if account in polled:
+                return 0
+            polled.add(account)
+        store = self._edge_projection_store
+        if self._has_real_method(store, "has_due_work") and not store.has_due_work(
+                account, profile=self._edge_projection_profile):
+            return 0
+        return store.drain_sync(account, self._embedder, self._edge_projection_profile)
+
+    def _drain_graph(self, accounts, stats):
+        if self._edge_projection_store is None:
+            return
+        for account in sorted(set(accounts)):
+            try:
+                count = self._project_graph_account(account)
+                stats["edge_projections"] = stats.get("edge_projections",0) + count
+            except Exception:
+                stats["edge_projection_failures"] = stats.get("edge_projection_failures",0) + 1
+                logger.exception("Graph projection drain failed for account %s",account)
 
     @staticmethod
     def _has_real_method(instance, name: str) -> bool:
@@ -168,6 +203,19 @@ class OutboxWorker:
                 return self._process_delete_context(event)
             elif event_type == "ARCHIVE_CONTEXT":
                 return self._process_archive_context(event)
+            elif event_type == "PROJECT_GRAPH":
+                if self._edge_projection_store is None:
+                    raise ValueError("Graph projection worker is not enabled")
+                resolved_ctx = ctx or self._build_request_context(event)
+                if resolved_ctx is None:
+                    raise ValueError("Missing graph projection account")
+                count = self._project_graph_account(resolved_ctx.account_id)
+                if self._edge_projection_store.unfinished(resolved_ctx.account_id,event.payload["edge_id"]):
+                    return WorkerResult(
+                        event_id=event.event_id, success=False,
+                        records_upserted=count, deferred=True,
+                    )
+                return WorkerResult(event_id=event.event_id,success=True,records_upserted=count)
             else:
                 logger.warning("Unknown event type: %s", event_type)
                 return WorkerResult(
@@ -257,7 +305,10 @@ class OutboxWorker:
                     and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT", "DELETE_CONTEXT"})
 
     def _current_projection_records(self, event: OutboxEvent, records: list[IndexRecord]) -> list[IndexRecord]:
-        if not self._is_memory_projection_event(event):
+        if not (self._is_memory_projection_event(event) or (
+                self._fs is not None and _MEMORY_OWNER_PATTERN.match(event.uri)
+                and "/memories/" in event.uri
+                and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT"})):
             return records
         if self._fs is None:
             raise RuntimeError("memory projection requires canonical node storage")
@@ -412,6 +463,10 @@ class OutboxWorker:
                 build_record_id(l2_uri, 2),
             ]
 
+        ids_to_delete = list(ids_to_delete)
+        activation_id = IndexRecord.generate_id(event.uri,3)
+        if activation_id not in ids_to_delete:
+            ids_to_delete.append(activation_id)
         self._vector_index.delete(ids_to_delete)
 
         logger.info(
@@ -449,6 +504,10 @@ class OutboxWorker:
                 build_record_id(l2_uri, 2),
             ]
 
+        ids_to_delete = list(ids_to_delete)
+        activation_id = IndexRecord.generate_id(event.uri,3)
+        if activation_id not in ids_to_delete:
+            ids_to_delete.append(activation_id)
         self._vector_index.delete(ids_to_delete)
 
         logger.info(
@@ -590,6 +649,12 @@ class OutboxWorker:
             # Create a copy with embedding in metadata
             new_metadata = dict(record.metadata)
             new_metadata["_embedding"] = embedding
+            # Persist identity for ordinary vectors too: equal dimensions do
+            # not make embeddings from different models comparable.
+            model = getattr(self._embedder, "model", None)
+            if isinstance(model, str) and model:
+                new_metadata["embedding_model"] = model
+            new_metadata["embedding_dimension"] = len(embedding)
 
             # Create new IndexRecord with augmented metadata
             # Note: IndexRecord is a dataclass, we can create a new instance
@@ -643,10 +708,22 @@ class OutboxWorker:
             result: Processing result
             stats: Statistics dict to update
         """
+        try:
+            self._ensure_processing_owned(outbox_store, event, node_uri)
+        except Exception:
+            logger.warning("Event %s awaits its processing lease owner", event.event_id, exc_info=True)
+            stats["skipped"] += 1
+            return
         if result.success:
             self._notify_memory_projection(event, result)
             outbox_store.mark_done(event, node_uri)
             stats["succeeded"] += 1
+            return
+
+        if result.deferred:
+            next_retry_at = datetime.now(UTC) + self.calculate_backoff(0)
+            outbox_store.defer(event, node_uri, next_retry_at)
+            stats["deferred"] = stats.get("deferred", 0) + 1
             return
 
         reason = str(result.error_message or "").strip()
@@ -749,6 +826,20 @@ class OutboxWorker:
             return outbox_store.processing_lock(node_uri)
         return nullcontext()
 
+    @staticmethod
+    def _ensure_processing_owned(outbox_store, event, node_uri):
+        if callable(getattr(type(outbox_store), "ensure_processing_owned", None)):
+            outbox_store.ensure_processing_owned(event, node_uri)
+
+    def _projection_owner(self, store, event, uri):
+        check = getattr(type(store), "ensure_processing_owned", None)
+        return projection_owner(lambda: check(store, event, uri)) if callable(check) else nullcontext()
+
+    @staticmethod
+    def _is_upsert_event(event: OutboxEvent) -> bool:
+        return event.event_type in {"UPSERT_CONTEXT", "UPSERT_DIRECTORY"}
+
+
     def _rollback_stale_upsert(
         self,
         event: OutboxEvent,
@@ -772,8 +863,11 @@ class OutboxWorker:
         records_data = event.payload.get("records", [])
         ids = [r["id"] for r in records_data if "id" in r]
 
+        self._ensure_processing_owned(outbox_store, event, event.uri)
         if ids:
-            self._vector_index.delete(ids)
+            with self._projection_owner(outbox_store, event, event.uri):
+                self._vector_index.delete(ids)
+                self._ensure_processing_owned(outbox_store, event, event.uri)
             logger.info(
                 "Rolled back %d stale records for tombstoned event %s",
                 len(ids), event.event_id,
@@ -832,6 +926,12 @@ class OutboxWorker:
     ) -> None:
         """Process already-claimed events and update acknowledgement state."""
         for node_uri, event in claimed_events:
+            # Old/custom claim implementations may not honor exclusions. A
+            # disabled feature is not a processing failure or a completed job.
+            if event.event_type == "PROJECT_GRAPH" and self._edge_projection_store is None:
+                outbox_store.release(event, node_uri)
+                stats["skipped"] += 1
+                continue
             if (event.event_type == "EXTRACT_AGENT_MEMORY"
                     and self._has_real_method(outbox_store, "claim_agent_event")):
                 self._process_agent_claim(event, outbox_store, stats, worker_id)
@@ -880,6 +980,13 @@ class OutboxWorker:
     ) -> None:
         """Process and acknowledge one event while its URI lock is held."""
 
+        try:
+            self._ensure_processing_owned(outbox_store, event, node_uri)
+        except Exception:
+            logger.info("Event %s awaits its current claim owner", event.event_id, exc_info=True)
+            stats["skipped"] += 1
+            return
+
         # Tombstone check: if move_node deleted this event between
         # claim_batch and here, skip processing to avoid writing stale
         # vectors at the old URI.  DB errors propagate so we don't
@@ -906,7 +1013,8 @@ class OutboxWorker:
 
         try:
             ctx = self._build_request_context(event)
-            result = self.process_event(event, ctx)
+            with self._projection_owner(outbox_store, event, node_uri):
+                result = self.process_event(event, ctx)
 
             # Post-upsert tombstone check: close the race where
             # move_node deleted this event *after* the pre-check
@@ -986,7 +1094,10 @@ class OutboxWorker:
                 embeddings = all_embeddings[start : start + len(records)]
                 augmented = self._augment_with_embeddings(records, embeddings)
                 try:
-                    self._vector_index.upsert(augmented)
+                    self._ensure_processing_owned(outbox_store, event, node_uri)
+                    with self._projection_owner(outbox_store, event, node_uri):
+                        self._vector_index.upsert(augmented)
+                        self._ensure_processing_owned(outbox_store, event, node_uri)
                     result = WorkerResult(
                         event_id=event.event_id,
                         success=True,
@@ -1035,11 +1146,34 @@ class OutboxWorker:
                 )
                 self._handle_processing_result(event, node_uri, outbox_store, failure, stats)
 
+    def excluded_event_types(self) -> list[str]:
+        """Events this worker leaves for a handler that can process them."""
+        excluded = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
+        if self._edge_projection_store is None:
+            excluded.append("PROJECT_GRAPH")
+        return excluded
+
     def run_once(
+        self,
+        outbox_store,
+        account_ids: list[str],
+        worker_id: str = "default",
+        pending_events: list[tuple[str, OutboxEvent]] | None = None,
+    ) -> dict:
+        # Context-local state is reset even on errors and cannot suppress a
+        # future retry, another worker, or a concurrent polling context.
+        token = self._graph_poll_accounts.set(set())
+        try:
+            return self._run_once(outbox_store, account_ids, worker_id, pending_events)
+        finally:
+            self._graph_poll_accounts.reset(token)
+
+    def _run_once(
         self,
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
         account_ids: list[str],
         worker_id: str = "default",
+        pending_events: list[tuple[str, OutboxEvent]] | None = None,
     ) -> dict:
         """Single polling cycle: scan → process → ack/retry/dlq.
 
@@ -1054,25 +1188,51 @@ class OutboxWorker:
             Dict with counts: processed / succeeded / failed / moved_to_dlq / skipped
         """
         stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
-        excluded_types = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
+        excluded_types = self.excluded_event_types()
 
         # Fast path: SQL outbox with batch-claim support
         if self._supports_batch_claim(outbox_store):
-            try:
-                claimed_events = outbox_store.claim_batch(
-                    worker_id=worker_id, exclude_event_types=excluded_types,
-                )
-            except Exception as e:
-                logger.error("Failed to claim pending events: %s", e)
-                return stats
-
-            self._process_claimed_events(claimed_events, outbox_store, stats, worker_id)
+            remaining = ({event.event_id for _, event in pending_events}
+                         if pending_events is not None else None)
+            accounts = set(account_ids)
+            while remaining is None or remaining:
+                try:
+                    scoped = {"event_ids": list(remaining)} if remaining is not None else {}
+                    claimed_events = outbox_store.claim_batch(
+                        worker_id=worker_id, exclude_event_types=excluded_types, **scoped,
+                    )
+                except Exception as e:
+                    logger.error("Failed to claim pending events: %s", e)
+                    return stats
+                if not claimed_events:
+                    break
+                self._process_claimed_events(claimed_events, outbox_store, stats, worker_id)
+                for node_uri, event in claimed_events:
+                    ctx = self._build_request_context(event)
+                    if ctx is not None:
+                        accounts.add(ctx.account_id)
+                if remaining is None:
+                    break
+                completed = {event.event_id for _, event in claimed_events}
+                if not remaining.intersection(completed):
+                    break
+                remaining.difference_update(completed)
+            if pending_events is not None:
+                outstanding = outbox_store.list_pending_events(
+                    [(uri, event.event_id) for uri, event in pending_events
+                     if event.event_type not in excluded_types])
+                pending_count = sum(event.event_type not in excluded_types for _, event in outstanding)
+                if pending_count:
+                    stats["pending"] = pending_count
+                    stats["deferred"] = True
+            self._drain_graph(accounts,stats)
             return stats
 
         # Collect all pending events across accounts, grouped by type.
+        self._drain_graph(account_ids,stats)
         # UPSERT_CONTEXT events are batch-embedded for efficiency.
-        all_pending: list[tuple[str, object]] = []  # (node_uri, event)
-        for account_id in account_ids:
+        all_pending: list[tuple[str, OutboxEvent]] = list(pending_events or [])
+        for account_id in account_ids if pending_events is None else []:
             try:
                 pending = outbox_store.list_pending(account_id)
             except Exception as e:
@@ -1080,6 +1240,16 @@ class OutboxWorker:
                 continue
             all_pending.extend(pending)
 
+        batch_size = max(1, self._config.processing_batch_size)
+        for start in range(0, len(all_pending), batch_size):
+            with ExitStack() as processing_stack:
+                self._process_pending_events(
+                    all_pending[start:start + batch_size], outbox_store, stats,
+                    worker_id, excluded_types, processing_stack,
+                )
+        return stats
+
+    def _process_pending_events(self, all_pending, outbox_store, stats, worker_id, excluded_types, processing_stack):
         # Phase 1: Batch-embed all UPSERT_CONTEXT events
         upsert_batch: list[tuple[object, str, list[IndexRecord]]] = []  # (event, node_uri, records)
         other_events: list[tuple[object, str]] = []  # (event, node_uri)
@@ -1092,7 +1262,28 @@ class OutboxWorker:
                     and self._has_real_method(outbox_store, "claim_agent_event")):
                 self._process_agent_claim(event, outbox_store, stats, worker_id)
                 continue
-            if not outbox_store.try_acquire(event, node_uri, worker_id):
+            if self._has_real_method(outbox_store, "claim_processing_event"):
+                event_stack = ExitStack()
+                try:
+                    acquired = event_stack.enter_context(
+                        outbox_store.claim_processing_event(event, node_uri, worker_id)
+                    )
+                except TimeoutError:
+                    event_stack.close()
+                    stats["skipped"] += 1
+                    continue
+                except Exception:
+                    event_stack.close()
+                    logger.exception("Failed to claim event %s under its URI lease", event.event_id)
+                    stats["failed"] += 1
+                    continue
+                if acquired:
+                    processing_stack.enter_context(event_stack)
+                else:
+                    event_stack.close()
+            else:
+                acquired = outbox_store.try_acquire(event, node_uri, worker_id)
+            if not acquired:
                 stats["skipped"] += 1
                 continue
 
@@ -1121,8 +1312,28 @@ class OutboxWorker:
         for event, node_uri in other_events:
             stats["processed"] += 1
             try:
+                self._ensure_processing_owned(outbox_store, event, node_uri)
                 ctx = self._build_request_context(event)
-                result = self.process_event(event, ctx)
+                with self._projection_owner(outbox_store, event, node_uri):
+                    result = self.process_event(event, ctx)
+                self._ensure_processing_owned(outbox_store, event, node_uri)
+                if (
+                    result.success
+                    and self._is_upsert_event(event)
+                    and self._supports_liveness_check(outbox_store)
+                ):
+                    current = self._event_is_current(outbox_store, event, node_uri)
+                    if not current:
+                        self._rollback_stale_upsert(
+                            event,
+                            outbox_store,
+                            ctx,
+                        )
+                        result = WorkerResult(
+                            event_id=event.event_id,
+                            success=True,
+                            records_upserted=0,
+                        )
                 self._handle_processing_result(event, node_uri, outbox_store, result, stats)
             except Exception as e:
                 logger.error("Exception processing event %s: %s", event.event_id, e, exc_info=True)

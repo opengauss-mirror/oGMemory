@@ -133,6 +133,8 @@ class TestBm25Index:
         assert idx.doc_count == 3
 
 
+
+
 class TestVectorAnchoredFusion:
     def test_fuse_pure_vector(self):
         """No BM25 hits -> scores unchanged."""

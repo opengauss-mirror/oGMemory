@@ -41,7 +41,7 @@ def test_after_turn_retry_reuses_normalized_trace_identity(trace_client, request
         response = client.post("/api/v1/after_turn", json=body, headers={
             "X-API-Key": "root-key", "X-Account-ID": "acct-1", "X-User-ID": "alice",
         })
-        assert response.status_code == 200
+        assert response.status_code == 202
         responses.append(response.get_json())
     assert [item["status"] for item in responses] == ["accumulating", "duplicate"]
     turns = store._read_state("acct-1", collections=("turns",), session_id="retry")["turns"]
@@ -78,7 +78,7 @@ def test_after_turn_accepts_native_tool_and_reasoning_structures(trace_client, t
         "X-API-Key": "root-key", "X-Account-ID": "acct-1", "X-User-ID": "alice",
     })
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.get_json()["trace_captured"] is True
     turns = store._read_state("acct-1", collections=("turns",), session_id="native")["turns"]
     events = next(iter(turns.values()))["content"]

@@ -3,7 +3,9 @@
 Persists OutboxEvents to AGFS for processing by OutboxWorker.
 """
 
+import hashlib
 import json
+import re
 import uuid
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
@@ -11,6 +13,7 @@ from datetime import UTC, datetime
 
 from pyagfs import AGFSClient
 
+from commit.outbox_scope import record_persisted_event, remember_persisted_event
 from core.enums import EventType
 from core.interfaces import ContextFS
 from core.logging_config import get_logger
@@ -18,6 +21,31 @@ from core.models import ContextNode, OutboxEvent, RequestContext
 
 logger = get_logger(__name__)
 _AGENT_PROCESSING_LEASE = ContextVar("agent_processing_lease", default=None)
+_PROCESSING_LEASES = ContextVar("outbox_processing_leases", default=None)
+
+
+def serialize_outbox_event(event: OutboxEvent) -> bytes:
+    """Return the canonical on-disk representation of an Outbox event."""
+
+    return json.dumps(
+        {
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "uri": event.uri,
+            "payload": event.payload,
+            "status": event.status,
+            "retry_count": event.retry_count,
+            "created_at": event.created_at,
+            "next_retry_at": event.next_retry_at,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+
+
+class OutboxPublishOutcomeUnknownError(RuntimeError):
+    """Raised when atomic event publication cannot be classified safely."""
 
 
 class OutboxStore:
@@ -49,6 +77,105 @@ class OutboxStore:
         self._client = client
         self._fs = fs
         self._mount_prefix = mount_prefix.rstrip("/")
+
+    def _processing_key(self, node_uri: str):
+        return (self._client.api_base, self._uri_to_agfs_path(node_uri).rstrip("/"))
+
+    @contextmanager
+    def processing_lock(self, node_uri: str, *, timeout_seconds: float = 0):
+        """Hold a renewable cross-process lease for one URI's projection."""
+        from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, parse_uri
+
+        key = self._processing_key(node_uri)
+        leases = _PROCESSING_LEASES.get() or {}
+        if key in leases:
+            lease = leases[key]
+            lease.ensure_owned()
+            yield lease
+            lease.ensure_owned()
+            return
+        account_id = parse_uri(node_uri)["account"]
+        lock_id = hashlib.sha256(key[1].encode("utf-8")).hexdigest()
+        lock_uri = f"ctx://{account_id}/agents/outbox-worker/memories/outbox_processing/outbox-processing-{lock_id}"
+        ctx = RequestContext(account_id=account_id, user_id="outbox-worker",
+                             agent_id="outbox-worker", session_id=lock_id, trace_id=lock_id)
+        fs = AGFSContextFS(self._client, mount_prefix=self._mount_prefix)
+        with fs.resource_mutation_lock(lock_uri, ctx, timeout_seconds=timeout_seconds) as lease:
+            lease.outbox_directory = f"{lease.lock_path}/outbox-{lease.owner_token}"
+            self._client.mkdir(lease.outbox_directory)
+            lease.ensure_owned()
+            token = _PROCESSING_LEASES.set({**leases, key: lease})
+            try:
+                yield lease
+            finally:
+                _PROCESSING_LEASES.reset(token)
+
+    def ensure_processing_owned(self, event: OutboxEvent, node_uri: str) -> None:
+        self._check_agent_lease(event)
+        lease = getattr(event, "_outbox_processing_lease", None)
+        if lease is not None:
+            lease.ensure_owned()
+            if (_PROCESSING_LEASES.get() or {}).get(self._processing_key(node_uri)) is not lease:
+                raise RuntimeError("Outbox processing lease scope changed")
+
+    @contextmanager
+    def claim_processing_event(self, event: OutboxEvent, node_uri: str, worker_id: str):
+        """Reload and claim a live event, retaining its lease through acknowledgement."""
+        with self.processing_lock(node_uri) as lease:
+            path = self._uri_to_agfs_path(node_uri) + ".outbox/" + event.event_id + ".json"
+            try:
+                data = self._load_event_json(self._client.read(path))
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    yield False
+                    return
+                raise
+            if data.get("event_id") != event.event_id or data.get("uri") != node_uri:
+                raise ValueError("Outbox event identity changed during claim")
+            if data.get("status", "PENDING") not in {"PENDING", "PROCESSING"}:
+                yield False
+                return
+            next_retry_at = data.get("next_retry_at", "")
+            if next_retry_at and datetime.now(UTC) < datetime.fromisoformat(next_retry_at):
+                yield False
+                return
+            event.event_type = data["event_type"]
+            event.payload, event.retry_count = data.get("payload", {}), data.get("retry_count", 0)
+            event.status, event.next_retry_at = data.get("status", "PENDING"), next_retry_at
+            event._outbox_processing_lease = lease
+            yield self.try_acquire(event, node_uri, worker_id)
+
+    def _write_processing_file(self, path: str, data: bytes, event: OutboxEvent, node_uri: str) -> None:
+        self.ensure_processing_owned(event, node_uri)
+        lease = getattr(event, "_outbox_processing_lease", None)
+        if lease is None:
+            self._client.write(path, data)
+            return
+        temporary = f"{lease.outbox_directory}/.outbox-{uuid.uuid4().hex}.json"
+        try:
+            self._client.write(temporary, data)
+            self.ensure_processing_owned(event, node_uri)
+            self._client.mv(temporary, path)
+            self.ensure_processing_owned(event, node_uri)
+        finally:
+            self._rm_if_present(temporary)
+
+    def _remove_processing_file(self, path: str, event: OutboxEvent, node_uri: str) -> bool:
+        """Acknowledge by moving a file into the current owner's private directory."""
+        self.ensure_processing_owned(event, node_uri)
+        lease = getattr(event, "_outbox_processing_lease", None)
+        if lease is None:
+            return self._rm_if_present(path)
+        completed = f"{lease.outbox_directory}/.completed-{uuid.uuid4().hex}"
+        try:
+            self._client.mv(path, completed)
+        except Exception as exc:
+            self.ensure_processing_owned(event, node_uri)
+            if self._is_not_found_error(exc):
+                return False
+            raise
+        self._rm_if_present(completed)
+        return True
 
     def register_write(
         self,
@@ -117,7 +244,23 @@ class OutboxStore:
         self._write_event(event, uri)
         return event
 
+    def persist_event(
+        self,
+        event: OutboxEvent,
+        node_uri: str | None = None,
+    ) -> OutboxEvent:
+        """Persist a pre-built event at its owning node Outbox."""
+
+        self._write_event(event, node_uri or event.uri)
+        return event
+
+
     def register_once(self, event: OutboxEvent, ctx: RequestContext) -> None:
+        if event.event_type != EventType.EXTRACT_AGENT_MEMORY.value:
+            with self.processing_lock(event.uri, timeout_seconds=5):
+                if self.get_event_status(event.uri, event.event_id) is None:
+                    self.persist_event(event)
+            return
         with self._agent_event_lock(event):
             node_path = self._uri_to_agfs_path(event.uri)
             if self._cleanup_completed_agent_event(event):
@@ -155,17 +298,7 @@ class OutboxStore:
         fs = AGFSContextFS(self._client, mount_prefix=self._mount_prefix)
         return fs.resource_mutation_lock(event.uri, ctx)
 
-    @staticmethod
-    def _is_not_found_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return "no such file" in message or "not found" in message
 
-    def _rm_if_present(self, path: str) -> None:
-        try:
-            self._client.rm(path)
-        except Exception as exc:
-            if not self._is_not_found_error(exc):
-                raise
 
     def _remove_agent_event_files(self, event: OutboxEvent) -> None:
         prefix = self._uri_to_agfs_path(event.uri) + ".outbox/" + event.event_id
@@ -346,6 +479,7 @@ class OutboxStore:
         }, ensure_ascii=False, indent=2)
 
         self._client.write(outbox_path, event_json.encode('utf-8'))
+        record_persisted_event(dir_uri, event.event_id)
 
         return event
 
@@ -414,6 +548,7 @@ class OutboxStore:
             return self._mount_prefix + base_path
         return base_path
 
+    @remember_persisted_event
     def _write_event(self, event: OutboxEvent, node_uri: str) -> None:
         """Write OutboxEvent to .outbox/ directory using atomic write pattern.
 
@@ -455,37 +590,73 @@ class OutboxStore:
         except Exception:
             pass  # Directory may already exist
 
-        # Serialize event
-        event_json = json.dumps({
-            "event_id": event.event_id,
-            "event_type": event.event_type,
-            "uri": event.uri,
-            "payload": event.payload,
-            "status": event.status,
-            "retry_count": event.retry_count,
-            "created_at": event.created_at,
-            "next_retry_at": event.next_retry_at,
-        }, ensure_ascii=False, indent=2)
+        event_bytes = serialize_outbox_event(event)
 
         # Write to temporary file first
         try:
-            self._client.write(temp_path, event_json.encode('utf-8'))
+            self._client.write(temp_path, event_bytes)
         except Exception as e:
             # Temp write failed - no state change
             logger.error("Failed to write temp outbox event %s: %s", event.event_id, e)
             raise
 
-        # Rename to final path (atomic if AGFS supports it)
+        # Move to the final path.  AGFS exposes same-backend atomic rename as
+        # ``mv``; a direct final write would expose a partially written event.
         try:
-            # AGFS rename is atomic for same-backend operations
-            self._client.rename(temp_path, event_path)
-        except Exception:
-            # If rename fails, attempt direct write (last resort)
+            self._client.mv(temp_path, event_path)
+        except Exception as exc:
+            try:
+                final_raw = self._client.read(event_path)
+            except Exception as inspect_exc:
+                if self._is_not_found_error(inspect_exc):
+                    try:
+                        self._client.rm(temp_path)
+                    except Exception:
+                        pass
+                    raise exc
+                try:
+                    self._client.rm(temp_path)
+                except Exception:
+                    pass
+                raise OutboxPublishOutcomeUnknownError(
+                    "AGFS Outbox publish outcome cannot be proven"
+                ) from inspect_exc
+
+            if isinstance(final_raw, bytearray):
+                final_raw = bytes(final_raw)
+            elif isinstance(final_raw, str):
+                final_raw = final_raw.encode("utf-8")
+            if final_raw == event_bytes:
+                try:
+                    self._client.rm(temp_path)
+                except Exception:
+                    pass
+                return
             try:
                 self._client.rm(temp_path)
             except Exception:
                 pass
-            self._client.write(event_path, event_json.encode('utf-8'))
+            raise OutboxPublishOutcomeUnknownError(
+                "AGFS Outbox publish outcome cannot be proven"
+            ) from exc
+
+    @staticmethod
+    def _is_not_found_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(marker in message for marker in ("no such file", "no such directory", "not found"))
+
+    def _rm_if_present(self, path: str, *, recursive: bool = False) -> bool:
+        try:
+            if recursive:
+                self._client.rm(path, recursive=True)
+            else:
+                self._client.rm(path)
+            return True
+        except Exception as exc:
+            if self._is_not_found_error(exc):
+                return False
+            raise
+
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
         """Mark an event as being processed.
@@ -511,13 +682,62 @@ class OutboxStore:
 
         self._client.write(event_path, event_json.encode('utf-8'))
 
+    def _done_receipt_path(self, node_uri: str, event_id: str) -> str:
+        from fs.agfs_adapter.agfs_context_fs import parse_uri
+
+        account = parse_uri(node_uri)["account"]
+        if not event_id or any(char in event_id for char in ("/", "\\", ".")):
+            raise ValueError("event identity must be a path component")
+        identity = hashlib.sha256((node_uri + "\n" + event_id).encode()).hexdigest()
+        return f"{self._mount_prefix}/accounts/{account}/.outbox-done/{identity}.json"
+
+    def _persist_done(self, event: OutboxEvent, node_uri: str) -> None:
+        """Publish an account-scoped projection receipt under the processing lease."""
+        path = self._done_receipt_path(node_uri, event.event_id)
+        receipt = {"event_id": event.event_id, "uri": node_uri, "status": "DONE",
+                   "event_type": event.event_type, "completed_at": datetime.now(UTC).isoformat(),
+                   "payload_sha256": hashlib.sha256(json.dumps(
+                       event.payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+        self.ensure_processing_owned(event, node_uri)
+        try:
+            self._client.mkdir(path.rsplit("/", 1)[0])
+        except Exception as exc:
+            if "already exists" not in str(exc).lower():
+                raise
+        temporary = path + "." + uuid.uuid4().hex + ".tmp"
+        data = json.dumps(receipt, ensure_ascii=False).encode()
+        try:
+            self._client.write(temporary, data)
+            self.ensure_processing_owned(event, node_uri)
+            self._client.mv(temporary, path)
+            self.ensure_processing_owned(event, node_uri)
+        finally:
+            self._rm_if_present(temporary)
+
+    def get_event_status(self, node_uri: str, event_id: str) -> str | None:
+        """Read a durable projection receipt or its current queued event."""
+        done_path = self._done_receipt_path(node_uri, event_id)
+        event_path = self._uri_to_agfs_path(node_uri) + ".outbox/" + event_id + ".json"
+        for path in (done_path, event_path, event_path.replace("/.outbox/", "/.outbox/dlq/")):
+            try:
+                data = self._load_event_json(self._client.read(path))
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    continue
+                raise
+            if data.get("event_id") != event_id or data.get("uri") != node_uri:
+                raise ValueError("Outbox receipt identity differs from the requested event")
+            return str(data.get("status") or "UNKNOWN")
+        return None
+
     def mark_done(self, event: OutboxEvent, node_uri: str) -> None:
-        """Mark an event as completed and delete it.
+        """Persist completion evidence and remove the live event.
 
         Args:
             event: OutboxEvent to complete
             node_uri: URI of the associated node
         """
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
         processing_path = node_path + ".outbox/" + event.event_id + ".processing"
@@ -527,20 +747,21 @@ class OutboxStore:
                 self._check_agent_lease(event)
                 audit = {key: event.payload[key] for key in ("trace_uri", "value_reviews") if key in event.payload}
                 self._client.write(node_path + ".agent_memory_done", json.dumps(audit, ensure_ascii=False).encode())
+                self._persist_done(event, node_uri)
                 self._remove_agent_event_files(event)
             return
 
-        # Delete the event file
-        try:
-            self._client.rm(event_path)
-        except Exception:
-            pass
-
-        # Delete the processing lock file
-        try:
-            self._client.rm(processing_path)
-        except Exception:
-            pass
+        self._persist_done(event, node_uri)
+        if getattr(event, "_outbox_processing_lease", None) is not None:
+            self._remove_processing_file(event_path, event, node_uri)
+            self._remove_processing_file(processing_path, event, node_uri)
+            return
+        for path in (event_path, processing_path):
+            self.ensure_processing_owned(event, node_uri)
+            try:
+                self._rm_if_present(path)
+            except Exception:
+                pass
 
     def list_pending(self, account_id: str) -> list[tuple[str, "OutboxEvent"]]:
         """Scan AGFS for all pending OutboxEvents under an account.
@@ -554,6 +775,16 @@ class OutboxStore:
             self._scan_outbox_recursive(prefix, results)
         except Exception:
             pass
+        return sorted(results, key=lambda item: (item[1].created_at, item[1].event_id))
+
+    def list_pending_events(self, references) -> list[tuple[str, "OutboxEvent"]]:
+        """Load the durable events recorded by the current write invocation."""
+        results = []
+        for node_uri, event_id in dict.fromkeys(references):
+            path = self._uri_to_agfs_path(node_uri) + ".outbox"
+            if not event_id or any(char in event_id for char in ("/", "\\", ".")):
+                raise ValueError("event identity must be a path component")
+            self._collect_outbox_events(path, [{"name": event_id + ".json"}], results)
         return results
 
     @staticmethod
@@ -629,6 +860,21 @@ class OutboxStore:
                 return True
         return False
 
+    @staticmethod
+    def _is_atomic_resource_staging_directory(name: str) -> bool:
+        """Return whether ``name`` is a hidden atomic mutation tree."""
+
+        if re.fullmatch(r"\.outbox-processing-[0-9a-f]{64}\.resource-mutation-lock(?:-[0-9a-f]{32})?", name):
+            return True
+        prefix, separator, token = name.rpartition(".resource-create-")
+        return bool(
+            separator
+            and prefix.startswith(".")
+            and len(prefix) > 1
+            and len(token) == 32
+            and all(char in "0123456789abcdef" for char in token)
+        )
+
     def _count_unfinished_entries(
         self,
         path: str,
@@ -649,7 +895,8 @@ class OutboxStore:
                 self._count_unfinished_outbox(child_path, counts)
             elif (
                 is_dir
-                and name != ".outbox"
+                and name not in {".outbox", ".outbox-done", ".write_operations"}
+                and not self._is_atomic_resource_staging_directory(name)
             ):
                 self._count_unfinished_recursive(child_path + "/", counts)
 
@@ -711,7 +958,11 @@ class OutboxStore:
                 except Exception:
                     continue
                 self._collect_outbox_events(child_path, ev_entries, results)
-            elif is_dir and name not in (".outbox", "dlq"):
+            elif (
+                is_dir
+                and name not in (".outbox", ".outbox-done", "dlq", ".write_operations")
+                and not self._is_atomic_resource_staging_directory(str(name))
+            ):
                 self._scan_outbox_recursive(child_path + "/", results)
 
     def _collect_outbox_events(self, outbox_path: str, entries: list[dict], results: list) -> None:
@@ -776,7 +1027,7 @@ class OutboxStore:
 
     def move_to_dlq(self, event: "OutboxEvent", node_uri: str) -> None:
         """Move a failed event to the dead letter queue."""
-        self._check_agent_lease(event)
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         src_path = node_path + ".outbox/" + event.event_id + ".json"
         dlq_dir = node_path + ".outbox/dlq/"
@@ -796,9 +1047,10 @@ class OutboxStore:
             "created_at": event.created_at,
             "next_retry_at": event.next_retry_at,
         }, ensure_ascii=False, indent=2)
-        self._client.write(dlq_path, data.encode("utf-8"))
+        self._write_processing_file(dlq_path, data.encode("utf-8"), event, node_uri)
+        self.ensure_processing_owned(event, node_uri)
         try:
-            self._client.rm(src_path)
+            self._remove_processing_file(src_path, event, node_uri)
         except Exception:
             pass
 
@@ -815,7 +1067,7 @@ class OutboxStore:
             node_uri: URI of the associated node
             next_retry_at: Optional datetime for scheduled retry (exponential backoff)
         """
-        self._check_agent_lease(event)
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
         event.retry_count += 1
@@ -832,7 +1084,7 @@ class OutboxStore:
             "created_at": event.created_at,
             "next_retry_at": event.next_retry_at,
         }, ensure_ascii=False, indent=2)
-        self._client.write(event_path, data.encode("utf-8"))
+        self._write_processing_file(event_path, data.encode("utf-8"), event, node_uri)
 
     def try_acquire(
         self,
@@ -841,6 +1093,7 @@ class OutboxStore:
         worker_id: str,
         timeout_seconds: int = 300,
     ) -> bool:
+        self.ensure_processing_owned(event, node_uri)
         if event.event_type == EventType.EXTRACT_AGENT_MEMORY.value:
             with self._agent_event_lock(event):
                 if self._cleanup_completed_agent_event(event) or not self.is_event_current(event.event_id, node_uri):
@@ -897,9 +1150,11 @@ class OutboxStore:
             "worker_id": worker_id,
             "acquired_at": datetime.now(UTC).isoformat(),
         }
-        self._client.write(
+        self._write_processing_file(
             processing_path,
-            json.dumps(lock_data, ensure_ascii=False).encode("utf-8")
+            json.dumps(lock_data, ensure_ascii=False).encode("utf-8"),
+            event,
+            node_uri,
         )
         return True
 
@@ -912,12 +1167,12 @@ class OutboxStore:
             event: OutboxEvent to release
             node_uri: URI of the associated node
         """
-        self._check_agent_lease(event)
+        self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         processing_path = node_path + ".outbox/" + event.event_id + ".processing"
 
         try:
-            self._client.rm(processing_path)
+            self._remove_processing_file(processing_path, event, node_uri)
         except Exception:
             # Lock file may have been removed already, silently ignore
             pass

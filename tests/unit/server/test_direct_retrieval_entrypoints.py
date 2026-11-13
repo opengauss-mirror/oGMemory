@@ -188,7 +188,8 @@ def test_compose_uses_l2_summary_and_legacy_skill(harness, skill_sedimentation):
         (ROOT + "preferences/summary_only", 0, "Summary-only evidence", "preference"),
     ])
     response = h.service.compose({"_ctx": h.ctx, "prompt": QUERY})
-    assert "Full session_summary content evidence" in response["sessionContext"]
+    assert "Full session_summary content evidence" in response["retrievedEvidence"]
+    assert response["sessionContext"] == ""
     assert "Full skill overview evidence" in response["retrievedEvidence"]
     assert "Summary-only evidence" not in response["retrievedEvidence"]
     assert h.searcher.expand.call_count == h.index.search_children.call_count == 0

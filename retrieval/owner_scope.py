@@ -94,3 +94,47 @@ def _compact_owner_spaces(spaces: list[str]) -> str | list[str]:
         compacted.append(space)
         seen.add(space)
     return compacted if len(compacted) > 1 else compacted[0]
+
+
+def visible_owner_spaces(ctx: RequestContext) -> list[str]:
+    return list(dict.fromkeys(ctx.visible_owner_spaces or ()))
+
+def validate_owner_filter(
+    requested: str | list[str] | None,
+    ctx: RequestContext,
+    *,
+    require: bool = True,
+) -> str | list[str] | None:
+    """Validate an explicit filter or derive it from visible owner grants."""
+    visible = visible_owner_spaces(ctx)
+    visible_set = set(visible)
+    if requested is not None:
+        values = [requested] if isinstance(requested, str) else list(requested)
+        if getattr(ctx, "acl_enforced", False) or visible_set:
+            unauthorized = [value for value in values if value not in visible_set]
+            if unauthorized:
+                raise PermissionError(
+                    f"owner_space access denied: {unauthorized} not in "
+                    f"visible_owner_spaces {visible}"
+                )
+        return requested
+    if visible:
+        return visible
+    if require:
+        raise ValueError(
+            "owner_space filter required: neither a requested owner nor "
+            "visible_owner_spaces is set"
+        )
+    return None
+
+
+def candidate_owner_spaces(owner_scope: str, ctx: RequestContext) -> list[str]:
+    """Return ordered authorized spaces for a user- or agent-owned candidate."""
+    primary = (
+        ctx.user_space_name() if owner_scope == "user" else ctx.agent_space_name()
+    )
+    visible = visible_owner_spaces(ctx)
+    ordered = list(dict.fromkeys((primary, *visible)))
+    if not getattr(ctx, "acl_enforced", False):
+        return ordered
+    return [space for space in ordered if space in set(visible)]

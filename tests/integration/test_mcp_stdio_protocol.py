@@ -12,6 +12,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from fs.sql_adapter.pool import SharedConnectionPool
 from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,7 +53,8 @@ async def _run_stdio_protocol_check() -> None:
             "OG_AGENT_ID": "main",
         }
     )
-    env.update({"STORAGE_BACKEND": "sql", "SQL_CONNECTION_STRING": sql_dsn})
+    env.update({"STORAGE_BACKEND": "sql", "SQL_CONNECTION_STRING": sql_dsn,
+                "SQL_DIALECT": os.environ.get("OGMEM_TEST_SQL_DIALECT", "postgresql")})
     _seed_reviewed_skill(sql_dsn, account_id=account_id, agent_id="main")
     server = StdioServerParameters(
         command=sys.executable,
@@ -72,7 +74,6 @@ async def _run_stdio_protocol_check() -> None:
                 "ogm_list_memories",
                 "ogm_query_memory",
                 "ogm_read_memory",
-                "ogm_search_code",
                 "ogm_search_skills",
                 "ogm_list_skills",
                 "ogm_read_skill",
@@ -80,6 +81,7 @@ async def _run_stdio_protocol_check() -> None:
                 "ogm_install_skill",
                 "ogm_update_skill",
                 "ogm_delete_skill",
+                "ogm_get_write_request_status",
                 "ogm_write_memory",
                 "ogm_delete_memory",
             }
@@ -239,7 +241,14 @@ def _assert_no_trace_provenance(*payloads: dict[str, Any]) -> None:
 
 
 def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
-    SQLTraceEventStore(connection_string=dsn, pool_size=1)
+    pool = SharedConnectionPool(
+        connection_string=dsn, pool_size=1,
+        dialect=os.environ.get("OGMEM_TEST_SQL_DIALECT", "postgresql"),
+    )
+    try:
+        SQLTraceEventStore(pool=pool)
+    finally:
+        pool.close_all()
     candidate_id = f"protocol-candidate-{account_id}"
     uri = f"ctx://{account_id}/agents/{agent_id}/skills/protocol-review"
     content = "---\nname: protocol-review\ndescription: Review protocol behavior.\n---\n# Protocol review\n"

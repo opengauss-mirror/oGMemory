@@ -57,6 +57,7 @@ dev = [
 ]
 opengauss = []  # psycopg2-binary now in core dependencies
 chroma = ["chromadb>=0.4.0"]
+milvus = ["pymilvus>=2.6.17,<2.7"]
 deepagents = ["deepagents>=0.7.23,<0.8"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 
@@ -68,7 +69,7 @@ e2e = [
 
 # All extras
 all = [
-    "context-engine[opengauss,chroma,sentence-transformers]",
+    "context-engine[opengauss,chroma,milvus,sentence-transformers]",
 ]
 
 [project.urls]

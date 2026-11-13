@@ -38,7 +38,7 @@ from extraction.schemas.registry import SchemaRegistry
 
 MEMORY_CATEGORIES = frozenset({"entity", "preference", "pattern"})
 OCCURRENCE_CATEGORIES = frozenset({"event", "case"})
-_USER_ROLE_MARKERS = frozenset({"user", "<user>"})
+_USER_ROLE_MARKERS = frozenset({"user", "<user>", "用户"})
 _LOCAL_LOCKS: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
 _LOCAL_LOCKS_GUARD = threading.Lock()
 
@@ -101,13 +101,20 @@ class MemoryIdentityResolver:
 
     @staticmethod
     def _self_holder(value, ctx):
-        holder = canonical_scope(value or "")
-        return canonical_scope(ctx.user_id) if holder in _USER_ROLE_MARKERS else holder
+        normalized = unicodedata.normalize("NFKC", value or "").strip()
+        holder = canonical_scope(normalized)
+        subject, separator, annotation = normalized.rpartition("(")
+        if (holder in _USER_ROLE_MARKERS
+                or (separator and annotation.endswith(")")
+                    and canonical_scope(annotation[:-1]) in _USER_ROLE_MARKERS
+                    and subject.strip() == unicodedata.normalize("NFKC", ctx.user_id).strip())):
+            return canonical_scope(ctx.user_id)
+        return holder
 
     @staticmethod
     def _normalize_subject(candidate, ctx):
         if (candidate.category == "preference" and candidate.who
-                and canonical_scope(candidate.who) in _USER_ROLE_MARKERS):
+                and MemoryIdentityResolver._self_holder(candidate.who, ctx) == canonical_scope(ctx.user_id)):
             return replace(candidate, who=ctx.user_id)
         return candidate
 
@@ -168,10 +175,19 @@ class MemoryIdentityResolver:
     @staticmethod
     def _in_scope(node, candidate, ctx):
         owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
-        if (node.category != candidate.category or node.owner_space != owner
-                or canonical_scope(node.metadata.get("scope_ref", ""))
-                != canonical_scope(candidate.scope_ref)):
+        if node.category != candidate.category or node.owner_space != owner:
             return False
+        stored_scope = canonical_scope(node.metadata.get("scope_ref", ""))
+        incoming_scope = canonical_scope(candidate.scope_ref)
+        if stored_scope != incoming_scope:
+            if candidate.category != "entity" or not MemoryIdentityResolver._names_match(node, candidate):
+                return False
+            self_scopes = {"", *(canonical_scope(value) for value in (
+                node.metadata.get("object_name", ""), *node.metadata.get("object_name_aliases", []),
+                candidate.object_name, *candidate.verified_object_aliases,
+            ) if value)}
+            if stored_scope not in self_scopes or incoming_scope not in self_scopes:
+                return False
         if candidate.category != "preference":
             return True
         stored = MemoryIdentityResolver._self_holder(node.metadata.get("who"), ctx)
@@ -442,7 +458,7 @@ class MemoryIdentityResolver:
         object_aliases = list(dict.fromkeys(filter(None, object_names)))
         return dict(identity_version=2, routing_key=routing_key,
                     routing_key_aliases=routing_aliases, object_name_aliases=object_aliases,
-                    scope_ref=candidate.scope_ref,
+                    scope_ref=meta.get("scope_ref", "") if existing and candidate.category == "entity" else candidate.scope_ref,
                     object_name=meta.get("object_name") or candidate.object_name)
 
     def _plan(self, candidate, existing, nodes, directory, ctx, *, duplicate=False):
@@ -500,7 +516,7 @@ class MemoryIdentityResolver:
                            "identity_create": existing is None and archived_version is None},
         )
 
-    def write(self, candidate, ctx, commit):
+    def write(self, candidate, ctx, commit, *, recover_receipt=None):
         if candidate.owner_scope == "agent" and not ctx.agent_id:
             return commit(candidate, ctx)
         candidate = self._normalize_subject(candidate, ctx)
@@ -508,7 +524,8 @@ class MemoryIdentityResolver:
             try:
                 with self._lock(self._directory(candidate, ctx), ctx):
                     if candidate.write_operation_id:
-                        committed = receipt_plan(self.fs, self.uris, candidate, ctx)
+                        committed = (recover_receipt() if recover_receipt is not None
+                                     else receipt_plan(self.fs, self.uris, candidate, ctx))
                         if committed is not None:
                             return committed
                     return self._write_once(candidate, ctx, commit)
@@ -521,18 +538,38 @@ class MemoryIdentityResolver:
         directory = self._directory(candidate, ctx)
         replay = occurrence_replay_id(candidate)
         nodes = self._nodes(directory, ctx)
+        def replay_sources(node):
+            # Read pre-fix replay hashes using the descriptor stored on that
+            # node. New writes use descriptor-independent factual identity.
+            metadata = dict(candidate.metadata)
+            for key in ("update_activation", "update_activation_version"):
+                metadata.pop(key, None)
+                if key in node.metadata:
+                    metadata[key] = node.metadata[key]
+            legacy = occurrence_replay_fields(replace(candidate, metadata=metadata),
+                                              include_graph_annotations=True)
+            legacy_id = hashlib.sha256(json.dumps(legacy, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            sources = node.metadata.get("occurrence_replay_sources", {})
+            return set(sources.get(replay, [])) | set(sources.get(legacy_id, []))
         matches = [node for node in nodes if self._in_scope(node, candidate, ctx)
-                   and set(candidate.provenance_ids) <= set(
-                       node.metadata.get("occurrence_replay_sources", {}).get(replay, []))]
+                   and set(candidate.provenance_ids) <= replay_sources(node)]
         if len(matches) > 1:
             raise ValueError("occurrence replay has ambiguous targets; select a read target explicitly")
         if matches:
-            if candidate.write_operation_id:
+            if candidate.write_operation_id or self._descriptor_changed(candidate, matches[0]):
                 existing = self.fs.read_node(matches[0].uri, ctx)
-                commit(candidate, ctx, self._plan(candidate, existing, nodes, directory, ctx, duplicate=True))
+                return commit(candidate, ctx, self._plan(candidate, existing, nodes, directory, ctx, duplicate=True))
             return WritePlan(action="skip", target_uri=matches[0].uri,
                              merged_fields={"status": "duplicate"})
         return commit(candidate, ctx, self._plan(candidate, None, nodes, directory, ctx))
+
+    @staticmethod
+    def _descriptor_changed(candidate, existing):
+        from index.activation_projection import ACTIVATION_VERSION, candidate_activation
+        descriptor = candidate_activation(candidate)
+        return descriptor is not None and (
+            descriptor != existing.metadata.get("update_activation")
+            or existing.metadata.get("update_activation_version") != ACTIVATION_VERSION)
 
     def _write_once(self, candidate, ctx, commit):
         if candidate.category in OCCURRENCE_CATEGORIES and not candidate.target_uri:
@@ -543,6 +580,10 @@ class MemoryIdentityResolver:
         observation = observation_id(candidate)
         nodes = self._candidate_nodes(candidate, directory, ctx)
         matched = self._match(candidate, nodes, directory, ctx)
+        # Explicit updates must validate the extracted revision even when only
+        # graph annotations changed or the content is an exact replay.
+        if matched and candidate.target_uri and candidate.expected_version != matched.metadata.get("version", 0):
+            raise ValueError("memory changed since extraction; refresh and re-extract the update")
         if matched and not candidate.target_uri:
             matched = self.fs.read_node(matched.uri, ctx)
         repeats = [node for node in nodes if self._in_scope(node, candidate, ctx)
@@ -555,6 +596,11 @@ class MemoryIdentityResolver:
         if repeats:
             existing = repeats[0] if candidate.target_uri else self.fs.read_node(repeats[0].uri, ctx)
             plan = self._plan(candidate, existing, nodes, directory, ctx, duplicate=True)
+            # Content replay identity stays unchanged. A valid descriptor-only
+            # refresh still needs a real versioned write and index event, while
+            # preserving the existing content rather than appending it twice.
+            if self._descriptor_changed(candidate, existing):
+                return commit(candidate, ctx, plan)
             metadata = plan.merged_fields["identity_metadata"]
             changed = any(metadata.get(name) != existing.metadata.get(name) for name in
                           ("provenance_ids", "memory_observation_sources",
@@ -572,7 +618,5 @@ class MemoryIdentityResolver:
                 fields.update(existing_content=matched.content, content_append=candidate.content,
                               existing_overview=matched.overview, overview_append=candidate.overview)
                 return commit(candidate, ctx, plan)
-            if candidate.expected_version != matched.metadata.get("version", 0):
-                raise ValueError("memory changed since extraction; refresh and re-extract the update")
         plan = self._plan(candidate, matched, nodes, directory, ctx)
         return commit(candidate, ctx, plan)

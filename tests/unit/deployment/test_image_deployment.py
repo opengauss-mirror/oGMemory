@@ -7,6 +7,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_root_env_template_uses_the_buffer_default():
+    values = dict(line.split('=', 1) for line in (ROOT / '.env.example').read_text().splitlines()
+                  if line and not line.startswith('#') and '=' in line)
+    from providers.unified_config import OgMemConfig
+    assert int(values['OGMEM_AFTER_TURN_THRESHOLD']) == OgMemConfig().after_turn_threshold
+
+
 @pytest.fixture(autouse=True)
 def forbid_network_in_deployment_unit_tests(monkeypatch):
     import socket
@@ -75,7 +82,7 @@ def test_prepare_preserves_keys_and_special_character_values(tmp_path):
     parsed = yaml.safe_load((Path(first['stack_dir']) / 'ogmemory.yaml').read_text())
     assert parsed['llm']['api_key'] == config()['LLM_API_KEY']
     assert parsed['mcp']['default_toolset'] == 'read-write'
-    assert parsed['memory']['after_turn_threshold'] == 800
+    assert parsed['memory']['after_turn_threshold'] == 400
     assert (Path(first['stack_dir']) / 'secrets.env').stat().st_mode & 0o777 == 0o600
 
 

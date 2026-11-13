@@ -87,8 +87,7 @@ def test_register_directory_writes_event_to_parent_outbox_even_if_mkdir_fails(st
     assert payload["payload"]["child_abstracts"] == ["one", "two"]
 
 
-def test_write_event_falls_back_to_direct_write_when_rename_fails(store):
-    store._client.rename.side_effect = RuntimeError("rename failed")
+def test_write_event_publishes_staged_event_atomically(store):
     event = OutboxEvent(
         event_id="evt-1",
         event_type="UPSERT_CONTEXT",
@@ -99,12 +98,11 @@ def test_write_event_falls_back_to_direct_write_when_rename_fails(store):
 
     store._write_event(event, event.uri)
 
-    assert store._client.write.call_count == 2
-    temp_path = store._client.write.call_args_list[0].args[0]
-    final_path = store._client.write.call_args_list[1].args[0]
+    temp_path, event_bytes = store._client.write.call_args.args
     assert temp_path.endswith(".tmp_evt-1.json")
-    assert final_path.endswith("evt-1.json")
-    store._client.rm.assert_called_once_with(temp_path)
+    final_path = temp_path.replace(".tmp_evt-1.json", "evt-1.json")
+    store._client.mv.assert_called_once_with(temp_path, final_path)
+    assert json.loads(event_bytes)["event_id"] == event.event_id
 
 
 def test_write_event_reraises_when_temp_write_fails(store):
@@ -147,7 +145,7 @@ def test_mark_done_ignores_delete_errors(store):
         payload={"records": []},
         status="PENDING",
     )
-    store._client.rm.side_effect = RuntimeError("already gone")
+    store._client.rm.side_effect = FileNotFoundError("No such file")
 
     store.mark_done(event, event.uri)
 

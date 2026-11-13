@@ -72,4 +72,4 @@ def test_fallback_summary_repair_preserves_read_snapshot_and_details(field, valu
     assert getattr(candidate, field) == "Reader works as an engineer."
     assert span.span.prefetch_result.read_versions == {uri: 1}
     assert len(candidate.provenance_ids) == 1
-    assert llm.complete_json.call_count == 2
+    assert llm.complete_json.call_count == 3

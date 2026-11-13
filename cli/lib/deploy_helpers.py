@@ -25,6 +25,7 @@ def generate_quickstart_env(
     llm_config: dict,
     embedding_config: dict,
     *,
+    vector_config: dict | None = None,
     instance_name: str = "ogmem",
     opengauss_port: int = 15432,
     ogmem_http_port: int = 18090,
@@ -48,7 +49,17 @@ def generate_quickstart_env(
                 "Use local mode for mock providers."
             )
 
+    vector_config = vector_config or {"type": "opengauss"}
+    backend = vector_config.get("type", "opengauss")
+    if backend not in {"opengauss", "milvus"}:
+        raise ValueError(f"Unsupported Docker vector provider: {backend!r}")
     values = {
+        "VECTOR_DB_TYPE": backend,
+        "MILVUS_URI": vector_config.get("milvus_uri", os.environ.get("MILVUS_URI", "http://host.docker.internal:19530")),
+        "MILVUS_COLLECTION": vector_config.get("milvus_collection", "contextengine"),
+        "MILVUS_DB_NAME": vector_config.get("milvus_db_name", "default"),
+        "MILVUS_TIMEOUT": vector_config.get("milvus_timeout", os.environ.get("MILVUS_TIMEOUT", "30")),
+        "MILVUS_TOKEN": os.environ.get("MILVUS_TOKEN", ""),
         "INSTANCE_NAME": instance_name,
         "OPENGAUSS_HOST_PORT": opengauss_port,
         "OGMEM_HTTP_HOST_PORT": ogmem_http_port,

@@ -40,12 +40,15 @@ class LifecycleBatchJournal(ExtractionBatchJournal):
             actual = [asdict(message) for message in buffer.messages if message.id in source_ids]
             if len(source_ids) != len(snapshot) or actual != expected:
                 raise RecoveryNeedsConfirmationError("lifecycle source snapshot changed before checkpoint")
-        super().__init__(manager, buffer, ctx, snapshot,
+        request_id = f"{kind}-{kwargs['archive_id']}"
+        super().__init__(manager, buffer, ctx, snapshot, client_request_id=request_id,
                          lifecycle={"kind": kind, "source_digest": source_digest(
                              [asdict(message) for message in snapshot])}, **kwargs)
         lifecycle = self.batch["lifecycle"]
         if lifecycle.get("source_digest") != source_digest(self.batch["snapshot"]):
             raise RecoveryNeedsConfirmationError("pending lifecycle source digest changed")
+        if not self.batch.get("client_request_id"):
+            self.mutate(lambda batch: batch.update(client_request_id=request_id))
 
     @property
     def snapshot(self):
@@ -87,11 +90,13 @@ class LifecycleBatchJournal(ExtractionBatchJournal):
     def archive_complete(self, uri):
         self.mutate(lambda batch: batch["lifecycle"]["archive"].update(status="complete", uri=uri))
 
-    def finish(self, *, reset_window_state=False):
+    def finish(self, *, reset_window_state=False, outcome=None, resolve_outcome=None):
         archive = self.archive_record()
-        super().finish(reset_window_state=reset_window_state)
+        receipt = super().finish(reset_window_state=reset_window_state, outcome=outcome,
+                                 resolve_outcome=resolve_outcome)
         if archive is not None and archive.get("status") == "complete":
             self.manager._maybe_merge_archives(self.buffer.session_id, self.ctx)
+        return receipt
 
     def archive_recover(self, manager):
         """An uncertain archive is confirmed only by a complete exact read."""

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -260,24 +261,116 @@ function buildAuthHeaders(authCfg = {}, params = {}, contentType = null) {
 
   const userId = typeof params?.userId === "string" ? params.userId.trim() : "";
   if (userId) headers["X-User-ID"] = userId;
+  if (params?.agentId) headers["X-Agent-ID"] = params.agentId;
 
   return headers;
 }
 
-async function callHttp(baseUrl, method, params, cfg = {}) {
+function degradedSourceArchived(result) {
+  const sourceIds = result?.source_message_ids;
+  const archivedIds = result?.archived_source_ids;
+  if (!Array.isArray(sourceIds) || !sourceIds.length || !Array.isArray(archivedIds)) return false;
+  const archived = new Set(archivedIds);
+  return Boolean(result.request_status === "DEGRADED" && !(result.httpStatus >= 400)
+    && result.semantic_status === "DEGRADED"
+    && ["ARCHIVED", "RAW_ARCHIVED"].includes(result.source_status)
+    && result.archive_id && new Set(sourceIds).size === archived.size
+    && sourceIds.every((id) => archived.has(id)));
+}
+
+function degradedWriteSettled(result) {
+  return degradedSourceArchived(result) && ["DONE", "NOT_REQUIRED"].includes(result.projection_status);
+}
+
+function writeRequestNeedsPoll(result) {
+  return result.retry_action === "poll"
+    || (degradedSourceArchived(result) && result.projection_status === "PENDING");
+}
+
+function writeReceiptSummary(result) {
+  return Object.fromEntries([
+    "request_id", "status", "request_status", "source_status", "semantic_status",
+    "projection_status", "retry_action", "error_code", "error_type", "archive_id",
+  ].filter((key) => result[key] != null).map((key) => [key, result[key]]));
+}
+
+function writeHttpObservation(method, path, response, result, started) {
+  return {
+    method, path, http_status: response.status, at: new Date().toISOString(),
+    duration_ms: performance.now() - started, ...writeReceiptSummary(result),
+  };
+}
+
+export async function pollWriteRequest(baseUrl, params, cfg, initial, deadline) {
+  const requestId = initial.request_id || params.clientRequestId;
+  const sessionId = params.sessionId || params.session_id;
+  if (!requestId || !sessionId) return initial;
+  const path = `/api/v1/sessions/${encodeURIComponent(sessionId)}`
+    + `/write-requests?clientRequestId=${encodeURIComponent(requestId)}`;
+  const observations = [...(initial.http_observations || [])];
+  let result = initial;
+  let interruption = { observation_status: "OBSERVATION_TIMEOUT" };
+  while (writeRequestNeedsPoll(result) && performance.now() + 1000 < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const started = performance.now();
+    try {
+      const response = await fetch(`${baseUrl}${path}`, {
+        headers: buildAuthHeaders(cfg, params, "application/json"),
+        signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(30_000, deadline - performance.now())))),
+      });
+      const outcome = await response.json();
+      observations.push(writeHttpObservation("GET", path, response, outcome, started));
+      if (!response.ok && !["FAILED", "NEEDS_CONFIRMATION"].includes(outcome.request_status)) {
+        interruption = { observation_status: "OBSERVATION_HTTP_ERROR", observation_http_status: response.status };
+        break;
+      }
+      if (outcome.request_status === "DEGRADED" && outcome.request_id !== requestId) {
+        interruption = { observation_status: "OBSERVATION_RECEIPT_MISMATCH" };
+        break;
+      }
+      const state = outcome.request_status;
+      const handled = state === "SUCCEEDED" || (state === "ACCEPTED" && outcome.retry_action === "none");
+      result = state === "DEGRADED"
+        ? { compacted: initial.compacted, result: initial.result, ...outcome, ok: false }
+        : { ...initial, ...outcome, ok: handled && outcome.ok !== false };
+    } catch (error) {
+      observations.push({ method: "GET", path, request_id: requestId, at: new Date().toISOString(),
+        duration_ms: performance.now() - started, http_status: null, error_type: error.name });
+      interruption = {
+        observation_status: error.name === "TimeoutError" ? "OBSERVATION_TIMEOUT" : "OBSERVATION_ERROR",
+        observation_error_type: error.name,
+      };
+      break;
+    }
+  }
+  const polling = writeRequestNeedsPoll(result);
+  const { observation_status, observation_error_type, observation_http_status, ...receipt } = result;
+  return {
+    ...receipt,
+    ok: !polling && result.ok,
+    retryable: result.retry_action === "retry_same_request",
+    http_observations: observations,
+    ...(polling ? { retry_action: "poll", ...interruption } : {}),
+  };
+}
+
+export async function callHttp(baseUrl, method, params, cfg = {}) {
+  const timeoutMs = cfg.requestTimeoutMs ?? (method === "after_turn" ? 300_000 : 120_000);
+  const deadline = performance.now() + timeoutMs;
+  if (method === "after_turn" && !params.clientRequestId) {
+    const source = JSON.stringify([params.accountId || cfg.authAccountId, params.userId,
+      params.agentId, params.sessionId, params.semanticTurnId,
+      params.semanticTurnSourceNamespace, params.runtimeContext?.currentMessageId,
+      params.prePromptMessageCount || 0, params.messages]);
+    params = { ...params, clientRequestId: "oc-" + createHash("sha256").update(source).digest("hex") };
+  }
   try {
     const headers = buildAuthHeaders(cfg, params, "application/json");
     const resp = await fetch(`${baseUrl}/api/v1/${method}`, {
       method: "POST",
       headers,
       body: JSON.stringify(params),
-      signal: AbortSignal.timeout(
-        cfg.requestTimeoutMs ?? (
-          method === "after_turn"
-            ? 300_000
-            : 120_000
-        ),
-      ),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!resp.ok) {
       const body = await resp.text();
@@ -289,11 +382,15 @@ async function callHttp(baseUrl, method, params, cfg = {}) {
       } catch {
         parsed = {};
       }
-      const safeErrorBody = parsedBody && parsed && typeof parsed === "object"
-        ? { ...parsed }
-        : null;
-      if (safeErrorBody) {
+      if (method === "after_turn") {
+        parsed.http_observations = [writeHttpObservation("POST", `/api/v1/${method}`, resp, parsed, deadline - timeoutMs)];
       }
+      if (method === "after_turn" && parsed.retry_action === "poll") {
+        return pollWriteRequest(baseUrl, params, cfg, parsed, deadline);
+      }
+      const safeErrorBody = parsedBody && parsed && typeof parsed === "object"
+        ? writeReceiptSummary(parsed)
+        : null;
       console.error(
         `[og-memory] HTTP ${resp.status} from ${method}, body: ${safeErrorBody
           ? JSON.stringify(safeErrorBody)
@@ -309,7 +406,7 @@ async function callHttp(baseUrl, method, params, cfg = {}) {
         return {
           ...parsed,
           ok: false,
-          retryable: (
+          retryable: parsed?.retry_action ? parsed.retry_action === "retry_same_request" : (
             (
               retryableSessionConflict
               || [408, 425, 429].includes(resp.status)
@@ -322,15 +419,24 @@ async function callHttp(baseUrl, method, params, cfg = {}) {
       }
       return null;
     }
-    return await resp.json();
+    const result = await resp.json();
+    if (method === "after_turn") {
+      result.http_observations = [writeHttpObservation("POST", `/api/v1/${method}`, resp, result, deadline - timeoutMs)];
+      if (["DEGRADED", "FAILED", "NEEDS_CONFIRMATION"].includes(result.request_status)) result.ok = false;
+      if (result.retry_action) result.retryable = result.retry_action === "retry_same_request";
+    }
+    return (method === "after_turn" || method === "compact") && writeRequestNeedsPoll(result)
+      ? pollWriteRequest(baseUrl, params, cfg, result, deadline) : result;
   } catch (err) {
-    console.error(`[og-memory] HTTP ${method} error: ${err.message}`);
+    console.error(`[og-memory] HTTP ${method} error: ${err.name}`);
     if (cfg.structuredFailures === true) {
       return {
         ok: false,
         retryable: true,
         status: "transport_error",
-        error: err.message,
+        error_type: err.name,
+        request_id: params.clientRequestId,
+        observation_status: err.name === "TimeoutError" ? "OBSERVATION_TIMEOUT" : "OBSERVATION_ERROR",
       };
     }
     return null;
@@ -416,7 +522,7 @@ function requireSuccessfulTransportResult(method, result) {
   if (!result) {
     throw new Error(`og-memory ${method} failed: empty transport response`);
   }
-  if (result.error) {
+  if (result.error && !degradedWriteSettled(result)) {
     throw new Error(`og-memory ${method} failed: ${result.error}`);
   }
   return result;
@@ -470,7 +576,12 @@ export async function runCompactControlFlow({
     prepareToken: prepared.prepareToken,
   });
   const successfulResult = requireSuccessfulTransportResult("compact", result);
-  if (successfulResult.ok && successfulResult.compacted) {
+  const degraded = degradedWriteSettled(successfulResult);
+  const summary = successfulResult.result?.summary;
+  if (successfulResult.compacted && degraded && (typeof summary !== "string" || !summary.trim())) {
+    return delegateCompactionToRuntimeOrThrow({ params, runtimeDelegate, loadDelegate });
+  }
+  if ((successfulResult.ok || degraded) && successfulResult.compacted) {
     const boundary = await persistTakeoverCompactionBoundary({
       sessionFile: params?.sessionFile,
       summary: successfulResult.result?.summary,
@@ -486,7 +597,7 @@ export async function runCompactControlFlow({
       };
     }
   }
-  return successfulResult;
+  return degraded && successfulResult.compacted ? { ...successfulResult, ok: true } : successfulResult;
 }
 
 export function buildLayeredComposeMessages(result, fallbackMessages = []) {
@@ -777,6 +888,40 @@ export default {
     });
 
     api.registerContextEngine("og-memory-context-engine", () => {
+      const pendingWriteReceipts = new Map();
+      const afterTurnChains = new Map();
+      const submitAfterTurn = async (params) => {
+        const sessionKey = params.sessionId || params.sessionKey;
+        const previous = afterTurnChains.get(sessionKey) || Promise.resolve();
+        const run = previous.then(async () => {
+          const pending = pendingWriteReceipts.get(sessionKey);
+          if (pending) {
+            const receipt = await pollWriteRequest(
+              ogmemUrl, pending.params, authCfg, pending.receipt,
+              performance.now() + (cfg.requestTimeoutMs ?? 300_000),
+            );
+            if (writeRequestNeedsPoll(receipt)) {
+              pending.receipt = receipt;
+              return receipt;
+            }
+            pendingWriteReceipts.delete(sessionKey);
+          }
+          const result = await callAsync("after_turn", params);
+          if (result && writeRequestNeedsPoll(result)) {
+            pendingWriteReceipts.set(sessionKey, { params, receipt: result });
+          }
+          if (result && ["DEGRADED", "FAILED", "NEEDS_CONFIRMATION", "UNKNOWN"].includes(result.request_status)) {
+            console.error(`[og-memory] after_turn receipt: ${JSON.stringify(writeReceiptSummary(result))}`);
+          }
+          return result;
+        });
+        const tail = run.catch(() => null);
+        afterTurnChains.set(sessionKey, tail);
+        void tail.then(() => {
+          if (afterTurnChains.get(sessionKey) === tail) afterTurnChains.delete(sessionKey);
+        });
+        return run;
+      };
       return ({
       info: {
         id: "og-memory-context-engine",
@@ -962,7 +1107,7 @@ export default {
           commitTokenThreshold: cfg.commitTokenThreshold,
         };
 
-        return callAsync("after_turn", enhancedParams);
+        return submitAfterTurn(enhancedParams);
       },
 
       async dispose() {

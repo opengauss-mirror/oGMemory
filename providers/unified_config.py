@@ -21,6 +21,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from providers.decision.config import DecisionConfig
+
 # Auto-load .env from config/ directory so API keys are available
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _dotenv_path = os.path.join(_project_root, "config", ".env")
@@ -481,6 +483,12 @@ class OgMemConfig:
     chroma_persist_directory: str = ".chroma_data"
     chroma_collection_name: str = "contextengine"
 
+    milvus_uri: str = field(default="http://localhost:19530", repr=False)
+    milvus_token: str = field(default="", repr=False)
+    milvus_collection_name: str = "contextengine"
+    milvus_db_name: str = "default"
+    milvus_timeout: float = 30.0
+
     # -- Service ---------------------------------------------------------------
     http_port: int = 8090
     workers: int = 2
@@ -513,9 +521,21 @@ class OgMemConfig:
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
     agent_memory_enabled: bool = False
+    # Opt-in ContextNode semantic graph; not the multimodal graph store.
+    graph_backend: str = "none"  # none | sql
+    enable_graph_expansion: bool = True
+    graph_expand_top_k: int = 5
+    graph_expand_limit: int = 3
+    graph_min_weight: float = 0.0
+    graph_edge_similarity_threshold: float = 0.35
+    graph_edge_embedding_profile: str = "shared-node-embedding-v1"
+    graph_projection_representation: str = "relation-target-v2"
+    graph_supplement_enabled: bool = True
 
     # -- Scene memory ---------------------------------------------------------
     scene_enabled: bool = False
+    scene_generation_enabled: bool = True
+    scene_retrieval_enabled: bool = True
     scene_options: dict[str, Any] = field(default_factory=dict)
 
     # -- Agent skill sedimentation --------------------------------------------
@@ -564,7 +584,7 @@ class OgMemConfig:
 
     # -- Memory extraction -----------------------------------------------------
     extraction_mode: str = "eager"  # "eager" (prefetch + single-shot) or "lazy" (ReAct loop)
-    after_turn_threshold: int = 200
+    after_turn_threshold: int = 400
     rolling_compress_enabled: bool = True
     rolling_compress_fallback_enabled: bool = False
     compact_prepare_token_ttl: int = 300
@@ -588,6 +608,7 @@ class OgMemConfig:
     retrieval_candidate_pool_multiplier: int = 3
     retrieval_min_candidate_pool_size: int = 15
     retrieval_result_ranker_strategy: str = "semantic"
+    retrieval_decision_rerank_enabled: bool = False
     retrieval_global_result_rerank_enabled: bool = False
     retrieval_owner_scope_filter_enabled: bool = False
     retrieval_hybrid_enabled: bool = False
@@ -622,11 +643,22 @@ class OgMemConfig:
     dual_pass_enabled: bool = True
     node_processing_enabled: bool = False
 
+    # Explicit opt-in, independent of the generative LLM and eager/lazy mode.
+    decision: DecisionConfig | None = None
+
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if isinstance(self.decision, dict):
+            self.decision = DecisionConfig.from_mapping(self.decision)
+        elif self.decision is not None and not isinstance(self.decision, DecisionConfig):
+            raise ValueError("decision must be DecisionConfig, a mapping, or null")
+        if type(self.retrieval_decision_rerank_enabled) is not bool:
+            raise ValueError("retrieval.decision_rerank_enabled must be a boolean")
+        if self.retrieval_decision_rerank_enabled and self.decision is None:
+            raise ValueError("retrieval.decision_rerank_enabled requires decision configuration")
         if type(self.source_occurrence_reconciliation_enabled) is not bool:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         if type(self.card_format_enabled) is not bool:
@@ -635,6 +667,21 @@ class OgMemConfig:
             raise ValueError("dual_pass_enabled must be a boolean")
         if type(self.node_processing_enabled) is not bool:
             raise ValueError("node_processing_enabled must be a boolean")
+        if self.graph_backend not in {"none", "sql"}:
+            raise ValueError("graph.backend must be none or sql")
+        if self.graph_backend == "sql" and self.storage_backend != "sql":
+            raise ValueError("graph.backend=sql requires storage.backend=sql")
+        if not 0 <= self.graph_edge_similarity_threshold <= 1 or not 0 <= self.graph_min_weight <= 1:
+            raise ValueError("graph similarity threshold and minimum weight must be between 0 and 1")
+        if (any(not isinstance(v,int) or isinstance(v,bool) for v in (self.graph_expand_top_k,self.graph_expand_limit))
+                or not 1 <= self.graph_expand_top_k <= 5 or not 1 <= self.graph_expand_limit <= 3):
+            raise ValueError("graph expansion supports 1..5 anchors and 1..3 outgoing edges per anchor")
+        if not self.graph_edge_embedding_profile.strip():
+            raise ValueError("graph edge embedding profile must not be empty")
+        if self.graph_projection_representation not in {
+            "relation-target-v2", "relation-target-factorized-full-v1",
+        }:
+            raise ValueError("graph.projection_representation must select a supported graph encoding")
         from fs.sql_adapter.dialect import normalize_sql_dialect
 
         if self.sql_dialect is None:
@@ -787,6 +834,7 @@ class OgMemConfig:
         svc = raw.get("service") or {}
         mcp = raw.get("mcp") or {}
         storage = raw.get("storage") or {}
+        graph = raw.get("graph") or {}
         agfs = raw.get("agfs") or {}
         idx = raw.get("index") or {}
         ident = raw.get("identity") or {}
@@ -823,7 +871,13 @@ class OgMemConfig:
             )
         )
 
+        decision_raw = raw.get("decision")
+        if isinstance(decision_raw, dict) and decision_raw:
+            decision_raw = {**decision_raw, "api_key": _resolve(decision_raw.get("api_key"), "OGMEM_DECISION_API_KEY", "")}
+        decision_config = DecisionConfig.from_mapping(decision_raw)
+
         cfg = cls(
+            decision=decision_config,
             # LLM
             provider=_resolve(llm.get("provider"), "CONTEXTENGINE_PROVIDER", "mock"),
             openai_api_key=llm_api_key,
@@ -897,6 +951,11 @@ class OgMemConfig:
                 "CHROMA_COLLECTION",
                 "contextengine",
             ),
+            milvus_uri=_resolve(vdb.get("milvus_uri"), "MILVUS_URI", "http://localhost:19530"),
+            milvus_token=_resolve(vdb.get("milvus_token"), "MILVUS_TOKEN", ""),
+            milvus_collection_name=_resolve(vdb.get("milvus_collection"), "MILVUS_COLLECTION", "contextengine"),
+            milvus_db_name=_resolve(vdb.get("milvus_db_name"), "MILVUS_DB_NAME", "default"),
+            milvus_timeout=_resolve(vdb.get("milvus_timeout"), "MILVUS_TIMEOUT", 30.0, float),
             # Service
             http_port=_resolve(svc.get("http_port"), "OGMEM_HTTP_PORT", 8090, int),
             workers=_resolve(svc.get("workers"), "OGMEM_WORKERS", 2, int),
@@ -1012,12 +1071,29 @@ class OgMemConfig:
                 128,
                 int,
             ),
+            graph_backend=_resolve(graph.get("backend"), "GRAPH_BACKEND", "none"),
+            enable_graph_expansion=_resolve_bool(graph.get("enable_expansion"), "ENABLE_GRAPH_EXPANSION", True),
+            graph_expand_top_k=_resolve(graph.get("expand_top_k"), "GRAPH_EXPAND_TOP_K", 5, int),
+            graph_expand_limit=_resolve(graph.get("expand_limit"), "GRAPH_EXPAND_LIMIT", 3, int),
+            graph_min_weight=_resolve(graph.get("min_weight"), "GRAPH_MIN_WEIGHT", 0.0, float),
+            graph_edge_similarity_threshold=_resolve(graph.get("edge_similarity_threshold"), "GRAPH_EDGE_SIMILARITY_THRESHOLD", 0.35, float),
+            graph_edge_embedding_profile=_resolve(graph.get("edge_embedding_profile"), "GRAPH_EDGE_EMBEDDING_PROFILE", "shared-node-embedding-v1"),
+            graph_projection_representation=_resolve(
+                graph.get("projection_representation"), "GRAPH_PROJECTION_REPRESENTATION", "relation-target-v2",
+            ),
+            graph_supplement_enabled=_resolve_bool(graph.get("supplement_enabled"), "GRAPH_SUPPLEMENT_ENABLED", True),
             # Agent skill sedimentation
             agent_memory_enabled=_resolve_bool(
                 (raw.get("agent_memory") or {}).get("enabled"), "OGMEM_AGENT_MEMORY_ENABLED", False,
             ),
             scene_enabled=_resolve_bool(
                 (raw.get("scene") or {}).get("enabled"), "OGMEM_SCENE_ENABLED", False,
+            ),
+            scene_generation_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("generation_enabled"), "OGMEM_SCENE_GENERATION_ENABLED", True,
+            ),
+            scene_retrieval_enabled=_resolve_bool(
+                (raw.get("scene") or {}).get("retrieval_enabled"), "OGMEM_SCENE_RETRIEVAL_ENABLED", True,
             ),
             scene_options=dict((raw.get("scene") or {}).get("options") or {}),
             skill_sedimentation_enabled=_resolve_bool(
@@ -1162,7 +1238,7 @@ class OgMemConfig:
             after_turn_threshold=_resolve(
                 memory.get("after_turn_threshold"),
                 "OGMEM_AFTER_TURN_THRESHOLD",
-                200,
+                400,
                 int,
             ),
             rolling_compress_enabled=_resolve_bool(
@@ -1284,6 +1360,10 @@ class OgMemConfig:
                 retrieval.get("result_ranker_strategy"),
                 "OGMEM_RETRIEVAL_RESULT_RANKER_STRATEGY",
                 "semantic",
+            ),
+            retrieval_decision_rerank_enabled=_resolve_bool(
+                retrieval.get("decision_rerank_enabled"),
+                "OGMEM_RETRIEVAL_DECISION_RERANK_ENABLED", False,
             ),
             retrieval_global_result_rerank_enabled=_resolve_bool(
                 retrieval.get("global_result_rerank_enabled"),
@@ -1434,7 +1514,7 @@ class OgMemConfig:
         """Return a sanitised dict suitable for logging (keys masked)."""
         def sanitize(name: str, value: Any) -> Any:
             lowered = name.casefold()
-            credential_name = lowered.endswith("token") or any(
+            credential_name = lowered == "milvus_uri" or lowered.endswith("token") or any(
                 marker in lowered
                 for marker in ("key", "password", "secret", "connection_string")
             )

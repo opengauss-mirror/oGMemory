@@ -31,6 +31,7 @@ from server.mcp_server import (
 ROOT = Path(__file__).resolve().parents[2]
 
 MCP_BUSINESS_TOOLS = {
+    "ogm_get_write_request_status",
     LIST_MEMORY_TOOL_NAME,
     QUERY_MEMORY_TOOL_NAME,
     READ_MEMORY_TOOL_NAME,
@@ -77,7 +78,7 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
   "servers": {
     "ogmemory": {
       "launch": "http://127.0.0.1:8091/mcp",
-      "tools": 13,
+      "tools": 14,
       "resources": true,
       "prompts": true
     }
@@ -86,13 +87,13 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
     "ogmemory__ogm_list_memories",
     "ogmemory__ogm_query_memory",
     "ogmemory__ogm_read_memory",
+    "ogmemory__ogm_get_write_request_status",
     "ogmemory__ogm_write_memory",
     "ogmemory__ogm_delete_memory",
     "ogmemory__ogm_search_skills",
     "ogmemory__ogm_list_skills",
     "ogmemory__ogm_read_skill",
     "ogmemory__ogm_list_skill_candidates",
-    "ogmemory__ogm_search_code",
     "ogmemory__ogm_install_skill",
     "ogmemory__ogm_update_skill",
     "ogmemory__ogm_delete_skill",

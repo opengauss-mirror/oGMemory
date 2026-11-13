@@ -86,7 +86,6 @@ async def _run_streamable_http_protocol_check() -> None:
                         "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
-                        "ogm_search_code",
                         "ogm_search_skills",
                         "ogm_list_skills",
                         "ogm_read_skill",
@@ -198,7 +197,6 @@ async def _run_streamable_http_all_tools_check() -> None:
                         "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
-                        "ogm_search_code",
                         "ogm_search_skills",
                         "ogm_list_skills",
                         "ogm_read_skill",
@@ -206,6 +204,7 @@ async def _run_streamable_http_all_tools_check() -> None:
                         "ogm_install_skill",
                         "ogm_update_skill",
                         "ogm_delete_skill",
+                        "ogm_get_write_request_status",
                         "ogm_write_memory",
                         "ogm_delete_memory",
                     }
@@ -342,7 +341,10 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     assert _tool_json(delete_skill_result)["action"] == "delete"
 
                     account_id = headers["X-Account-ID"]
-                    pool = SharedConnectionPool(connection_string=sql_dsn, pool_size=1)
+                    pool = SharedConnectionPool(
+                        connection_string=sql_dsn, pool_size=1,
+                        dialect=os.environ.get("OGMEM_TEST_SQL_DIALECT", "postgresql"),
+                    )
                     try:
                         fs = SQLContextFS(pool=pool)
                         ctx = RequestContext(account_id=account_id, user_id="root", agent_id="main",
@@ -461,7 +463,8 @@ def _start_http_server(
         }
     )
     if sql_dsn:
-        env.update({"STORAGE_BACKEND": "sql", "SQL_CONNECTION_STRING": sql_dsn})
+        env.update({"STORAGE_BACKEND": "sql", "SQL_CONNECTION_STRING": sql_dsn,
+                "SQL_DIALECT": os.environ.get("OGMEM_TEST_SQL_DIALECT", "postgresql")})
     log_file = tempfile.NamedTemporaryFile(
         prefix="ogmemory-mcp-http-", suffix=".log", delete=False, mode="w", encoding="utf-8",
     )
@@ -580,7 +583,14 @@ def _assert_no_trace_provenance(*payloads: dict[str, Any]) -> None:
 
 
 def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
-    SQLTraceEventStore(connection_string=dsn, pool_size=1)
+    pool = SharedConnectionPool(
+        connection_string=dsn, pool_size=1,
+        dialect=os.environ.get("OGMEM_TEST_SQL_DIALECT", "postgresql"),
+    )
+    try:
+        SQLTraceEventStore(pool=pool)
+    finally:
+        pool.close_all()
     candidate_id = f"protocol-candidate-{account_id}"
     uri = f"ctx://{account_id}/agents/{agent_id}/skills/protocol-review"
     content = "---\nname: protocol-review\ndescription: Review protocol behavior.\n---\n# Protocol review\n"

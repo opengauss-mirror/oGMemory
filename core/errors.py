@@ -106,6 +106,14 @@ class ExtractionIncompleteError(ContextEngineError, RuntimeError):
     """Extraction stopped with unresolved or incomplete draft operations."""
 
 
+class ExtractionBudgetError(ExtractionIncompleteError):
+    """The complete extraction context exceeds the configured model budget."""
+
+
+class ExtractionSemanticError(ExtractionIncompleteError):
+    """Generated identity or facts require semantic verification."""
+
+
 class LLMTransientError(ExtractionIncompleteError):
     """The model provider can be retried after a transport or service failure."""
 
@@ -137,6 +145,10 @@ class ToolCallProtocolError(ContextEngineError, RuntimeError):
         if tool_choice:
             message += f" (tool_choice={tool_choice})"
         super().__init__(message)
+
+
+class ExtractionOutputError(ToolCallProtocolError, ExtractionIncompleteError):
+    """Model output could not be parsed or did not match the requested schema."""
 
 
 class ConcurrentModificationError(ContextEngineError):
