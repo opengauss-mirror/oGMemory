@@ -713,13 +713,7 @@ The plugin can run in `remote` mode against an already-running oG-Memory service
 
 ### Benchmark Results (LoCoMo10)
 
-| Run | Accuracy | Key Changes |
-|-----|----------|-------------|
-| Run76 | **88.2%** (1358/1540) | L0 structured summary + BM25 hybrid retrieval + extraction prompt optimization |
-| Run69 | 88.2% | L0 summary injection + prompt optimization (+6.6% over run68) |
-| Run68 | 81.6% | session_time fix (baseline) |
-
-Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversational memory benchmark (10 sessions, 4 categories, 1540 questions).
+**LoCoMo benchmark: 92.21% accuracy across 1,540 questions (1,420 correct)** (LLM: DeepSeek-V4.1-Flash-1017; embedding model: `BAAI/bge-m3`). The evaluation framework is in [`tests/e2e/`](tests/e2e/).
 
 **Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + compose, ④ afterTurn, ⑤ prepare_compaction + compact, and the session-state persistence portion of ⑥ session_end + dispose.
 

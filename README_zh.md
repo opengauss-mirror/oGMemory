@@ -713,7 +713,9 @@ ContextFS / SQL 存储 + 向量索引
 
 **已覆盖的生命周期阶段：** ① message_received、② bootstrap + ingest + compose、④ afterTurn、⑤ prepare_compaction + compact，以及 ⑥ session_end + dispose 中的会话状态持久化部分。
 
-**LoCoMo 基准测试：1343 道题准确率 78.1%**（gpt-4o-mini 评判，与 claude-sonnet-4 在 100 题样本上 100% 一致）。评测框架见 `tests/e2e/`。
+### 基准测试结果（LoCoMo10）
+
+**LoCoMo 基准测试：1,540 道题准确率 92.21%（答对 1,420 道）**（LLM：DeepSeek-V4.1-Flash-1017，Embedding 模型：`BAAI/bge-m3`）。评测框架见 [`tests/e2e/`](tests/e2e/)。
 
 ### 已完成（Phase 0 + 1）
 
