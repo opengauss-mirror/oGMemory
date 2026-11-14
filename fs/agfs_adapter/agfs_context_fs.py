@@ -49,6 +49,7 @@ from core.resource_identity import (
     validate_resource_uri_slug,
 )
 from fs.access_control import check_uri_access
+from fs.agfs_adapter.client import enable_registration_fence, publish_workspace_file
 
 logger = logging.getLogger(__name__)
 
@@ -592,6 +593,7 @@ class AGFSContextFS:
                          Use "" for root mount, "/local" for localfs, etc.
         """
         self._client = client
+        enable_registration_fence(client)
         self._mount_prefix = mount_prefix.rstrip("/")
         self._on_node_change = on_node_change
         self._ensure_mount_prefix()
@@ -932,7 +934,7 @@ class AGFSContextFS:
         try:
             self._ensure_workspace_binding_mutex_owned(lock_path, owner_token)
             try:
-                self._client.mv(temporary_path, state_path)
+                publish_workspace_file(self._client, temporary_path, state_path, payload.encode("utf-8"))
             except Exception:
                 try:
                     persisted = self._read_code_workspace_binding_state_from_path(

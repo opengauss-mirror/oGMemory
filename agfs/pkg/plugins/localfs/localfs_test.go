@@ -70,6 +70,31 @@ func TestLocalFSCreate(t *testing.T) {
 	}
 }
 
+func TestLocalFSCreateAcrossInstances(t *testing.T) {
+	dir := t.TempDir()
+	start := make(chan struct{})
+	results := make(chan error, 16)
+	for i := 0; i < cap(results); i++ {
+		fs := newTestFS(t, dir)
+		go func() {
+			<-start
+			results <- fs.Create("/registration.lock")
+		}()
+	}
+	close(start)
+	winners := 0
+	for i := 0; i < cap(results); i++ {
+		if err := <-results; err == nil {
+			winners++
+		} else if err.Error() != "file already exists: /registration.lock" {
+			t.Fatal(err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("expected one successful create, got %d", winners)
+	}
+}
+
 func TestLocalFSWriteBasic(t *testing.T) {
 	dir, cleanup := setupTestDir(t)
 	defer cleanup()

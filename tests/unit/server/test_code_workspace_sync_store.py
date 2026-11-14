@@ -19,6 +19,90 @@ from server.control_plane_store import ControlPlaneStore
 from server.sql_control_plane_store import SQLControlPlaneStore
 
 
+def test_registration_lock_excludes_other_stores_and_releases_on_failure(tmp_path, monkeypatch):
+    first, second = (ControlPlaneStore("/mount", local_root=str(tmp_path)) for _ in range(2))
+    with pytest.raises(ValueError, match="failed registration"):
+        with first.code_workspace_registration_lock():
+            # Even a long-running owner must not lose its lock to a timeout.
+            monkeypatch.setattr("server.control_plane_store.time.time", lambda: 10**12)
+            with pytest.raises(RuntimeError, match="registration is busy"):
+                with second.code_workspace_registration_lock():
+                    pytest.fail("concurrent registration entered")
+            raise ValueError("failed registration")
+    with second.code_workspace_registration_lock():
+        pass
+
+
+def test_registration_preserves_older_writers_lock(tmp_path):
+    store = ControlPlaneStore("/mount", local_root=str(tmp_path))
+    legacy = tmp_path / "_system" / "code_workspace_registration.lock"
+    legacy.parent.mkdir()
+    legacy.touch()
+    with pytest.raises(RuntimeError, match="busy"), store.code_workspace_registration_lock():
+        pytest.fail("older writer still owns the lock")
+    legacy.unlink()
+    with store.code_workspace_registration_lock(), pytest.raises(FileExistsError), legacy.open("xb"):
+        pytest.fail("older writer bypassed the session lock")
+
+
+@pytest.mark.parametrize("outcome", ["success", "exception", "disconnect"])
+def test_sql_registration_uses_one_transaction_and_cleans_up(monkeypatch, outcome):
+    from contextlib import nullcontext
+    from unittest.mock import MagicMock
+
+    import psycopg2
+
+    connection = MagicMock()
+    connect = Mock(return_value=connection)
+    monkeypatch.setattr("server.sql_control_plane_store.psycopg2.connect", connect)
+    store = SQLControlPlaneStore.__new__(SQLControlPlaneStore)
+    store._connection_string = "test-dsn"
+    pooled = MagicMock()
+    store._get_connection = Mock(return_value=pooled)
+    store._return_connection = Mock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = ({"root_id": "root"}, None, None)
+    cursor.fetchall.return_value = []
+    error = ValueError if outcome == "exception" else psycopg2.InterfaceError
+    with nullcontext() if outcome == "success" else pytest.raises(error):
+        with store.code_workspace_registration_lock():
+            connection.set_session.assert_called_once_with(isolation_level="READ COMMITTED")
+            assert store.read_code_workspace_sync_state("acct", "root")["root_id"] == "root"
+            assert store.list_code_workspace_sync_registrations() == []
+            store.mutate_code_workspace_sync_state("acct", "root", lambda state: state)
+            connection.commit.assert_not_called()
+            connection.rollback.assert_not_called()
+            if outcome == "exception":
+                raise ValueError("failed registration")
+            if outcome == "disconnect":
+                cursor.execute.side_effect = psycopg2.InterfaceError("connection closed")
+                store.mutate_code_workspace_sync_state("acct", "root", lambda state: state)
+    connect.assert_called_once_with("test-dsn", connect_timeout=5)
+    assert connection.commit.call_count == (outcome == "success")
+    store._get_connection.assert_not_called()
+    connection.close.assert_called_once()
+    with store._workspace_sync_connection() as conn:
+        assert conn is pooled
+    store._return_connection.assert_called_once_with(pooled)
+
+
+@pytest.mark.parametrize("backend", ["local", "agfs"])
+@pytest.mark.parametrize("raw", [b'{"private":', b'null', b'[]', b'\xff'])
+def test_workspace_registry_rejects_unreadable_records(tmp_path, backend, raw):
+    client = FakeAtomicAGFSClient()
+    client.ls = lambda path: ["acct"] if path == "/mount/accounts" else ["root.json"]
+    kwargs = {"local_root": str(tmp_path)} if backend == "local" else {"client": client}
+    store = ControlPlaneStore("/mount", **kwargs)
+    path = store.code_workspace_sync_path("acct", "root")
+    store._ensure_parent(path)
+    store._write_bytes(path, raw)
+    for read in (lambda: store.read_code_workspace_sync_state("acct", "root"),
+                 store.list_code_workspace_sync_registrations):
+        with pytest.raises(RuntimeError, match="^workspace registry record is unreadable$"):
+            read()
+    assert store.read_code_workspace_sync_state("acct", "absent") is None
+
+
 def test_local_workspace_sync_state_is_copied_and_enumerated_by_registration(tmp_path):
     store = ControlPlaneStore(mount_prefix="", local_root=str(tmp_path))
     first = {
@@ -48,6 +132,101 @@ def test_local_workspace_sync_state_is_copied_and_enumerated_by_registration(tmp
         ("acct-a", "root-a", first),
         ("acct-b", "root-b", second),
     ]
+
+
+@pytest.mark.parametrize("other_account", [False, True], ids=["fresh-store", "unregistered-account"])
+@pytest.mark.parametrize("reason", ["no such directory", "permission denied", "request timeout"])
+def test_agfs_registration_handles_directory_scan_errors(tmp_path, monkeypatch, other_account, reason):
+    from contextlib import nullcontext
+    from pyagfs import AGFSClientError
+
+    from tests.unit.service.test_code_workspace_sync import FakeLifecycle, _config, _ctx, _service
+
+    client = FakeAtomicAGFSClient()
+    missing = "/mount/accounts"
+    if other_account:
+        missing += "/other/_system/code_workspace_sync"
+
+    def ls(path):
+        if path == missing:
+            raise AGFSClientError(f"{reason}: {path}")
+        assert other_account and path == "/mount/accounts"
+        return ["other"]
+
+    client.ls = Mock(side_effect=ls)
+    store = ControlPlaneStore("/mount", client=client)
+    # This double injects listing errors. Session exclusion is tested on real AGFS.
+    monkeypatch.setattr(store, "code_workspace_registration_lock", nullcontext)
+    service = _service(store, FakeLifecycle(), config=_config(code_workspace_allowed_roots=[str(tmp_path)]))
+    if reason == "no such directory":
+        result = service.register(path=str(tmp_path), ctx=_ctx(), name="repo")
+        assert result["accepted"]
+        assert store.read_code_workspace_sync_state("acct", result["root_id"]) is not None
+    else:
+        with pytest.raises(RuntimeError, match="^workspace registry directory is unreadable$"):
+            service.register(path=str(tmp_path), ctx=_ctx(), name="repo")
+        assert not client.files
+    client.ls.assert_any_call(missing)
+
+
+@pytest.mark.parametrize("denied", ["accounts", "accounts/acct/_system/code_workspace_sync"])
+def test_local_registration_refuses_unreadable_directory(tmp_path, monkeypatch, denied):
+    import os
+    from pathlib import Path
+
+    from tests.unit.service.test_code_workspace_sync import FakeLifecycle, _config, _ctx, _service
+
+    store = ControlPlaneStore("", local_root=str(tmp_path / "registry"))
+    service = _service(store, FakeLifecycle(), config=_config(code_workspace_allowed_roots=[str(tmp_path)]))
+    service.register(path=str(tmp_path), ctx=_ctx(), name="repo")
+    scandir = os.scandir
+
+    def guarded_scandir(path):
+        if Path(path) == tmp_path / "registry" / denied:
+            raise PermissionError(path)
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", guarded_scandir)
+    with pytest.raises(RuntimeError, match="^workspace registry directory is unreadable$"):
+        service.register(path=str(tmp_path), ctx=_ctx("other"), name="repo")
+    assert not (tmp_path / "registry/accounts/other").exists()
+
+
+@pytest.mark.parametrize("backend", ["local", "agfs"])
+@pytest.mark.parametrize("fail_publish", [False, True])
+def test_registry_scan_sees_only_published_state(tmp_path, monkeypatch, backend, fail_publish):
+    import os
+
+    client = FakeAtomicAGFSClient()
+    client.ls = lambda path: (
+        ["acct"] if path == "/mount/accounts" else
+        [name.rsplit("/", 1)[1] for name in client.files if name.startswith(path + "/")]
+    )
+    kwargs = {"local_root": str(tmp_path)} if backend == "local" else {"client": client}
+    store = ControlPlaneStore("/mount", **kwargs)
+    reader = ControlPlaneStore("/mount", **kwargs)
+    old, new = {"version": 1}, {"version": 2}
+    store.write_code_workspace_sync_state("acct", "root", old)
+    owner, method = (os, "replace") if backend == "local" else (client, "mv")
+    publish = getattr(owner, method)
+
+    def scan_before_publish(source, target):
+        assert reader.list_code_workspace_sync_registrations() == [("acct", "root", old)]
+        if fail_publish:
+            raise OSError("publication failed")
+        publish(source, target)
+
+    intercept = Mock(side_effect=scan_before_publish)
+    monkeypatch.setattr(owner, method, intercept)
+    if fail_publish:
+        with pytest.raises(OSError, match="publication failed"):
+            store.write_code_workspace_sync_state("acct", "root", new)
+    else:
+        store.write_code_workspace_sync_state("acct", "root", new)
+    intercept.assert_called_once()
+    assert reader.list_code_workspace_sync_registrations() == [("acct", "root", old if fail_publish else new)]
+    files = list(tmp_path.rglob("*.tmp")) if backend == "local" else list(client.files)
+    assert not any(str(path).endswith(".tmp") for path in files)
 
 
 class FakeAtomicAGFSClient:
@@ -93,6 +272,10 @@ class FakeAtomicAGFSClient:
         self.files.pop(path, None)
         self.stats.pop(path, None)
         self.removed.append(path)
+
+    def mv(self, source: str, target: str) -> None:
+        self.files[target] = self.files.pop(source)
+        self.stats[target] = self.stats.pop(source)
 
     def mkdir(self, path: str) -> None:
         self.directories.append(path)
@@ -148,7 +331,7 @@ def test_agfs_workspace_sync_mutex_never_releases_a_replaced_token():
     state_path = store.code_workspace_sync_path("acct", "root-a")
 
     def replace_after_state_write(path: str, _data: bytes) -> None:
-        if path == state_path:
+        if path.startswith(state_path + ".") and path.endswith(".tmp"):
             client.read_overrides[lock_path] = json.dumps(
                 {
                     "kind": "code_workspace_sync_mutex",

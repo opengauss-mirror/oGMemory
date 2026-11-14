@@ -31,6 +31,7 @@ type Node struct {
 
 // MemoryFS implements FileSystem and HandleFS interfaces with in-memory storage
 type MemoryFS struct {
+	registration chan struct{}
 	root       *Node
 	mu         sync.RWMutex
 	pluginName string
@@ -49,6 +50,7 @@ func NewMemoryFS() *MemoryFS {
 // NewMemoryFSWithPlugin creates a new in-memory file system with a plugin name
 func NewMemoryFSWithPlugin(pluginName string) *MemoryFS {
 	return &MemoryFS{
+		registration: make(chan struct{}, 1),
 		root: &Node{
 			Name:     "/",
 			IsDir:    true,
@@ -59,6 +61,15 @@ func NewMemoryFSWithPlugin(pluginName string) *MemoryFS {
 		pluginName:   pluginName,
 		handles:      make(map[int64]*MemoryFileHandle),
 		nextHandleID: 1,
+	}
+}
+
+func (mfs *MemoryFS) RegistrationView() (filesystem.FileSystem, func(), error) {
+	select {
+	case mfs.registration <- struct{}{}:
+		return mfs, func() { <-mfs.registration }, nil
+	case <-time.After(5 * time.Second):
+		return nil, nil, filesystem.ErrRegistrationBusy
 	}
 }
 

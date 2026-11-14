@@ -6,6 +6,7 @@ import os
 import posixpath
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import yaml
@@ -15,6 +16,112 @@ from pyagfs.exceptions import AGFSClientError, AGFSHTTPError
 # The C library shares one mount table among all clients in a process.
 _mount_lock = threading.Lock()
 _mounts = {}
+_registration = ContextVar("agfs_registration", default=None)
+_REGISTRATION_HEADER = "X-AGFS-Registration"
+
+
+def enable_registration_fence(client):
+    """Tag SDK requests in the registering context, including lifecycle binding writes."""
+    if not isinstance(client, AGFSClient):
+        return
+    session = client.session
+    prepare = session.prepare_request
+    if getattr(prepare, "_registration_fenced", False):
+        return
+
+    def prepare_request(request):
+        prepared = prepare(request)
+        active = _registration.get()
+        if active is not None:
+            base, token = active
+            if not prepared.url.startswith(base + "/"):
+                raise RuntimeError("registration request uses a different AGFS endpoint")
+            prepared.url = base + "/registration-session" + prepared.url[len(base):]
+            prepared.headers[_REGISTRATION_HEADER] = token
+        return prepared
+
+    prepare_request._registration_fenced = True
+    session.prepare_request = prepare_request
+
+
+@contextmanager
+def registration_session(client, path):
+    if isinstance(client, NativeAGFSClient):
+        if not hasattr(client.lib, "AGFS_LockRegistration"):
+            raise RuntimeError("AGFS does not support workspace registration sessions")
+        try:
+            result = client._json("LockRegistration", path.encode())
+        except AGFSClientError as exc:
+            if str(exc) == "workspace registration is busy":
+                raise RuntimeError("workspace registration is busy") from None
+            raise RuntimeError("cannot acquire workspace registration session") from None
+        if not result["supported"]:
+            raise RuntimeError("mount does not support workspace registration sessions")
+        reset = _registration.set((client.api_base, result["id"]))
+        try:
+            yield
+        finally:
+            _registration.reset(reset)
+            client.lib.AGFS_UnlockRegistration(result["id"])
+    elif isinstance(client, AGFSClient):
+        with client.session.post(
+            f"{client.api_base}/registration-session", params={"path": path},
+            stream=True, timeout=client.timeout, allow_redirects=False,
+        ) as response:
+            if response.status_code in {404, 501}:
+                raise RuntimeError("mount does not support workspace registration sessions")
+            if response.status_code == 409:
+                raise RuntimeError("workspace registration is busy")
+            if response.status_code != 200:
+                raise RuntimeError("cannot acquire workspace registration session")
+            token = response.headers.get(_REGISTRATION_HEADER)
+            if not token:
+                raise RuntimeError("AGFS registration session unavailable")
+            reset = _registration.set((client.api_base, token))
+            try:
+                yield
+            finally:
+                _registration.reset(reset)
+    else:
+        raise RuntimeError("AGFS does not support workspace registration sessions")
+
+
+def list_workspace_registry(client, path):
+    """Both directory levels of a claim scan must bypass instance-local caches."""
+    if isinstance(client, NativeAGFSClient):
+        return client._file_op("LsFresh", path)["files"]
+    if not isinstance(client, AGFSClient):
+        return client.ls(path)
+    response = client.session.get(
+        f"{client.api_base}/directories", params={"path": path, "fresh": "true"}, timeout=client.timeout,
+    )
+    if response.headers.get("X-AGFS-Fresh") != "true":
+        raise RuntimeError("AGFS does not support fresh directory listings")
+    if response.status_code == 404:
+        raise FileNotFoundError
+    response.raise_for_status()
+    entries = response.json()["files"]
+    if entries is not None and not isinstance(entries, list):
+        raise ValueError("invalid directory listing")
+    return entries or []
+
+
+def publish_workspace_file(client, staged, target, payload):
+    """Publish a staged registry file while its record lock is held."""
+    try:
+        client.mv(staged, target)
+    except AGFSClientError as exc:
+        if str(exc).partition(":")[0].lower() != "file already exists":
+            raise
+        info = client.stat(target)
+        if info.get("isDir") is not False or info.get("meta", {}).get("Name") != "sqlfs":
+            raise
+        # SQLFS writes all bytes with one SQL UPDATE; the old row stays visible until commit.
+        client.write(target, payload)
+        try:
+            client.rm(staged)
+        except AGFSClientError:
+            pass  # Publication succeeded; the unlisted staging file is safe to leave.
 
 
 class NativeAGFSClient:
@@ -52,7 +159,15 @@ class NativeAGFSClient:
             fn = getattr(self.lib, "AGFS_" + name)
             fn.argtypes = args
             fn.restype = result
-        self.id = self.lib.AGFS_NewClient()
+        if hasattr(self.lib, "AGFS_LsFresh"):
+            self.lib.AGFS_LsFresh.argtypes = signatures["Ls"][0]
+            self.lib.AGFS_LsFresh.restype = c.c_void_p
+        if hasattr(self.lib, "AGFS_LockRegistration"):
+            self.lib.AGFS_LockRegistration.argtypes = signatures["Ls"][0]
+            self.lib.AGFS_LockRegistration.restype = c.c_void_p
+            self.lib.AGFS_UnlockRegistration.argtypes = [c.c_int64]
+            self.lib.AGFS_UnlockRegistration.restype = None
+        self._id = self.lib.AGFS_NewClient()
         settings = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         volumes = {}
         with _mount_lock:
@@ -74,6 +189,15 @@ class NativeAGFSClient:
                     mounted[path] = identity
         self._volumes = sorted(volumes.items(), key=lambda item: len(item[0]), reverse=True)
 
+    @property
+    def id(self):
+        active = _registration.get()
+        if active is None:
+            return self._id
+        if active[0] != self.api_base:
+            raise RuntimeError("registration request uses a different native AGFS library")
+        return active[1]
+
     @contextmanager
     def _volume_lock(self, path, *, shared):
         # Native workers share this directory inode; a read must span stat and open
@@ -94,7 +218,7 @@ class NativeAGFSClient:
             os.close(fd)
 
     def _file_op(self, method, path, *args):
-        with self._volume_lock(path, shared=method in {"Ls", "Stat"}):
+        with self._volume_lock(path, shared=method in {"Ls", "LsFresh", "Stat"}):
             return self._json(method, path.encode(), *args)
 
     def _string(self, pointer):

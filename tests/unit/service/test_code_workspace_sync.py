@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +36,10 @@ class FakeControlStore:
 
     def __init__(self) -> None:
         self.states: dict[tuple[str, str], dict[str, Any]] = {}
+        self.registration_lock = threading.Lock()
+
+    def code_workspace_registration_lock(self):
+        return self.registration_lock
 
     def read_code_workspace_sync_state(self, account_id: str, root_id: str):
         state = self.states.get((account_id, root_id))
@@ -178,7 +184,7 @@ def _state(store: FakeControlStore, root_id: str) -> dict[str, Any]:
     return dict(state)
 
 
-def test_registration_enforces_one_durable_identity_for_one_workspace(tmp_path):
+def test_registration_enforces_one_durable_identity_for_one_workspace(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     store = FakeControlStore()
@@ -186,6 +192,11 @@ def test_registration_enforces_one_durable_identity_for_one_workspace(tmp_path):
     first_service = _service(store, lifecycle, worker_id="worker-a")
     root_id = _register(first_service, root)
     second_service = _service(store, lifecycle, worker_id="worker-b")
+
+    def reject_global_scan():
+        pytest.fail("existing registrations must not scan other tenants")
+
+    monkeypatch.setattr(store, "list_code_workspace_sync_registrations", reject_global_scan)
 
     with pytest.raises(ResourceIdentityError, match="different root slug"):
         second_service.register(path=str(root), ctx=_ctx(), name="renamed-repo")
@@ -199,6 +210,10 @@ def test_registration_enforces_one_durable_identity_for_one_workspace(tmp_path):
 
     assert recovered["root_id"] == root_id
     assert workspace_root_ids == {root_id}
+
+    store.states[("acct", root_id)]["root_fingerprint"] = "invalid"
+    with pytest.raises(ResourceIdentityError, match="identity collision"):
+        second_service.register(path=str(root), ctx=_ctx())
 
 
 def test_registration_rejects_a_slug_bound_to_another_workspace(tmp_path):
@@ -214,6 +229,117 @@ def test_registration_rejects_a_slug_bound_to_another_workspace(tmp_path):
 
     with pytest.raises(ResourceIdentityError, match="root slug"):
         service.register(path=str(second_root), ctx=_ctx(), name="shared-root")
+
+
+@pytest.mark.parametrize("account", ["acct", "other-tenant"])
+@pytest.mark.parametrize("relationship", ["same", "parent", "child", "symlink", "dotdot"])
+def test_registration_rejects_overlapping_directories_without_side_effects(tmp_path, account, relationship):
+    from unittest.mock import Mock
+
+    root = tmp_path / "repo"
+    (root / "child").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    candidate = {"same": root, "parent": tmp_path, "child": root / "child",
+                 "symlink": alias, "dotdot": root / "child" / ".."}[relationship]
+    store, lifecycle = FakeControlStore(), FakeLifecycle()
+    service = _service(store, lifecycle)
+    _register(service, root)
+    before = deepcopy(store.states)
+    lifecycle.resolve_workspace_binding = Mock(wraps=lifecycle.resolve_workspace_binding)
+    if account == "acct" and relationship in {"same", "symlink", "dotdot"}:
+        service.register(path=str(candidate), ctx=_ctx(account), name="repo")
+        assert len(store.states) == len(before)
+    else:
+        with pytest.raises(FileExistsError) as exc:
+            service.register(path=str(candidate), ctx=_ctx(account), name="another")
+        assert str(exc.value) == "workspace directory conflicts with an existing registration"
+        assert store.states == before
+        lifecycle.resolve_workspace_binding.assert_not_called()
+
+
+def test_registration_allows_siblings_and_preserves_existing_legacy_update(tmp_path):
+    store, lifecycle = FakeControlStore(), FakeLifecycle()
+    service = _service(store, lifecycle)
+    root = tmp_path / "repo"
+    root.mkdir()
+    root_id = _register(service, root)
+    sibling = tmp_path / "repo-other"
+    sibling.mkdir()
+    service.register(path=str(sibling), ctx=_ctx("other"), name="repo")
+    # Existing conflicting rows are not silently deleted or claimed by a new root.
+    store.states[("legacy", "legacy-root")] = {"workspace_path": str(root / "child")}
+    assert service.register(path=str(root), ctx=_ctx())["root_id"] == root_id
+    with pytest.raises(FileExistsError):
+        service.register(path=str(root / "child" / "nested"), ctx=_ctx("new"))
+
+
+@pytest.mark.parametrize("unavailable", ["removed", "symlink_loop"])
+def test_unavailable_registered_directory_does_not_block_unrelated_tenant(tmp_path, unavailable):
+    store = FakeControlStore()
+    service = _service(store, FakeLifecycle())
+    root, sibling = tmp_path / "private", tmp_path / "sibling"
+    root.mkdir()
+    sibling.mkdir()
+    root_id = _register(service, root)
+    before = _state(store, root_id)
+    root.rmdir()
+    if unavailable == "symlink_loop":
+        root.symlink_to(root, target_is_directory=True)
+
+    with pytest.raises(FileExistsError) as exc:
+        service.register(path=str(tmp_path), ctx=_ctx("other"), name="parent")
+    assert str(exc.value) == "workspace directory conflicts with an existing registration"
+    result = service.register(path=str(sibling), ctx=_ctx("other"), name="sibling")
+    assert result["accepted"] is True
+    assert str(root) not in json.dumps(result)
+    assert _state(store, root_id) == before
+
+
+def test_concurrent_directory_claims_have_one_winner(tmp_path):
+    from server.control_plane_store import ControlPlaneStore
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    barrier = threading.Barrier(2)
+
+    def register(account):
+        store = ControlPlaneStore("", local_root=str(tmp_path / "state"))
+        service = _service(store, FakeLifecycle())
+        barrier.wait(timeout=5)
+        try:
+            service.register(path=str(root), ctx=_ctx(account), name="repo")
+            return "accepted"
+        except FileExistsError:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert sorted(executor.map(register, ["a", "b"])) == ["accepted", "conflict"]
+
+
+@pytest.mark.parametrize("invalid", [
+    b"{", b"{}", b'{"workspace_path":null}', b'{"workspace_path":""}', b'{"workspace_path":"  "}',
+    b'{"workspace_path":"private/relative"}', b'{"workspace_path":"/private/../root"}',
+    br'{"workspace_path":"/private/\u0000"}',
+])
+def test_unreadable_registry_does_not_allow_another_tenant_to_claim_directory(tmp_path, invalid):
+    from server.control_plane_store import ControlPlaneStore
+
+    store = ControlPlaneStore("", local_root=str(tmp_path / "state"))
+    service = _service(store, FakeLifecycle())
+    root = tmp_path / "repo"
+    root.mkdir()
+    root_id = _register(service, root)
+    path = Path(store.code_workspace_sync_path("acct", root_id))
+    original = path.read_bytes()
+    path.write_bytes(invalid)
+    with pytest.raises(RuntimeError, match="^workspace registry record is unreadable$"):
+        service.register(path=str(root), ctx=_ctx("other"), name="repo")
+    assert store.list_code_workspace_sync_states("other") == []
+    assert path.read_bytes() == invalid
+    path.write_bytes(original)
+    with pytest.raises(FileExistsError):
+        service.register(path=str(root), ctx=_ctx("other"), name="repo")
 
 
 @pytest.mark.parametrize("register_child", [False, True])

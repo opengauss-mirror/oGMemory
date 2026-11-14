@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -34,6 +36,10 @@ class ControlPlaneStore:
 
     def __init__(self, mount_prefix: str, client=None, local_root: str | None = None):
         self._client = client
+        if client is not None:
+            from fs.agfs_adapter.client import enable_registration_fence
+
+            enable_registration_fence(client)
         self._mount_prefix = mount_prefix.rstrip("/")
         self._local_root = Path(local_root) if local_root else None
 
@@ -67,6 +73,50 @@ class ControlPlaneStore:
     def global_accounts_path(self) -> str:
         return self._join("_system", "accounts.json")
 
+    @contextmanager
+    def code_workspace_registration_lock(self):
+        """Keep the scan and publication in one registration session."""
+        path = self._join("_system", "code_workspace_registration.lock")
+        if self._local_root is not None:
+            self._ensure_parent(path)
+            connection = sqlite3.connect(path + ".sqlite")
+            try:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    if exc.sqlite_errorcode == sqlite3.SQLITE_BUSY:
+                        raise RuntimeError("workspace registration is busy") from None
+                    raise
+                self._guard_legacy_registration_lock(path)
+                yield
+            finally:
+                connection.close()
+            return
+
+        from fs.agfs_adapter.client import registration_session
+
+        with registration_session(self._client, path):
+            self._ensure_parent(path)
+            self._guard_legacy_registration_lock(path)
+            yield
+
+    def _guard_legacy_registration_lock(self, path):
+        # Only writers that exclusively create this lock file are fenced by the directory.
+        # Writers predating the lock must be stopped before enabling registration.
+        if self._local_root is not None:
+            try:
+                Path(path).mkdir(exist_ok=True)
+            except FileExistsError:
+                raise RuntimeError("workspace registration is busy") from None
+        else:
+            try:
+                self._client.mkdir(path)
+            except Exception as exc:
+                if "exists" not in str(exc).lower():
+                    raise
+            if self._client.stat(path).get("isDir") is not True:
+                raise RuntimeError("workspace registration is busy")
+
     def users_path(self, account_id: str) -> str:
         return self._join("accounts", account_id, "_system", "users.json")
 
@@ -92,8 +142,15 @@ class ControlPlaneStore:
         """Read one protected workspace state without exposing it to retrieval."""
 
         path = self.code_workspace_sync_path(account_id, root_id)
-        state = self.read_json(path, None)
-        return copy.deepcopy(dict(state)) if isinstance(state, Mapping) else None
+        try:
+            state = json.loads(self._read_bytes(path))
+            if not isinstance(state, dict):
+                raise ValueError("expected registry object")
+        except FileNotFoundError:
+            return None
+        except Exception:
+            raise RuntimeError("workspace registry record is unreadable") from None
+        return state
 
     def write_code_workspace_sync_state(
         self,
@@ -114,39 +171,12 @@ class ControlPlaneStore:
         """List one account's protected workspace states for reconciliation."""
 
         self._validate_workspace_sync_identity(account_id, "registry")
-        if self._local_root is not None:
-            local_directory = Path(
-                self._join("accounts", account_id, "_system", "code_workspace_sync")
-            )
-            if not local_directory.is_dir():
-                return []
-            result: list[tuple[str, dict[str, Any]]] = []
-            for path in sorted(local_directory.glob("*.json")):
-                root_id = path.stem
-                if root_id == CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID:
-                    continue
-                state = self.read_code_workspace_sync_state(account_id, root_id)
-                if state is not None:
-                    result.append((root_id, state))
-            return result
-
-        if self._client is None:
-            return []
-        list_dir = getattr(self._client, "ls", None)
-        if not callable(list_dir):
-            return []
-        remote_directory = self._join(
+        directory = self._join(
             "accounts", account_id, "_system", "code_workspace_sync"
         )
-        try:
-            entries = list_dir(remote_directory)
-        except Exception as exc:
-            if "not found" in str(exc).lower() or "no such file" in str(exc).lower():
-                return []
-            raise
 
         result = []
-        for entry in entries or []:
+        for entry in self._list_workspace_registry_directory(directory):
             name = self._workspace_sync_entry_name(entry)
             if not name or not name.endswith(".json"):
                 continue
@@ -173,28 +203,8 @@ class ControlPlaneStore:
         """
 
         accounts_directory = self._join("accounts")
-        if self._local_root is not None:
-            directory = Path(accounts_directory)
-            if not directory.is_dir():
-                return []
-            account_ids = [
-                path.name
-                for path in sorted(directory.iterdir())
-                if path.is_dir()
-            ]
-        else:
-            if self._client is None:
-                return []
-            list_dir = getattr(self._client, "ls", None)
-            if not callable(list_dir):
-                return []
-            try:
-                entries = list_dir(accounts_directory)
-            except Exception as exc:
-                if "not found" in str(exc).lower() or "no such file" in str(exc).lower():
-                    return []
-                raise
-            account_ids = [self._workspace_sync_entry_name(entry) for entry in entries or []]
+        entries = self._list_workspace_registry_directory(accounts_directory, directories_only=True)
+        account_ids = [self._workspace_sync_entry_name(entry) for entry in entries]
 
         registrations: list[tuple[str, str, dict[str, Any]]] = []
         for account_id in sorted(set(account_ids)):
@@ -205,6 +215,32 @@ class ControlPlaneStore:
             for root_id, state in self.list_code_workspace_sync_states(account_id):
                 registrations.append((account_id, root_id, state))
         return registrations
+
+    def _list_workspace_registry_directory(self, path: str, *, directories_only: bool = False) -> list[Any]:
+        if self._local_root is not None:
+            try:
+                with os.scandir(path) as entries:
+                    return [entry.name for entry in entries if not directories_only or entry.is_dir()]
+            except FileNotFoundError:
+                return []
+            except OSError:
+                raise RuntimeError("workspace registry directory is unreadable") from None
+        try:
+            from fs.agfs_adapter.client import list_workspace_registry
+
+            return list_workspace_registry(self._client, path)
+        except FileNotFoundError:
+            return []
+        except Exception as exc:
+            # pyagfs can expose just the backend's error text, including its path.
+            message = str(exc).lower()
+            reason = message.partition(":")[0].strip()
+            if (reason == "readdir" and message.endswith(": not found")) or reason in {
+                "not found", "404 not found", "no such directory",
+                "no such file", "no such file or directory",
+            }:
+                return []
+            raise RuntimeError("workspace registry directory is unreadable") from None
 
     def mutate_code_workspace_sync_state(
         self,
@@ -229,10 +265,37 @@ class ControlPlaneStore:
                 if not isinstance(updated, Mapping):
                     raise ValueError("workspace sync mutator must return a mapping")
                 result = copy.deepcopy(dict(updated))
-                self.write_json(self.code_workspace_sync_path(account_id, root_id), result)
+                self._publish_workspace_state(self.code_workspace_sync_path(account_id, root_id), result)
                 return result
             finally:
                 self._release_control_plane_mutex(lock)
+
+    def _publish_workspace_state(self, path: str, state: dict[str, Any]) -> None:
+        # Registry scans only enumerate *.json. Publish a complete sibling file in one rename.
+        self._ensure_parent(path)
+        payload = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
+        if self._local_root is not None:
+            fd, staged = tempfile.mkstemp(dir=Path(path).parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+                os.replace(staged, path)
+            finally:
+                Path(staged).unlink(missing_ok=True)
+            return
+
+        from fs.agfs_adapter.client import publish_workspace_file
+
+        staged = f"{path}.{uuid.uuid4().hex}.tmp"
+        try:
+            self._client.write(staged, payload)
+            publish_workspace_file(self._client, staged, path, payload)
+        except Exception:
+            try:
+                self._client.rm(staged)
+            except Exception:
+                pass  # A failed cleanup leaves an unlisted staging file.
+            raise
 
     def read_json(self, path: str, default: Any) -> Any:
         try:
@@ -256,10 +319,7 @@ class ControlPlaneStore:
 
     def _read_bytes(self, path: str) -> bytes:
         if self._local_root is not None:
-            p = Path(path)
-            if not p.exists():
-                raise FileNotFoundError(path)
-            return p.read_bytes()
+            return Path(path).read_bytes()
         try:
             raw = self._client.read(path)
         except Exception as exc:
