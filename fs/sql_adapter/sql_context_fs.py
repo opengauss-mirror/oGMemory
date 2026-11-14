@@ -95,6 +95,10 @@ _READ_NODE_SQL = (
 
 def parse_uri(uri: str) -> dict:
     """Parse a ContextEngine URI into its components."""
+    shared = re.fullmatch(r"ctx://([^/]+)/spaces/([^/]+)/(memories|skills)/(.+)", uri)
+    if shared:
+        return {"account": shared[1], "owner_type": "spaces", "owner_id": shared[2],
+                "category": shared[3], "slug": shared[4]}
     match = _SKILL_URI_PATTERN.match(uri)
     if match:
         g = match.groupdict()

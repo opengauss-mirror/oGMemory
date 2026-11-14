@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import threading
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -50,6 +51,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 "Install with: pip install psycopg2-binary"
             )
         self._init_pool(pool, connection_string, pool_size, dialect)
+        self._snapshots = threading.local()
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -289,6 +291,34 @@ class SQLControlPlaneStore(PoolAdapterMixin):
     # ------------------------------------------------------------------
 
     def read_json(self, path: str, default: Any) -> Any:
+        result = self._read_json(path, default)
+        snapshots = getattr(self._snapshots, "values", None)
+        if snapshots is None:
+            snapshots = self._snapshots.values = {}
+        if self._parse_path(path)[0] in ('accounts', 'users', 'agents'):
+            if path not in snapshots and len(snapshots) >= 8:
+                snapshots.pop(next(iter(snapshots)))
+            snapshots[path] = copy.deepcopy(result)
+        return result
+
+    def resolve_user_key(self, api_key: str, account_hint: str | None = None) -> dict | None:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT u.account_id,u.user_id,u.role FROM cp_users u "
+                    "JOIN cp_accounts a USING(account_id) "
+                    "WHERE u.key=%s AND u.status='active' AND a.status='active' "
+                    "AND (%s IS NULL OR u.account_id=%s) LIMIT 1",
+                    (api_key, account_hint, account_hint),
+                )
+                row = cur.fetchone()
+                return dict(zip(('account_id', 'user_id', 'role'), row, strict=True)) if row else None
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def _read_json(self, path: str, default: Any) -> Any:
         entity, account_id = self._parse_path(path)
         conn = self._get_connection()
         try:
@@ -311,7 +341,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 elif entity == "users":
                     cur.execute(
                         "SELECT user_id, role, key, created_at, status "
-                        "FROM cp_users WHERE account_id = %s AND status <> 'deleted'",
+                        "FROM cp_users WHERE account_id = %s AND status = 'active'",
                         (account_id,),
                     )
                     rows = cur.fetchall()
@@ -331,8 +361,8 @@ class SQLControlPlaneStore(PoolAdapterMixin):
 
                 elif entity == "agents":
                     cur.execute(
-                        "SELECT agent_id, owner_user_id, created_at "
-                        "FROM cp_agents WHERE account_id = %s",
+                        "SELECT agent_id, owner_user_id, created_at, status "
+                        "FROM cp_agents WHERE account_id = %s AND status = 'active'",
                         (account_id,),
                     )
                     rows = cur.fetchall()
@@ -343,6 +373,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                             r[0]: {
                                 "owner_user_id": r[1],
                                 "created_at": r[2].isoformat() if r[2] else "",
+                                "status": r[3],
                             }
                             for r in rows
                         }
@@ -390,80 +421,82 @@ class SQLControlPlaneStore(PoolAdapterMixin):
 
     def write_json(self, path: str, data: Any) -> None:
         entity, account_id = self._parse_path(path)
+        if entity not in ("accounts", "users", "agents"):
+            return self._write_json(path, data)
+        from server.space_locks import lock_space_account
+
+        snapshots = getattr(self._snapshots, "values", {})
+        previous = snapshots.pop(path, {}).get(entity, {})
+        current = data.get(entity, {})
+        table, id_column, fields = {
+            "accounts": ("cp_accounts", "account_id", ("status", "created_at")),
+            "users": ("cp_users", "user_id", ("role", "key", "status", "created_at")),
+            "agents": ("cp_agents", "agent_id", ("owner_user_id", "created_at", "status")),
+        }[entity]
+        defaults = {"role": "user", "key": "", "status": "active", "owner_user_id": "", "created_at": None}
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                if entity in ("accounts", "users", "agents"):
-                    from server.space_locks import lock_space_account
-
-                    lock_space_account(cur, account_id or "__accounts__")
-                    self._write_registry(cur, entity, account_id, data.get(entity, {}))
-
-                elif entity == "audit_logs":
-                    # Append-only: INSERT new events, skip existing by log_id
-                    for ev in data.get("events", []):
-                        params = (
-                            ev.get("log_id"),
-                            account_id,
-                            ev.get("actor", ""),
-                            ev.get("target", ""),
-                            ev.get("action", ""),
-                            ev.get("timestamp") or None,
-                            ev.get("result", ""),
-                            ev.get("trace_id", ""),
-                            Json(ev.get("details", {})),
-                        )
-                        self.sql_dialect.insert_audit_log(cur, params)
-
+                lock_space_account(cur, account_id or "__accounts__")
+                for identity in previous.keys() - current.keys():
+                    if entity == "users":
+                        self._delete_user_row(cur, account_id, identity)
+                        continue
+                    where = f"{id_column}=%s"
+                    values = [identity]
+                    if entity != "accounts":
+                        where += " AND account_id=%s"
+                        values.append(account_id)
+                    cur.execute(f"UPDATE {table} SET status='deleted' WHERE {where}", values)
+                for identity, info in current.items():
+                    before = previous.get(identity)
+                    if before is None:
+                        where = f"{id_column}=%s"
+                        identity_values = [identity]
+                        if entity != "accounts":
+                            where += " AND account_id=%s"
+                            identity_values.append(account_id)
+                        cur.execute(f"SELECT status FROM {table} WHERE {where} FOR UPDATE", identity_values)
+                        existing = cur.fetchone()
+                        if existing and (entity == "users" or existing[0] != "deleted"):
+                            raise ValueError(f"{entity[:-1]} already exists: {identity}")
+                        field_values = [info.get(field, defaults[field]) or (None if field == 'created_at' else defaults[field]) for field in fields]
+                        if existing:
+                            cur.execute(
+                                f"UPDATE {table} SET " + ','.join(f"{field}=%s" for field in fields) + f" WHERE {where}",
+                                [*field_values, *identity_values],
+                            )
+                            continue
+                        columns = [id_column, *fields]
+                        values = [identity, *field_values]
+                        if entity != "accounts":
+                            columns.insert(0, "account_id")
+                            values.insert(0, account_id)
+                        placeholders = ','.join(['%s'] * len(columns))
+                        cur.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders})", values)
+                    else:
+                        changed = [field for field in fields if info.get(field) != before.get(field)]
+                        if not changed:
+                            continue
+                        values = [info.get(field, defaults[field]) for field in changed]
+                        where = f"{id_column}=%s"
+                        values.append(identity)
+                        if entity != "accounts":
+                            where += " AND account_id=%s"
+                            values.append(account_id)
+                        if entity == "users":
+                            where += " AND status = 'active'"
+                        cur.execute(f"UPDATE {table} SET " + ','.join(f"{field}=%s" for field in changed) + f" WHERE {where}", values)
+                        if entity == "users" and cur.rowcount == 0:
+                            raise ValueError(f"user no longer exists: {identity}")
+                if entity in ("users", "agents"):
+                    cur.execute("UPDATE cp_accounts SET authz_rev=authz_rev+1 WHERE account_id=%s", (account_id,))
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         finally:
             self._return_connection(conn)
-
-    @staticmethod
-    def _write_registry(cur, entity, account_id, records):
-        definitions = {
-            "accounts": ("account_id", ("created_at", "status"), (None, "active")),
-            "users": ("user_id", ("role", "key", "created_at", "status"), ("user", "", None, "active")),
-            "agents": ("agent_id", ("owner_user_id", "created_at"), ("", None)),
-        }
-        identity, fields, defaults = definitions[entity]
-        table = "cp_" + entity
-        scoped = entity != "accounts"
-        users = entity == "users"
-        scope = " WHERE account_id = %s" if scoped else ""
-        scope_params = (account_id,) if scoped else ()
-        # Serialize snapshot replacement while retaining referenced row identities.
-        cur.execute(f"LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE")
-        projection = f"{identity}, status" if users else identity
-        cur.execute(f"SELECT {projection} FROM {table}{scope}", scope_params)
-        current = set()
-        for row in cur.fetchall():
-            key = row[0]
-            if users and row[1] == "deleted":
-                if key in records:
-                    raise ValueError(f"user ID reserved by a deleted user: {key}")
-            else:
-                current.add(key)
-        predicate = f"{identity} = %s" + (" AND account_id = %s" if scoped else "")
-        for key in current - records.keys():
-            if users:
-                SQLControlPlaneStore._delete_user_row(cur, account_id, key)
-            else:
-                cur.execute(f"DELETE FROM {table} WHERE {predicate}", (key,) + scope_params)
-        columns = (("account_id",) if scoped else ()) + (identity,) + fields
-        assignments = ", ".join(f"{field} = %s" for field in fields)
-        placeholders = ", ".join(["%s"] * len(columns))
-        for key, info in records.items():
-            values = tuple((info.get(field) or None) if field == "created_at"
-                           else info.get(field, default) for field, default in zip(fields, defaults))
-            if key in current:
-                cur.execute(f"UPDATE {table} SET {assignments} WHERE {predicate}", values + (key,) + scope_params)
-            else:
-                cur.execute(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-                            scope_params + (key,) + values)
 
     @staticmethod
     def _delete_user_row(cur, account_id, user_id):
@@ -479,3 +512,24 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 params,
             )
         cur.execute("RELEASE SAVEPOINT cp_delete_user")
+
+    def _write_json(self, path: str, data: Any) -> None:
+        entity, account_id = self._parse_path(path)
+        if entity != 'audit_logs':
+            raise ValueError(f'Unknown control-plane entity: {entity}')
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                for event in data.get('events', []):
+                    self.sql_dialect.insert_audit_log(cur, (
+                        event.get('log_id'), account_id, event.get('actor', ''),
+                        event.get('target', ''), event.get('action', ''),
+                        event.get('timestamp') or None, event.get('result', ''),
+                        event.get('trace_id', ''), Json(event.get('details', {})),
+                    ))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
