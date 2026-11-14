@@ -12,7 +12,8 @@ from service.api import MemoryWriteAPI
 def test_default_configuration_has_no_write_planning_switch(tmp_path):
     path = tmp_path / "ogmemory.yaml"
     path.write_text("{}")
-    assert OgMemConfig.load(str(path)).extraction_mode == "eager"
+    cfg = OgMemConfig.load(str(path))
+    assert (cfg.extraction_mode, cfg.after_turn_threshold, cfg.dual_pass_enabled) == ("eager", 400, False)
     assert not hasattr(OgMemConfig(), "eager_write_plan_enabled")
 
 
@@ -25,7 +26,9 @@ def test_api_factories_use_standard_extraction_without_an_opt_in(factory, monkey
     else:
         create = MemoryWriteAPI
     writer = create(Mock(), MockLLM())
-    assert writer._pipeline._extractors[0]._mode == "eager"
+    extractor = writer._pipeline._extractors[0]
+    assert extractor._mode == "eager"
+    assert extractor._native_temperatures() == (None,)
 
 
 def test_direct_api_keeps_lazy_mode_available_without_an_opt_in():

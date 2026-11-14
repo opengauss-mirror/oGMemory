@@ -310,10 +310,9 @@ fi
 if [[ -n "$external_after_turn_threshold_set" ]]; then
   OGMEM_AFTER_TURN_THRESHOLD="$external_after_turn_threshold_value"
 fi
-# Default to short-conversation extraction for this testing quickstart only.
-OGMEM_AFTER_TURN_THRESHOLD="${OGMEM_AFTER_TURN_THRESHOLD-1}"
+OGMEM_AFTER_TURN_THRESHOLD="${OGMEM_AFTER_TURN_THRESHOLD-400}"
 [[ "$OGMEM_AFTER_TURN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
-  fail "OGMEM_AFTER_TURN_THRESHOLD 必须是正整数（例如 1 或 200）"
+  fail "OGMEM_AFTER_TURN_THRESHOLD 必须是正整数（例如 1 或 400）"
 
 RESET_OPENCLAW_CONFIG="${RESET_OPENCLAW_CONFIG:-false}"
 RESET_AGFS_DATA="${RESET_AGFS_DATA:-false}"

@@ -418,7 +418,7 @@ llm:
   api_key: {quote(llm.get('api_key', ''))}
   base_url: {quote(llm.get('base_url', ''))}
   model: {quote(llm['model'])}
-  temperature: 0.1
+  temperature: 0.7
 
 embedding:
   provider: {quote(embedding_provider)}
@@ -564,15 +564,27 @@ def run(args) -> int:
 
         import yaml
 
-        from cli.lib.local_config import load_local_config
+        from cli.lib.local_config import load_env, load_local_config
         from cli.lib.local_runtime import require_stopped, runtime_lock
         from cli.lib.onboard_config import changed_fields, merge_config, save_config
-        value = merge_config(existing, _build_config(llm_config, embedding_config, vdb_config, db_config, port=args.port))
+        generated = _build_config(llm_config, embedding_config, vdb_config, db_config, port=args.port)
+        if (
+            not existing
+            and db_config.get("backend") == "sql"
+            and db_config.get("dialect") == "opengauss"
+            and "OGMEM_RETRIEVAL_HYBRID_ENABLED" not in os.environ
+            and "OGMEM_RETRIEVAL_HYBRID_ENABLED" not in load_env(root)
+        ):
+            from cli.lib.db_setup import supports_opengauss_bm25
+
+            lexical_dsn = vdb_config.get("connection_string") or db_config["connection_string"]
+            if supports_opengauss_bm25(lexical_dsn):
+                generated["retrieval"] = {"hybrid_enabled": True}
+        value = merge_config(existing, generated)
         changes = changed_fields(existing, value)
         print(info("Changed fields (values hidden): " + (", ".join(changes) or "none")))
         try:
             # Validate privately before replacing the saved configuration.
-            import os
             previous_env = dict(os.environ)
             try:
                 with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", encoding="utf-8") as staged:
