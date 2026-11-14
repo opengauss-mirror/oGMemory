@@ -110,6 +110,7 @@ const elements = {
 
 function requestHeaders() { return state.apiKey ? { 'X-API-Key': state.apiKey } : {}; }
 function setApiKey(value) {
+  window.sharedSpaces?.reset();
   state.apiKey = value.trim();
   if (state.apiKey) sessionStorage.setItem(API_KEY_STORAGE_KEY, state.apiKey);
   else sessionStorage.removeItem(API_KEY_STORAGE_KEY);
@@ -146,10 +147,11 @@ async function fetchJson(url, options = {}) {
 async function loadTree() {
   const requestId = ++state.treeRequestId;
   const accountRequestId = ++state.accountRequestId;
-  const requestOptions = { headers: requestHeaders() };
+  const requestOptions = { headers: requestHeaders(), signal: AbortSignal.timeout(10000) };
   resetRetrieval();
   resetScenes();
   setLoading(true);
+  if (state.view === 'spaces') window.sharedSpaces?.notify('正在连接并读取团队空间…');
   try {
     const scope = await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), requestOptions);
     const adminMode = Boolean(scope.admin_mode);
@@ -173,9 +175,12 @@ async function loadTree() {
     renderDashboard();
     loadInventories(body.accounts || []);
     setConnection(true);
+    if (state.view === 'spaces') await window.sharedSpaces?.initialize();
   } catch (error) {
     if (requestId !== state.treeRequestId || accountRequestId !== state.accountRequestId) return;
-    showTreeError(error.message);
+    const message = error.name === 'TimeoutError' ? '连接超时，请检查服务或连接设置后刷新。' : error.message;
+    showTreeError(message);
+    if (state.view === 'spaces') window.sharedSpaces?.notify(message, true);
     setConnection(false);
     if (!state.apiKey || error.message === 'Invalid API Key') openSettings();
   } finally {
@@ -1232,7 +1237,7 @@ function resetRetrieval() {
   $('#retrieval-result-count').textContent = '';
   elements.retrievalResults.innerHTML = '<div class="retrieval-empty"><span>⌕</span><strong>输入内容后开始检索</strong><p>结果将按语义相关度排序。</p></div>';
 }
-function switchView(view) {
+function switchView(view, loadContent = true) {
   state.view = view;
   document.querySelectorAll('[data-view]').forEach((item) => {
     item.classList.toggle('active', item.dataset.view === view);
@@ -1243,13 +1248,18 @@ function switchView(view) {
   const monitoring = view === 'monitoring';
   const tasks = view === 'tasks';
   const scenes = view === 'scenes';
+  const spaces = view === 'spaces';
   elements.dashboardView.hidden = !dashboard;
-  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes;
+  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes || spaces;
+  $('#spaces-view').hidden = !spaces;
+  elements.account.closest('.scope-switcher').hidden = spaces;
   elements.retrievalView.hidden = !retrieval;
   elements.monitoringView.hidden = !monitoring;
   elements.tasksView.hidden = !tasks;
   elements.scenesView.hidden = !scenes;
-  elements.pageTitle.textContent = dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
+  elements.pageTitle.textContent = spaces ? '团队空间' : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
+  document.title = `${elements.pageTitle.textContent} · oGMemory`;
+  if (spaces) { if (loadContent) window.sharedSpaces?.load(); return; }
   const skill = view === 'skill';
   $('#tree-label').textContent = skill ? 'Agent Skill' : 'ContextFS';
   elements.tree.setAttribute('aria-label', skill ? 'Agent Skill 目录树' : 'ContextFS 目录树');
@@ -1274,6 +1284,11 @@ function switchView(view) {
     });
   }
   renderContextTree();
+}
+
+function navigateToView(view, trigger) {
+  if (state.view === 'spaces') return window.sharedSpaces.guardNavigation(() => switchView(view), trigger);
+  return switchView(view);
 }
 
 function showTreeError(message) {
@@ -1302,7 +1317,7 @@ elements.account.addEventListener('change', async () => {
 });
 document.querySelector('.app-sidebar').addEventListener('click', (event) => {
   const view = event.target.closest('[data-view]');
-  if (view) switchView(view.dataset.view);
+  if (view) navigateToView(view.dataset.view, view);
 });
 elements.dashboardView.addEventListener('click', (event) => {
   const view = event.target.closest('[data-view]');
@@ -1380,8 +1395,15 @@ elements.monitoringContent.addEventListener('click', (event) => {
   renderMonitoring();
 });
 $('#monitoring-refresh').addEventListener('click', loadMonitoring);
+async function refreshSpaces() {
+  setLoading(true);
+  try {
+    if (await window.sharedSpaces.load()) window.sharedSpaces.notify('团队空间已刷新。');
+  } finally { setLoading(false); }
+}
 elements.refresh.addEventListener('click', () => {
-  if (state.view === 'dashboard') loadDashboardMetrics();
+  if (state.view === 'spaces') window.sharedSpaces.guardNavigation(refreshSpaces, elements.refresh);
+  else if (state.view === 'dashboard') loadDashboardMetrics();
   else if (state.view === 'monitoring') loadMonitoring();
   else if (state.view === 'tasks') loadTasks();
   else if (state.view === 'scenes') loadScenes(state.sceneOffset);
@@ -1457,10 +1479,15 @@ $('#api-key-input').addEventListener('keydown', (event) => {
 });
 $('#settings-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  setApiKey($('#api-key-input').value);
-  apiKeyChannel?.postMessage({ type: 'update', apiKey: state.apiKey });
-  elements.settings.close();
-  loadTree();
+  const apiKey = $('#api-key-input').value;
+  const applySettings = () => {
+    setApiKey(apiKey);
+    apiKeyChannel?.postMessage({ type: 'update', apiKey: state.apiKey });
+    elements.settings.close();
+    return loadTree();
+  };
+  if (state.view === 'spaces') window.sharedSpaces.guardNavigation(applySettings, event.submitter);
+  else applySettings();
 });
 apiKeyChannel?.addEventListener('message', (event) => {
   const message = event.data;
@@ -1484,13 +1511,16 @@ elements.settings.addEventListener('click', (event) => {
   if (event.target === elements.settings) elements.settings.close();
 });
 
-document.documentElement.dataset.theme = localStorage.getItem('ogmemory-viewer-theme') || 'light';
-elements.shell.classList.toggle('sidebar-collapsed', localStorage.getItem('ogmemory-viewer-sidebar') === 'collapsed');
-if (location.hash === '#scenes') switchView('scenes');
-if (initialTreeLoadPending) {
-  apiKeyChannel.postMessage({ type: 'request' });
-  setTimeout(loadTreeAfterApiKeySync, 100);
-} else loadTree();
+document.addEventListener('DOMContentLoaded', () => {
+  document.documentElement.dataset.theme = localStorage.getItem('ogmemory-viewer-theme') || 'light';
+  elements.shell.classList.toggle('sidebar-collapsed', localStorage.getItem('ogmemory-viewer-sidebar') === 'collapsed');
+  if (location.hash === '#scenes') switchView('scenes');
+  if (location.hash === '#spaces') switchView('spaces', false);
+  if (initialTreeLoadPending) {
+    apiKeyChannel.postMessage({ type: 'request' });
+    setTimeout(loadTreeAfterApiKeySync, 100);
+  } else loadTree();
+}, { once: true });
 setInterval(() => {
   if (state.view === 'monitoring' && !$('#monitoring-refresh').disabled) loadMonitoring();
 }, 15_000);

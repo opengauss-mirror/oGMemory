@@ -7,6 +7,8 @@
     <title>oGMemory · 记忆查看器</title>
     <link rel="stylesheet" href="/memory-viewer/styles.css">
     <script src="/memory-viewer/app.js" defer></script>
+    <script src="/memory-viewer/content.js" defer></script>
+    <script src="/memory-viewer/spaces.js" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -20,6 +22,7 @@
             <button class="sidebar-link" type="button" data-view="scenes" aria-label="场景记忆"><span>◈</span>场景记忆</button>
             <button class="sidebar-link" type="button" data-view="retrieval"><span>⌕</span>检索</button>
             <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Agent Skill</button>
+            <button class="sidebar-link" type="button" data-view="spaces"><span>▦</span>团队空间</button>
           </section>
           <section class="nav-group">
             <p>活动</p>
@@ -51,6 +54,16 @@
         </header>
 
         <main class="memory-browser">
+      <section id="spaces-view" hidden aria-label="团队空间">
+        <div class="space-heading">
+          <div class="space-team-identity"><span class="space-team-mark" data-space-icon="team" aria-hidden="true"></span><header id="space-header"><h2>团队空间</h2></header></div>
+          <div class="space-heading-actions"><div class="space-sidebar"><label class="space-sidebar-heading" for="space-picker">切换团队</label><div id="space-list"></div><div id="space-list-pagination"></div></div><button type="button" class="primary-button" data-space-action="create"><span aria-hidden="true">＋</span> 创建团队空间</button></div>
+        </div>
+        <p id="space-message" class="space-message" role="status" aria-live="polite" hidden></p>
+        <div class="space-layout">
+          <section class="space-main"><nav id="space-tabs" class="type-tabs" role="tablist" aria-label="团队空间功能"></nav><div id="space-body" role="tabpanel" tabindex="0"><p class="space-empty">暂无团队空间</p></div></section>
+        </div>
+      </section>
       <section id="dashboard-view" class="dashboard-view" hidden>
         <header><h1>控制台</h1><p>当前账户的记忆运行概况。</p></header>
         <div class="dashboard-grid dashboard-inventory-grid">
@@ -183,7 +196,7 @@
         </div>
       </section>
       <section id="retrieval-view" class="retrieval-view" hidden>
-        <form id="retrieval-form" class="retrieval-form">
+        <form id="retrieval-form" class="retrieval-form" novalidate>
           <span aria-hidden="true">⌕</span>
           <input id="retrieval-input" type="search" placeholder="输入语义问题或关键词" autocomplete="off" aria-label="检索内容">
           <button id="retrieval-submit" class="retrieval-submit" type="submit">检索</button>
@@ -236,7 +249,7 @@
     </div>
 
     <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-description">
-      <form id="settings-form">
+      <form id="settings-form" novalidate>
         <div class="dialog-head">
           <div><h2 id="settings-title">连接 oGMemory</h2></div>
           <button id="settings-close" class="close-button" type="button" aria-label="关闭">×</button>
