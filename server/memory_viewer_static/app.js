@@ -131,7 +131,14 @@ async function fetchJson(url, options = {}) {
   });
   const isJson = (response.headers.get('content-type') || '').includes('application/json');
   const body = isJson ? await response.json() : null;
-  if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(typeof body?.error === 'string' ? body.error : body?.error?.message || body?.message || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.code = body?.code || body?.error?.code;
+    error.requestId = body?.request_id || response.headers.get('X-Request-Id');
+    error.retryAfter = Number(response.headers.get('Retry-After')) || 1;
+    throw error;
+  }
   if (!body) throw new Error('服务返回了无法识别的响应');
   return body;
 }
