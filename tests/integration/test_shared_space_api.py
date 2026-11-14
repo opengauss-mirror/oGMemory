@@ -121,3 +121,66 @@ def test_registered_candidates_flow_through_management_api(spaces_api):
     current = client.get(base, headers=headers, query_string={'space_id': 'ops'}).get_json()['space']
     assert current['authz_rev'] == saved['authz_rev']
     assert [row['principal'] for row in current['members']] == ['user:alice', 'user:bob']
+
+
+def test_http_and_mcp_share_authenticated_retrieval(spaces_api):
+    client, headers, service, _, actor = spaces_api
+    import anyio
+
+    from server.mcp_server import create_mcp_server
+    from server.mcp_tools import search_shared_memory
+
+    mcp = create_mcp_server(service=service)
+    tool = next(tool for tool in anyio.run(mcp.list_tools) if tool.name == "search_shared_memory")
+    assert {"query", "space_ids"} <= set(tool.input_schema["required"])
+    assert tool.input_schema['properties']['mode']['default'] == 'hybrid'
+    assert {'limit', 'cursor'} <= set(tool.input_schema['properties'])
+    mutate(client, headers, "POST", "/management/spaces", {"space_id": "ops", "name": "运维"})
+    response = client.post("/api/spaces/search", headers=headers, json={"query": "排障", "space_ids": ["ops"]})
+    assert response.status_code == 200, response.get_json()
+    result = search_shared_memory(service, query="排障", space_ids=["ops"], transport_headers=headers, allow_stdio_env_auth=False)
+    assert result["items"] == response.get_json()["items"]
+    paged = client.post('/api/spaces/search', headers=headers, json={
+        'query': '排障', 'space_ids': ['ops'], 'mode': 'keyword', 'top_k': 100, 'limit': 10})
+    assert paged.status_code == 200
+    result = search_shared_memory(service, query='排障', space_ids=['ops'], mode='keyword',
+                                  top_k=100, limit=10, transport_headers=headers, allow_stdio_env_auth=False)
+    assert (result['mode'], result['total'], result['next_cursor']) == (
+        paged.get_json()['mode'], paged.get_json()['total'], paged.get_json()['next_cursor'])
+
+
+def test_management_deletions_replay_and_refresh_lists(spaces_api):
+    client, headers, _, _, _ = spaces_api
+    base = '/management/spaces'
+    mutate(client, headers, 'POST', base, {'space_id': 'ops', 'name': 'Operations'})
+    mutate(client, headers, 'POST', base, {'space_id': 'remaining', 'name': 'Remaining'})
+    source_payload = {'principal': 'user:alice', 'memory_types': ['event']}
+    source = mutate(client, headers, 'PUT', base + '/ops/sources/alice-old', source_payload, 0)
+    rule_payload = {'name': 'Resolution', 'spec': {'description': 'Verified resolution steps', 'memory_types': ['event']}}
+    mutate(client, headers, 'PUT', base + '/ops/rules/retired', rule_payload, 0)
+    mutate(client, headers, 'PUT', base + '/ops/rules/remaining', rule_payload, 0)
+
+    deleted_rule = mutate(client, headers, 'DELETE', base + '/ops/rules/retired', {}, 1, key='delete-rule')
+    replay = mutate(client, headers, 'DELETE', base + '/ops/rules/retired', {}, 1, key='delete-rule')
+    assert (deleted_rule['deleted'], deleted_rule['rule_id'], deleted_rule['rule_rev']) == (True, 'retired', 2)
+    assert (replay['deleted'], replay['rule_rev']) == (True, deleted_rule['rule_rev'])
+    rules = client.get(base + '/ops/rules', headers=headers).get_json()['items']
+    assert [row['rule_id'] for row in rules] == ['remaining']
+
+    deleted_source = mutate(client, headers, 'DELETE', base + '/ops/sources/alice-old', {}, source['grant_rev'], key='delete-source')
+    replay = mutate(client, headers, 'DELETE', base + '/ops/sources/alice-old', {}, source['grant_rev'], key='delete-source')
+    assert (deleted_source['deleted'], deleted_source['grant_rev']) == (True, 2)
+    assert replay['authz_rev'] == deleted_source['authz_rev']
+    renewed = mutate(client, headers, 'PUT', base + '/ops/sources/alice-new', source_payload, 0)
+    detail = client.get(base + '?space_id=ops', headers=headers).get_json()['space']
+    assert [row['binding_id'] for row in detail['sources']] == ['alice-new']
+    assert detail['sources'][0]['can_delete']
+    assert detail['capabilities']['delete_space']
+
+    deleted_space = mutate(client, headers, 'DELETE', base + '/ops', {}, renewed['authz_rev'], key='delete-space')
+    replay = mutate(client, headers, 'DELETE', base + '/ops', {}, renewed['authz_rev'], key='delete-space')
+    assert (deleted_space['deleted'], deleted_space['space_id']) == (True, 'ops')
+    assert replay['authz_rev'] == deleted_space['authz_rev']
+    assert [row['space_id'] for row in client.get(base, headers=headers).get_json()['items']] == ['remaining']
+    mutate(client, headers, 'POST', base, {'space_id': 'ops-new', 'name': 'Operations'})
+    assert [row['space_id'] for row in client.get(base, headers=headers).get_json()['items']] == ['ops-new', 'remaining']
