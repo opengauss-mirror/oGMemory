@@ -5,7 +5,7 @@ readonly ENV_FILE="${OGMEMORY_ENV_FILE:-$HOME/ogmemory.env}"
 readonly STACK_ROOT="${OGMEMORY_STACK_ROOT:-$HOME}"
 readonly PUBLISH_IP="127.0.0.1"
 readonly OPENGAUSS_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328"
-readonly DEFAULT_OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013"
+readonly DEFAULT_OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114"
 readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0903"
 
 fail() {

@@ -23,7 +23,7 @@ docker info
 | 组件 | 使用场景 | 镜像 |
 | --- | --- | --- |
 | openGauss | 所有部署方式 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328` |
-| oGMemory | 所有部署方式 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013` |
+| oGMemory | 所有部署方式 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114` |
 | OpenClaw | Context Engine / MCP 部署 | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0903` |
 
 按以下顺序完成部署：
@@ -169,7 +169,7 @@ docker run -d --name ogmem --network host \
   -e OGMEM_CONFIG=/etc/ogmem/config.yaml \
   -v /your_directory/ogmemory.yaml:/etc/ogmem/config.yaml:ro \
   -v /your_directory/ogmem:/data/agfs \
-  swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013
+  swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114
 ```
 
 参数说明：

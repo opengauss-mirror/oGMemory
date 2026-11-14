@@ -49,7 +49,7 @@ command -v python3 >/dev/null || fail '部署管理需要 Python 3 解析结构�
 resolved_env=$("${compose[@]}" config --format json)
 value() { printf '%s' "$resolved_env" | python3 -c 'import json,sys; m=json.load(sys.stdin); print(m.get("name", "") if sys.argv[1]=="COMPOSE_PROJECT_NAME" else m.get("x-deployment-inputs",{}).get(sys.argv[1],"").replace("$$","$"))' "$1"; }
 image="$(value OGMEM_IMAGE)"
-image="${image:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013}"
+image="${image:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114}"
 project="$(value COMPOSE_PROJECT_NAME)"
 project="${project:-ogmemory}"
 # Docker container names are atomic and shared by every client of this daemon.
