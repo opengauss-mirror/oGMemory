@@ -20,6 +20,7 @@
 - [部署方式选择](/docs/deployment.md)：Compose、ARM64、源码和镜像部署。
 - [记忆导入导出](/docs/deployment/memory-migration.md)：维护窗口内的全量迁移、附件恢复与索引重建。
 - [Memory Viewer 使用指南](/docs/memory_viewer_guide.md)：连接账户、浏览记忆和查看运行状态。
+- [团队空间使用指南](/docs/shared_spaces.md)：成员管理、来源贡献、规则、团队记忆与读取权限，含前台截图和后台接口示例。
 
 ## 集成
 
