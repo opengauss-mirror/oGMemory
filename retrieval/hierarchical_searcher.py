@@ -79,6 +79,10 @@ class HierarchicalSearcher:
         prev_topk_uris: set[tuple[str, str, int]] = set()
         convergence_rounds = 0
 
+        shared_prefix = f"ctx://{ctx.account_id}/spaces/"
+        initial_candidates = [hit for hit in initial_candidates if not hit.uri.startswith(shared_prefix)]
+        starting_points = [hit for hit in starting_points if not hit.uri.startswith(shared_prefix)]
+
         for hit in initial_candidates:
             if hit.level == 2 and hit.uri:
                 identity = (*memory_identity(hit.uri, hit.metadata), hit.level)
@@ -124,6 +128,8 @@ class HierarchicalSearcher:
                 continue
 
             for child in children:
+                if child.uri.startswith(shared_prefix):
+                    continue
                 final_score = (
                     alpha * child.score + (1 - alpha) * current_score
                     if current_score

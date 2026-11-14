@@ -15,10 +15,6 @@ import threading
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
-from core.write_contract import (
-    OUTCOMES_KEY, PUBLIC_FIELDS, error_fields, needs_projection_refresh, normalize_write_result,
-    projection_outcome, store_outcome, write_request_contract,
-)
 from dataclasses import asdict, replace
 from datetime import UTC
 from datetime import datetime as _dt
@@ -26,8 +22,8 @@ from functools import wraps
 from typing import Any
 from uuid import uuid4
 
-from commit.write_receipts import WriteOutcomeUnknownError
 from commit.outbox_scope import capture_outbox_events, current_outbox_events
+from commit.write_receipts import WriteOutcomeUnknownError
 from core.errors import (
     AccessDeniedError,
     ExtractionIncompleteError,
@@ -50,6 +46,16 @@ from core.models import (
 )
 from core.operation_deadline import check_deadline, operation_deadline
 from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
+from core.write_contract import (
+    OUTCOMES_KEY,
+    PUBLIC_FIELDS,
+    error_fields,
+    needs_projection_refresh,
+    normalize_write_result,
+    projection_outcome,
+    store_outcome,
+    write_request_contract,
+)
 
 # Chunking support
 from extraction.chunking import ConversationChunker
@@ -281,6 +287,42 @@ def _code_memory_only_requested(params: Mapping[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 # Helpers (stateless, reusable)
 # ---------------------------------------------------------------------------
+
+def _check_shared_agfs_storage(cfg):
+    if not cfg.shared_spaces_enabled or cfg.storage_backend != "agfs":
+        return
+    from pyagfs.exceptions import AGFSClientError
+
+    from fs.agfs_adapter.agfs_context_fs import _is_not_found_error
+
+    client = AGFSClient(api_base_url=cfg.agfs_base_url)
+    prefix = cfg.agfs_mount_prefix.rstrip("/")
+
+    def names(path):
+        try:
+            return {entry["name"] for entry in client.ls(path)}
+        except AGFSClientError as exc:
+            if _is_not_found_error(exc):
+                return set()
+            raise
+
+    def require_migration():
+        raise ValueError(
+            "shared_spaces.enabled requires an AGFS namespace without legacy data; "
+            "migrate and verify accounts, keys, memories and sessions before enabling shared spaces"
+        )
+
+    # SQL becomes authoritative for identities and node/session metadata.
+    if "accounts.json" in names(f"{prefix}/_system"):
+        require_migration()
+    for account in names(f"{prefix}/accounts"):
+        path = f"{prefix}/accounts/{account}"
+        children = names(path)
+        if children & {"users", "agents", "resources", "sessions"}:
+            require_migration()
+        if "_system" in children and names(f"{path}/_system") & {"users.json", "agents.json"}:
+            require_migration()
+
 
 def _serialize_lazy_initialization(attribute: str):
     """Protect only the first initialization of a process-wide resource."""
@@ -687,6 +729,7 @@ class MemoryService:
         *, scene_manager=None, scene_ranker=None, scene_source=None,
     ):
         cfg = config or get_config()
+        _check_shared_agfs_storage(cfg)
         self._cfg = cfg
         self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
 
@@ -751,6 +794,9 @@ class MemoryService:
         self._pending_tool_usage_lock = threading.Lock()
         self._retrieval_monitoring: dict[tuple[str, str], dict[str, Any]] = {}
         self._retrieval_monitoring_lock = threading.Lock()
+        self._space_repository = None
+        self._space_content_store = None
+        self._space_worker = None
         self._init_lock = threading.RLock()
         self._scene_manager = scene_manager
         self._scene_ranker = scene_ranker
@@ -767,6 +813,73 @@ class MemoryService:
             self._initialize_tool_result_externalization(tool_result_store)
         if self._cfg.skill_sedimentation_enabled:
             self._start_skill_sedimentation_worker()
+        if self._cfg.shared_spaces_enabled:
+            self._start_space_worker()
+
+    @_serialize_lazy_initialization("_space_repository")
+    def get_space_repository(self):
+        from server.auth import ControlPlaneDisabledError
+        from server.space_repository import SpaceRepository
+
+        if not self._cfg.shared_spaces_enabled:
+            raise ControlPlaneDisabledError("Enable shared_spaces.enabled to use shared memory")
+        if self._space_repository is None:
+            self.get_control_plane_store()
+            self._space_repository = SpaceRepository(
+                self._get_shared_sql_pool(), content_store=self._get_space_content_store(),
+            )
+        return self._space_repository
+
+    @_serialize_lazy_initialization("_space_worker")
+    def _start_space_worker(self):
+        from service.space_lifecycle import SpaceMemoryWorker
+
+        if self._space_worker is None:
+            self._space_worker = SpaceMemoryWorker(self.get_space_repository(), self.get_llm())
+            self._space_worker.start()
+            self._start_outbox_worker()
+
+    def get_shared_memory_retrieval(self, mode="hybrid"):
+        from service.shared_memory import SharedMemoryRetrievalService
+
+        repository = self.get_space_repository()
+        semantic = mode in ("hybrid", "semantic")
+        return SharedMemoryRetrievalService(
+            repository,
+            vector_index=self._get_shared_vector_index() if semantic else None,
+            embedder=self._get_shared_embedder() if semantic else None,
+        )
+
+    def search_shared_memory(
+        self, ctx: RequestContext, *, query: str, space_ids: list[str],
+        kind: str | None = None, top_k: int = 10, max_context_tokens: int = 4096,
+        mode: str = "hybrid", limit: int | None = None, cursor: str | None = None,
+    ) -> dict:
+        return self.get_shared_memory_retrieval(mode).search(
+            ctx, query=query, space_ids=space_ids, kind=kind,
+            top_k=top_k, max_context_tokens=max_context_tokens,
+            mode=mode, limit=limit, cursor=cursor,
+        )
+
+    @property
+    def _use_sql_metadata(self) -> bool:
+        return bool(self._use_sql or (
+            self._cfg.shared_spaces_enabled and _HAS_SQL and self._cfg.sql_connection_string
+        ))
+
+    @_serialize_lazy_initialization("_space_content_store")
+    def _get_space_content_store(self):
+        if self._cfg.shared_spaces_enabled and self._cfg.storage_backend == "agfs":
+            if self._space_content_store is None:
+                from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
+
+                self._space_content_store = AGFSSpaceBridge(
+                    pool=self._get_shared_sql_pool(),
+                    client=AGFSClient(api_base_url=self._agfs_base_url),
+                    mount_prefix=self._mount_prefix,
+                )
+            return self._space_content_store
+        return None
 
     def _create_tool_result_store(self, store=None):
         """Create only the Artifact Store, without enabling message governance."""
@@ -890,6 +1003,9 @@ class MemoryService:
 
     def _get_context_fs(self):
         """Create the appropriate ContextFS implementation based on config."""
+        content_store = self._get_space_content_store()
+        if content_store is not None:
+            return content_store
         if self._use_sql:
             return SQLContextFS(pool=self._get_shared_sql_pool())
         if _HAS_AGFS:
@@ -912,7 +1028,7 @@ class MemoryService:
 
     def _get_outbox_store(self, fs):
         """Create the appropriate OutboxStore implementation based on config."""
-        if self._use_sql:
+        if self._use_sql_metadata:
             return SQLOutboxStore(
                 pool=self._get_shared_sql_pool(),
                 fs=fs,
@@ -924,7 +1040,7 @@ class MemoryService:
 
     def _get_relation_store(self):
         """Create the appropriate RelationStore implementation based on config."""
-        if self._use_sql:
+        if self._use_sql_metadata:
             return SQLRelationStore(pool=self._get_shared_sql_pool(),
                 edge_projection_profile_id=(self._cfg.graph_edge_embedding_profile if self._graph_enabled() else None),
                 edge_projection_representation=getattr(
@@ -940,7 +1056,8 @@ class MemoryService:
 
     def _graph_profile(self):
         from providers.relation_store.projection_identity import (
-            FACTORIZED_REPRESENTATION_VERSION, REPRESENTATION_VERSION,
+            FACTORIZED_REPRESENTATION_VERSION,
+            REPRESENTATION_VERSION,
         )
         embedder = self._get_shared_embedder()
         profile = dict(profile_id=self._cfg.graph_edge_embedding_profile,
@@ -966,8 +1083,8 @@ class MemoryService:
     def _graph_projection_components(self):
         if not self._graph_enabled():
             return None,None
-        from providers.relation_store.sql_projection import SQLEdgeProjectionStore
         from providers.relation_store.projection_identity import FACTORIZED_REPRESENTATION_VERSION
+        from providers.relation_store.sql_projection import SQLEdgeProjectionStore
         profile = self._graph_profile()
         options = {}
         if profile["representation_version"] == FACTORIZED_REPRESENTATION_VERSION:
@@ -1624,8 +1741,8 @@ class MemoryService:
 
     @staticmethod
     def _summary_stage_inputs(messages, session_time, session_id, llm):
-        from extraction.summary_generator import SUMMARY_PROMPT, SUMMARY_SCHEMA
         from core.model_stage import model_signature
+        from extraction.summary_generator import SUMMARY_PROMPT, SUMMARY_SCHEMA
 
         return {"messages": deepcopy(messages), "session_id": session_id,
                 "session_time": session_time.isoformat() if session_time else None,
@@ -1638,6 +1755,7 @@ class MemoryService:
         """Join summary generation at the owner-thread write boundary."""
         from concurrent.futures import Future, ThreadPoolExecutor
         from contextvars import copy_context
+
         from core.model_stage import stage_collector_scope, wait_model_result
 
         restored = candidate_checkpoint.load() if candidate_checkpoint is not None else None
@@ -2072,7 +2190,7 @@ class MemoryService:
         """
         session_id = params.get("sessionId") or params.get("session_id") or "unknown"
         explicit_agent_id = params.get("agentId")
-        user_id = params.get("userId") or params.get("user_id")
+        user_id = params.get("userId") or params.get("user_id") or (identity.user_id if identity else None)
         if not user_id:
             # Inherit from session meta when caller doesn't supply userId
             mgr = self.get_session_manager()
@@ -2134,7 +2252,7 @@ class MemoryService:
     @_serialize_lazy_initialization("_control_store")
     def get_control_plane_store(self) -> ControlPlaneStore:
         if self._control_store is None:
-            if self._use_sql:
+            if self._use_sql_metadata:
                 from server.sql_control_plane_store import SQLControlPlaneStore
                 self._control_store = SQLControlPlaneStore(
                     pool=self._get_shared_sql_pool(),
@@ -3083,10 +3201,17 @@ class MemoryService:
             self._shutdown_resources(join_timeout)
 
     def _shutdown_resources(self, join_timeout: float) -> None:
+        if self._space_worker is not None:
+            if not self._space_worker.stop(timeout=join_timeout):
+                logger.warning("Shared-space work is draining; service resources retained")
+                return
+            self._space_worker = None
         if self._scene_manager is not None and not self._scene_manager.stop(timeout=join_timeout):
             logger.warning("Scene worker is completing its current request")
             return
-        self._extraction_retry.close(join_timeout)
+        if self._extraction_retry.close(join_timeout) is False:
+            logger.warning("Extraction retries are still draining; service resources retained")
+            return
         scene_index = getattr(self._scene_source, "candidate_index", None)
         if scene_index is not None and not scene_index.close(timeout=join_timeout):
             logger.warning("Scene lexical index is still closing")
@@ -3096,7 +3221,8 @@ class MemoryService:
                 self._code_workspace_sync_service.shutdown()
             except Exception as exc:
                 logger.warning("Failed to stop code workspace sync scheduler: %s", exc)
-        self.stop_skill_sedimentation(timeout=join_timeout)
+        if self.stop_skill_sedimentation(timeout=join_timeout) is False:
+            return
         if self._outbox_listener is not None:
             try:
                 self._outbox_listener.stop()
@@ -3134,7 +3260,26 @@ class MemoryService:
             self._lexical_index = None
             self._lexical_backfill = None
             self._vector_index = None
+        if self._space_content_store is not None:
+            if not self._space_content_store.close(timeout=join_timeout):
+                logger.warning("Shared-space content reads are still draining")
+                return
+            self._space_content_store = None
+        if self._lexical_index is None and self._vector_index is not None:
+            close = getattr(self._vector_index, "close", None)
+            if callable(close):
+                try:
+                    if close() is False:
+                        logger.warning("Vector index is still closing; service resources retained")
+                        return
+                except Exception as exc:
+                    logger.warning("Failed to close vector index: %s", exc)
+                    return
+                self._projection_index = None
+                self._vector_index = None
         with self._init_lock:
+            if self._sql_pool is not None:
+                self._sql_pool.close_all()
             self._outbox_listener = None
             self._outbox_thread = None
             self._outbox_stop.clear()
@@ -3466,7 +3611,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 global_result_rerank_enabled=getattr(
                     self._cfg, "retrieval_global_result_rerank_enabled", False,
                 ),
-                owner_scope_filter_enabled=getattr(self._cfg, "retrieval_owner_scope_filter_enabled", False),
+                owner_scope_filter_enabled=(
+                    self._cfg.shared_spaces_enabled
+                    or getattr(self._cfg, "retrieval_owner_scope_filter_enabled", False)
+                ),
                 hybrid_enabled=getattr(self._cfg, "retrieval_hybrid_enabled", False),
                 vector_top_k=getattr(self._cfg, "retrieval_vector_top_k", 100),
                 lexical_top_k=getattr(self._cfg, "retrieval_lexical_top_k", 50),
@@ -3510,9 +3658,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if cfg.enable_graph_expansion:
                 if relation_store is None or context_reader is None:
                     raise RuntimeError("Graph retrieval requires canonical relation storage and reader")
-                from service.graph_service import GraphService
                 from retrieval.graph_retriever import OneHopRetriever
                 from retrieval.graph_supplement import GraphSupplement
+                from service.graph_service import GraphService
                 graph = GraphService(None,relation_reader=relation_store)
                 profile = self._graph_profile()
                 graph_kwargs = dict(graph_retriever=OneHopRetriever(graph,
@@ -3982,7 +4130,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 get_write_api=self.get_write_api,
                 get_agfs=self._get_context_fs,
                 get_archive_store=self._get_archive_store,
-                archive_store_required=self._use_sql,
+                archive_store_required=self._use_sql_metadata,
                 get_context_fs=session_state_context_fs,
                 archive_max_count=self._cfg.archive_max_count,
                 archive_merge_threshold=self._cfg.archive_merge_threshold,
@@ -4003,7 +4151,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         SQL mode: cached for service lifetime (shared connection pool).
         AGFS mode: fresh instance each call (self-healing on transient failures).
         """
-        if self._use_sql:
+        if self._use_sql_metadata:
             if self._archive_store is not None:
                 return self._archive_store
             if self._archive_store_failed:
@@ -5326,6 +5474,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     @contextmanager
     def _session_mutation_scope(self, ctx, *, refresh=True):
         import time
+
         from fs.sql_adapter.session_mutation import active_session_guard
         from service.api import MemoryWriteAPI
         nested = active_session_guard() is not None
@@ -5464,6 +5613,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def get_write_request_status(self, params: dict) -> dict:
         """Read the owner-scoped durable receipt and its exact projection events."""
         import json
+
         from core.errors import NodeNotFoundError
 
         session_id = str(params.get("sessionId") or params.get("session_id") or "").strip()
