@@ -220,6 +220,7 @@ def test_documented_docker_command_consumes_all_explicit_model_settings(monkeypa
         "LLM_API_KEY": "explicit-llm-key", "LLM_BASE_URL": "https://private-llm.example.test/v1",
         "LLM_MODEL": "custom-llm", "EMBEDDING_API_KEY": "explicit-embedding-key",
         "EMBEDDING_BASE_URL": "https://private-embedding.example.test/v1", "EMBEDDING_MODEL": "custom-embedding",
+        "EMBEDDING_DIMENSION": "1024",
     }
     for key, value in values.items():
         block = block.replace("$" + key, value)

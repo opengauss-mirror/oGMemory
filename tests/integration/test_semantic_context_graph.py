@@ -168,7 +168,7 @@ def test_real_extraction_writer_and_index_pipeline_keeps_descriptors(graph_db):
             relation="depends on",evidence_ids=new[0]["source_ids"]+new[1]["source_ids"])]}
     llm.complete_json.side_effect = relation_response
     api = MemoryWriteAPI(fs,llm,outbox_store=outbox,vector_index=index,embedder=worker._embedder,
-        directory_summary_enabled=False,graph_enabled=True,relation_store=store,
+        directory_summary_enabled=False,dual_pass_enabled=True,graph_enabled=True,relation_store=store,
         relation_candidate_service=RelationCandidateService(AuthorizedVectorSearch(
             index,worker._embedder,ContextReader(fs,storage_backend="sql"))))
     result = api.commit_session([dict(id="turn",role="user",content="Projectx depends on Projecty.")],
