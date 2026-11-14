@@ -24,13 +24,25 @@ llm:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/api-key"]
   base_url: "https://api.openai.com/v1"  # [local] your endpoint; [docker] use "${LLM_BASE_URL}"
   model: "gpt-4o-mini"           # [local] your model; [docker] use "${LLM_MODEL}"
-  temperature: 0.1               # [all] recommended: 0-0.1 for deterministic extraction
+  temperature: 0.7               # [all] LLM sampling temperature
   max_tokens: 4096               # [all]
   json_mode: false               # [all]
-  # reasoning_effort: "medium"  # [all] optional; sent only when configured
   # is_reasoning_model: true     # [all] optional override; null means auto-detect
-  # extra_body:                  # [all] arbitrary OpenAI-compatible provider options
-  #   thinking: {type: enabled}
+  #
+  # The default OpenAI gpt-4o-mini is a non-reasoning model.
+  # When changing base_url or model, use the matching Chat Completions example
+  # below to keep thinking off.
+  #
+  # OpenAI GPT-5.1 and other models that support the "none" effort:
+  # reasoning_effort: "none"
+  #
+  # Volcengine Ark Doubao and DeepSeek official endpoints, for supported models:
+  # extra_body:
+  #   thinking: {type: disabled}
+  #
+  # Alibaba Cloud DashScope Qwen, for models that support switching thinking off:
+  # extra_body:
+  #   enable_thinking: false
 
 # ---- Decision model [all, optional] ----
 # Omit or use null to preserve native behavior. Credentials alone do not enable it.
@@ -150,7 +162,7 @@ memory:
     card_format_enabled: false  # Validate entity/preference cards and recover malformed output in background.
     mode: eager                   # [all] eager / lazy (lazy = ReAct loop with read tools)
     node_processing_enabled: false # [all] eager or lazy extraction followed by topic node processing
-    dual_pass_enabled: true       # [all] Run two native extraction passes per span
+    dual_pass_enabled: false      # [all] Set true to run two native extraction passes per span
   # after_turn_threshold: 400    # [all] tokens before auto-extraction
   # rolling_compress_enabled: true
   # compact_prepare_token_ttl: 300

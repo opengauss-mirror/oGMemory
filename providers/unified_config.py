@@ -640,7 +640,7 @@ class OgMemConfig:
     # Appended to preserve positional configuration arguments; eager opt-in only.
     source_occurrence_reconciliation_enabled: bool = False
     card_format_enabled: bool = False
-    dual_pass_enabled: bool = True
+    dual_pass_enabled: bool = False
     node_processing_enabled: bool = False
 
     # Explicit opt-in, independent of the generative LLM and eager/lazy mode.
@@ -1224,7 +1224,7 @@ class OgMemConfig:
             ),
             dual_pass_enabled=_resolve_bool(
                 memory.get("extraction", {}).get("dual_pass_enabled"),
-                "OGMEM_DUAL_PASS_ENABLED", True,
+                "OGMEM_DUAL_PASS_ENABLED", False,
             ),
             node_processing_enabled=_resolve_bool(
                 memory.get("extraction", {}).get("node_processing_enabled"),

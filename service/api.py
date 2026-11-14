@@ -54,7 +54,7 @@ internal_tool_usage_tracker=None,
         directory_summary_enabled: bool = True,
         source_occurrence_reconciliation_enabled: bool = False,
         card_format_enabled: bool = False,
-        dual_pass_enabled: bool = True,
+        dual_pass_enabled: bool = False,
         node_processing_enabled: bool = False,
         graph_enabled: bool = False,
         relation_store=None,
@@ -756,7 +756,7 @@ def init_write_api(
     uri_resolver=None,
     internal_tool_usage_tracker=None,
     source_occurrence_reconciliation_enabled: bool = False,
-    dual_pass_enabled: bool = True,
+    dual_pass_enabled: bool = False,
     node_processing_enabled: bool = False,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
