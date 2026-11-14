@@ -998,12 +998,11 @@ class TestSQLContextFSMoveNode:
         new_uri = "ctx://acme/users/alice/memories/preferences/latte"
         old_uri = "ctx://acme/users/alice/memories/preferences/coffee"
 
-        # fetchall is called twice:
-        # 1) SELECT uri ... for DELETE events (all moved nodes)
-        # 2) SELECT uri,abstract,... for UPSERT events (re-index)
         cursor.fetchall.side_effect = [
-            [(old_uri,)],  # ordered endpoint lock
+            [(old_uri, 1)],  # ordered endpoint lock
             [],  # no graph jobs on this legacy move
+            [(new_uri, 1)],  # moved root version
+            [],  # moved descendant versions
             [(new_uri,)],  # all_new_uris — just the moved node
             [(new_uri, "abs", "ov", "content", "user:alice", "preference", "MEMORY", {}, 1)],  # moved_rows
         ]
@@ -1078,6 +1077,8 @@ class TestSQLContextFSMoveNode:
         cursor.fetchall.side_effect = [
             [],  # endpoint lock result
             [],  # no graph jobs
+            [(new_uri, 1)],  # moved root version
+            [],  # moved descendant versions
             [(new_uri,)],
             [(new_uri, "a", "o", "c", "user:alice", "preference", "MEMORY", {}, 1)],
         ]

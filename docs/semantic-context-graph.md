@@ -234,8 +234,10 @@ columns, durable job table with tenant RLS, a memory-update invalidation trigger
 and widening existing relation labels to at least 256 characters. Revision
 changes invalidate projections; an old worker result cannot complete a newer
 revision's job. Queue SQL supports the existing PostgreSQL/openGauss dialect
-seam; openGauss avoids `SKIP LOCKED`. Live integration coverage currently uses
-PostgreSQL/pgvector, not a live openGauss deployment.
+seam. The graph projection queue selects `FOR UPDATE` on openGauss through
+`supports_batch_claim`; this flag also selects the outbox polling/notification
+path. Team-memory queues use `SKIP LOCKED` with their independently verified
+[SQL storage baseline](deployment/team-memory-sql-compatibility.md).
 
 The vector adapter also guards a legacy `node_id` backfill: current upstream
 `context_nodes` is URI-keyed and has no `node_id` column. No legacy node-id

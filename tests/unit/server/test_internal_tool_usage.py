@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -398,7 +399,7 @@ def test_session_tool_usage_flush_writes_session_files_and_read_by_session(tmp_p
     assert stats["rounds"][0]["round_id"] == "round-a"
 
 
-def test_session_tool_usage_flush_clears_in_memory_session_after_success(tmp_path):
+def test_session_tool_usage_flush_clears_in_memory_session_after_success(tmp_path, monkeypatch):
     service = MemoryService(config=OgMemConfig())
     service._internal_tool_usage_store = InternalToolUsageStore(
         ControlPlaneStore(mount_prefix="", local_root=str(tmp_path))
@@ -426,7 +427,16 @@ def test_session_tool_usage_flush_clears_in_memory_session_after_success(tmp_pat
         trace_id="trace-1",
     )
 
+    cleared = Event()
+    clear_session = service._internal_tool_usage.clear_session
+
+    def clear_and_notify(session_id):
+        clear_session(session_id)
+        cleared.set()
+
+    monkeypatch.setattr(service._internal_tool_usage, "clear_session", clear_and_notify)
     service._flush_session_tool_usage_async("session-a", ctx)
+    assert cleared.wait(2)
     tool_calls_path = (
         tmp_path
         / "accounts"
@@ -436,10 +446,6 @@ def test_session_tool_usage_flush_clears_in_memory_session_after_success(tmp_pat
         / "tool_usage"
         / "tool_calls.json"
     )
-    deadline = time.time() + 2
-    while time.time() < deadline and not tool_calls_path.exists():
-        time.sleep(0.01)
-
     assert tool_calls_path.exists()
     live_stats = service._internal_tool_usage.get_stats(session_id="session-a")
     assert live_stats["summary"]["llm_tool_rounds"] == 0
