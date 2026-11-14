@@ -311,7 +311,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 elif entity == "users":
                     cur.execute(
                         "SELECT user_id, role, key, created_at, status "
-                        "FROM cp_users WHERE account_id = %s",
+                        "FROM cp_users WHERE account_id = %s AND status <> 'deleted'",
                         (account_id,),
                     )
                     rows = cur.fetchall()
@@ -393,56 +393,8 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                if entity == "accounts":
-                    cur.execute("DELETE FROM cp_accounts")
-                    for aid, info in data.get("accounts", {}).items():
-                        cur.execute(
-                            "INSERT INTO cp_accounts (account_id, created_at, status) "
-                            "VALUES (%s, %s, %s)",
-                            (
-                                aid,
-                                info.get("created_at") or None,
-                                info.get("status", "active"),
-                            ),
-                        )
-
-                elif entity == "users":
-                    cur.execute(
-                        "DELETE FROM cp_users WHERE account_id = %s",
-                        (account_id,),
-                    )
-                    for uid, info in data.get("users", {}).items():
-                        cur.execute(
-                            "INSERT INTO cp_users "
-                            "(account_id, user_id, role, key, created_at, status) "
-                            "VALUES (%s, %s, %s, %s, %s, %s)",
-                            (
-                                account_id,
-                                uid,
-                                info.get("role", "user"),
-                                info.get("key", ""),
-                                info.get("created_at") or None,
-                                info.get("status", "active"),
-                            ),
-                        )
-
-                elif entity == "agents":
-                    cur.execute(
-                        "DELETE FROM cp_agents WHERE account_id = %s",
-                        (account_id,),
-                    )
-                    for aid, info in data.get("agents", {}).items():
-                        cur.execute(
-                            "INSERT INTO cp_agents "
-                            "(account_id, agent_id, owner_user_id, created_at) "
-                            "VALUES (%s, %s, %s, %s)",
-                            (
-                                account_id,
-                                aid,
-                                info.get("owner_user_id", ""),
-                                info.get("created_at") or None,
-                            ),
-                        )
+                if entity in ("accounts", "users", "agents"):
+                    self._write_registry(cur, entity, account_id, data.get(entity, {}))
 
                 elif entity == "audit_logs":
                     # Append-only: INSERT new events, skip existing by log_id
@@ -466,3 +418,61 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             raise
         finally:
             self._return_connection(conn)
+
+    @staticmethod
+    def _write_registry(cur, entity, account_id, records):
+        definitions = {
+            "accounts": ("account_id", ("created_at", "status"), (None, "active")),
+            "users": ("user_id", ("role", "key", "created_at", "status"), ("user", "", None, "active")),
+            "agents": ("agent_id", ("owner_user_id", "created_at"), ("", None)),
+        }
+        identity, fields, defaults = definitions[entity]
+        table = "cp_" + entity
+        scoped = entity != "accounts"
+        users = entity == "users"
+        scope = " WHERE account_id = %s" if scoped else ""
+        scope_params = (account_id,) if scoped else ()
+        # Serialize snapshot replacement while retaining referenced row identities.
+        cur.execute(f"LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE")
+        projection = f"{identity}, status" if users else identity
+        cur.execute(f"SELECT {projection} FROM {table}{scope}", scope_params)
+        current = set()
+        for row in cur.fetchall():
+            key = row[0]
+            if users and row[1] == "deleted":
+                if key in records:
+                    raise ValueError(f"user ID reserved by a deleted user: {key}")
+            else:
+                current.add(key)
+        predicate = f"{identity} = %s" + (" AND account_id = %s" if scoped else "")
+        for key in current - records.keys():
+            if users:
+                SQLControlPlaneStore._delete_user_row(cur, account_id, key)
+            else:
+                cur.execute(f"DELETE FROM {table} WHERE {predicate}", (key,) + scope_params)
+        columns = (("account_id",) if scoped else ()) + (identity,) + fields
+        assignments = ", ".join(f"{field} = %s" for field in fields)
+        placeholders = ", ".join(["%s"] * len(columns))
+        for key, info in records.items():
+            values = tuple((info.get(field) or None) if field == "created_at"
+                           else info.get(field, default) for field, default in zip(fields, defaults))
+            if key in current:
+                cur.execute(f"UPDATE {table} SET {assignments} WHERE {predicate}", values + (key,) + scope_params)
+            else:
+                cur.execute(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                            scope_params + (key,) + values)
+
+    @staticmethod
+    def _delete_user_row(cur, account_id, user_id):
+        params = (account_id, user_id)
+        cur.execute("SAVEPOINT cp_delete_user")
+        try:
+            cur.execute("DELETE FROM cp_users WHERE account_id = %s AND user_id = %s", params)
+        except psycopg2.errors.ForeignKeyViolation:
+            cur.execute("ROLLBACK TO SAVEPOINT cp_delete_user")
+            cur.execute(
+                "UPDATE cp_users SET status = 'deleted', key = 'revoked' "
+                "WHERE account_id = %s AND user_id = %s",
+                params,
+            )
+        cur.execute("RELEASE SAVEPOINT cp_delete_user")
