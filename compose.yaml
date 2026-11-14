@@ -18,7 +18,7 @@ services:
       start_period: 30s
     networks: [memory]
   ogmemory:
-    image: ${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013}
+    image: ${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114}
     platform: linux/arm64
     init: true
     restart: unless-stopped
@@ -61,7 +61,7 @@ networks:
 # Structured deployment inputs; config output contains credentials.
 x-deployment-inputs:
   DATA_ROOT: ${DATA_ROOT:-./data}
-  OGMEM_IMAGE: ${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013}
+  OGMEM_IMAGE: ${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114}
   OGMEM_HTTP_HOST_PORT: ${OGMEM_HTTP_HOST_PORT:-18090}
   OGMEM_MCP_HOST_PORT: ${OGMEM_MCP_HOST_PORT:-18091}
   LLM_PROVIDER: ${LLM_PROVIDER:-openai}

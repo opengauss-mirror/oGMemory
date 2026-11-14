@@ -333,7 +333,7 @@ load_config() {
     POSTGRES_WAIT_TIMEOUT="${POSTGRES_WAIT_TIMEOUT:-60}"
 
     OGMEM_CONTAINER_NAME="${OGMEM_CONTAINER_NAME:-ogmem}"
-    OGMEM_IMAGE="${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:v0.8}"
+    OGMEM_IMAGE="${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114}"
 
     OPENCLAW_CONTAINER_NAME="${OPENCLAW_CONTAINER_NAME:-openclaw_ogmem}"
     OPENCLAW_IMAGE="${OPENCLAW_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmemory:v0.2}"

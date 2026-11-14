@@ -33,7 +33,7 @@ Compose 不启动 OpenClaw，也不下载 OpenClaw 镜像。OpenClaw 的 Context
 | 服务 | 默认镜像 |
 | --- | --- |
 | openGauss | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328` |
-| oGMemory | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013` |
+| oGMemory | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114` |
 
 镜像地址通过 `.env` 配置，需要部署其他版本时修改对应镜像引用。模型和服务访问密钥在部署时配置。
 
@@ -165,7 +165,7 @@ OGMEM_MCP_HOST_PORT=18091
 
 # 服务镜像。
 OPENGAUSS_IMAGE=swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328
-OGMEM_IMAGE=swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:1013
+OGMEM_IMAGE=swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:20261114
 
 # LLM：填写供应商提供的 OpenAI 兼容地址、模型名和密钥。
 LLM_PROVIDER=openai

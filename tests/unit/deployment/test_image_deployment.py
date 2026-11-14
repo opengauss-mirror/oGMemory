@@ -70,7 +70,11 @@ def test_compose_does_not_build_source():
     compose = yaml.safe_load((ROOT / 'compose.yaml').read_text())
     assert set(compose['services']) == {'opengauss', 'ogmemory'}
     assert all('build' not in x for x in compose['services'].values())
-    assert 'ogmemory:1013' in compose['services']['ogmemory']['image']
+    values = dict(line.split('=', 1) for line in (ROOT / '.env.example').read_text().splitlines()
+                  if line and not line.startswith('#') and '=' in line)
+    expected_image = '${OGMEM_IMAGE:-' + values['OGMEM_IMAGE'] + '}'
+    assert compose['services']['ogmemory']['image'] == expected_image
+    assert compose['x-deployment-inputs']['OGMEM_IMAGE'] == expected_image
 
 
 def test_prepare_preserves_keys_and_special_character_values(tmp_path):
