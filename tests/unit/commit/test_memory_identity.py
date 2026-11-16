@@ -83,8 +83,8 @@ def memory(key, *, category="entity", content="经验索引文件", **kwargs):
                            provenance_ids=["prov:1:archive:sample:message-one"], **kwargs)
 
 
-def api(fs, llm):
-    return MemoryWriteAPI(fs, llm, directory_summary_enabled=False)
+def api(fs, llm, **kwargs):
+    return MemoryWriteAPI(fs, llm, directory_summary_enabled=False, **kwargs)
 
 
 def test_topic_scope_and_write_share_backend_lock(ctx):

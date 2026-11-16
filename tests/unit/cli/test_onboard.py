@@ -328,6 +328,32 @@ def test_docker_environment_rejects_chroma(tmp_path):
     assert not (tmp_path / "unsupported.env").exists()
 
 
+def test_local_onboard_defaults_to_hybrid_on_bm25_opengauss(tmp_path, monkeypatch):
+    from cli.lib.local_config import load_local_config
+
+    path = tmp_path / "config.yaml"
+    dsn = "host=example dbname=ogmemory"
+    monkeypatch.setenv("OGMEM_CONFIG", str(path))
+    monkeypatch.delenv("OGMEM_RETRIEVAL_HYBRID_ENABLED", raising=False)
+    monkeypatch.setattr("cli.lib.process.find_project_root", lambda: tmp_path)
+    monkeypatch.setattr(onboard, "_step1_check", lambda args: True)
+    monkeypatch.setattr(onboard, "_step2_llm", lambda args: {"provider": "mock", "model": "mock"})
+    monkeypatch.setattr(onboard, "_step3_embedding", lambda *args: {
+        "provider": "mock", "model": "mock", "dimension": 3,
+    })
+    monkeypatch.setattr("cli.lib.db_setup.check_postgresql", lambda _: True)
+    monkeypatch.setattr("cli.lib.db_setup.check_opengauss_compatibility", lambda _: True)
+    monkeypatch.setattr("cli.lib.db_setup.supports_opengauss_bm25", lambda connection: connection == dsn)
+    monkeypatch.setattr(onboard, "_step_install_deps", lambda *args: True)
+    monkeypatch.setattr(onboard, "confirm", lambda *args, **kwargs: False)
+
+    args = build_parser().parse_args(["onboard", "--mode", "local", "--non-interactive", "--db-connection", dsn])
+    assert onboard.run(args) == 0
+    cfg = load_local_config(tmp_path, str(path))
+    assert cfg.retrieval_hybrid_enabled is True
+    assert cfg.llm_temperature == 0.7
+
+
 @pytest.mark.parametrize("mode", ["local", "headless"])
 @pytest.mark.parametrize("existing", [False, True])
 def test_milvus_cli_parameters_survive_save_and_reload(tmp_path, monkeypatch, mode, existing):

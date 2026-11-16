@@ -76,10 +76,9 @@ class NativeProtocolLLM:
             return [
                 {'id': 'read-body', 'name': 'read', 'input': {'uri': target}},
                 {'id': 'list-catalog', 'name': 'list', 'input': {'uri': target.rsplit('/', 1)[0]}},
-                {'id': 'read-relations', 'name': 'get_relations', 'input': {'uri': target}},
                 {'id': 'read-stats', 'name': 'get_access_stats', 'input': {'uri': target}},
             ], ''
-        if len(replies) == 4:
+        if len(replies) == 3:
             with self.lock:
                 self.tool_replies.append(replies)
             assert all('error' not in reply for reply in replies), replies
@@ -153,7 +152,7 @@ def test_guarded_real_native_multispan_reads_preserve_owner_and_tool_protocol(na
                   for key, uri in uris.items()]
     writer = MemoryWriteAPI(fs, llm, outbox, schema_registry=registry,
                             uri_resolver=URIResolver(registry), vector_index=index, embedder=embedder,
-                            extraction_mode=mode, directory_summary_enabled=False)
+                            extraction_mode=mode, dual_pass_enabled=True, directory_summary_enabled=False)
     assert writer._pipeline._extractors[0].__class__.__name__ == 'Extractor'
     if entry == 'commit_session':
         with request_usage_scope(ctx), fs.session_mutation_lock(SessionState.state_uri(ctx.account_id, ctx.session_id), ctx) as guard:
@@ -230,7 +229,8 @@ class GuardedSourceProtocolLLM(SourceLLM):
 def source_writer(fs, outbox, llm):
     return MemoryWriteAPI(fs, llm, outbox, vector_index=FakeVectorIndex(),
                           embedder=FakeEmbedder(), directory_summary_enabled=False,
-                          extraction_mode='eager', source_occurrence_reconciliation_enabled=True)
+                          extraction_mode='eager', dual_pass_enabled=True,
+                          source_occurrence_reconciliation_enabled=True)
 
 
 def assert_source_protocol_owner(llm, ctx, *, parallel_models=False):

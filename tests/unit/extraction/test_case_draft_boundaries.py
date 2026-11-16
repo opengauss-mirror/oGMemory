@@ -256,7 +256,7 @@ class CaseSourceLLM:
 def test_source_controlled_extraction_pipeline_write_api_preserves_case_facts(runs, expected):
     llm = CaseSourceLLM(runs)
     fs = MemoryFS()
-    writer = api(fs, llm)
+    writer = api(fs, llm, dual_pass_enabled=True)
     ctx = RequestContext("case-boundaries", "reader", "agent", "session", "trace")
     messages = [{"id": "message-one", "role": "user", "content":
                  "On 2026-10-01 at Lab A, I repaired the receiver in project-a. "
@@ -287,7 +287,7 @@ def test_source_controlled_extraction_pipeline_write_api_preserves_case_facts(ru
 def test_checkpoint_accepts_distinct_case_facts_and_resume_reuses_final_outputs(initial_archive, resumed_archive):
     fs = MemoryFS()
     llm = CaseSourceLLM((["I replaced the cable."], ["I rebooted the device."]))
-    writer = api(fs, llm)
+    writer = api(fs, llm, dual_pass_enabled=True)
     ctx = RequestContext("case-checkpoint", "reader", "agent", "session", "trace")
     session_time = datetime(2026, 10, 1, tzinfo=UTC)
     messages = [{"id": "message-one", "role": "user", "content":
@@ -326,7 +326,7 @@ def test_checkpoint_accepts_distinct_case_facts_and_resume_reuses_final_outputs(
             raise AssertionError(f"Accepted case outputs must not call a model: {name}")
 
     stored = deepcopy(fs.nodes)
-    restarted = api(fs, NoModel())
+    restarted = api(fs, NoModel(), dual_pass_enabled=True)
     restored_manager = SessionManager(get_context_fs=lambda: fs, session_state_bridge_enabled=False)
     restored_buffer = restored_manager.get_or_create(ctx.session_id, ctx)
     restored_journal = ExtractionBatchJournal(

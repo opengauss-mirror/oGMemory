@@ -36,6 +36,8 @@ def test_default_plan_needs_no_credentials_and_writes_nothing(tmp_path, monkeypa
     fixture.main(arguments(tmp_path))
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "planned" and report["docker_calls"] == report["provider_calls"] == 0
+    assert report["native_extraction_temperature_arguments"] == [None]
+    assert report["native_extraction_effective_temperatures"] == [0.7]
     assert report["extraction_max_tokens"] == 32768
     assert OgMemConfig().llm_max_tokens == 4096
     assert not (tmp_path / "fixture").exists()
@@ -117,6 +119,8 @@ def test_explicit_sampling_changes_are_recorded_not_silently_selected(tmp_path, 
     assert c.llm_temperature == 0 and c.llm_max_tokens == 32768
     assert c.llm_extra_body == {"thinking": {"type": "disabled"}}
     report = json.loads(capsys.readouterr().out)
+    assert report["native_extraction_temperature_arguments"] == [None]
+    assert report["native_extraction_effective_temperatures"] == [0.0]
     assert report["extraction_max_tokens"] == 32768
 
 
@@ -144,14 +148,17 @@ def test_graph_profile_uses_only_native_feature_switches_and_records_models(tmp_
     assert cfg.after_turn_threshold == defaults.after_turn_threshold == 400
     setup = load_setup(root / "setup.json")
     assert setup["variant"] == setup["fixture_profile"] == "graph"
+    report = json.loads(capsys.readouterr().out)
     manifest = setup["benchmark_settings"]
+    assert report["native_extraction_temperature_arguments"] == manifest["native_extraction_temperature_arguments"]
+    assert report["native_extraction_effective_temperatures"] == manifest["native_extraction_effective_temperatures"]
     assert setup["native_policy"]["after_turn_threshold"] == 400
     assert setup["native_policy"]["recall_score_gap_ratio"] == 0.10
-    assert setup["native_policy"]["extraction_temperature_arguments"] == [None, 0]
-    assert setup["native_policy"]["extraction_effective_temperatures"] == [float(temperature), 0]
+    assert setup["native_policy"]["extraction_temperature_arguments"] == [None]
+    assert setup["native_policy"]["extraction_effective_temperatures"] == [float(temperature)]
     assert all(value > 0 for value in setup["native_policy"]["routing_keyword_counts"].values())
-    assert manifest["native_extraction_temperature_arguments"] == [None, 0]
-    assert manifest["native_extraction_effective_temperatures"] == [float(temperature), 0]
+    assert manifest["native_extraction_temperature_arguments"] == [None]
+    assert manifest["native_extraction_effective_temperatures"] == [float(temperature)]
     assert manifest["embedding_model"] == "embedding-model" and manifest["embedding_dimension"] == 1536
     assert manifest["extraction_model"] == "extraction-model" and manifest["qa_model"] == "answer-model"
     assert manifest["routing"] == "native keyword matching; unchanged"

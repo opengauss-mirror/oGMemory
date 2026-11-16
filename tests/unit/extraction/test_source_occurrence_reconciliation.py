@@ -108,6 +108,7 @@ class SourceLLM:
 def writer(llm, *, fs=None, enabled=True, mode="eager"):
     fs = fs or MemoryFS()
     return MemoryWriteAPI(fs, llm, directory_summary_enabled=False, extraction_mode=mode,
+                          dual_pass_enabled=True,
                           source_occurrence_reconciliation_enabled=enabled), fs
 
 
@@ -210,6 +211,7 @@ def test_real_lazy_react_path_with_explicit_flag_makes_no_new_source_group_calls
     registry = SchemaRegistry()
     api = MemoryWriteAPI(fs, llm, schema_registry=registry, uri_resolver=URIResolver(registry),
                          extraction_mode="lazy", source_occurrence_reconciliation_enabled=True,
+                         dual_pass_enabled=True,
                          directory_summary_enabled=False)
     assert api._pipeline._extractors[0]._use_lazy_mode()
     assert len(extract(api, messages())) == 2
