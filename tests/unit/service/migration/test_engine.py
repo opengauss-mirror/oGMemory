@@ -616,3 +616,136 @@ def test_restore_rechecks_model_configuration_after_preview(tmp_path):
     with pytest.raises(PackageError, match="dimension 384.*dimension 1024"):
         importer.restore(package)
     assert not target.files
+
+
+@pytest.mark.parametrize("endpoint", ["from_uri", "to_uri"])
+@pytest.mark.parametrize("operation", ["preflight", "restore"])
+def test_sql_graph_archive_endpoint_rejected_before_target_access(tmp_path, endpoint, operation):
+    from service.migration.records import archive_uri
+
+    edge = dict(
+        from_uri=node()["uri"],
+        to_uri=node()["uri"],
+        relation_type="derived_from",
+        weight=1.0,
+        reason="history evidence",
+    )
+    edge[endpoint] = archive_uri(archive())
+    package = tmp_path / "archive-edge.tar.gz"
+    write_package(
+        package,
+        {"nodes": [node()], "archives": [archive()], "relations": [edge]},
+        source_backend="agfs",
+        source_version="test",
+    )
+    target = Files()
+    importer = service(target)
+    importer.cfg.graph_backend = "sql"
+
+    def forbidden(cfg):
+        pytest.fail("invalid graph endpoint reached target storage")
+
+    importer.adapter_factory = forbidden
+    with pytest.raises(PackageError, match="SQL graph projection requires node endpoints"):
+        getattr(importer, operation)(package)
+    assert not target.files
+
+
+@pytest.mark.parametrize("graph", ["none", "sql"])
+@pytest.mark.parametrize("endpoint", ["from_uri", "to_uri"])
+def test_sql_relation_alias_rejected_before_target_access(tmp_path, graph, endpoint):
+    directory = {**node(), "uri": node()["uri"].rsplit("/", 1)[0] + "/", "content": ""}
+    edge = dict(
+        from_uri=node()["uri"],
+        to_uri=node()["uri"],
+        relation_type="related_to",
+        weight=1.0,
+        reason="directory",
+    )
+    edge[endpoint] = directory["uri"].rstrip("/")
+    package = tmp_path / "alias.tar.gz"
+    write_package(
+        package,
+        {"nodes": [node(), directory], "relations": [edge], "archives": []},
+        source_backend="agfs",
+        source_version="test",
+    )
+    importer = service(Files())
+    importer.cfg.storage_backend = "sql"
+    importer.cfg.graph_backend = graph
+
+    def forbidden(cfg):
+        pytest.fail("alias reached target adapter")
+
+    importer.adapter_factory = forbidden
+    for operation in (importer.preflight, importer.restore):
+        with pytest.raises(PackageError, match="exactly match stored URI"):
+            operation(package)
+
+
+@pytest.mark.parametrize("count", [8, 16])
+def test_scoped_index_reads_decode_each_node_once(tmp_path, count):
+    from unittest.mock import patch
+
+    from service.migration.engine import Inventory
+    from service.migration.rebuild import Rebuilder
+
+    inv = Inventory(tmp_path / "inventory.sqlite")
+    try:
+        scopes = []
+        for i in range(count):
+            account, owner = f"account{i % 2}", f"user:u{i}"
+            inv.add(
+                "nodes",
+                {
+                    **node(),
+                    "account_id": account,
+                    "owner_space": owner,
+                    "uri": f"ctx://{account}/users/u{i}/memories/preferences/editor",
+                },
+            )
+            scopes.append((account, owner))
+        inv.finish()
+        rebuilder = Rebuilder.__new__(Rebuilder)
+        with patch("service.migration.engine.json.loads", wraps=json.loads) as decode:
+            for scope in scopes:
+                records = list(rebuilder._records(inv, scope))
+                assert records
+                assert all(
+                    (r.filters["account_id"], r.filters["owner_space"]) == scope for r in records
+                )
+            assert decode.call_count == count
+        plan = inv.db.execute(
+            "EXPLAIN QUERY PLAN SELECT body FROM records WHERE kind=? "
+            "AND json_extract(body,'$.account_id')=? AND json_extract(body,'$.owner_space')=? ORDER BY key",
+            ("nodes", *scopes[0]),
+        ).fetchall()
+        assert any("record_scope" in row[-1] for row in plan)
+    finally:
+        inv.close()
+
+
+@pytest.mark.parametrize("count", [8, 16])
+def test_agfs_edges_are_written_once_per_source(count):
+    from unittest.mock import patch
+
+    files = Files()
+    adapter = AGFSStorage(config(), files)
+    adapter.restore("nodes", [node()])
+    edges = [
+        dict(
+            from_uri=node()["uri"],
+            to_uri=node()["uri"],
+            relation_type=f"related_{i}",
+            weight=1.0,
+            reason="edge",
+        )
+        for i in range(count)
+    ]
+    with (
+        patch.object(files, "read", wraps=files.read) as read,
+        patch.object(files, "write", wraps=files.write) as write,
+    ):
+        adapter.restore("relations", iter(edges))
+        assert read.call_count == write.call_count == 1
+    assert list(adapter.records("relations")) == edges

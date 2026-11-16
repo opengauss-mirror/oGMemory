@@ -632,3 +632,590 @@ def test_rebuilt_vectors_are_accepted_by_graph_and_activation(tmp_path):
         }
     finally:
         index.close()
+
+
+@pytest.mark.parametrize("mutation", ["comment", "trailer", "crc", "concatenated", "padding"])
+def test_invalid_gzip_rejected_before_target_restore(tmp_path, mutation):
+    import gzip
+
+    from service.migration.package import DATASETS, PackageError, PackageLimits, write_package
+
+    target = new_config("sql", "invalid-envelope")
+    package = tmp_path / "invalid.tar.gz"
+    write_package(package, {k: [] for k in DATASETS}, source_backend="agfs", source_version="test")
+    raw = package.read_bytes()
+    if mutation == "comment":
+        end = raw.index(b"\0", 10) + 1 if raw[3] & 8 else 10
+        raw = raw[:3] + bytes([raw[3] | 16]) + raw[4:end] + b"A" * 65536 + b"\0" + raw[end:]
+    elif mutation == "trailer":
+        raw = raw[:-8]
+    elif mutation == "crc":
+        raw = raw[:-8] + bytes([raw[-8] ^ 1]) + raw[-7:]
+    elif mutation == "concatenated":
+        raw += gzip.compress(b"another member")
+    else:
+        raw = gzip.compress(gzip.decompress(raw) + b"\0" * 65536)
+    package.write_bytes(raw)
+    service = MigrationService(target)
+    # Exercise the same reader used by restore with a small deterministic budget.
+    from functools import partial
+    from unittest.mock import patch
+
+    from service.migration.package import open_package
+
+    with patch(
+        "service.migration.engine.open_package",
+        partial(open_package, limits=PackageLimits(max_bytes=1024, max_files=4)),
+    ):
+        with pytest.raises(PackageError):
+            service.restore(package)
+    with storage(target) as adapter:
+        adapter.check(empty=True)
+        assert all(not list(adapter.records(kind)) for kind in DATASETS)
+    index = target.to_provider_config().create_vector_index()
+    try:
+        assert index.count() == 0
+    finally:
+        index.close()
+
+
+def test_business_writes_migrate_to_graph_candidate_selection(tmp_path):
+    from dataclasses import replace
+
+    from core.models import RelationEdge, RequestContext
+    from fs.sql_adapter.pool import SharedConnectionPool
+    from fs.sql_adapter.sql_context_fs import SQLContextFS
+    from providers.relation_store.sql_relation_store import SQLRelationStore
+    from retrieval.context_reader import ContextReader
+    from retrieval.graph_supplement import GraphSupplement
+    from service.api import MemoryWriteAPI
+    from service.graph_service import GraphService
+    from tests.unit.commit.test_memory_identity import memory
+    from tests.unit.server.test_extraction_batch_recovery import NoModel
+
+    source, target = new_config("sql", "graph-source"), new_config("sql", "graph-target")
+    target.graph_backend = "sql"
+    ctx = RequestContext(
+        account_id="acme", user_id="alice", agent_id="main", session_id="graph", trace_id="graph"
+    )
+    pool = SharedConnectionPool(
+        source.sql_connection_string, dialect=source.sql_dialect, pool_size=2
+    )
+    try:
+        writer = MemoryWriteAPI(SQLContextFS(pool=pool), NoModel(), directory_summary_enabled=False)
+        uris = [
+            writer.write_memory(
+                replace(memory(key, category="preference", content=text), provenance_ids=[]), ctx
+            )["target_uri"]
+            for key, text in (
+                ("editor", "Use the editor for development."),
+                ("terminal", "Use a terminal to run commands."),
+            )
+        ]
+        SQLRelationStore(pool=pool).upsert_edges(
+            [
+                RelationEdge(
+                    from_uri=uris[0],
+                    to_uri=uris[1],
+                    relation_type="related_to",
+                    weight=1.0,
+                    reason="Development tools",
+                )
+            ],
+            ctx,
+        )
+    finally:
+        pool.close_all()
+    package = tmp_path / "graph-business.tar.gz"
+    MigrationService(source).export(package)
+    MigrationService(target).restore(package)
+    pool = SharedConnectionPool(
+        target.sql_connection_string, dialect=target.sql_dialect, pool_size=2
+    )
+    provider = target.to_provider_config()
+    index, embedder = provider.create_vector_index(), provider.create_embedder()
+    try:
+        reader = ContextReader(SQLContextFS(pool=pool), storage_backend="sql")
+        profile = dict(
+            profile_id=target.graph_edge_embedding_profile,
+            model=embedder.model,
+            dimension=target.opengauss_dimension,
+            representation_version=target.graph_projection_representation,
+        )
+        graph = GraphService(None, relation_reader=SQLRelationStore(pool=pool))
+        consumer = GraphSupplement(graph, reader, index, embedder, profile)
+        anchor = reader.read_authorized(uris[1], ctx)
+        selected = consumer.select("Use the editor for development.", [anchor], [anchor], ctx)
+        candidate = next(item for item in selected["selected"] if item["uri"] == uris[0])
+        assert candidate["incoming"]
+        assert candidate["visited_endpoint_similarity"] == pytest.approx(1.0)
+        assert candidate["accepted"]
+        from server.memory_service import MemoryService
+
+        normal_service = MemoryService(target)
+        try:
+            baseline = [
+                dict(
+                    uri=anchor.uri,
+                    abstract=anchor.abstract,
+                    overview=anchor.overview,
+                    content=anchor.content_excerpt,
+                    category=anchor.category,
+                )
+            ]
+            stats = {"graph_expansion": {"two_hop_supplement": selected}}
+            query = "Use the editor for development."
+            budget = {"working_set": 20000}
+
+            def formatter(items, allocation):
+                return normal_service._format_working_set(items, allocation, query=query)
+
+            delivered = consumer.deliver(baseline, query, stats, ctx, budget, formatter)
+            assert [item["uri"] for item in delivered] == [uris[1], uris[0]]
+            assert formatter(delivered, budget).startswith(formatter(baseline, budget))
+            assert "Use the editor for development." in formatter(delivered, budget)
+        finally:
+            normal_service.shutdown()
+    finally:
+        index.close()
+        pool.close_all()
+
+
+def test_trace_produced_agent_memory_rejects_unsupported_evidence(tmp_path, request):
+    from pyagfs import AGFSClient
+
+    from commit.sql_outbox_store import SQLOutboxStore
+    from core.models import RequestContext
+    from fs.agfs_adapter.agfs_trace_store import AGFSTraceEventStore
+    from fs.sql_adapter.pool import SharedConnectionPool
+    from fs.sql_adapter.sql_context_fs import SQLContextFS
+    from server.agent_memory import process_trace_memory, trace_memory_event
+    from server.mcp_trace import message_events
+    from service.migration.package import PackageError
+    from tests.unit.server.test_agent_memory import MESSAGES, ExtractionLLM
+
+    source = new_config("sql", "trace-source")
+    client = AGFSClient(api_base_url=source.agfs_base_url)
+    pool = SharedConnectionPool(
+        source.sql_connection_string, dialect=source.sql_dialect, pool_size=2
+    )
+    request.addfinalizer(pool.close_all)
+    fs = SQLContextFS(pool=pool)
+    traces = AGFSTraceEventStore(client=client, mount_prefix=source.agfs_mount_prefix)
+    ctx = RequestContext("acme", "alice", "main", "trace-session", "trace-request")
+    for i, event in enumerate(
+        message_events(MESSAGES) + [{"event_type": "turn_end", "status": "ok"}]
+    ):
+        inserted = traces.insert(
+            event_id=str(i),
+            account_id=ctx.account_id,
+            owner_space=ctx.user_space_name(),
+            agent_id=ctx.agent_id,
+            session_id=ctx.session_id,
+            hook_type=event["event_type"],
+            content=event,
+        )
+    finalized = traces.finalize_session(
+        account_id=ctx.account_id,
+        owner_space=ctx.user_space_name(),
+        agent_id=ctx.agent_id,
+        session_id=ctx.session_id,
+        stop_event_index=inserted["event_index"],
+    )
+    outbox = SQLOutboxStore(pool=pool, fs=fs)
+    event = trace_memory_event(finalized["uri"], ctx)
+    outbox.register_once(event, ctx)
+    process_trace_memory(event, trace_store=traces, outbox=outbox, fs=fs, llm=ExtractionLLM())
+    outbox.mark_done(event, event.uri)
+    with storage(source) as adapter:
+        nodes = list(adapter.records("nodes"))
+    assert nodes and all(finalized["uri"] in n["metadata"]["provenance_ids"] for n in nodes)
+    with pytest.raises(PackageError, match="trace/tool evidence"):
+        MigrationService(source).export(tmp_path / "trace.tar.gz")
+    assert not (tmp_path / "trace.tar.gz").exists()
+
+
+@pytest.mark.parametrize(
+    "source_backend,target_backend",
+    [
+        ("agfs", "agfs"),
+        ("agfs", "sql"),
+        ("sql", "agfs"),
+        ("sql", "sql"),
+    ],
+)
+def test_archive_producer_to_provenance_consumer(tmp_path, source_backend, target_backend):
+    from contextlib import ExitStack
+    from dataclasses import replace
+
+    from pyagfs import AGFSClient
+
+    from core.models import RequestContext
+    from core.provenance_resolver import ProvenanceResolver
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from fs.sql_adapter.pool import SharedConnectionPool
+    from fs.sql_adapter.sql_context_fs import SQLContextFS
+    from service.api import MemoryWriteAPI
+    from session.archive_store import SessionArchiveStore
+    from session.sql_archive_store import SQLSessionArchiveStore
+    from tests.unit.commit.test_memory_identity import memory
+    from tests.unit.server.test_extraction_batch_recovery import NoModel
+
+    source, target = (
+        new_config(source_backend, "archive-source"),
+        new_config(target_backend, "archive-target"),
+    )
+    ctx = RequestContext("acme", "alice", "main", "archive-session", "archive-test")
+    messages = [{"id": "message-1", "role": "user", "content": "请记住：我偏好深色主题 🌙"}]
+    with ExitStack() as cleanup:
+
+        def open_readers(cfg):
+            if cfg.storage_backend == "sql":
+                pool = SharedConnectionPool(
+                    cfg.sql_connection_string, dialect=cfg.sql_dialect, pool_size=2
+                )
+                cleanup.callback(pool.close_all)
+                fs = SQLContextFS(pool=pool)
+                return fs, SQLSessionArchiveStore(pool=pool)
+            fs = AGFSContextFS(AGFSClient(api_base_url=cfg.agfs_base_url), cfg.agfs_mount_prefix)
+            return fs, SessionArchiveStore(fs)
+
+        source_fs, source_archives = open_readers(source)
+        written = source_archives.write_archive(
+            ctx.session_id, "主题偏好", "深色主题", messages, ctx
+        )
+        assert written.success, written.error
+        provenance = ProvenanceResolver.build_id("archive", written.archive_id, ["message-1"])
+        candidate = replace(
+            memory("theme", category="preference", content="我偏好深色主题 🌙"),
+            provenance_ids=[provenance],
+        )
+        uri = MemoryWriteAPI(source_fs, NoModel(), directory_summary_enabled=False).write_memory(
+            candidate, ctx
+        )["target_uri"]
+        package = tmp_path / "archive.tar.gz"
+        MigrationService(source).export(package)
+        MigrationService(target).restore(package)
+        target_fs, archives = open_readers(target)
+        restored = target_fs.read_node(uri, ctx)
+        parsed = ProvenanceResolver.parse_id(restored.metadata["provenance_ids"][0])
+        entry = archives.read_archive_by_id(parsed["source_id"], ctx)
+        assert entry is not None
+        assert entry.messages == messages and entry.abstract == "深色主题"
+        assert [m for m in entry.messages if m["id"] in parsed["detail"]] == messages
+        assert archives.read_archive_by_id(written.archive_id, replace(ctx, user_id="bob")) is None
+        assert (
+            archives.read_archive_by_id(written.archive_id, replace(ctx, account_id="other"))
+            is None
+        )
+
+
+@pytest.mark.parametrize("archive_endpoint", ["from_uri", "to_uri"])
+def test_archive_relation_requires_node_endpoints_only_for_sql_graph(tmp_path, archive_endpoint):
+    from dataclasses import replace
+
+    from pyagfs import AGFSClient
+
+    from core.models import RelationEdge, RequestContext
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from providers.relation_store.agfs_relation_store import AGFSRelationStore
+    from service.api import MemoryWriteAPI
+    from service.migration.package import PackageError
+    from session.archive_store import SessionArchiveStore
+    from tests.unit.commit.test_memory_identity import memory
+    from tests.unit.server.test_extraction_batch_recovery import NoModel
+
+    source, target = (
+        new_config("agfs", "archive-edge-source"),
+        new_config("sql", "archive-edge-target"),
+    )
+    target.graph_backend = "sql"
+    client = AGFSClient(api_base_url=source.agfs_base_url)
+    fs = AGFSContextFS(client, source.agfs_mount_prefix)
+    ctx = RequestContext("acme", "alice", "main", "edge-session", "edge-test")
+    archived = SessionArchiveStore(fs).write_archive(
+        ctx.session_id, "history", "history", [{"role": "user", "content": "theme"}], ctx
+    )
+    assert archived.success, archived.error
+    uri = MemoryWriteAPI(fs, NoModel(), directory_summary_enabled=False).write_memory(
+        replace(memory("theme", category="preference"), provenance_ids=[]), ctx
+    )["target_uri"]
+    edge = dict(
+        from_uri=uri,
+        to_uri=uri,
+        relation_type="derived_from",
+        weight=1.0,
+        reason="history evidence",
+    )
+    edge[archive_endpoint] = archived.uri
+    AGFSRelationStore(client, source.agfs_mount_prefix).upsert_edges([RelationEdge(**edge)], ctx)
+    package = tmp_path / "archive-edge.tar.gz"
+    MigrationService(source).export(package)
+    importer = MigrationService(target)
+    for operation in (importer.preflight, importer.restore):
+        with pytest.raises(PackageError, match="SQL graph projection requires node endpoints"):
+            operation(package)
+        with storage(target) as adapter:
+            adapter.check(empty=True)
+            assert all(
+                not list(adapter.records(kind)) for kind in ("nodes", "archives", "relations")
+            )
+        index = target.to_provider_config().create_vector_index()
+        try:
+            assert index.count() == 0
+        finally:
+            index.close()
+    target.graph_backend = "none"
+    importer.preflight(package)
+    importer.restore(package)
+    with storage(target) as adapter:
+        assert len(list(adapter.records("nodes"))) == 1
+        assert len(list(adapter.records("archives"))) == 1
+        assert list(adapter.records("relations")) == [edge]
+
+
+@pytest.mark.parametrize("source_backend", ["agfs", "sql"])
+@pytest.mark.parametrize("identity_case", ["account", "user", "agent"])
+def test_sessions_identifier_survives_sql_migration(tmp_path, source_backend, identity_case):
+    from contextlib import ExitStack
+
+    from pyagfs import AGFSClient
+
+    from core.models import ContextNode, RequestContext
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from fs.sql_adapter.pool import SharedConnectionPool
+    from fs.sql_adapter.sql_context_fs import SQLContextFS
+
+    source, target = new_config(source_backend, "id-source"), new_config("sql", "id-target")
+    ctx = RequestContext(
+        "sessions" if identity_case == "account" else "acme",
+        "sessions" if identity_case == "user" else "alice",
+        "sessions" if identity_case == "agent" else "main",
+        "s",
+        "test",
+    )
+    owner_type, owner = (
+        ("agents", ctx.agent_id) if identity_case == "agent" else ("users", ctx.user_id)
+    )
+    uri = f"ctx://{ctx.account_id}/{owner_type}/{owner}/memories/preferences/editor"
+    with ExitStack() as cleanup:
+        if source_backend == "sql":
+            pool = SharedConnectionPool(
+                source.sql_connection_string, dialect=source.sql_dialect, pool_size=2
+            )
+            cleanup.callback(pool.close_all)
+            fs = SQLContextFS(pool=pool)
+        else:
+            fs = AGFSContextFS(
+                AGFSClient(api_base_url=source.agfs_base_url), source.agfs_mount_prefix
+            )
+        fs.write_node(
+            ContextNode(
+                uri=uri,
+                context_type="MEMORY",
+                category="preference",
+                level=0,
+                owner_space=f"{owner_type[:-1]}:{owner}",
+                abstract="editor",
+                overview="editor",
+                content="Use a dark editor.",
+                metadata={},
+            ),
+            ctx,
+        )
+        package = tmp_path / "sessions-id.tar.gz"
+        exported = MigrationService(source).export(package)
+        assert exported["data"]["nodes"]["count"] == 1
+        imported = MigrationService(target).restore(package)
+        assert imported["data"] == exported["data"]
+        pool = SharedConnectionPool(
+            target.sql_connection_string, dialect=target.sql_dialect, pool_size=2
+        )
+        cleanup.callback(pool.close_all)
+        assert SQLContextFS(pool=pool).read_node(uri, ctx).content == "Use a dark editor."
+
+
+@pytest.mark.parametrize("graph", ["none", "sql"])
+@pytest.mark.parametrize("alias", [True, False])
+def test_directory_relation_uri_matches_sql_identity(tmp_path, graph, alias):
+    from dataclasses import replace
+
+    from pyagfs import AGFSClient
+
+    from core.models import ContextNode, RelationEdge, RequestContext
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from providers.relation_store.agfs_relation_store import AGFSRelationStore
+    from service.api import MemoryWriteAPI
+    from service.migration.package import PackageError
+    from tests.unit.commit.test_memory_identity import memory
+    from tests.unit.server.test_extraction_batch_recovery import NoModel
+
+    source, target = new_config("agfs", "directory-source"), new_config("sql", "directory-target")
+    target.graph_backend = graph
+    client = AGFSClient(api_base_url=source.agfs_base_url)
+    fs = AGFSContextFS(client, source.agfs_mount_prefix)
+    ctx = RequestContext("acme", "alice", "main", "s", "test")
+    uri = MemoryWriteAPI(fs, NoModel(), directory_summary_enabled=False).write_memory(
+        replace(memory("editor", category="preference"), provenance_ids=[]), ctx
+    )["target_uri"]
+    directory = uri.rsplit("/", 1)[0] + "/"
+    fs.write_node(
+        ContextNode(
+            uri=directory,
+            context_type="MEMORY",
+            category="preference",
+            level=0,
+            owner_space="user:alice",
+            abstract="preferences",
+            overview="preferences",
+            content="",
+            metadata={},
+        ),
+        ctx,
+    )
+    edge = RelationEdge(
+        from_uri=uri,
+        to_uri=directory.rstrip("/") if alias else directory,
+        relation_type="related_to",
+        weight=1,
+        reason="directory",
+    )
+    AGFSRelationStore(client, source.agfs_mount_prefix).upsert_edges([edge], ctx)
+    package = tmp_path / "directory.tar.gz"
+    MigrationService(source).export(package)
+    importer = MigrationService(target)
+    if alias:
+        for operation in (importer.preflight, importer.restore):
+            with pytest.raises(PackageError, match="exactly match stored URI"):
+                operation(package)
+        with storage(target) as adapter:
+            adapter.check(empty=True)
+        index = target.to_provider_config().create_vector_index()
+        try:
+            assert index.count() == 0
+        finally:
+            index.close()
+    else:
+        importer.preflight(package)
+        importer.restore(package)
+        with storage(target) as adapter:
+            rows = list(adapter.records("relations"))
+            nodes = {r["uri"] for r in adapter.records("nodes")}
+        assert rows and all(r["from_uri"] in nodes and r["to_uri"] in nodes for r in rows)
+
+
+def test_agfs_relation_group_uses_one_remote_read_and_write():
+    from unittest.mock import patch
+
+    from pyagfs import AGFSClient
+
+    from core.models import ContextNode, RelationEdge, RequestContext
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from providers.relation_store.agfs_relation_store import AGFSRelationStore
+    from service.migration.storage import AGFSStorage
+
+    cfg = new_config("agfs", "edge-batch")
+    client = AGFSClient(api_base_url=cfg.agfs_base_url)
+    ctx = RequestContext("acme", "alice", "main", "s", "test")
+    uri = "ctx://acme/users/alice/memories/preferences/editor"
+    AGFSContextFS(client, cfg.agfs_mount_prefix).write_node(
+        ContextNode(
+            uri=uri,
+            context_type="MEMORY",
+            category="preference",
+            level=0,
+            owner_space="user:alice",
+            abstract="editor",
+            overview="editor",
+            content="editor",
+            metadata={},
+        ),
+        ctx,
+    )
+    edges = [
+        dict(from_uri=uri, to_uri=uri, relation_type=f"related_{i}", weight=1.0, reason="edge")
+        for i in range(16)
+    ]
+    with (
+        patch.object(client, "read", wraps=client.read) as read,
+        patch.object(client, "write", wraps=client.write) as write,
+    ):
+        AGFSStorage(cfg, client).restore("relations", iter(edges))
+        assert read.call_count == write.call_count == 1
+    assert AGFSRelationStore(client, cfg.agfs_mount_prefix).get_edges(uri, ctx) == [
+        RelationEdge(**e) for e in edges
+    ]
+
+
+@pytest.mark.parametrize("failure", ["refused", "authentication"])
+def test_migration_job_logs_real_database_failure(tmp_path, caplog, failure):
+    import logging
+    import socket
+    import time
+
+    from psycopg2.extensions import make_dsn, parse_dsn
+
+    from server.migration_server import create_app
+
+    cfg = new_config("sql", "diagnostic-source")
+    cfg.root_api_key = "diagnostic-admin-key"
+    original_dsn = cfg.sql_connection_string
+    app = create_app(cfg, tmp_path, maintenance_confirmed=True)
+    client = app.test_client()
+    client.post("/api/migration/login", headers={"X-API-Key": cfg.root_api_key})
+
+    def export_job():
+        response = client.post(
+            "/api/migration/jobs", json={"kind": "export", "maintenance_confirmed": True}
+        )
+        assert response.status_code == 202
+        job_id = response.get_json()["job_id"]
+        for _ in range(200):
+            job = client.get("/api/migration/jobs/" + job_id).get_json()
+            if job["status"] != "running":
+                return job
+            time.sleep(0.05)
+        pytest.fail("migration job did not finish")
+
+    assert export_job()["status"] == "succeeded"
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="server.migration_server")
+    reserved = socket.socket()
+    try:
+        if failure == "refused":
+            # Reserve a non-listening port: real libpq connection refusal,
+            # without stopping or changing the database used by other tests.
+            reserved.bind(("127.0.0.1", 0))
+            cfg.sql_connection_string = make_dsn(
+                original_dsn, port=reserved.getsockname()[1], connect_timeout=1
+            )
+        else:
+            cfg.sql_connection_string = make_dsn(
+                original_dsn, password="deliberately-wrong-password", connect_timeout=2
+            )
+        job = export_job()
+        assert job["status"] == "failed"
+        assert (
+            job["error"]
+            == "OperationalError: operation failed; inspect isolated target before retrying"
+        )
+        records = [r for r in caplog.records if r.name == "server.migration_server"]
+        assert len(records) == 1 and records[0].exc_info is None
+        text = records[0].getMessage()
+        assert f"job_id={job['id']} kind=export phase=validating" in text
+        assert "service.migration.storage" in text and "OperationalError" in text
+        if failure == "refused":
+            assert "connection refused" in text.lower()
+        else:
+            assert any(word in text.lower() for word in ("password", "authentication", "login"))
+        for secret in (
+            parse_dsn(original_dsn)["password"],
+            "deliberately-wrong-password",
+            cfg.root_api_key,
+            cfg.sql_connection_string,
+        ):
+            assert secret not in text and secret not in str(job)
+    finally:
+        reserved.close()
+        cfg.sql_connection_string = original_dsn
+    assert export_job()["status"] == "succeeded"
