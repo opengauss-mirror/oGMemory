@@ -5,7 +5,7 @@
 ## 准备
 
 1. 源端完成在途写入、归档及落盘，停止源、目标业务 HTTP、MCP 和独立后台任务。
-2. 准备空目标业务存储和持久化向量库，配置目标模型。已有表或 collection 的维度须与模型一致；`memory` 向量后端不能作为导入目标。
+2. 准备空目标业务存储和持久化向量库，配置目标模型。AGFS 目标的节点、归档路径每个组件最多 255 UTF-8 字节，预检及导入前检查。已有表或 collection 的维度须与模型一致；`memory` 向量后端不能作为导入目标。
 3. 配置目标身份和访问权限。迁移保留账号、用户和 Agent 标识，不复制凭证或连接配置。
 4. SQL 全实例迁移使用可绕过租户 RLS 的管理员：PostgreSQL superuser 或 openGauss SYSADMIN。openGauss 数据库使用 `DBCOMPATIBILITY 'PG'`。
 

@@ -243,9 +243,10 @@ class MigrationService:
         validate_relation_endpoints(self.cfg, inv)
         return assets
 
-    def _check_target(self, adapter):
+    def _check_target(self, adapter, inv):
         from service.migration.rebuild import validate_target_model
 
+        adapter.validate_restore(inv)
         adapter.check(empty=True)
         target = describe(self.cfg, adapter)
         validate_target_model(self.cfg, target["embedding"]["dimension"])
@@ -258,7 +259,7 @@ class MigrationService:
         ):
             self._validate_source(package, inv)
             with self.adapter_factory(self.cfg) as adapter:
-                target = self._check_target(adapter)
+                target = self._check_target(adapter, inv)
             with self._indexes() as indexes:
                 indexes.check_empty()
                 indexes.validate_records(inv)
@@ -296,7 +297,7 @@ class MigrationService:
             assets = self._validate_source(package, inv)
             expected = inv.summary()
             with self.adapter_factory(self.cfg) as adapter:
-                self._check_target(adapter)
+                self._check_target(adapter, inv)
                 with self._indexes() as indexes:
                     indexes.check_empty()
                     indexes.validate_records(inv)

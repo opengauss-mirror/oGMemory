@@ -838,3 +838,56 @@ def test_oversize_attachment_rejected_before_hashing(tmp_path, monkeypatch):
     monkeypatch.setattr('hashlib.file_digest', lambda *a: pytest.fail('must reject before hashing'))
     with pytest.raises(PackageError, match='USTAR'):
         Assets(tmp_path, tmp_path).capture(row)
+
+
+@pytest.mark.parametrize('kind', ['owner', 'session', 'slug', 'encoded_slug'])
+@pytest.mark.parametrize('component_bytes', [255, 256])
+def test_agfs_target_path_byte_capacity_before_restore(tmp_path, kind, component_bytes):
+    from urllib.parse import quote
+
+    component = '用' * 85 + ('x' if component_bytes == 256 else '')
+    records = [node()]
+    archives = []
+    if kind == 'session':
+        item = archive()
+        item['session_id'] = component
+        archives.append(item)
+    else:
+        item = node()
+        if kind == 'owner':
+            item['uri'] = item['uri'].replace('/alice/', '/' + component + '/')
+            item['owner_space'] = 'user:' + component
+        else:
+            # Keep the encoded URI below the independent 512-character limit.
+            slug = quote('用') + component[1:] if kind == 'encoded_slug' else component
+            item['uri'] = item['uri'].rsplit('/', 1)[0] + '/' + slug
+        records.append(item)
+    package = tmp_path / 'sql-source.tar.gz'
+    write_package(package, {'nodes': records, 'archives': archives, 'relations': []},
+                  source_backend='sql', source_version='test')
+    target = Files()
+    migration = service(target)
+    if component_bytes == 256:
+        for operation in (migration.preflight, migration.restore):
+            with pytest.raises(PackageError, match='AGFS target path component'):
+                operation(package)
+            assert not target.files
+            assert not target.directories
+    else:
+        migration.preflight(package)
+        migration.restore(package)
+        assert len(list(AGFSStorage(config(), target).records('nodes'))) == len(records)
+        assert len(list(AGFSStorage(config(), target).records('archives'))) == len(archives)
+
+
+def test_sql_target_does_not_apply_agfs_path_byte_limit(tmp_path):
+    from service.migration.engine import inventory
+    from service.migration.storage import SQLStorage
+
+    row = node()
+    owner = '用' * 100
+    row['uri'] = row['uri'].replace('/alice/', '/' + owner + '/')
+    row['owner_space'] = 'user:' + owner
+    with inventory(tmp_path / 'inventory.sqlite',
+                   lambda kind: [row] if kind == 'nodes' else []) as inv:
+        SQLStorage.__new__(SQLStorage).validate_restore(inv)

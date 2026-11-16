@@ -17,6 +17,7 @@ from service.migration.records import (
     NODE_FIELDS,
     RUNTIME_META,
     archive_to_node,
+    archive_uri,
     identity,
     node_to_archive,
     normalize_archive,
@@ -33,6 +34,7 @@ class MigrationStorage(Protocol):
 
     def check(self, *, empty: bool = False) -> None: ...
     def description(self) -> dict: ...
+    def validate_restore(self, inv) -> None: ...
     def records(self, kind: str) -> Iterator[dict]: ...
     def restore(self, kind: str, records: Iterable[dict]) -> None: ...
     def close(self) -> None: ...
@@ -69,6 +71,10 @@ class SQLStorage:
         except Exception:
             self.conn.close()
             raise
+
+    def validate_restore(self, inv):
+        # SQL identity constraints are checked by the canonical record validator.
+        pass
 
     def description(self):
         with self.conn.cursor() as cur:
@@ -306,6 +312,18 @@ class AGFSStorage:
         for _ in self._walk(self.prefix + "/accounts", include_runtime=empty):
             if empty:
                 raise PackageError("target storage is not empty")
+
+    def validate_restore(self, inv):
+        from fs.agfs_adapter.agfs_context_fs import uri_to_path
+
+        # AGFS localfs uses filesystem names, whose capacity is measured in
+        # bytes rather than the character limits of SQL identity columns.
+        for kind in ("nodes", "archives"):
+            for record in inv.records(kind):
+                uri = archive_uri(record) if kind == "archives" else record["uri"]
+                path = self.prefix + uri_to_path(uri)
+                if any(len(part.encode("utf-8")) > 255 for part in path.split("/")):
+                    raise PackageError("AGFS target path component exceeds 255 UTF-8 bytes")
 
     def _node(self, path, meta):
         account, _ = identity(meta["uri"])
