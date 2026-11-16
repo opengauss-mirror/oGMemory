@@ -148,6 +148,7 @@ def test_second_run_native_edge_persists_when_later_generation_adds_nothing(gene
                               {"routing_key": "receiver"}), CTX)
     api = MemoryWriteAPI(fs, llm, schema_registry=registry, uri_resolver=uris,
                          graph_enabled=True, relation_store=store,
+                         dual_pass_enabled=True,
                          directory_summary_enabled=False)
     result = api.commit_session(deepcopy(MESSAGES), CTX, session_time=TIME, archive_id="repair-archive")
     assert result["writes_completed"] == 1

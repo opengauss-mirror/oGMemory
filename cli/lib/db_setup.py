@@ -37,6 +37,33 @@ def check_opengauss_compatibility(connection_string: str) -> bool:
         return False
 
 
+def supports_opengauss_bm25(connection_string: str) -> bool:
+    """Check native BM25 and the privileges needed to create its projection."""
+    from contextlib import closing
+
+    try:
+        import psycopg2
+    except ImportError:
+        return False
+
+    from providers.lexical_index.native_sql_index import supports_native_bm25
+
+    try:
+        with closing(psycopg2.connect(connection_string, connect_timeout=5)) as conn:
+            with conn.cursor() as cursor:
+                if not supports_native_bm25(cursor):
+                    return False
+                cursor.execute(
+                    "SELECT has_schema_privilege(current_schema(), 'USAGE') "
+                    "AND has_schema_privilege(current_schema(), 'CREATE')"
+                )
+                row = cursor.fetchone()
+                return bool(row and row[0])
+    except psycopg2.Error as exc:
+        logger.debug("Native BM25 capability check failed: %s", exc)
+        return False
+
+
 def init_schema(connection_string: str, dialect: str = "postgresql") -> bool:
     """Initialize the oG-Memory schema in the database.
 

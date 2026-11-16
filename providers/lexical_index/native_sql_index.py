@@ -227,6 +227,33 @@ class DatabaseNativeLexicalIndex(SQLNativeProjectionStore):
             except Exception:
                 pass
 
+def supports_native_bm25(cursor) -> bool:
+    """Check for the native text index and search operator."""
+    cursor.execute(
+        """
+        SELECT
+            EXISTS(
+                SELECT 1
+                FROM pg_opclass opc
+                JOIN pg_am am ON am.oid=opc.opcmethod
+                WHERE am.amname='bm25'
+                  AND opc.opcintype='pg_catalog.text'::regtype
+                  AND opc.opcdefault
+            ),
+            EXISTS(
+                SELECT 1
+                FROM pg_operator opr
+                WHERE opr.oprname='<&>'
+                  AND opr.oprleft='pg_catalog.text'::regtype
+                  AND opr.oprright='pg_catalog.text'::regtype
+                  AND pg_operator_is_visible(opr.oid)
+            )
+        """
+    )
+    row = cursor.fetchone()
+    return bool(row and row[0] and row[1])
+
+
 class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
     """openGauss BM25 provider backed by the native BM25 access method."""
 
@@ -275,29 +302,7 @@ class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
         conn = self._borrow()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                        EXISTS(
-                            SELECT 1
-                            FROM pg_opclass opc
-                            JOIN pg_am am ON am.oid=opc.opcmethod
-                            WHERE am.amname='bm25'
-                              AND opc.opcintype='pg_catalog.text'::regtype
-                              AND opc.opcdefault
-                        ),
-                        EXISTS(
-                            SELECT 1
-                            FROM pg_operator opr
-                            WHERE opr.oprname='<&>'
-                              AND opr.oprleft='pg_catalog.text'::regtype
-                              AND opr.oprright='pg_catalog.text'::regtype
-                              AND pg_operator_is_visible(opr.oid)
-                        )
-                    """
-                )
-                row = cur.fetchone()
-                return bool(row and row[0] and row[1])
+                return supports_native_bm25(cur)
         except Exception:
             self._rollback_preserving(conn)
             raise

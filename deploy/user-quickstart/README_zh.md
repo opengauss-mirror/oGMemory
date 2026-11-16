@@ -57,26 +57,24 @@ export EMBEDDING_MODEL='your-embedding-model'
 export EMBEDDING_API_KEY='your-embedding-api-key'
 export EMBEDDING_DIMENSION='1024'
 
-# 测试场景：短对话也触发记忆提取，必须是正整数。
-export OGMEM_AFTER_TURN_THRESHOLD='1'
+# 记忆提取的待处理 token 阈值，必须是正整数。
+export OGMEM_AFTER_TURN_THRESHOLD='400'
 ```
 
 保存并退出 `vi`：按 `Esc`，输入 `:wq`，按回车。
 
 `OGMEM_AFTER_TURN_THRESHOLD` 控制待处理 token 达到多少时触发记忆提取。
-quickstart 默认值为 `1`（旧环境文件未设置该变量时也使用 `1`），便于短对话测试；
-较小的值会增加模型调用频率。需要降低调用频率时可设为 `200` 或其他正整数。
+quickstart 默认值为 `400`。短对话演示可设为 `1`，让单次短对话触发提取。
 提取和索引仍是异步过程，“记住了”不代表后台处理已经完成；新会话检索前应等待处理完成。
 
-修改环境文件后重新执行部署脚本生效，也可以单次覆盖文件中的值：
+修改环境文件后重新执行部署脚本生效。短对话演示也可以在部署时单次覆盖：
 
 ```bash
-OGMEM_AFTER_TURN_THRESHOLD=200 "$HOME/deploy.sh"
+OGMEM_AFTER_TURN_THRESHOLD=1 "$HOME/deploy.sh"
 ```
 
-配置优先级为：进程环境变量 > `ogmemory.env` > 默认值 `1`。
+配置优先级为进程环境变量 > `ogmemory.env` > 默认值 `400`。
 单次覆盖不修改环境文件；后续部署会重新按以上优先级取值。
-这只改变 quickstart 的默认配置，其他部署方式的默认阈值不变。
 
 
 ### 1.2 执行部署
@@ -126,6 +124,8 @@ RESET_OPENGAUSS_DATA=true "$HOME/deploy.sh"   # 重置数据库和向量索引
 已有实例不能修改 `EMBEDDING_PROVIDER`、`EMBEDDING_MODEL` 或 `EMBEDDING_DIMENSION`。这些配置决定向量空间；混用不同模型会导致检索失真，维度变化会导致向量写入失败。需要更换时，请设置新的 `INSTANCE_NAME` 和一组未占用端口，创建独立实例。
 
 ## 2. 写入、检索与交互体验
+
+运行下文 OpenClaw CE 和 MCP 的短对话示例前，按 1.1 节以阈值 `1` 部署。
 
 ### 2.1 HTTP API 
 

@@ -1,10 +1,9 @@
 <div align="center">
 
-### ContextEngine: Context Lifecycle Engine <br> for CLI Agents
+### oGMemory: A Context Lifecycle Engine <br> for AI Agents
 
-Across every phase of the Agent loop, manage what goes **in**, what **stays**, what gets **evicted**, and what can be **recalled**.
-Seven context types. Three-level cache hierarchy. One virtual filesystem.
-Cut token cost. Preserve signal density. Survive session boundaries.
+Capture selected conversation and tool evidence, recall it across sessions, and manage what enters the model context.
+Memories use schema-defined types, layered representations, and a shared `ctx://` namespace.
 
 English | [中文](README_zh.md)
 
@@ -15,19 +14,17 @@ Documentation: [docs/README.md](docs/README.md)
 
 ## The Problem: Token Budget is the Bottleneck
 
-Every CLI Agent runs on a **fixed token budget**. The context window is both the most expensive and the most scarce resource.
+Agents operate within a model context window and a configured prompt budget. The memory layer determines which earlier facts and task details to bring into a turn.
 
 | Symptom | Root Cause | Missing Lifecycle Stage |
 | -------- | --------- | ----------------------- |
 | Agent forgets earlier conversation | Context window fills up, old content is evicted with no persistence | ④ **afterTurn** — no extraction + persist mechanism |
-| Same mistakes repeated across sessions | No mechanism to carry lessons from one session to the next | ⑥ **session_end** — no archival + ② **bootstrap** — no cold-start injection |
-| A query that should cost $0.05 costs $0.50 | Flat retrieval loads entire documents when an abstract would suffice | ② **assemble** — no L0/L1/L2 hierarchical retrieval |
+| Same mistakes repeated across sessions | Lessons are not carried forward | ⑥ **session_end** and ② **bootstrap** — persist and reuse relevant context |
+| Unnecessary context consumes the prompt budget | Flat retrieval loads entire documents when an abstract would suffice | ② **assemble** — no L0/L1/L2 hierarchical retrieval |
 | Multi-agent coordination failures | Agents cannot see each other's working context | ④ **afterTurn** — no cross-session sharing + multi-tenant isolation |
-| Context bloat in long sessions | No systematic compression — the Agent drowns in its own history | ⑤ **compact** — no signal scoring + summary chain |
+| Context bloat in long sessions | Earlier turns consume an increasing share of the prompt | ⑤ **compact** — summarize and archive eligible session history |
 
-This isn't a model problem. It's an **infrastructure problem**.
-
-ContextEngine provides the missing infrastructure: a full-stack context lifecycle management system that intercepts the Agent loop at six defined stages, treating the context window as a **managed resource** — not an unbounded buffer.
+oGMemory provides persistent context across six common lifecycle boundaries. Native adapters use the boundaries their host exposes. HTTP, MCP, and Python integrations can call the corresponding operations directly.
 
 ---
 
@@ -35,23 +32,21 @@ ContextEngine provides the missing infrastructure: a full-stack context lifecycl
 
 ### Core Insight: Context Has a Lifecycle
 
-Current RAG systems treat retrieval as a single operation — embed a query, search a vector store, return results. This misses the fundamental reality: **context in an Agent system has a complete lifecycle**, just like data in a database.
+Agent context has a lifecycle from extraction and persistence to indexing, recall, compaction, and archival.
 
 ```
   Born          Structured       Stored           Indexed          Recalled        Compressed       Archived
   (extracted    (categorized     (written         (embedded +      (vector         (summarized,     (session end,
-   from          by type,        atomically       upserted         search,         deduplicated,    archived,
-   conversation) routed by       with ordering    to L0/L1/L2      hierarchical    compressed)      checkpointed)
-                  policy)         guarantees)      IndexRecords)    expansion)
+   from          by type,        atomically       projected        search,         deduplicated,    archived,
+   conversation) routed by       with ordering    to applicable    hierarchical    compressed)      checkpointed)
+                  policy)         guarantees)      index levels)    expansion)
 ```
 
-Each phase has different constraints. Extraction must be incremental (don't reprocess old messages). Storage must be atomic (incomplete writes are detectable). Indexing must be asynchronous (don't block the Agent's response). Retrieval must be budget-aware (load only what fits). Compression must preserve signal (protect important context).
-
-A system that handles only one or two of these phases — say, just retrieval — leaves the rest to chance. ContextEngine covers the full lifecycle.
+Extraction processes eligible new messages. Persistence tracks completion separately from indexing. Retrieval applies owner scope and context budgets, and compaction prepares a smaller session context for the next model call.
 
 ### The Six Interception Points
 
-The Agent loop isn't a black box. It has well-defined execution phases. Each phase presents a different opportunity to read, write, or transform context.
+A native agent can use different lifecycle hooks to read, write, or transform context.
 
 ```
   ┌──────────────────────────────────────────────────────────────────────┐
@@ -71,23 +66,23 @@ The Agent loop isn't a black box. It has well-defined execution phases. Each pha
   └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The key design choice: **intercept at the loop boundary, not inside model inference.** Stages ①–⑥ are all outside the LLM call. This means zero latency impact on model inference itself — all context operations happen before or after, never during.
+Native integrations map the host's available hooks to these operations. Retrieval and compaction can add work before a model call. Projection can run in the background, and callers can wait for it when fresh recall is required.
 
 ### Not All Context Is Equal
 
-Seven types of context, each with fundamentally different lifecycle behavior. This isn't arbitrary categorization — it's driven by the semantics of the information itself.
+The following schema-defined categories illustrate how write policies follow the shape of the information.
 
 | Type | Why this lifecycle? | Write Policy |
 | ---- | ------------------- | ------------ |
 | **Profile** | User state changes — "I live in London" may become "I moved to Tokyo" | **Merge** — new overwrites old on conflict |
-| **Preference** | Preferences accumulate per topic but each topic has one current view | **Aggregate by slug** — merge within topic |
-| **Entity** | Entities accumulate facts, but "Project Alpha" is still "Project Alpha" | **Aggregate by slug** — merge within entity |
+| **Preference** | Preferences accumulate per topic but each topic has one current view | **Aggregate by routing key** — merge within topic |
+| **Entity** | Entities accumulate facts, but "Project Alpha" is still "Project Alpha" | **Aggregate by routing key** — merge within entity |
 | **Event** | History is immutable — "completed migration on March 15" never changes | **Append only** — never overwrite |
 | **Case** | Problem-solving traces are historical records | **Append only** — never overwrite |
-| **Pattern** | Patterns emerge from repeated observations and evolve over time | **Aggregate by slug** — refine over time |
-| **Skill** | Tool expertise grows cumulatively — more experience = better knowledge | **Cumulative append** — knowledge accumulates |
+| **Pattern** | Patterns emerge from repeated observations and evolve over time | **Aggregate by routing key** — refine over time |
+| **Skill** | Reusable procedures can evolve with new experience | **Upsert** — keep a reusable skill or tool record current |
 
-Four distinct write policies, each justified by the information's lifecycle semantics. A single "store everything the same way" approach would either lose mutable state (if append-only) or corrupt immutable history (if overwriting).
+These are the core policy examples. Agent-owned tool and experience memory, skill packages, and optional scenario memory have their own update and access rules.
 
 ---
 
@@ -97,28 +92,28 @@ Four distinct write policies, each justified by the information's lifecycle sema
 
 **The problem:** Hardcoding extraction schemas in Python means every new context type requires code changes, testing, and deployment.
 
-**The solution:** YAML schemas declare what to extract and how to categorize it. The SchemaRegistry, PolicyRouter, and URIResolver all consume these schemas at runtime. Adding a new type — say "Decision" or "Handoff" — means adding a YAML file, not modifying the extraction pipeline.
+**The solution:** YAML schemas declare extraction fields, URI layout, owner scope, and operation mode. SchemaRegistry, PolicyRouter, and URIResolver consume these definitions. A new category can reuse an existing policy. A new write behavior can also require a policy or API change.
 
-**What breaks without it:** Every new context type becomes a code change that touches extraction, commit routing, and URI resolution — three packages that must be co-released. In practice, teams just skip adding new types, and everything gets shoved into generic "notes."
+**What breaks without it:** Extraction, routing, and URI rules would have to repeat category definitions in separate components.
 
 ### Why the Outbox pattern for async indexing?
 
-**The problem:** Embedding + upserting to a vector index takes 100–500ms. If synchronous, every `afterTurn` blocks for that duration, adding latency to the Agent's response.
+**The problem:** Embedding and upserting into a search index can take longer than publishing the canonical record, and the index can be temporarily unavailable.
 
-**The solution:** The Outbox pattern decouples writing (fast, ~50ms) from indexing (slow, async). Each write deposits an OutboxEvent on disk. A background worker consumes events with at-least-once delivery guarantees and a DLQ for permanent failures. The write path returns immediately; the index catches up within seconds.
+**The solution:** The write path records index work in an outbox backed by the selected storage. Workers claim events, update projections, and retry recoverable failures. The caller can wait for the required completion level.
 
-**What breaks without it:** The Agent's perceived response time balloons by 2–10x. Worse, if the vector index is temporarily down, writes fail and context is lost — the system becomes fragile to infrastructure transients.
+**What breaks without it:** A service must otherwise coordinate canonical persistence and index publication in the request path. A durable outbox lets workers resume incomplete indexing after transient failures.
 
 ### Why L0/L1/L2 three-level retrieval?
 
-**The problem:** Longer content doesn't mean better vector similarity — in fact, the opposite. An embedding of a 5000-token document must represent *every* concept it contains, diluting the signal for any single topic. When you query "what does Alice do?", an L2 content chunk packed with details about Go, Kubernetes, PostgreSQL, and migration strategies produces a diffuse embedding where "backend engineer" is just one signal among dozens. A focused L0 abstract ("Alice is a backend engineer") produces a concentrated embedding that matches the query directly.
+**The problem:** A long record can contain several topics. A short query such as "what does Alice do?" may match a focused abstract more closely than the full record containing many unrelated details.
 
-**The solution:** Each context node is indexed at three granularities. L0 abstracts (~100 tokens) produce focused embeddings — they're accurate topic signposts. L1 overviews (~500 tokens) are mid-grain. L2 full content (~5000 tokens) has the detail but diffuse embeddings. The retrieval engine does a single vector search across all levels, then uses L0/L1 hits as **directory entry points** for recursive tree expansion: when an L0 abstract matches, the searcher expands into its children to discover L2 content that flat search would miss. Score propagation (`final = α·child + (1-α)·parent`) boosts borderline L2 hits under strongly-matching parents.
+**The solution:** L0 abstracts, L1 overviews, and L2 content offer different reading depths. Ordinary memory nodes emit an L0 index record and an L2 record when content is present. Directory summaries and typed agent memory can also emit L1. Hierarchical retrieval uses eligible L0/L1 matches to expand to L2 evidence.
 
 ```
   ┌─────────────┐    ┌─────────────┐    ┌──────────────┐
   │  L0 Abstract │    │  L1 Overview │    │  L2 Content   │
-  │  ~100 tokens │    │  ~500 tokens │    │  ~5000 tokens │
+  │  Brief summary │    │  Overview │    │  Full material │
   │  Focused     │    │  Balanced    │    │  Comprehensive│
   │  embedding   │    │  signal      │    │  but diffuse  │
   │  → signpost  │    │  → decision  │    │  → full detail│
@@ -128,50 +123,50 @@ Four distinct write policies, each justified by the information's lifecycle sema
     .abstract.md        .overview.md          content.md
 ```
 
-**Recall benefit**: Flat vector search on L2 content alone misses relevant chunks whose embeddings got diluted by surrounding detail. The L0/L1 signposts guide the searcher to the right neighborhood, then tree expansion discovers the full content underneath — including chunks whose raw vector score was below threshold but whose parent topic was a strong match.
+**Recall benefit:** Summary matches can lead to relevant full records even when the initial search ranks the full content lower. Direct L2 search is also available when hierarchy expansion is disabled.
 
 ### Why a filesystem abstraction?
 
 **The problem:** Context operations — create, read, update, link, delete — need to be composable, atomic, and multi-tenant-safe. Building each as a bespoke API means reimplementing concurrency, permissions, and consistency for every operation.
 
-**The solution:** ContextFS maps every context operation to a file operation on `ctx://` URIs. The file metaphor is universally understood — `open`, `read`, `write`, `link`, `unlink`, `gc` map directly to context operations. Multi-tenant isolation is enforced at the filesystem level (via `account_id + owner_space` in every path), making it impossible to bypass even by buggy callers.
+**The solution:** ContextFS provides a common `ctx://` interface over SQL and AGFS. Storage and retrieval use the request's account and authorized owner spaces to scope access.
 
-**What breaks without it:** Tenant isolation becomes "each caller must remember to check permissions." Atomic writes become "each caller must implement the 4-step write protocol correctly." Every new feature re-solves the same infrastructure problems.
+**What breaks without it:** Each feature would need to implement its own storage access, scope checks, and update conventions.
 
 | Filesystem Concept | Context Equivalent | Benefit |
 | ------------------ | ------------------ | ------- |
 | `open(path)` | Load context by URI | Uniform access to any context type |
 | `read(fd, offset, len)` | Read L0 / L1 / L2 at chosen depth | Pay only for the tokens you need |
-| `write(fd, data)` | Persist new context | Atomic writes with ordering guarantees |
-| `link(src, dst)` | Create relation edge | Graph traversal without a separate API |
-| `unlink(path)` | Delete / archive context | GC for stale context |
-| `gc()` | Repair Job | Self-healing persistence layer |
-| Permissions (chmod) | Tenant isolation | Enforced at filesystem level, not by callers |
+| `write(fd, data)` | Persist new context | Publication and version checks appropriate to the storage backend |
+| `link(src, dst)` | Relate context records | Relation metadata and optional SQL graph traversal |
+| `unlink(path)` | Request deletion or archival | Apply memory lifecycle and visibility rules |
+| `gc()` | Maintenance and repair | Reconcile incomplete background work |
+| Permissions (chmod) | Tenant and owner scope | Storage and retrieval check access |
 
 ### Why optimistic locking for concurrent writes?
 
 **The problem:** Profile nodes are written by every session a user has. Two sessions can extract conflicting profile updates simultaneously.
 
-**The solution:** Optimistic locking — read the current `.meta.json` version, write only if unchanged. This handles the common case (no contention) with zero infrastructure overhead. On the rare case of concurrent writes, the second writer retries with fresh state.
+**The solution:** Updates can check the expected node version. A conflicting update can retry with fresh state or report a conflict. SQL also uses guarded updates and locks where the operation requires them.
 
-**What breaks without it:** Distributed locks require a coordination service (etcd/ZooKeeper) — adding infrastructure complexity for a problem that occurs rarely. Without any locking, last-writer-wins silently loses the first writer's updates.
+**What breaks without it:** Concurrent writers can overwrite each other's changes. Version checks detect a stale update before publication.
 
 ### Why the ReAct loop for extraction?
 
 **The problem:** Extraction quality depends on knowing what already exists. If the system already knows "Alice is a backend engineer," extracting that again wastes LLM tokens and creates duplicate entries that must be deduplicated later.
 
-**The solution:** The LLM is given tool access — `read(uri)`, `list(uri)`, `get_relations(uri)`, plus `extract_*` actions — and runs in a loop. Each iteration: it *reads* existing memory nodes (Reason), decides what's genuinely new, then calls the appropriate `extract_*` tool (Act). If unsure, it reads more nodes and loops. This is true ReAct: interleaved reasoning and tool use, not single-shot extraction.
+**The solution:** Default eager mode prepares relevant context and extracts once. Optional lazy mode uses a bounded ReAct loop with available memory reads and schema-defined extraction tools. Dual-pass extraction is separately configurable.
 
 ```
-  Iteration 1:  read(profile_uri) → "Alice, backend engineer, London"
+  Lazy mode, iteration 1:  read(profile_uri) → "Alice, backend engineer, London"
                  → Nothing new to extract. Skip.
 
-  Iteration 2:  read(entities/go) → "Go expert, prefers error handling pattern X"
+  Lazy mode, iteration 2:  read(entities/go) → "Go expert, prefers error handling pattern X"
                  → New: "Alice now also uses Rust for side projects"
-                 → extract_entity(slug="rust", ...)
+                 → extract_entity(routing_key="rust", ...)
 ```
 
-**What breaks without it:** Every turn re-extracts the same facts. Over 100 turns, "Alice is a backend engineer" gets extracted 100 times, creating 100 Profile merge operations — each one burning LLM tokens on content that was already stored. Extraction cost grows linearly with conversation length instead of with information density.
+**What breaks without it:** Extraction with no view of existing memory can propose redundant facts. Prepared context, incremental processing, and merge policies help identify and reconcile repeat information.
 
 ---
 
@@ -180,115 +175,68 @@ Four distinct write policies, each justified by the information's lifecycle sema
 ### Overall Architecture
 
 ```
-         CLI Agent (Claude Code / OpenClaw / SDK)
-              │  HTTP REST (port 8090) or Python SDK
-              ▼
-    ┌─ HTTP Layer ──── Flask REST · Auth/RBAC · Sessions ─┐
-    └──────────────────────┬───────────────────────────────┘
-    ┌─ Service Layer ── MemoryWriteAPI · MemoryReadAPI ────┐
-    └──────────────────────┬───────────────────────────────┘
-        ┌──────────────────┴──────────────────┐
-        │  Write Path          │  Read Path    │
-        │  Two-Phase Extract   │  IntentClass. │
-        │  PolicyRouter        │  SeedRetriever│
-        │  MergePolicy         │  ResultRanker │
-        │  ContextWriter       │  ContextReader│
-        └──────────────────────┬───────────────┘
-    ┌─ ContextFS ── Semantic · Relation · Content · Meta ──┐
-    └──────────────────────┬───────────────────────────────┘
-    ┌─ Async Index ── OutboxWorker · RepairJob ────────────┐
-    └──────────────────────┬───────────────────────────────┘
-              ┌─────────────▼─────────────┐
-              │  PostgreSQL · Vector · Graph│
-              └───────────────────────────┘
+  Native agent hooks / HTTP REST / MCP / Python API
+                          │
+                MemoryService + sessions
+                   /                 \
+      Write API + PolicyRouter      Read API + QueryPlanner
+      Extraction + ContextWriter    Retrieval + ContextReader
+                   \                 /
+      ContextFS: SQL (openGauss / PostgreSQL) or AGFS
+                          │
+               Durable outbox and index workers
+                          │
+           Vector index + optional native BM25 and graph projections
 ```
 
-**Dev mode**: InMemory vectors + PostgreSQL — install `postgresql` and `pgvector` extension.
-**Production**: pgvector + PostgreSQL RLS — horizontally scalable with row-level tenant isolation.
+**Local onboarding:** The wizard defaults to openGauss for SQL storage and vector search.
+**Deployment:** SQL and AGFS are storage options. The vector backend can be openGauss,
+PostgreSQL with pgvector, Chroma, Milvus, or an in-memory index for development.
 
 ### Write Path: Conversation to Persistent Memory
 
 ```
-  Agent Turn completes
-        │
-        ▼
-  ┌─────────────────────────────────────────────────┐
-  │  ReAct Extraction Loop                          │
-  │                                                 │
-  │  LLM has tools: read(uri), list(uri),           │
-  │  get_relations(uri), extract_*()                │
-  │                                                 │
-  │  Iteration 1: read(profile) → "Alice, engineer" │
-  │  Iteration 2: "Alice now also uses Rust"        │
-  │              → extract_entity(slug="rust")       │
-  └────────────────────┬────────────────────────────┘
-                       │  CandidateMemory[]
-                       ▼
-  ┌──────────────────┐     ┌──────────────────┐
-  │  Policy Routing  │     │  Atomic Write    │
-  │                  │────▶│  (4-step order)  │
-  │  ProfilePolicy   │     │                  │
-  │  AggregatePolicy │     │  ① content.md    │
-  │  AppendOnlyPolicy│     │  ② .relations    │
-  │  SkillToolPolicy │     │  ③ abstract+over │
-  └──────────────────┘     │  ④ .meta.json ✱  │
-                           └────────┬─────────┘
-                                    │
-                          ┌─────────▼─────────┐
-                          │  Outbox Event     │
-                          │  (async, durable) │
-                          └─────────┬─────────┘
-                                    │
-                    ┌───────────────▼───────────────┐
-                    │  Index Worker (background)    │
-                    │  embed(abstract) → L0 upsert  │
-                    │  embed(overview)  → L1 upsert  │
-                    │  embed(content)   → L2 upsert  │
-                    └───────────────────────────────┘
+  Completed turn or explicit memory write
+                      │
+          Buffer and extract eligible messages
+               (eager or optional lazy)
+                      │
+              Typed memory candidates
+                      │
+      Route by schema (merge, aggregate, append, skill/tool)
+                      │
+       Publish records to SQL or AGFS and record outbox work
+                      │
+      Worker projects applicable vector and optional lexical records
 ```
 
-The write path is designed so that the synchronous portion (extraction through atomic write) completes in ~50ms. The expensive operations — embedding and vector upsert — happen asynchronously via the Outbox, never blocking the Agent's response.
+Write acknowledgments can describe buffered, completed, or pending work.
+Use a stable request ID to look up the receipt or retry the write, and wait for
+indexing when the next operation needs to retrieve the memory.
 
 ### Read Path: Query to Assembled Context
 
 ```
-  User Message arrives
+  Query or prompt
         │
         ▼
-  ┌───────────────────┐     ┌──────────────────────────────────────────┐
-  │  Intent Classify  │     │  Global Vector Search (all levels)       │
-  │                   │     │                                          │
-  │  Keywords → type  │────▶│  Embed query, search L0+L1+L2 in one go │
-  │  "recall"→MEMORY  │     │  → L0/L1 hits = directory signposts      │
-  │  "how"→SKILL      │     │  → L2 hits = direct content matches      │
-  │  "doc"→RESOURCE   │     └────────────────────┬─────────────────────┘
-  └───────────────────┘                          │
-                                          ┌──────▼──────┐
-                                          │  L0/L1 hit? │
-                                          └──────┬──────┘
-                                           Yes   │   No
-                                          ┌──────▼──────▼──────┐
-                                          │  Recursive Expand  │  Use L2 hits
-                                          │                    │  directly
-                                          │  search_children() │
-                                          │  per directory node│
-                                          │  Score propagation │
-                                          │  α·child+(1-α)·   │
-                                          │  parent            │
-                                          └────────┬───────────┘
-                                                   │
-                                          ┌────────▼─────────┐
-                                          │  Assemble         │
-                                          │  Merge + dedup    │
-                                          │  (cos>0.9)        │
-                                          │  Rank by blended  │
-                                          │  score + hotness  │
-                                          │  Inject into      │
-                                          │  context window   │
-                                          └──────────────────┘
+  Plan the query and apply the caller's memory scope
+        │
+        ▼
+  Search vectors and, if configured, fuse openGauss BM25 matches
+        ├── L0 / L1 summary hits → hierarchical expansion
+        └── L2 content hits → direct candidates
+        │
+        ▼
+  Rank and deduplicate by memory identity
+        │
+        ▼
+  Read authorized records and assemble context within the configured budget
 ```
 
-One vector search, not three sequential passes. L0/L1 hits serve as directory entry points for tree expansion — discovering relevant L2 content that flat search would miss due to embedding dilution in long documents.
+With hierarchy enabled, an initial mixed-level search can lead from summary matches to
+full content. Optional BM25 combines lexical and vector ranks with weighted reciprocal
+rank fusion. Relationship graph and scenario retrieval can add scoped evidence when enabled.
 
 Hierarchical expansion is enabled by default. To search only L2 content,
 set `retrieval.expand_hierarchy: false` in the service YAML, or
@@ -302,24 +250,24 @@ lose results discovered through L0/L1 summaries; measure recall on your
 workload. See [retrieval configuration](config/README.md#hierarchical-retrieval-expansion)
 for precedence and accepted values.
 
-**Namespace isolation:** Queries are scoped by intent type. MEMORY queries search both `users/{user}/memories/` and `agents/{agent}/memories/`. SKILL queries search only `agents/{agent}/skills/`. The `owner_space` filter is set by the QueryPlanner based on `context_type` and `visible_owner_spaces`, enforced at the vector index level — callers cannot override it.
+**Namespace isolation:** Retrieval filters by account and authorized owner spaces. Query filters can narrow the visible scope, and canonical record reads enforce access checks.
 
 ---
 
 ## The Agent Context Lifecycle
 
-The six stages form a pipeline where each stage's output feeds the next. The design principle: **never block model inference**. All context operations happen at loop boundaries — before the LLM thinks or after it acts, never during.
+These six boundaries show where an agent can use oGMemory. Lifecycle coverage depends on the host and adapter.
 
 | Stage | When | What happens | Key invariant |
 | ----- | ---- | ------------ | ------------- |
-| ① message_received | Before inference | Classify intent, prefetch candidates from L0 | Never block; fail silently if timeout |
-| ② bootstrap + ingest + assemble | Before prompt build | Cold-start profile injection, budget-aware L0→L1→L2 loading, dedup, skill injection | Never exceed token budget |
-| ③ before_tool_call + tool_result_persist | Around tool execution | Inject known failure patterns, compress oversized results, extract immediate facts | Tool params informed by history |
-| ④ afterTurn | After Agent responds | Incremental extraction of delta, policy-routed writes, relation building, async index | Only extract what's new |
-| ⑤ before_compaction + compact | When context fills | Score signal, protect critical nodes, compress redundancy | Never lose Profile or active task |
-| ⑥ session_end + dispose | Session closes | Archive completed tasks, snapshot state for next session, audit integrity | Next session picks up seamlessly |
+| ① message_received | Before inference | Optionally prefetch scoped candidates | Use the session and authorized memory scope |
+| ② bootstrap + ingest + compose | Before prompt assembly | Load startup context and assemble relevant facts and skills | Apply the configured context budget |
+| ③ before_tool_call + after_tool_call | Around tool execution | Capture tool traces and apply supported host hooks | Tool behavior depends on the integration and enabled features |
+| ④ afterTurn | After the agent responds | Buffer messages and extract when eligible or explicitly requested | Track write completion separately from index visibility |
+| ⑤ prepare_compaction + compact | When context needs compaction | Prepare extraction and compact session context | A prepare token is single use when the host uses both stages |
+| ⑥ session_end + dispose | Session closes | Finalize traces and persist or dispose of available session state | Preserve eligible records for later recall |
 
-The lifecycle is circular: Stage ⑥'s task snapshot becomes Stage ②'s Handoff injection. Context born in Stage ④ gets recalled in Stage ①. What persists across sessions is what makes the system *learn*, not just *remember*.
+Later sessions can retrieve eligible memories after persistence and indexing. The client can use the same authorized memory scope across sessions.
 
 ---
 
@@ -328,43 +276,42 @@ The lifecycle is circular: Stage ⑥'s task snapshot becomes Stage ②'s Handoff
 ```
   Session 1 — Write Path: "I'm Alice, a backend engineer based in London"
   ────────────────────────────────────────────────────────────────────────
-    User Message → Stage ④ afterTurn
+    User Message → Stage ④ afterTurn with forceExtract for this short example
         → Incremental Extraction (name, role, location)
         → CandidateMemory(category="profile")
         → PolicyRouter → ProfilePolicy (merge)
-        → ContextWriter (atomic 4-step: content → relations → abstract+overview → meta.json ✱)
-        → OutboxEvent → async IndexRecordBuilder (L0 + L1 + L2 embed + upsert)
+        → ContextWriter publishes to the configured storage backend
+        → OutboxEvent → worker projects the applicable index levels
 
   Session 2 — Read Path: "What does Alice do for a living?"
   ────────────────────────────────────────────────────────────────────────
-    User Message → Stage ① message_received
-        → Intent Classifier → "fact recall"
-        → Async Prefetch → embed query → L0 search → seed hit (profile matches)
-        → Stage ② assemble → Budget Planner → L0 hit → L2 load
-        → Inject "Alice is a backend engineer"
-        → Agent responds correctly
+    User Message → Stage ① message_received (optional prefetch)
+        → Stage ② compose runs scoped recall and finds the profile
+        → Load the relevant record within the context budget
+        → Provide "Alice is a backend engineer" as context to the agent
 ```
 
-Write costs ~50ms (synchronous) + ~100ms (async indexing). Read costs ~50ms. The cost is paid *once* at write time, amortized over *many* reads.
+Check write completion and index visibility before testing recall in another session. Model, embedding, and storage configuration all affect latency.
 
 ---
 
 ## How It Differs
 
-ContextEngine is not "vector RAG with extra steps." The fundamental differences are in lifecycle coverage, write policies, and retrieval granularity.
+This table compares oGMemory's lifecycle integration with a basic vector search
+workflow and the documented [Mem0 Platform quickstart](https://docs.mem0.ai/platform/quickstart).
 
-| Dimension | ContextEngine | Standard Vector RAG | Mem0 |
-| --------- | ------------- | ------------------- | ---- |
-| **Lifecycle coverage** | 6 stages: extract → store → index → recall → compress → archive | 1 stage: retrieve | 2 stages: write + retrieve |
-| **Write policies** | 4 policies (merge, aggregate, append, cumulative) matched to information semantics | Single: upsert | Single: upsert with memory_id |
-| **Retrieval granularity** | L0/L1 as directory signposts → recursive tree expansion → L2 content discovery, score propagation | Flat top-k similarity search | Flat top-k with graph expansion |
-| **Context types** | 7 types with distinct lifecycle behavior per type | 1 type: "document chunk" | 1 type: "memory" with scope labels |
-| **Multi-tenant isolation** | Enforced at filesystem level (account_id + owner_space in every path), impossible to bypass | Application-level filtering (depends on caller) | Application-level filtering |
-| **Concurrent writes** | Optimistic locking with version check | Last-writer-wins (or external lock) | Last-writer-wins |
-| **Atomicity** | 4-step ordered write with detectable incomplete state | Best-effort | Best-effort |
-| **Compression** | Signal scoring + protected nodes + summary chain (Phase 2) | None | None |
+| Dimension | oGMemory lifecycle integration | Basic vector-search workflow | Mem0 Platform quickstart |
+| --- | --- | --- | --- |
+| **Lifecycle coverage** | Write, index, recall, compact, and archive through the service lifecycle | Query and return indexed records | Add and search memories |
+| **Write policies** | Schema-driven merge, aggregate, append, and skill/tool policies | The application decides how to write or update records | The client adds messages and can use separate update and delete APIs |
+| **Retrieval granularity** | Scoped L0/L1 expansion to L2, direct L2, and optional lexical or graph retrieval | Commonly returns the top matching chunks | Search returns matching memory records, with metadata filters available |
+| **Context types** | Typed memories and skills with category-specific handling | The application defines document and metadata types | Search results include memory text and associated metadata |
+| **Multi-tenant isolation** | Account and authorized owner scope in retrieval and canonical reads | Depends on the application's identity and filter configuration | The example adds and searches within a user ID |
+| **Concurrent writes** | Version checks and backend-specific updates | Depends on the application's storage policy | Outside the quickstart's scope |
+| **Atomicity** | Backend-specific record publication and durable outbox work | Depends on how canonical writes and index updates are coordinated | Outside the quickstart's scope |
+| **Compression** | Prepare and compact session context with supported hooks | The application implements session compaction if needed | Outside the quickstart's scope |
 
-The core distinction: ContextEngine treats context as a **managed lifecycle**, not a store-and-retrieve problem. Write policies are not configuration — they're architectural decisions derived from information semantics. Retrieval is not a single operation — it's a three-stage decision process with budget awareness. And the system is designed to run continuously across sessions, not just serve queries.
+oGMemory exposes both direct memory APIs and agent lifecycle hooks. Choose the integration points that the client supports.
 
 ---
 
@@ -375,6 +322,8 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
   <img alt="tau2-bench task success: Retail 72.50% without memory vs 81.56% with oGMemory; Airline 65.00% vs 70.63%." src="docs/images/tau2-benchmark-light.svg">
 </picture>
 
+This paired OpenClaw CE evaluation measured weighted task success of 70.00% without memory and 77.92% with oGMemory across 480 rollouts per arm. See the [tau2-bench report and runtime manifest](docs/benchmarks/tau2-bench/README.md).
+
 ---
 
 ## Quick Start
@@ -382,7 +331,9 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 ### Prerequisites
 
 - **Python 3.11+**
-- **PostgreSQL 14+** with [pgvector](https://github.com/pgvector/pgvector) extension (for PostgreSQL mode)
+- **An existing openGauss database in PG compatibility mode** for the default local setup
+- **PostgreSQL** with [pgvector](https://github.com/pgvector/pgvector) extension (for PostgreSQL mode)
+- **LLM and embedding endpoints** with credentials and a matching embedding dimension
 - **Docker** (optional, for containerized deployment)
 
 ### Install
@@ -397,22 +348,20 @@ python3 -m venv .venv && source .venv/bin/activate
 <summary><strong>Option A: Local OpenGauss mode (default)</strong></summary>
 
 ```bash
-pip install -e .
-
-# Interactive setup wizard (OpenGauss is the default vector and SQL backend)
-ogmem onboard
-
-# Check the existing database and start ContextEngine (SQL mode needs no AGFS)
-ogmem start local
+python -m pip install -e .
+# Local onboarding defaults to openGauss for SQL storage and vector search.
+ogmem onboard --mode local
+ogmem status
 ```
 
-Start OpenGauss separately before onboarding. The wizard verifies connectivity
-before writing configuration; local startup checks the configured SQL database
-and launches ContextEngine. SQL startup and shutdown do not manage AGFS.
-When using a custom config, pass `-c /path/to/ogmem.yaml` to
-`ogmem start local`. The stop command uses the verified process record and does
-not need the configuration path. For
-a file-backed local setup, explicitly use
+Start openGauss separately before onboarding. On first setup, the wizard checks
+database connectivity and can enable hybrid retrieval when the openGauss
+vector database supports native BM25 and the role can create schema objects.
+The wizard offers to start the service. If you defer startup, run
+`ogmem start local -d` later. Use `ogmem start local -d --config /path/to/ogmem.yaml`
+for a custom configuration and `ogmem stop local` to stop the managed service.
+For an AGFS setup with Chroma, install `.[chroma]`, prepare the AGFS server as
+described in the [AGFS guide](agfs/README.md), and select
 `--vector-db chroma --storage-backend agfs`.
 
 Docker mode reuses the repository's `deploy/user-quickstart/deploy.sh` flow,
@@ -425,7 +374,8 @@ ogmem onboard --non-interactive --mode docker --provider openai --api-key "$LLM_
   --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
   --embedding-provider openai --embedding-api-key "$EMBEDDING_API_KEY" \
   --embedding-base-url "$EMBEDDING_BASE_URL" \
-  --embedding-model "$EMBEDDING_MODEL" --embedding-dimension 1024
+  --embedding-model "$EMBEDDING_MODEL" --embedding-dimension "$EMBEDDING_DIMENSION" \
+  --port 18090
 ```
 
 This non-interactive command starts containers after preflight. To generate configuration
@@ -441,9 +391,13 @@ it does not change a model's output dimension by itself.
 <summary><strong>Non-interactive mode (CI / automation)</strong></summary>
 
 ```bash
+python -m pip install -e '.[chroma]'
 ogmem onboard --non-interactive --mode local \
-  --provider openai --api-key sk-xxx \
-  --embedding-model text-embedding-ada-002 --vector-db chroma \
+  --provider openai --api-key "$LLM_API_KEY" \
+  --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
+  --embedding-provider openai --embedding-api-key "$EMBEDDING_API_KEY" \
+  --embedding-base-url "$EMBEDDING_BASE_URL" --embedding-model "$EMBEDDING_MODEL" \
+  --embedding-dimension "$EMBEDDING_DIMENSION" --vector-db chroma \
   --storage-backend sql --sql-dialect opengauss \
   --db-connection "$DB_CONNECTION"
 ```
@@ -468,24 +422,31 @@ brew install pgvector
 
 # Start PostgreSQL
 sudo service postgresql start   # Ubuntu
-brew services start postgresql  # macOS
+brew services start postgresql@16  # macOS
 
-# Create database & enable pgvector
+# Ubuntu / Debian example: create the database and enable pgvector.
 sudo -u postgres createdb ogmemory
-sudo -u postgres psql -d ogmemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
+sudo -u postgres psql -d ogmemory -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+# On macOS, run createdb and psql as the role that administers your local instance.
 ```
 
-**2. Install ContextEngine with SQL extras**
+**2. Install oGMemory**
 
 ```bash
-pip install -e ".[dev,sql]"
+python -m pip install -e .
 ```
 
 **3. Configure connection**
 
+Set `DB_CONNECTION` to the PostgreSQL DSN for your application role. The vector
+backend key `opengauss` is also used for PostgreSQL with pgvector. If you prefer
+Chroma for vectors, install `.[chroma]` and select `--vector-db chroma`.
+
 ```bash
-cp config/ogmem.reference.yaml config/ogmem.yaml
-# Edit storage.connection_string to point at your PostgreSQL instance
+ogmem onboard --mode local --storage-backend sql --sql-dialect postgresql \
+  --vector-db opengauss --db-connection "$DB_CONNECTION" \
+  --vector-db-connection "$DB_CONNECTION"
+ogmem status
 ```
 
 </details>
@@ -495,31 +456,32 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 <details>
 <summary><strong>HTTP Server (recommended)</strong></summary>
 
-**AGFS mode:**
+**AGFS mode:** Point the service YAML at a running AGFS instance and choose a
+compatible vector backend. Start the configured service with `ogmem start local -d`.
+
+**SQL mode:** Start the SQL-backed instance with the wizard or
+`ogmem start local -d` after configuration.
+
+The next example uses the default local HTTP port. With role control enabled,
+send the tenant API key and account/user headers and provide an authorized
+agent ID. See [HTTP authentication](docs/integrations/http-rest.md).
 
 ```bash
-ogmem start local    # Start AGFS + ContextEngine, ports 1833 + 8090
+# Submit a short turn and force extraction below the configured threshold.
+curl -fsS http://127.0.0.1:8090/api/v1/after_turn \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":"user-1","sessionId":"write-demo","forceExtract":true,"wait":true,
+       "messages":[{"role":"user","content":"I am Alice, a backend engineer."},
+                   {"role":"assistant","content":"Nice to meet you, Alice."}]}'
 ```
 
-**PostgreSQL mode:**
+After the write completes and indexing is ready, retrieve context from another session.
 
 ```bash
-cp config/ogmem.reference.yaml config/ogmem.yaml
-# Edit ogmem.yaml: set storage.connection_string to your PostgreSQL DSN
-python server/app.py
-```
-
-# Ingest a conversation turn
-curl -X POST http://localhost:8090/api/v1/after_turn \
-  -H "Content-Type: application/json" \
-  -d '{"userId":"user-1","sessionId":"session-1",
-       "messages":[{"role":"user","content":"I am Alice, a backend engineer"},
-                   {"role":"assistant","content":"Nice to meet you!"}]}'
-
-# Search memory
-curl -X POST http://localhost:8090/api/v1/compose \
-  -H "Content-Type: application/json" \
-  -d '{"userId":"user-1","sessionId":"session-2","query":"what is alice job"}'
+curl -fsS http://127.0.0.1:8090/api/v1/compose \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":"user-1","sessionId":"read-demo","prompt":"What does Alice do for work?",
+       "messages":[{"role":"user","content":"What does Alice do for work?"}]}'
 ```
 
 </details>
@@ -527,21 +489,28 @@ curl -X POST http://localhost:8090/api/v1/compose \
 <details>
 <summary><strong>Python SDK</strong></summary>
 
+Use the configured service dependencies from a Python process. See the
+[Python API guide](docs/integrations/python-api.md) for context and query options.
+
 ```python
-from service.api import MemoryWriteAPI
-from core.models import RequestContext
-from fs.sql_adapter import SQLContextFS
-from providers.config import ProviderConfig
+from providers.unified_config import OgMemConfig
+from server.memory_service import MemoryService
 
-config = ProviderConfig.from_env()
-fs = SQLContextFS(connection_string="host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres")
-write_api = MemoryWriteAPI(fs=fs, llm=config.create_llm())
-
-ctx = RequestContext(account_id="acct", user_id="u1", agent_id="a1", session_id="s1", trace_id="t1")
-result = write_api.commit_session([
-    {"role": "user", "content": "I'm Alice, backend engineer, London"},
-    {"role": "assistant", "content": "Nice to meet you, Alice!"},
-], ctx)
+memory = MemoryService(config=OgMemConfig.load("config/ogmem.yaml"))
+try:
+    result = memory.after_turn({
+        "userId": "user-1",
+        "sessionId": "sdk-demo",
+        "messages": [
+            {"role": "user", "content": "I'm Alice, a backend engineer in London."},
+            {"role": "assistant", "content": "Nice to meet you, Alice."},
+        ],
+        "forceExtract": True,
+        "wait": True,
+    })
+    print(result["status"])
+finally:
+    memory.shutdown()
 ```
 
 </details>
@@ -550,23 +519,32 @@ result = write_api.commit_session([
 <summary><strong>Docker / HTTP API Reference</strong></summary>
 
 ```bash
-# Configure .env, then follow deploy/compose/README_zh.md.
+cp .env.example .env
+# Configure model endpoints and credentials in .env before starting.
 bash deploy/compose/deploy.sh start
-
-# Multimodal stack: see deploy/README.md.
-cd deploy
-docker compose --profile with-db up
 ```
 
-The Compose stack runs oGMemory and openGauss images and preserves memory and database data in host directories.
-The current database image requires ARM64. Database and AGFS ports are internal.
+To build the source deployment instead, configure the files in `deploy/` first.
+
+```bash
+# Multimodal stack: see deploy/README.md.
+cd deploy
+cp .env.example .env
+cp ogmemory.example.yaml ogmemory.yaml
+# Configure services, database credentials, and ports before starting.
+docker compose --profile with-db up -d
+```
+
+The root Compose stack runs oGMemory with AGFS for canonical storage and openGauss for vectors. Its default image set targets ARM64. It publishes HTTP on port 18090 and MCP on port 18091 by default, and keeps the database and AGFS ports internal. Set the image tags for the version you want to run.
 See [Docker Compose deployment and verification](deploy/compose/README_zh.md) for configuration,
 networking, model connectivity checks and cross-session persistence tests.
 
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
 | `/api/v1/compose` | POST | Search memory, return context for current turn |
-| `/api/v1/after_turn` | POST | Extract + persist memories from conversation |
+| `/api/v1/after_turn` | POST | Buffer a completed turn and extract when eligible or requested |
+| `/api/v1/sessions/{id}/write-requests/{request_id}` | GET | Check the status of an identified memory write |
+| `/api/v1/memories/write`, `/query`, `/read` | POST | Write or access memory directly. Direct writes require `mcp.enable_write_tools`. |
 | `/api/v1/ingest` | POST | Single message ingest |
 | `/api/v1/ingest_batch` | POST | Batch message ingest |
 | `/api/v1/prefetch` | POST | Best-effort pre-compose retrieval staged into the session topic buffer |
@@ -577,14 +555,14 @@ networking, model connectivity checks and cross-session persistence tests.
 | `/api/v1/sessions/{id}/commit` | POST | Commit session: archive + extract |
 | `/api/v1/session_working_set` | GET/POST | List active sessions ordered by access time |
 | `/api/v1/evict_idle_sessions` | POST | Evict sessions idle longer than `maxIdleSeconds` |
-| `/api/v1/health` | GET | Health check (PostgreSQL + LLM + vector DB) |
+| `/api/v1/health` | GET | Report service and backend health |
 | `/api/v1/admin/*` | Various | Tenant admin (accounts, users, roles, agents) |
 
 </details>
 
 ### Configuration
 
-Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for full reference):
+The table lists service fallback values. The [reference YAML](config/ogmem.reference.yaml), local wizard, and deployment templates can select different settings. See [Configuration reference](docs/OGMEMORY_ENV.md) for precedence.
 
 | Variable | Default | Description |
 | -------- | ------- | ----------- |
@@ -593,13 +571,16 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 | `OGMEM_LLM_MODEL` | `gpt-4o-mini` | LLM model for extraction + classification |
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | Embedding model for vector indexing |
 | `OGMEM_EMBEDDING_API_KEY` | — | Separate key for embedding API (falls back to `OGMEM_API_KEY`) |
-| `VECTOR_DB_TYPE` | `memory` | Vector backend: `memory` / `opengauss` (pgvector) |
-| `STORAGE_BACKEND` | `sql` | Storage backend: `sql` |
-| `SQL_DIALECT` | `postgresql` | SQL dialect: `postgresql` / `opengauss` |
-| `SQL_CONNECTION_STRING` | — | SQL database DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
+| `VECTOR_DB_TYPE` | `chroma` | Vector backend: `memory`, `chroma`, `opengauss` (also for pgvector), or [`milvus`](docs/integrations/milvus.md) |
+| `STORAGE_BACKEND` | `agfs` | Canonical storage: `agfs` or `sql`. The local wizard defaults to SQL. |
+| `SQL_DIALECT` | `postgresql` or auto-detected | Set `postgresql` or `opengauss` for the SQL storage connection. The local wizard defaults to openGauss. |
+| `STORAGE_DB_CONNECTION_STRING` | — | Canonical SQL DSN. `SQL_CONNECTION_STRING` is a legacy alias. |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
-| `OGMEM_CONFIG` | `ogmem.yaml` | Path to YAML config file |
+| `OGMEM_CONFIG` | Project `config/ogmem.yaml` or `/etc/ogmem/config.yaml` | Path to the service YAML |
 | `OGMEM_AFTER_TURN_THRESHOLD` | `400` | Pending token threshold before automatic after-turn extraction |
+| `OGMEM_EXTRACTION_MODE` | `eager` | Extraction mode. Choose `lazy` for bounded ReAct extraction. |
+| `OGMEM_DUAL_PASS_ENABLED` | `false` | Enable a second extraction pass. |
+| `OGMEM_RETRIEVAL_HYBRID_ENABLED` | `false` | Enable native openGauss BM25 with SQL storage. Eligible first-time local onboarding can enable it. |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | Enable Layer 2 rolling session compression |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | Use rule-based rolling fallback when LLM compression is unavailable |
 | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | One-time prepare token TTL in seconds |
@@ -622,7 +603,7 @@ For portable memory retrieval and writing across clients, see the
 [Agent Plugin package](plugins/agent-plugins/README.md) and
 [client tutorial](docs/integrations/agent-plugins.md).
 
-The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all Codex lifecycle hooks to a local or remote oGMemory HTTP service. It captures sessions, prompts, tools, permissions, compaction, subagents, completed turns, and session shutdown. See the [Codex integration guide](docs/integrations/codex.md).
+The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects supported Codex lifecycle hooks to a local or remote oGMemory HTTP service. It captures sessions, prompts, tools, permissions, compaction, subagents, completed turns, and session shutdown. See the [Codex integration guide](docs/integrations/codex.md).
 
 ---
 
@@ -663,6 +644,12 @@ See the [Hermes Agent integration guide](docs/integrations/hermes.md).
 
 ---
 
+## QwenPaw Integration
+
+The native [QwenPaw adapter](docs/integrations/qwenpaw.md) connects QwenPaw middleware to oGMemory. Follow its integration guide to install and configure it.
+
+---
+
 ## OpenClaw Integration
 
 ```bash
@@ -676,7 +663,7 @@ cd plugins/openclaw && openclaw plugins install -l .
 Agent and independently deployed oGMemory service**. It does not install the
 Agent/plugin, change active Agent settings, install backend dependencies, or
 start services. Select OpenClaw, Claude Code, Codex, OpenCode, DeepSeek Harness,
-Hermes, or Deep Agents with `--agent`; other Agent names generate HTTP MCP configuration.
+Hermes, or Deep Agents with `--agent`. Use `agent-plugins` to export the portable bundle. Other agent names generate HTTP MCP configuration.
 
 ```bash
 ogmem onboard --mode plugin --agent openclaw --non-interactive \
@@ -703,23 +690,25 @@ OpenClaw Agent
   → ContextFS / SQL storage + vector index
 ```
 
-The plugin can run in `remote` mode against an already-running oG-Memory service, or `local` mode where it starts AGFS and ContextEngine for the gateway. It stages optional prefetch hits before compose, injects layered context messages, delegates turn-end extraction to `/after_turn`, and can let oG-Memory own compact result generation through the two-stage prepare/compact protocol.
+The plugin can run in `remote` mode against an existing oGMemory service, or in `local` mode to manage a local service based on its configured storage. It stages optional prefetch hits before compose, injects layered context messages, delegates turn-end extraction to `/after_turn`, and can let oG-Memory own compact result generation through the two-stage prepare/compact protocol.
 
 ---
 
 ## Implementation Status
 
-**Phase 0 + 1 (production quality):** Core models, ContextFS/PostgreSQL adapter (SQLContextFS), extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2) with **BM25 hybrid search** (vector + keyword fusion, alpha-weighted), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, compact/rolling compression, session state persistence, archive merge, prefetch staging, and **L0 structured summary generation** with dual-template extraction. 100+ test files (contract + unit + integration + e2e).
+**Current capabilities:** oGMemory supports schema-based extraction, scoped memory and skill retrieval, session state and compaction, source archives, durable write receipts, and outbox indexing. It also provides authorized memory access through HTTP and MCP, plus Memory Viewer for browsing records, background activity, and model usage. See the [feature guide](docs/features.md) and [Memory Viewer guide](docs/memory_viewer_guide.md).
 
 ### Benchmark Results (LoCoMo10)
 
-**LoCoMo benchmark: 92.21% accuracy across 1,540 questions (1,420 correct)** (LLM: DeepSeek-V4.1-Flash-1017; embedding model: `BAAI/bge-m3`). The evaluation framework is in [`tests/e2e/`](tests/e2e/).
+**LoCoMo benchmark: 92.21% accuracy across 1,540 scored questions (1,420 correct).** The November 2026 920B run used source revision `59d354ae8`, native OpenClaw CE, DeepSeek-V4.1-Flash-1017, and `BAAI/bge-m3`. All 272 session writes settled. The run used eager single-pass extraction and native openGauss BM25. Category 5 was excluded from scoring. See the [evaluation protocol](docs/testing/memory-evaluation-guide-zh.md) and [`tests/e2e/`](tests/e2e/).
 
-**Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + compose, ④ afterTurn, ⑤ prepare_compaction + compact, and the session-state persistence portion of ⑥ session_end + dispose.
+**Lifecycle stages covered:** Native adapters cover different sets of hooks. OpenClaw supports contextual recall, turn write-back, two-stage compaction, session finalization, and tool-call traces. See the [OpenClaw plugin guide](plugins/openclaw/README.md) and [integration matrix](docs/integrations/README.md).
 
-**Phase 2 (planned):** Tool context injection, result compression around tool calls, graph retrieval, AI_Functions, optional topic detection and compression quality gates. **Phase 3 (planned):** Graph clustering, adaptive planning, observability.
+**Optional runtimes:** Enable the SQL text relationship graph to build and retrieve typed links. [Scenario memory](docs/scene-runtime.md) has a separate configuration and groups related facts. [Agent tool and experience memory](deploy/agent-memory.md) can learn from finalized traces. The service also supports [skill management and learning](docs/features.md#技能学习与复用).
 
-**Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist and the remaining operational hardening for ⑥ session_end + dispose.
+**Tool integration:** Native adapters handle tool hooks according to the host. See the [context management guide](docs/features.md#上下文管理) for supported behavior.
+
+**Dev extensions:** [Code understanding and editing](docs/features.md#代码理解与编辑) supports workspace registration, search, and targeted edits when enabled. [Multimodal memory](docs/MultiModelMemory-architecture.md) uses an [operator service](docs/operator_service.md) for document, image, audio, and video inputs. Compatible hosts can also enable large tool-result externalization.
 
 **Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](plugins/openclaw/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
 
@@ -727,14 +716,14 @@ The plugin can run in `remote` mode against an already-running oG-Memory service
 
 **Optional ContextNode graph:** [Semantic graph ingestion and retrieval](docs/semantic-context-graph.md) (opt-in SQL storage; no retrieval-time LLM)
 
-**Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
+**Testing:** Install `.[dev]` and run `python -m pytest tests/unit -q` for unit tests or `python -m pytest tests/contract -v` for core contracts. To generate an HTML unit-test coverage report, run `python -m pytest tests/unit --cov=core --cov=fs --cov=service --cov-report=html`. See the [test strategy](docs/testing/jenkins-test-strategy.md) for integration and evaluation prerequisites.
 
 ---
 
 ## References
 
 ### Benchmark & Evaluation
-- [LoCoMo: Evaluating Long-Context Conversational Memory](https://arxiv.org/abs/2402.10790) — Maharana et al., 2024 — long-context conversational memory benchmark used in our evaluation
+- [LoCoMo: Evaluating Very Long-Term Conversational Memory of LLM Agents](https://aclanthology.org/2024.acl-long.747/) — Maharana et al., 2024 — long-context conversational memory benchmark used in our evaluation
 
 ### Memory Architectures for LLM Agents
 - [MemoryBank: Enhancing LLMs with Long-Term Memory](https://arxiv.org/abs/2305.10250) — Zhong et al., 2023 — sentiment-centric memory processing for persistent conversational memory
@@ -762,7 +751,7 @@ The plugin can run in `remote` mode against an already-running oG-Memory service
 - [Cemri et al.](https://arxiv.org/abs/2503.13657) — multi-agent coordination failure analysis
 
 ### Infrastructure
-- oGMemory uses an AGFS-backed hierarchical storage layer for durable, session-scoped memory resources
+- oGMemory can use AGFS or SQL to store persistent, scoped memory records
 - [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
 
 ## SWE-bench reference workflow
@@ -771,4 +760,4 @@ See [SWE-bench Lite testing guide and scripts](benchmarks/swebench/README.md) fo
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Mulan Permissive Software License v2](LICENSE). The package metadata currently declares Apache-2.0.

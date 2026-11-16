@@ -119,8 +119,8 @@ def build_files(args, env):
         graph_enabled=graph_on, scene_enabled=False,
         extraction_model=env["BEAM_LLM_MODEL"],
         extraction_temperature=args.temperature,
-        native_extraction_temperature_arguments=[None, 0],
-        native_extraction_effective_temperatures=[args.temperature, 0],
+        native_extraction_temperature_arguments=setup["native_policy"]["extraction_temperature_arguments"],
+        native_extraction_effective_temperatures=setup["native_policy"]["extraction_effective_temperatures"],
         extraction_max_tokens=args.max_tokens,
         extraction_limit_scope="new BEAM fixture only",
         thinking_disabled=args.thinking_disabled,
@@ -186,12 +186,16 @@ def main(argv=None):
     parser.add_argument("--execute", action="store_true", help="Write new private configuration files only")
     args = parser.parse_args(argv)
     validate(args)
+    from scripts.beam_eval_safety import native_policy_manifest
+    from providers.unified_config import OgMemConfig
+
+    policy = native_policy_manifest(OgMemConfig(llm_temperature=args.temperature))
     report = dict(status="planned", directory=str(args.directory), docker_calls=0, provider_calls=0,
                   extraction_temperature=args.temperature, extraction_max_tokens=args.max_tokens,
                   extraction_limit_scope="new BEAM fixture only; production defaults unchanged",
                   fixture_profile=args.profile, graph_enabled=args.profile == "graph",
-                  native_extraction_temperature_arguments=[None, 0],
-                  native_extraction_effective_temperatures=[args.temperature, 0],
+                  native_extraction_temperature_arguments=policy["extraction_temperature_arguments"],
+                  native_extraction_effective_temperatures=policy["extraction_effective_temperatures"],
                   note="Review configurations; current native policy, not historical-score equivalence. No services started.")
     if args.execute:
         if args.directory.exists():
