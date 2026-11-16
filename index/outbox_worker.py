@@ -24,10 +24,10 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 
-from core.projection_ownership import projection_owner
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
 from core.models import IndexRecord, OutboxEvent, RequestContext
+from core.projection_ownership import projection_owner
 from providers.token_tracker import (
     distributed_usage_scope,
     embedding_scope_weights,
@@ -712,32 +712,9 @@ class OutboxWorker:
         Returns:
             Augmented records with embeddings in metadata
         """
-        augmented: list[IndexRecord] = []
+        from index.embedding_metadata import augment_with_embeddings
 
-        for record, embedding in zip(records, embeddings):
-            # Create a copy with embedding in metadata
-            new_metadata = dict(record.metadata)
-            new_metadata["_embedding"] = embedding
-            # Persist identity for ordinary vectors too: equal dimensions do
-            # not make embeddings from different models comparable.
-            model = getattr(self._embedder, "model", None)
-            if isinstance(model, str) and model:
-                new_metadata["embedding_model"] = model
-            new_metadata["embedding_dimension"] = len(embedding)
-
-            # Create new IndexRecord with augmented metadata
-            # Note: IndexRecord is a dataclass, we can create a new instance
-            augmented_record = IndexRecord(
-                id=record.id,
-                uri=record.uri,
-                level=record.level,
-                text=record.text,
-                filters=record.filters,
-                metadata=new_metadata,
-            )
-            augmented.append(augmented_record)
-
-        return augmented
+        return augment_with_embeddings(records, embeddings, self._embedder)
 
     def _handle_max_retry_exceeded(self, event: OutboxEvent) -> WorkerResult:
         """Handle event that has exceeded max retry attempts.

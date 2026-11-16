@@ -383,3 +383,13 @@ def test_milvus_late_projection_search_delete_and_recreate(index, monkeypatch, d
     assert index.get_record(old.id) is None
     index.upsert([new])
     assert index.get_record(new.id).text == "Friday"
+
+
+def test_migration_filter_contract_roundtrip(index):
+    record = make_record("migration-contract")
+    record.filters.update(category="document", context_type="RESOURCE", resource_type="code_chunk")
+    index.upsert([record])
+    restored = index.get_record(record.id)
+    assert restored.text == record.text
+    assert all(restored.filters.get(k) == v for k, v in record.filters.items())
+    assert index.search_by_vector([1.0, 0.0, 0.0], record.filters, 10)

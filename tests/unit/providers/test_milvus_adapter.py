@@ -501,3 +501,14 @@ def test_expected_text_query_budget_includes_dimension_and_all_text_fields(index
     worst_row = dimension * 4 + 512 + 8192 + 1024 + 5 * 65535
     assert call["limit"] * worst_row <= 48 * 1024 * 1024
     assert call["limit"] > 32
+
+
+def test_payload_validation_uses_write_encoding_without_rpc(index):
+    item = record()
+    index.validate_records([item])
+    assert not index._client.mock_calls
+    item.text = '🙂' * 100000
+    for operation in (index.validate_records, index.upsert):
+        with pytest.raises(ValueError, match='Milvus text exceeds'):
+            operation([item])
+    assert not index._client.mock_calls

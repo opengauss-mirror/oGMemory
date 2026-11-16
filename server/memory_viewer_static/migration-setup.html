@@ -1,0 +1,5 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>开启迁移模式</title><link rel="stylesheet" href="/memory-viewer/styles.css"></head>
+<body style="padding:32px;max-width:900px;margin:auto"><h1>记忆导入导出</h1><p>请先停止当前实例的业务服务、MCP 及独立后台任务，并完成必要落盘，再启动迁移专用页面。</p>
+<pre style="white-space:pre-wrap">ogmem migration --config /path/ogmem.yaml --workspace /path/migration-work --maintenance-confirmed</pre>
+<p>配置 root_api_key 或通过环境变量 OGMEM_MIGRATION_API_KEY 设置迁移管理员密钥。默认页面地址为 http://127.0.0.1:8091；远端部署可通过 SSH 端口转发访问。</p>
+<p>支持全量导出和空目标导入。导入成功后停止迁移模式，再按现有方式启动业务服务。此普通业务页面不会执行迁移。</p><a href="/memory-viewer/">返回记忆查看器</a></body></html>

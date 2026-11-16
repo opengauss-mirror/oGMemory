@@ -28,6 +28,11 @@ class MockEmbedder(Embedder):
         """
         self._dimension = dimension
 
+    @property
+    def model(self) -> str:
+        """Stable identity, matching the graph profile's existing fallback."""
+        return "MockEmbedder"
+
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts.
 
