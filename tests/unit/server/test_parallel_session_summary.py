@@ -97,7 +97,11 @@ def test_empty_candidate_batch_joins_summary_before_completion(restored):
     ctx, fs, llm, api = setup(lambda _: [])
     llm.complete_json = lambda prompt, schema: {"facts_and_details": "Caroline owns a necklace."}
     api._pipeline.extract = lambda *args, **kwargs: []
-    saved = SimpleNamespace(journal=SimpleNamespace(batch={"archive_id": "existing"}), load=lambda: ([], 0, 0))
+    saved = SimpleNamespace(
+        journal=SimpleNamespace(batch={"archive_id": "existing"}),
+        load=lambda: ([], 0, 0),
+        partial_checkpoints=list,
+    )
     service = MemoryService.__new__(MemoryService)
     service.get_llm = lambda: llm
     messages = [{"role": "user", "content": "Caroline owns a necklace."}]

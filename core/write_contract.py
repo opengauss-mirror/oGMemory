@@ -16,6 +16,7 @@ PUBLIC_FIELDS = (
     "projection_status", "retry_action", "error_detail", "archive_id",
     "accepted", "terminal", "http_status",
     "paused_projection_count",
+    "writes_completed", "candidates_extracted", "recovery_mode", "failed_nodes",
 )
 
 
@@ -213,10 +214,24 @@ def merge_source_outcome(pending, receipt, batch_ids):
                   outbox_tracking_complete=pending.get("outbox_tracking_complete", True) and receipt.get("outbox_tracking_complete", False))
     result["raw_source_uris"] = list(dict.fromkeys(pending.get("raw_source_uris", []) + receipt.get("raw_source_uris", [])))
     archives = dict(pending.get("archive_receipts", {}))
+    new_archive = receipt["archive_id"] not in archives
+    for field in ("writes_completed", "candidates_extracted"):
+        if field in pending or field in receipt:
+            result[field] = pending.get(field, 0) + (receipt.get(field, 0) if new_archive else 0)
+    failures = []
+    for source in (pending, receipt):
+        for failure in source.get("failed_nodes", []):
+            entry = {"archive_id": source.get("archive_id"), **deepcopy(failure)}
+            if entry not in failures:
+                failures.append(entry)
+    if "failed_nodes" in pending or "failed_nodes" in receipt:
+        result["failed_nodes"] = failures
     archives[receipt["archive_id"]] = receipt["source_sha256"]
     result["archive_receipts"] = archives
     degraded = pending.get("semantic_degraded", False) or receipt.get("semantic_status") == "DEGRADED"
     result["semantic_degraded"] = degraded
+    if degraded and "writes_completed" in result:
+        result["recovery_mode"] = "partial" if result["writes_completed"] else "source_only"
     if source_ids - archived_ids:
         result.update(source_status="BUFFERED", semantic_status="PENDING", request_status="ACCEPTED")
     elif degraded:

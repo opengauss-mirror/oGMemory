@@ -236,6 +236,22 @@ class ExtractionBatchJournal:
             return ("rejected_before_write" in statuses
                     and statuses <= {"complete", "rejected_before_write"})
 
+    def unresolved_node_failures(self):
+        pending = {}
+        for record in self.batch["slots"].values():
+            parent = record.get("partial_parent")
+            if parent is not None and parent not in self.batch["slots"]:
+                pending[parent] = record["node_failures"]
+        result = []
+        for slot, failures in pending.items():
+            drafts = self.checkpoint(slot).load_drafts() or []
+            for failure in failures:
+                result.append({"slot": slot, **deepcopy(failure), "drafts": [
+                    {"id": index, "category": drafts[index].category,
+                     "routing_key": drafts[index].routing_key, "object_name": drafts[index].object_name}
+                    for index in failure["draft_ids"] if 0 <= index < len(drafts)]})
+        return result
+
     def finish(self, *, reset_window_state=False, outcome=None, resolve_outcome=None,
                current_request_id="", current_source_ids=()):
         """Clear source claim, pending drafts and request ID in one durable state."""
@@ -321,7 +337,8 @@ class CandidateCheckpoint:
 
     def invalidate_unaccepted_preparation(self):
         """Prepare this slot again after its generated identity needs correction."""
-        prefix = f"slot:{self.slot}/"
+        partial = bool(self.partial_checkpoints())
+        prefix = f"slot:{self.slot}/" + ("node_processing" if partial else "")
 
         def invalidate(batch):
             if self.slot in batch["slots"]:
@@ -330,7 +347,8 @@ class CandidateCheckpoint:
             for name in list(stages):
                 if name.startswith(prefix):
                     del stages[name]
-            batch.get("node_drafts", {}).pop(self.slot, None)
+            if not partial:
+                batch.get("node_drafts", {}).pop(self.slot, None)
 
         self.journal.mutate(invalidate)
         self.journal._verified_stage_results = {
@@ -366,7 +384,8 @@ class CandidateCheckpoint:
         except (KeyError, TypeError, ValueError) as exc:
             raise RecoveryNeedsConfirmationError("accepted extraction checkpoint is invalid") from exc
 
-    def accept(self, candidates, extracted, filtered):
+    def accept(self, candidates, extracted, filtered, *, partial_parent=None,
+               node_failures=(), others_complete=False):
         if self.record is not None:
             raise RecoveryNeedsConfirmationError("accepted extraction candidates cannot be replaced")
         batch = self.journal.batch
@@ -377,8 +396,23 @@ class CandidateCheckpoint:
                   "candidate_digests": [operation_digest(candidate, self.journal.ctx) for candidate in accepted],
                   "extracted": extracted, "filtered": filtered, "operations": {},
                   "operation_id_version": 2, "relation_tracking": True}
+        if partial_parent is not None:
+            record.update(partial_parent=partial_parent, node_failures=deepcopy(node_failures),
+                          others_complete=others_complete)
         self.journal.mutate(lambda value: value["slots"].update({self.slot: record}))
         return accepted
+
+    def partial_checkpoints(self):
+        return [self.journal.checkpoint(slot) for slot, record in self.journal.batch["slots"].items()
+                if record.get("partial_parent") == self.slot]
+
+    def accept_partial(self, candidates, extracted, filtered, failures, *, others_complete):
+        previous = self.partial_checkpoints()
+        checkpoint = self.journal.checkpoint(f"{self.slot}/partial:{len(previous)}")
+        checkpoint.accept(candidates, 0 if previous else extracted, 0 if previous else filtered,
+                          partial_parent=self.slot, node_failures=failures,
+                          others_complete=others_complete)
+        return checkpoint
 
     def restore_relation_tracking(self):
         record = self.record
@@ -397,11 +431,13 @@ class CandidateCheckpoint:
         self.journal.mutate(lambda batch: batch.update(outbox_tracking_version=1))
 
     def load_drafts(self):
-        record = self.journal.batch.get("node_drafts", {}).get(self.slot)
+        slot = (self.record or {}).get("partial_parent", self.slot)
+        record = self.journal.batch.get("node_drafts", {}).get(slot)
         return [CandidateMemory(**c) for c in record["candidates"]] if record else None
 
     def draft_source(self):
-        return self.journal.batch.get("node_drafts", {}).get(self.slot, {}).get("messages", [])
+        slot = (self.record or {}).get("partial_parent", self.slot)
+        return self.journal.batch.get("node_drafts", {}).get(slot, {}).get("messages", [])
 
     def save_drafts(self, candidates, messages):
         record = {"candidates": [asdict(c) for c in candidates], "messages": messages}

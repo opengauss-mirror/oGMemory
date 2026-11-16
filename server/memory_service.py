@@ -1892,6 +1892,10 @@ class MemoryService:
                 ):
                     aggregated[key] += chunk_result.get(key, 0)
                 aggregated["plans"].extend(chunk_result.get("plans", []))
+                if chunk_result.get("degraded"):
+                    aggregated.update(degraded=True, recovery_mode="partial", reason=chunk_result["reason"])
+                    aggregated.setdefault("failed_nodes", []).extend(
+                        {"slot": f"chunk:{idx}", **failure} for failure in chunk_result.get("failed_nodes", []))
                 # Store raw chunk text for retrieval fallback
                 try:
                     write_api.write_raw_chunk(
@@ -1961,12 +1965,17 @@ class MemoryService:
         from service.extraction_retry import source_only_reason
         reason = source_only_reason()
         if reason:
+            stored_candidates, stored_plans = [], []
             for slot in list(journal.batch["slots"]):
                 if slot.startswith("raw:"):
                     continue
                 checkpoint = journal.checkpoint(slot)
                 candidates, extracted, filtered = checkpoint.load()
                 plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
+                if slot == "summary":
+                    continue
+                stored_candidates.extend(candidates)
+                stored_plans.extend(plans)
                 aggregated["candidates_extracted"] += extracted
                 aggregated["candidates_filtered"] += filtered
                 aggregated["writes_completed"] += sum(plan.action != "skip" for plan in plans)
@@ -1975,20 +1984,34 @@ class MemoryService:
                                              "merged_fields": plan.merged_fields} for plan in plans)
             logger.warning("Extraction completed from preserved source session=%s archive=%s reason=%s",
                            session_id, batch["archive_id"], reason)
-            return {**aggregated, "degraded": True, "recovery_mode": "source_only", "reason": reason}
+            failures = journal.unresolved_node_failures()
+            graph = write_api.finish_partial_relations(stored_candidates, stored_plans, ctx,
+                                                      checkpoint=journal.checkpoint("chunk:0"))
+            return {**aggregated, "degraded": True,
+                    "recovery_mode": "partial" if aggregated["writes_completed"] else "source_only",
+                    "failed_nodes": failures, "graph": graph,
+                    "reason": reason}
+        from extraction.node_processing import NodeProcessingPartialError
+        failures = []
         with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api,
                                             journal.checkpoint("summary")) as before_write:
             for index, chunk in enumerate(chunks):
                 check_deadline()
-                result = write_api.commit_session(
-                    messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
-                    session_time=session_time, session_summary=batch["session_summary"],
-                    tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
-                    candidate_checkpoint=journal.checkpoint(f"chunk:{index}"), before_write=before_write)
+                try:
+                    result = write_api.commit_session(
+                        messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
+                        session_time=session_time, session_summary=batch["session_summary"],
+                        tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
+                        candidate_checkpoint=journal.checkpoint(f"chunk:{index}"), before_write=before_write)
+                except NodeProcessingPartialError as exc:
+                    failures.extend({"slot": f"chunk:{index}", **failure} for failure in exc.failures)
+                    continue
                 for key in ("candidates_extracted", "candidates_filtered", "writes_completed",
                             "writes_skipped", "writes_failed"):
                     aggregated[key] += result.get(key, 0)
                 aggregated["plans"].extend(result.get("plans", []))
+        if failures:
+            raise NodeProcessingPartialError([], failures)
         return aggregated
 
     def _complete_extraction_source(self, ctx, archive_id, reason):
@@ -5934,8 +5957,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                            "writes_completed": write_result.get("writes_completed", 0),
                            "candidates_extracted": write_result.get("candidates_extracted", 0)}
                 if degraded:
-                    outcome["recovery_mode"] = "source_only"
-                    outcome["error_detail"] = {"code": "EXTRACTION_SOURCE_ONLY", "component": "extraction",
+                    outcome["recovery_mode"] = write_result.get("recovery_mode", "source_only")
+                    outcome["failed_nodes"] = deepcopy(write_result.get("failed_nodes", []))
+                    outcome["error_detail"] = {"code": ("EXTRACTION_PARTIAL" if outcome["recovery_mode"] == "partial"
+                                                       else "EXTRACTION_SOURCE_ONLY"), "component": "extraction",
                         "request_id": extraction_journal_request_id, "retry_action": "manual_review",
                         "cause": {"message": str(write_result.get("reason", "source preserved after recovery"))[:1000]}}
                 completed_outcome.update(extraction_journal.finish(
@@ -6866,7 +6891,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     buf.extraction_summary = _update_extraction_summary(buf.extraction_summary, write_result)
                 result["write_result"] = write_result
                 journal.mutate(lambda batch: batch["lifecycle"].update(
-                    semantic_status="DEGRADED" if write_result.get("degraded") else "COMPLETE"))
+                    semantic_status="DEGRADED" if write_result.get("degraded") else "COMPLETE",
+                    extraction_result={key: deepcopy(write_result[key]) for key in
+                        ("writes_completed", "candidates_extracted", "recovery_mode", "failed_nodes")
+                        if key in write_result}))
             result["prepareToken"] = journal.issue_prepare_token()
             source_ids = set(journal.batch["message_ids"])
             buf.extraction_watermark = max((index + 1 for index, message in enumerate(buf.messages)
@@ -6958,8 +6986,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def _lifecycle_extraction_outcome(lifecycle):
         if lifecycle.get("source_only_reason"):
             return {"semantic_status": "DEGRADED", "recovery_mode": "source_only",
-                    "error_detail": lifecycle["extraction_error_detail"]}
-        return {"semantic_status": lifecycle.get("semantic_status", "COMPLETE")}
+                    "error_detail": lifecycle["extraction_error_detail"],
+                    **deepcopy(lifecycle.get("extraction_result", {}))}
+        return {"semantic_status": lifecycle.get("semantic_status", "COMPLETE"),
+                **deepcopy(lifecycle.get("extraction_result", {}))}
 
     @staticmethod
     def _update_lifecycle_error(journal, exc=None, *, retryable=True):
@@ -7189,6 +7219,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         for slot, record in journal.batch["slots"].items() if slot.startswith("raw:")
                         for operation in record["operations"].values() if operation.get("status") == "complete"]
                     outcome = self._lifecycle_extraction_outcome(journal.batch["lifecycle"])
+                    outcome.update({key: deepcopy(write_result[key]) for key in
+                        ("writes_completed", "candidates_extracted", "recovery_mode", "failed_nodes")
+                        if key in write_result})
                     journal.finish(outcome={**outcome, "source_status": "RAW_ARCHIVED", "raw_source_uris": raw_uris},
                                    resolve_outcome=self._resolve_write_outcome)
                 else:
