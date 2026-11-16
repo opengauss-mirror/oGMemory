@@ -18,6 +18,7 @@
 - [Docker 部署说明](deployment/docker_deployment_guide.md)：镜像构建和容器运行参考。
 - [OpenClaw Context Engine 部署](deployment/openclaw_context_engine_quickstart_zh.md)：OpenClaw 单机接入。
 - [部署方式选择](deployment.md)：Compose、ARM64、源码和镜像部署。
+- [记忆导入导出](deployment/memory-migration.md)：维护窗口内的全量迁移、附件恢复与索引重建。
 - [Memory Viewer 使用指南](memory_viewer_guide.md)：连接账户、浏览记忆和查看运行状态。
 
 ## 集成
@@ -45,6 +46,7 @@
 - [目录摘要流程](architecture/directory-summarizer-flow.md)
 - [节点处理流程](architecture/node-processing.md)
 - [异步索引设计](architecture/async-indexing.md)
+- [记忆导入导出设计](architecture/memory-migration.md)
 
 ## 开发与测试
 
