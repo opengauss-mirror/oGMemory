@@ -1289,3 +1289,45 @@ def test_agfs_directory_source_alias_preserves_backend_semantics(tmp_path, targe
             assert index.count() == 0
         finally:
             index.close()
+
+
+@pytest.mark.parametrize("tail", ["buffered", "appended", "second_tar"])
+def test_tar_tail_rejected_before_business_restore(tmp_path, tail):
+    import gzip
+    import io
+    import tarfile
+
+    from service.migration.package import DATASETS, PackageError, write_package
+
+    target = new_config("sql", "tar-tail-target")
+    package = tmp_path / "tail.tar.gz"
+    record = {**fixtures()["nodes"][0], "metadata": {}}
+    write_package(
+        package,
+        {"nodes": [record], "archives": [], "relations": []},
+        source_backend="agfs",
+        source_version="test",
+    )
+    raw = gzip.decompress(package.read_bytes())
+    with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+        end = max(m.offset_data + ((m.size + 511) // 512) * 512 for m in archive)
+    if tail == "buffered":
+        assert end + 1024 < tarfile.RECORDSIZE
+        raw = raw[: end + 1024] + b"hidden" + raw[end + 1030 :]
+    elif tail == "appended":
+        raw += b"hidden"
+    else:
+        raw += raw
+    package.write_bytes(gzip.compress(raw))
+    importer = MigrationService(target)
+    for operation in (importer.preflight, importer.restore):
+        with pytest.raises(PackageError, match="non-zero data after tar end marker"):
+            operation(package)
+    with storage(target) as adapter:
+        adapter.check(empty=True)
+        assert all(not list(adapter.records(kind)) for kind in DATASETS)
+    index = target.to_provider_config().create_vector_index()
+    try:
+        assert index.count() == 0
+    finally:
+        index.close()

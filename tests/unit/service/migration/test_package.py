@@ -334,3 +334,66 @@ def test_gzip_envelope_is_validated_before_records_are_exposed(tmp_path, mutatio
     with pytest.raises(PackageError):
         with open_package(path, limits=PackageLimits(max_bytes=1024, max_files=4)):
             pytest.fail("invalid gzip envelope exposed records")
+
+
+@pytest.mark.parametrize("tail", ["buffered", "appended", "second_tar", "duplicate_member"])
+def test_tar_end_cannot_hide_payload_in_the_same_gzip_member(tmp_path, tail):
+    import gzip
+
+    path = tmp_path / "tail.tar.gz"
+    write(path)
+    raw = gzip.decompress(path.read_bytes())
+    with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+        members = list(archive)
+    end = max(m.offset_data + ((m.size + 511) // 512) * 512 for m in members)
+    if tail == "buffered":
+        assert end + 1024 < tarfile.RECORDSIZE
+        raw = raw[: end + 1024] + b"hidden" + raw[end + 1030 :]
+    elif tail == "appended":
+        raw += b"hidden"
+    elif tail == "second_tar":
+        raw += raw
+    else:
+        first = members[0]
+        raw += raw[: first.offset_data + ((first.size + 511) // 512) * 512]
+    path.write_bytes(gzip.compress(raw))
+    with pytest.raises(PackageError, match="non-zero data after tar end marker"):
+        with open_package(path):
+            pytest.fail("hidden tar payload accepted")
+
+
+@pytest.mark.parametrize("padding", [0, 512, 513, 1024, 1536])
+def test_tar_end_requires_two_zero_blocks_and_aligned_padding(tmp_path, padding):
+    import gzip
+
+    path = tmp_path / "padding.tar.gz"
+    expected = write(path)
+    raw = gzip.decompress(path.read_bytes())
+    with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+        end = max(m.offset_data + ((m.size + 511) // 512) * 512 for m in archive)
+    path.write_bytes(gzip.compress(raw[:end] + b"\0" * padding))
+    if padding >= 1024 and padding % 512 == 0:
+        with open_package(path) as loaded:
+            assert loaded.manifest == expected
+    else:
+        with pytest.raises(PackageError):
+            with open_package(path):
+                pytest.fail("incomplete tar ending accepted")
+
+
+def test_invalid_header_cannot_be_treated_as_tar_end(tmp_path):
+    import gzip
+
+    path = tmp_path / "header.tar.gz"
+    write(path)
+    raw = gzip.decompress(path.read_bytes())
+    with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+        end = max(m.offset_data + ((m.size + 511) // 512) * 512 for m in archive)
+    damaged = bytearray(raw)
+    header = tarfile.TarInfo("manifest.json").tobuf(format=tarfile.USTAR_FORMAT)
+    damaged[end : end + 512] = header
+    damaged[end + 148] = ord("x")  # Invalid checksum; still followed by zero padding.
+    path.write_bytes(gzip.compress(damaged))
+    with pytest.raises(PackageError, match="invalid or truncated tar header"):
+        with open_package(path):
+            pytest.fail("invalid header accepted as EOF")

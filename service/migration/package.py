@@ -255,7 +255,12 @@ class _UstarInfo(tarfile.TarInfo):
         # Some Python versions use an internal _frombuf() and bypass a
         # frombuf() override. Gate the fixed header at the actual read entry.
         buf = archive.fileobj.read(tarfile.BLOCKSIZE)
-        member = cls.frombuf(buf, archive.encoding, archive.errors)
+        try:
+            member = cls.frombuf(buf, archive.encoding, archive.errors)
+        except tarfile.EOFHeaderError:
+            raise  # Only a complete zero block may terminate member parsing.
+        except tarfile.HeaderError as exc:
+            raise PackageError("invalid or truncated tar header") from exc
         member.offset = archive.fileobj.tell() - tarfile.BLOCKSIZE
         return member._proc_member(archive)
 
@@ -309,11 +314,17 @@ class _BoundedTarStream:
             raise PackageError("decompressed archive exceeds resource limits")
         return bytes(output)
 
-    def finish(self):
-        # tar stops at its end marker; consume padding and verify gzip CRC/EOF
-        # before validating DTOs or allowing target writes.
-        while self.read(_CHUNK):
-            pass
+    def finish(self, tar_stream):
+        # Drain through tarfile's stream to include bytes it already prefetched.
+        # The parser consumed the first zero block; require the second and
+        # accept only complete zero padding blocks until the verified gzip EOF.
+        padding = 0
+        while chunk := tar_stream.read(_CHUNK):
+            if chunk.strip(b"\0"):
+                raise PackageError("non-zero data after tar end marker")
+            padding += len(chunk)
+        if padding < tarfile.BLOCKSIZE or padding % tarfile.BLOCKSIZE:
+            raise PackageError("invalid tar end padding")
 
 
 @contextmanager
@@ -371,7 +382,7 @@ def open_package(
                     if size != member.size:
                         raise PackageError("truncated member")
                     observed[name] = {"size": size, "sha256": digest.hexdigest()}
-                decompressed.finish()
+                decompressed.finish(archive.fileobj)
             manifest = _validate(root, observed, limits)
         except (tarfile.TarError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
             raise PackageError("invalid or truncated archive") from exc
