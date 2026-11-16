@@ -137,8 +137,25 @@ class Rebuilder:
             raise PackageError("embedding output count/dimension is invalid")
         return vectors
 
+    def validate_records(self, inv):
+        validate = getattr(self.vector, "validate_records", None)
+        if not callable(validate):
+            return
+        if self.embedder is None:
+            self.embedder = self.provider.create_embedder()
+        dimension = self.provider.embedding_dimension
+        for batch in batches(self._records(inv)):
+            records = augment_with_embeddings(
+                batch, ([0.0] * dimension for _ in batch), self.embedder
+            )
+            try:
+                validate(records)
+            except ValueError as exc:
+                raise PackageError(str(exc)) from exc
+
     def probe(self):
-        self.embedder = self.provider.create_embedder()
+        if self.embedder is None:
+            self.embedder = self.provider.create_embedder()
         self._embed(["migration validation"])
 
     def _records(self, inv, scope=None):

@@ -397,3 +397,45 @@ def test_invalid_header_cannot_be_treated_as_tar_end(tmp_path):
     with pytest.raises(PackageError, match="invalid or truncated tar header"):
         with open_package(path):
             pytest.fail("invalid header accepted as EOF")
+
+
+def test_export_normalizes_high_owner_ids(tmp_path, monkeypatch):
+    original = tarfile.TarFile.gettarinfo
+
+    def high_owner(self, *args, **kwargs):
+        info = original(self, *args, **kwargs)
+        info.uid = info.gid = 2097152
+        info.uname = info.gname = 'host-specific-owner'
+        return info
+
+    monkeypatch.setattr(tarfile.TarFile, 'gettarinfo', high_owner)
+    path = tmp_path / 'portable.tar.gz'
+    write(path)
+    with tarfile.open(path) as archive:
+        for member in archive:
+            assert (member.uid, member.gid, member.uname, member.gname) == (0, 0, '', '')
+    with open_package(path):
+        pass
+
+
+def test_ustar_size_boundary_and_early_blob_rejection(tmp_path):
+    from service.migration.package import USTAR_MAX_MEMBER_BYTES, check_member_size
+
+    check_member_size(USTAR_MAX_MEMBER_BYTES)
+    with pytest.raises(PackageError, match='USTAR'):
+        check_member_size(USTAR_MAX_MEMBER_BYTES + 1)
+    blob = tmp_path / 'large.bin'
+    with blob.open('wb') as stream:
+        stream.truncate(9 * 1024**3)
+    destination = tmp_path / 'rejected.tar.gz'
+    with pytest.raises(PackageError, match='USTAR'):
+        write(destination, blobs=[blob])
+    assert not destination.exists()
+
+
+def test_dataset_member_limit_is_cumulative(tmp_path):
+    path = tmp_path / 'rejected.tar.gz'
+    with pytest.raises(PackageError, match='USTAR'):
+        write(path, datasets([{'text': 'x' * 60}] * 2),
+              limits=PackageLimits(max_member_bytes=100))
+    assert not path.exists()

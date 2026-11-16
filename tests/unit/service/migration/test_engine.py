@@ -90,6 +90,9 @@ class Indexes:
     def check_empty(self):
         pass
 
+    def validate_records(self, inv):
+        pass
+
     def probe(self):
         pass
 
@@ -783,3 +786,55 @@ def test_agfs_relation_source_is_checked_by_physical_path(tmp_path, source):
         with pytest.raises(PackageError, match="relation source differs from owning node"):
             service(files).export(package)
         assert not package.exists()
+
+
+@pytest.mark.parametrize('oversize', ['text', 'metadata'])
+def test_milvus_payload_rejected_before_content_restore(tmp_path, oversize):
+    from providers.vector_index.milvus_index import MilvusVectorIndex
+    from service.migration.rebuild import Rebuilder
+
+    source, target = Files(), Files()
+    row = node()
+    if oversize == 'text':
+        row['content'] = '🙂' * 100000
+    else:
+        # A long model identity exercises metadata added by the rebuild step.
+        row['content'] = 'small'
+    AGFSStorage(config(), source).restore('nodes', [row])
+    package = tmp_path / 'source.tar.gz'
+    service(source).export(package)
+    vector = object.__new__(MilvusVectorIndex)
+    vector._dimension = 8
+
+    class CheckedIndexes(Indexes):
+        validate_records = Rebuilder.validate_records
+        _records = Rebuilder._records
+
+        def __init__(self, cfg):
+            self.vector = vector
+            self.embedder = SimpleNamespace(model='m' * (65536 if oversize == 'metadata' else 8))
+            self.provider = SimpleNamespace(embedding_dimension=8)
+
+        def rebuild(self, inv, progress):
+            pytest.fail('payload must be rejected before rebuilding')
+
+    migration = service(target)
+    migration.cfg.vector_db_type = 'milvus'
+    migration.index_factory = CheckedIndexes
+    for operation in (migration.preflight, migration.restore):
+        with pytest.raises(PackageError, match=f'Milvus {oversize} exceeds'):
+            operation(package)
+        assert not target.files
+
+
+def test_oversize_attachment_rejected_before_hashing(tmp_path, monkeypatch):
+    from service.migration.assets import Assets
+
+    blob = tmp_path / 'large.bin'
+    with blob.open('wb') as stream:
+        stream.truncate(9 * 1024**3)
+    row = node()
+    row['metadata']['source_path'] = str(blob)
+    monkeypatch.setattr('hashlib.file_digest', lambda *a: pytest.fail('must reject before hashing'))
+    with pytest.raises(PackageError, match='USTAR'):
+        Assets(tmp_path, tmp_path).capture(row)

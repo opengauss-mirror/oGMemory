@@ -261,6 +261,7 @@ class MigrationService:
                 target = self._check_target(adapter)
             with self._indexes() as indexes:
                 indexes.check_empty()
+                indexes.validate_records(inv)
             return {
                 "data": inv.summary(),
                 "source_backend": package.manifest["source_backend"],
@@ -298,6 +299,7 @@ class MigrationService:
                 self._check_target(adapter)
                 with self._indexes() as indexes:
                     indexes.check_empty()
+                    indexes.validate_records(inv)
                     # Probe the model before writing any canonical data.
                     indexes.probe()
                     progress(phase="restoring", counts={k: dict(v) for k, v in expected.items()})

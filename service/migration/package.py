@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+USTAR_MAX_MEMBER_BYTES = 8 * 1024**3 - 1
 FORMAT_VERSION = 1
 DATASETS = ("nodes", "relations", "archives")
 _CHUNK = 1024 * 1024
@@ -35,6 +36,7 @@ class PackageLimits:
     max_files: int = 100_000
     max_record_bytes: int = 16 * 1024**2
     max_manifest_bytes: int = 4 * 1024**2
+    max_member_bytes: int = USTAR_MAX_MEMBER_BYTES
 
     def __post_init__(self):
         if any(type(value) is not int or value <= 0 for value in vars(self).values()):
@@ -101,6 +103,17 @@ def _file_summary(path: Path) -> dict:
     return {"size": size, "sha256": digest.hexdigest()}
 
 
+def check_member_size(size, limit=USTAR_MAX_MEMBER_BYTES):
+    if size > min(limit, USTAR_MAX_MEMBER_BYTES):
+        raise PackageError("member exceeds USTAR byte limit")
+
+
+def _portable_member(info):
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    return info
+
+
 def write_package(
     destination: Path,
     datasets: Mapping[str, Iterable[dict]],
@@ -131,6 +144,7 @@ def write_package(
         for kind in DATASETS:
             name = f"entities/{kind}.jsonl"
             count = 0
+            member_size = 0
             with (root / name).open("wb") as stream:
                 for record in datasets[kind]:
                     if not isinstance(record, dict):
@@ -138,6 +152,8 @@ def write_package(
                     raw = _encode(record) + b"\n"
                     if len(raw) > limits.max_record_bytes:
                         raise PackageError("record exceeds byte limit")
+                    member_size += len(raw)
+                    check_member_size(member_size, limits.max_member_bytes)
                     total += len(raw)
                     if total > limits.max_bytes:
                         raise PackageError("package exceeds byte limit")
@@ -146,12 +162,14 @@ def write_package(
             files[name] = {**_file_summary(root / name), "records": count}
         (root / "blobs/sha256").mkdir(parents=True)
         for source in blobs:
+            check_member_size(Path(source).stat().st_size, limits.max_member_bytes)
             staging = root / "attachment.tmp"
             digest = hashlib.sha256()
             size = 0
             with Path(source).open("rb") as inp, staging.open("wb") as out:
                 while chunk := inp.read(_CHUNK):
                     size += len(chunk)
+                    check_member_size(size, limits.max_member_bytes)
                     if total + size > limits.max_bytes:
                         raise PackageError("package exceeds byte limit")
                     digest.update(chunk)
@@ -177,6 +195,7 @@ def write_package(
             validate_description(source_environment, source_backend)
             manifest["source_environment"] = source_environment
         raw_manifest = _encode(manifest)
+        check_member_size(len(raw_manifest), limits.max_member_bytes)
         if len(raw_manifest) > limits.max_manifest_bytes:
             raise PackageError("manifest exceeds byte limit")
         if total + len(raw_manifest) > limits.max_bytes or len(files) + 1 > limits.max_files:
@@ -185,7 +204,7 @@ def write_package(
         staged = root / "package.tar.gz"
         with tarfile.open(staged, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
             for name in ["manifest.json", *sorted(files)]:
-                archive.add(root / name, arcname=name, recursive=False)
+                archive.add(root / name, arcname=name, recursive=False, filter=_portable_member)
         # Same filesystem, atomic no-clobber publish; no partial final package.
         os.link(staged, destination)
     return manifest
@@ -361,6 +380,7 @@ def open_package(
                         raise PackageError("unsupported archive member")
                     if name in observed:
                         raise PackageError("duplicate archive member")
+                    check_member_size(member.size, limits.max_member_bytes)
                     total += member.size
                     if (
                         member.size < 0

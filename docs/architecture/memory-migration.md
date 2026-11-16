@@ -30,7 +30,7 @@
 
 ## 3. 迁移包契约
 
-使用单个 gzip／USTAR 包，格式版本为 1：
+使用单个 gzip／USTAR 包，格式版本为 1；成员属主统一为 UID/GID 0、空属主名称，单成员不超过 8 GiB−1 字节：
 
 | 成员 | 内容 |
 |---|---|
@@ -78,7 +78,7 @@ AGFS→AGFS、AGFS→SQL、SQL→AGFS、SQL→SQL 共用迁移协议。内容存
 
 向量后端的 `get_record(id)` 返回一致的 `IndexRecord`：完整 `text`、原有 `filters`（账号、owner、类别、内容类型及存在时的资源类型）和约定的业务 `metadata`。重建与 Outbox 共用 embedding 元数据增强逻辑，保留可用的目标模型标识和实际向量维度。
 
-`check_migration_target()` 由向量适配器检查持久化支持、空状态及已有表／collection 约束；记录为空不能绕过维度检查。未实现迁移能力的后端明确拒绝，不新增插件注册或能力协商框架。
+`check_migration_target()` 由向量适配器检查持久化支持、空状态及已有表／collection 约束；记录为空不能绕过维度检查。Milvus 的 `validate_records()` 复用写入编码逻辑，在预检和恢复前检查文本、字段及包含目标模型身份的元数据载荷限制。未实现迁移能力的后端明确拒绝，不新增插件注册或能力协商框架。
 
 ## 6. 管理与失败处理
 

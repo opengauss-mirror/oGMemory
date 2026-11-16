@@ -8,7 +8,7 @@ import re
 import shutil
 from pathlib import Path
 
-from service.migration.package import PackageError
+from service.migration.package import PackageError, check_member_size
 
 MAX_ASSET_BYTES = 10 * 1024**3
 ASSET_FIELDS = {"source_path", "blob_path", "media_path", "image_path", "video_path", "audio_path"}
@@ -47,6 +47,7 @@ class Assets:
             if not path.is_relative_to(self.root) or not path.is_file():
                 raise PackageError(f"attachment {field} is missing or outside --asset-root")
             suffix = path.suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,12}", path.suffix) else ""
+            check_member_size(path.stat().st_size)
             if path.stat().st_size > MAX_ASSET_BYTES:
                 raise PackageError("attachments exceed package byte limit")
             with path.open("rb") as inp:
