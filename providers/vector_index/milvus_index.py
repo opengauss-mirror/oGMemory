@@ -261,7 +261,14 @@ class MilvusVectorIndex(VectorIndex):
             )
         return " and ".join(f"({clause})" for clause in clauses)
 
+    def validate_records(self, records: list[IndexRecord]) -> None:
+        """Check serialized payload limits without embeddings or remote writes."""
+        self._encode_records(records, include_vectors=False)
+
     def upsert(self, records: list[IndexRecord]) -> None:
+        self._publish(self._encode_records(records))
+
+    def _encode_records(self, records, *, include_vectors=True):
         rows = {}
         for record in records:
             if not record.filters.get("account_id") or not record.filters.get("owner_space"):
@@ -281,7 +288,7 @@ class MilvusVectorIndex(VectorIndex):
                 **self._text_parts(record.text),
                 memory_directory=memory_directory(record.uri),
                 metadata=metadata,
-                embedding=self._vector(record.metadata.get("_embedding")),
+                embedding=self._vector(record.metadata.get("_embedding")) if include_vectors else [],
             )
             # Validate locally before any batch is written.
             for name, limit in _VARCHAR_LIMITS.items():
@@ -294,7 +301,7 @@ class MilvusVectorIndex(VectorIndex):
                 raise ValueError("Milvus metadata exceeds 65536 UTF-8 bytes")
             json.dumps(row, allow_nan=False)
             rows[record.id] = row
-        self._publish(list(rows.values()))
+        return list(rows.values())
 
     def _epoch(self):
         epoch = self._client._get_connection().alloc_timestamp(timeout=self._timeout)
@@ -610,6 +617,13 @@ class MilvusVectorIndex(VectorIndex):
         for key, row in zip(keys, batch):
             if heads.get(key) == row["id"]:
                 yield row
+
+    def check_migration_target(self) -> None:
+        from pymilvus import DataType
+
+        self._validate_schema(DataType)
+        if self.count():
+            raise ValueError("target vector index is not empty")
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         if not record_id:

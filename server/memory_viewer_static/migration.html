@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>记忆导入导出 · oGMemory</title><link rel="stylesheet" href="/memory-viewer/styles.css">
+<style>body{padding:24px}main{max-width:900px;margin:auto}section{border:1px solid var(--line);border-radius:10px;padding:20px;margin:18px 0}button,input{margin:6px;padding:9px}button{border:1px solid var(--line);border-radius:6px;cursor:pointer}button:disabled{cursor:default}details{margin-top:12px}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}progress{width:100%}.error{color:#c33}a{color:inherit}</style>
+<script src="/memory-viewer/migration.js" defer></script></head>
+<body><main><h1>记忆导入导出</h1>
+<p>维护模式：请先停止所有业务写入及后台任务。导入仅支持空目标；完成校验后停止迁移服务，再启动业务服务。</p>
+<section><h2>管理员连接</h2><label>迁移管理员密钥 <input id="key" type="password" autocomplete="off"></label><button id="connect">连接</button><p id="connection">尚未连接</p></section>
+<p id="error" class="error" role="alert"></p>
+<div id="operations" hidden>
+<p><label><input type="checkbox" id="maintenance">已停止其他业务进程并完成必要落盘</label></p>
+<section><h2>导出记忆</h2><p>全量导出支持的持久化节点、关系与历史归档。包含模型及存储的来源描述，不包含模型文件、密钥或运行任务。</p><button id="export">开始导出</button><a id="download" hidden>下载迁移包</a></section>
+<section><h2>导入记忆</h2><p>自动按目标存储配置恢复，使用目标 embedding 重建持久化索引。此过程会调用 embedding 模型。</p><input id="file" type="file" accept=".gz"><button id="inspect">上传并预检</button><button id="import" disabled>开始导入</button><p id="upload"></p><p id="plan-summary"></p><div id="compatibility"></div><details><summary>预检详情</summary><pre id="plan"></pre></details></section>
+<section><h2>进度与结果</h2><p id="phase">等待操作</p><p id="result-summary"></p><details><summary>完整报告</summary><pre id="result"></pre></details></section>
+<section><h2>最近任务</h2><div id="history"></div></section>
+</div></main></body></html>
