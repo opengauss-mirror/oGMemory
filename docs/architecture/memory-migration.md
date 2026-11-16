@@ -92,4 +92,4 @@ AGFS→AGFS、AGFS→SQL、SQL→AGFS、SQL→SQL 共用迁移协议。内容存
 
 验收检查迁移前后的数据与权限一致性、索引重建和业务读取，以及异常输入在目标写入前被拒绝。向量后端使用统一契约测试，并检查跨后端迁移和新进程读取。
 
-启动命令、GUI 步骤、配置要求及资源限额见[操作说明](../deployment/memory-migration.md)。
+启动命令、GUI 步骤、配置要求及资源限额见[操作说明](/docs/deployment/memory-migration.md)。

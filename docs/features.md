@@ -22,7 +22,7 @@ oGMemory 帮助 Agent 保存和查找长期记忆、在连续任务中使用上�
 
 ## 使用准备
 
-准备已运行的 oGMemory HTTP 服务、LLM、Embedding 和持久化存储。服务启动与连接配置见 [快速开始](QUICKSTART.md)、[配置说明](OGMEMORY_ENV.md)。配置片段合并到服务使用的 YAML 文件后，重启服务使其生效；明确支持热更新的场景配置可通过管理接口修改。
+准备已运行的 oGMemory HTTP 服务、LLM、Embedding 和持久化存储。服务启动与连接配置见 [快速开始](/docs/QUICKSTART.md)、[配置说明](/docs/OGMEMORY_ENV.md)。配置片段合并到服务使用的 YAML 文件后，重启服务使其生效；明确支持热更新的场景配置可通过管理接口修改。
 
 SQL 主存储和向量索引使用同一数据库连接与匹配的方言。HTTP、MCP 和索引服务使用相同的存储、身份和特性配置。
 
@@ -399,7 +399,7 @@ print(forgotten)
 
 在维护窗口内停止源、目标业务写入，准备空目标。通过 Memory Viewer 的“导入导出”入口查看启动说明，在独立迁移页面执行源端导出和目标端上传、预检、导入。预检展示模型、维度及存储差异；来源描述不会覆盖目标配置。
 
-迁移不接续运行中会话，不复制凭证、连接配置或工作区同步状态。启动命令、管理员认证、附件目录与操作步骤统一见[操作说明](deployment/memory-migration.md)，数据范围和协议见[设计说明](architecture/memory-migration.md)。
+迁移不接续运行中会话，不复制凭证、连接配置或工作区同步状态。启动命令、管理员认证、附件目录与操作步骤统一见[操作说明](/docs/deployment/memory-migration.md)，数据范围和协议见[设计说明](/docs/architecture/memory-migration.md)。
 
 ### 效果验证
 
@@ -1189,7 +1189,7 @@ print(result["search_rounds"], result["search_history"])
 PY
 ```
 
-音视频联合处理选择 `video_episodic_full.yaml`，安装 `cv`、`asr` 扩展并配置 CV、语音识别和说话人模型；QA 阶段传入生成的问题文件。问答可通过 `m3.qa_context` 配置上下文预算、检索次数和证据数量。参数见 [视频流水线](m3_resume.md)、[问答配置](m3_bounded_context.md)。
+音视频联合处理选择 `video_episodic_full.yaml`，安装 `cv`、`asr` 扩展并配置 CV、语音识别和说话人模型；QA 阶段传入生成的问题文件。问答可通过 `m3.qa_context` 配置上下文预算、检索次数和证据数量。参数见 [视频流水线](/docs/m3_resume.md)、[问答配置](/docs/m3_bounded_context.md)。
 
 ### 效果验证
 
@@ -1374,18 +1374,18 @@ print(scene["scene"]["scene_id"])
 
 | 方式 | 接入入口 | 操作步骤 |
 | --- | --- | --- |
-| HTTP | `/api/v1/memories/*` 和会话接口 | [HTTP API](integrations/http-rest.md) |
-| Python | `MemoryService`、`MemoryWriteAPI`、`ReadAPI` | [Python API](integrations/python-api.md) |
-| MCP | stdio、Streamable HTTP、SSE | [MCP 接入](integrations/mcp.md) |
-| OpenClaw | Context Engine 插件 | [OpenClaw](integrations/openclaw.md) |
-| Claude Code | 原生 Hook 插件 | [Claude Code](integrations/claude-code.md) |
-| Codex | 原生插件与 Hooks | [Codex](integrations/codex.md) |
-| OpenCode | 原生生命周期插件 | [OpenCode](integrations/opencode.md) |
-| DeepSeek Harness | DSH 插件 | [DeepSeek Harness](integrations/deepseek-harness.md) |
-| Hermes | MemoryProvider 插件 | [Hermes](integrations/hermes.md) |
-| QwenPaw | 原生插件和 Agent 中间件 | [QwenPaw](integrations/qwenpaw.md) |
-| Deep Agents | `OGMemoryMiddleware` | [Deep Agents](integrations/deepagents.md) |
-| 通用 Agent Plugin | MCP 代理与记忆 Skill | [通用插件](integrations/agent-plugins.md) |
+| HTTP | `/api/v1/memories/*` 和会话接口 | [HTTP API](/docs/integrations/http-rest.md) |
+| Python | `MemoryService`、`MemoryWriteAPI`、`ReadAPI` | [Python API](/docs/integrations/python-api.md) |
+| MCP | stdio、Streamable HTTP、SSE | [MCP 接入](/docs/integrations/mcp.md) |
+| OpenClaw | Context Engine 插件 | [OpenClaw](/docs/integrations/openclaw.md) |
+| Claude Code | 原生 Hook 插件 | [Claude Code](/docs/integrations/claude-code.md) |
+| Codex | 原生插件与 Hooks | [Codex](/docs/integrations/codex.md) |
+| OpenCode | 原生生命周期插件 | [OpenCode](/docs/integrations/opencode.md) |
+| DeepSeek Harness | DSH 插件 | [DeepSeek Harness](/docs/integrations/deepseek-harness.md) |
+| Hermes | MemoryProvider 插件 | [Hermes](/docs/integrations/hermes.md) |
+| QwenPaw | 原生插件和 Agent 中间件 | [QwenPaw](/docs/integrations/qwenpaw.md) |
+| Deep Agents | `OGMemoryMiddleware` | [Deep Agents](/docs/integrations/deepagents.md) |
+| 通用 Agent Plugin | MCP 代理与记忆 Skill | [通用插件](/docs/integrations/agent-plugins.md) |
 
 使用配置生成器为客户端创建连接配置，输出目录由调用方指定：
 
