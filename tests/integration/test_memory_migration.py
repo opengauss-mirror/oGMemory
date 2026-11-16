@@ -1219,3 +1219,73 @@ def test_migration_job_logs_real_database_failure(tmp_path, caplog, failure):
         reserved.close()
         cfg.sql_connection_string = original_dsn
     assert export_job()["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("target_backend", ["agfs", "sql"])
+def test_agfs_directory_source_alias_preserves_backend_semantics(tmp_path, target_backend):
+    from dataclasses import replace
+
+    from pyagfs import AGFSClient
+
+    from core.models import ContextNode, RelationEdge, RequestContext
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from providers.relation_store.agfs_relation_store import AGFSRelationStore
+    from service.api import MemoryWriteAPI
+    from service.migration.package import PackageError
+    from tests.unit.commit.test_memory_identity import memory
+    from tests.unit.server.test_extraction_batch_recovery import NoModel
+
+    source, target = new_config("agfs", "source-alias"), new_config(target_backend, "alias-target")
+    target.graph_backend = "none"
+    client = AGFSClient(api_base_url=source.agfs_base_url)
+    fs = AGFSContextFS(client, source.agfs_mount_prefix)
+    ctx = RequestContext("acme", "alice", "main", "s", "test")
+    uri = MemoryWriteAPI(fs, NoModel(), directory_summary_enabled=False).write_memory(
+        replace(memory("editor", category="preference"), provenance_ids=[]), ctx
+    )["target_uri"]
+    directory = uri.rsplit("/", 1)[0] + "/"
+    fs.write_node(
+        ContextNode(
+            uri=directory,
+            context_type="MEMORY",
+            category="preference",
+            level=0,
+            owner_space="user:alice",
+            abstract="preferences",
+            overview="preferences",
+            content="",
+            metadata={},
+        ),
+        ctx,
+    )
+    edge = RelationEdge(
+        from_uri=directory.rstrip("/"),
+        to_uri=uri,
+        relation_type="related_to",
+        weight=1,
+        reason="directory",
+    )
+    relations = AGFSRelationStore(client, source.agfs_mount_prefix)
+    relations.upsert_edges([edge], ctx)
+    assert relations.get_edges(directory, ctx) == [edge]
+    package = tmp_path / "source-alias.tar.gz"
+    MigrationService(source).export(package)
+    importer = MigrationService(target)
+    if target_backend == "agfs":
+        importer.preflight(package)
+        importer.restore(package)
+        target_client = AGFSClient(api_base_url=target.agfs_base_url)
+        assert AGFSRelationStore(target_client, target.agfs_mount_prefix).get_edges(
+            directory, ctx
+        ) == [edge]
+    else:
+        for operation in (importer.preflight, importer.restore):
+            with pytest.raises(PackageError, match="exactly match stored URI"):
+                operation(package)
+        with storage(target) as adapter:
+            adapter.check(empty=True)
+        index = target.to_provider_config().create_vector_index()
+        try:
+            assert index.count() == 0
+        finally:
+            index.close()

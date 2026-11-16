@@ -749,3 +749,37 @@ def test_agfs_edges_are_written_once_per_source(count):
         adapter.restore("relations", iter(edges))
         assert read.call_count == write.call_count == 1
     assert list(adapter.records("relations")) == edges
+
+
+@pytest.mark.parametrize("source", ["alias", "other_node", "other_account"])
+def test_agfs_relation_source_is_checked_by_physical_path(tmp_path, source):
+    from fs.agfs_adapter.agfs_context_fs import uri_to_path
+
+    files = Files()
+    adapter = AGFSStorage(config(), files)
+    directory = {**node(), "uri": node()["uri"].rsplit("/", 1)[0] + "/", "content": ""}
+    adapter.restore("nodes", [directory, node()])
+    from_uri = directory["uri"].rstrip("/")
+    if source == "other_node":
+        from_uri = node()["uri"]
+    elif source == "other_account":
+        from_uri = from_uri.replace("ctx://acme/", "ctx://other/")
+    edge = dict(
+        from_uri=from_uri,
+        to_uri=node()["uri"],
+        relation_type="related_to",
+        weight=1.0,
+        reason="directory",
+    )
+    path = config().agfs_mount_prefix + uri_to_path(directory["uri"]) + ".relations.json"
+    files.write(path, json.dumps([edge]).encode())
+    package = tmp_path / "alias.tar.gz"
+    if source == "alias":
+        service(files).export(package)
+        target = Files()
+        service(target).restore(package)
+        assert list(AGFSStorage(config(), target).records("relations")) == [edge]
+    else:
+        with pytest.raises(PackageError, match="relation source differs from owning node"):
+            service(files).export(package)
+        assert not package.exists()

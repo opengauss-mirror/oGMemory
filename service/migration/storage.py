@@ -329,6 +329,8 @@ class AGFSStorage:
         return r
 
     def records(self, kind):
+        from fs.agfs_adapter.agfs_context_fs import uri_to_path
+
         for path, meta in self._walk(self.prefix + "/accounts"):
             r = self._node(path, meta)
             is_archive = identity(r["uri"])[1][0] == "sessions" and r["category"] == "history"
@@ -343,7 +345,9 @@ class AGFSStorage:
                     if not isinstance(edges, list):
                         raise PackageError("invalid relations file")
                     for edge in edges:
-                        if edge["from_uri"] != r["uri"]:
+                        identity(edge["from_uri"])
+                        source_path = self.prefix + uri_to_path(edge["from_uri"])
+                        if source_path.rstrip("/") != path.rstrip("/"):
                             raise PackageError("relation source differs from owning node")
                         yield {k: edge[k] for k in EDGE_FIELDS}
 
