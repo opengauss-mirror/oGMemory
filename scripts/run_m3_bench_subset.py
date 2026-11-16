@@ -670,36 +670,53 @@ def aggregate_jsonl(
 ) -> dict[str, Any]:
     """Concatenate per-video ``m3_qa_results.jsonl`` files into one.
 
-    Skips missing/empty files. Returns counts for the run report.
+    Skips missing/empty files. Duplicate ``(video_id, question_id)``
+    records — the QA stage *appends* retry attempts on resume rather than
+    replacing the failed row — are collapsed to the latest record, the
+    same last-wins rule the judge applies when reading predictions, so
+    the merged counts reflect questions rather than attempts. Returns
+    counts for the run report.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     total_records = 0
     answered = 0
     failed = 0
     per_video: dict[str, int] = {}
-    with out_path.open("w", encoding="utf-8") as out:
-        for vid in video_ids:
-            jsonl = work_dir_root / vid / "m3_qa_results.jsonl"
-            if not jsonl.exists():
-                logger.warning("[%s] no m3_qa_results.jsonl at %s", vid, jsonl)
+    # key -> (raw line, parsed record or None); insertion order preserved.
+    records: dict[tuple[str, str], tuple[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    for vid in video_ids:
+        jsonl = work_dir_root / vid / "m3_qa_results.jsonl"
+        if not jsonl.exists():
+            logger.warning("[%s] no m3_qa_results.jsonl at %s", vid, jsonl)
+            continue
+        count = 0
+        for lineno, line in enumerate(jsonl.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
                 continue
-            count = 0
-            for line in jsonl.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                out.write(line + "\n")
-                count += 1
-                total_records += 1
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    failed += 1
-                    continue
-                if rec.get("error"):
-                    failed += 1
-                else:
-                    answered += 1
-            per_video[vid] = count
+            count += 1
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                rec = None
+            qid = rec.get("question_id") if isinstance(rec, dict) else None
+            # Records without a question id (or malformed lines) cannot be
+            # deduped against their retries; give them a unique key so they
+            # still pass through and are counted as failed.
+            key = (vid, str(qid)) if qid else (vid, f"__noid_{lineno}")
+            if key not in records:
+                order.append(key)
+            records[key] = (line, rec)
+        per_video[vid] = count
+    with out_path.open("w", encoding="utf-8") as out:
+        for key in order:
+            line, rec = records[key]
+            out.write(line + "\n")
+            total_records += 1
+            if not isinstance(rec, dict) or rec.get("error"):
+                failed += 1
+            else:
+                answered += 1
     return {
         "merged_jsonl": str(out_path),
         "total_records": total_records,

@@ -399,3 +399,57 @@ def test_live_judge_rejudges_when_judge_model_changes(monkeypatch, tmp_path):
     )
     assert judge_calls == ["v1", "v1"]
     assert second[0]["judge"].get("status") != "reused"
+
+
+def test_aggregate_jsonl_dedupes_retry_records(tmp_path):
+    """QA resume *appends* retry attempts; the merge must collapse them.
+
+    A question that failed once and was answered on retry produces two
+    rows in the per-video jsonl. The merged file must contain one row
+    (the latest, last-wins like the judge) and count it as answered —
+    not as one answered + one failed attempt.
+    """
+    work = tmp_path / "work"
+    vid_dir = work / "v1"
+    vid_dir.mkdir(parents=True)
+    rows = [
+        {"video_id": "v1", "question_id": "v1_Q1", "predicted_answer": "ok", "error": None},
+        {"video_id": "v1", "question_id": "v1_Q2", "predicted_answer": "", "error": "llm_error"},
+        {"video_id": "v1", "question_id": "v1_Q2", "predicted_answer": "recovered", "error": None},
+    ]
+    with (vid_dir / "m3_qa_results.jsonl").open("w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+    out = tmp_path / "agg" / "all.jsonl"
+    result = driver.aggregate_jsonl(["v1"], work, out)
+
+    merged = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
+    assert len(merged) == 2
+    assert merged[-1]["predicted_answer"] == "recovered"
+    assert result["total_records"] == 2
+    assert result["answered"] == 2
+    assert result["failed"] == 0
+    assert result["per_video"] == {"v1": 3}  # raw rows read, attempts included
+
+
+def test_aggregate_jsonl_malformed_and_noid_rows_pass_through(tmp_path):
+    work = tmp_path / "work"
+    vid_dir = work / "v1"
+    vid_dir.mkdir(parents=True)
+    with (vid_dir / "m3_qa_results.jsonl").open("w") as f:
+        f.write(json.dumps({"video_id": "v1", "question_id": "v1_Q1",
+                            "predicted_answer": "ok", "error": None}) + "\n")
+        f.write("{not json\n")
+        f.write(json.dumps({"video_id": "v1", "predicted_answer": "x"}) + "\n")
+
+    out = tmp_path / "agg" / "all.jsonl"
+    result = driver.aggregate_jsonl(["v1"], work, out)
+
+    lines = [l for l in out.read_text().splitlines() if l.strip()]
+    assert len(lines) == 3  # nothing silently dropped
+    assert result["total_records"] == 3
+    # The malformed line counts as failed; the no-question-id record has no
+    # error field and keeps the legacy "answered" classification.
+    assert result["answered"] == 2
+    assert result["failed"] == 1

@@ -17,7 +17,9 @@ All tests run in-process — no speechbrain / torch download.
 from __future__ import annotations
 
 import math
+import os
 import struct
+import tempfile
 import wave
 from pathlib import Path
 from typing import Any
@@ -439,3 +441,59 @@ def test_exact_100ms_is_not_skipped():
     }), patch.object(backend, '_load', side_effect=RuntimeError('reached model')):
         with pytest.raises(RuntimeError, match='reached model'):
             backend.embed('fake.wav', start_sec=0, end_sec=0.1)
+
+
+class TestSpeechBrainSavedirFallback:
+    """savedir must resolve to a writable location even when HOME=/
+
+    The m3-runner container ships HOME=/ — the legacy ~/.cache default
+    resolved to /.cache and every ECAPA embed failed with EACCES
+    (observed: 71/79 clips failed before HOME was overridden manually).
+    """
+
+    def test_savedir_explicit_param_wins(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.delenv("HF_HOME", raising=False)
+        backend = SpeechBrainECAPABackend(savedir="/explicit/dir")
+        assert backend._savedir == "/explicit/dir"
+
+    def test_savedir_default_uses_home_cache_when_writable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.delenv("HF_HOME", raising=False)
+        backend = SpeechBrainECAPABackend()
+        assert backend._savedir == str(
+            tmp_path / ".cache" / "speechbrain" / "speechbrain_spkrec-ecapa-voxceleb"
+        )
+
+    def test_savedir_falls_back_when_home_is_root(self, monkeypatch, tmp_path):
+        # HOME=/ -> ~/.cache probes /, which is not writable for non-root.
+        monkeypatch.setenv("HOME", "/")
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+        backend = SpeechBrainECAPABackend()
+        assert backend._savedir == str(
+            tmp_path / "hf" / "speechbrain" / "speechbrain_spkrec-ecapa-voxceleb"
+        )
+
+    def test_savedir_prefers_xdg_cache_home_over_hf_home(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", "/")
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+        backend = SpeechBrainECAPABackend()
+        assert backend._savedir == str(
+            tmp_path / "xdg" / "speechbrain" / "speechbrain_spkrec-ecapa-voxceleb"
+        )
+
+    def test_savedir_tempdir_fallback_when_home_is_root(self, monkeypatch, tmp_path):
+        # The real m3-runner scenario: HOME=/, no XDG/HF overrides — the
+        # legacy /.cache path is unwritable, so the tempdir candidate wins.
+        monkeypatch.setenv("HOME", "/")
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.delenv("HF_HOME", raising=False)
+        backend = SpeechBrainECAPABackend()
+        assert backend._savedir == os.path.join(
+            tempfile.gettempdir(), "speechbrain",
+            "speechbrain_spkrec-ecapa-voxceleb",
+        )

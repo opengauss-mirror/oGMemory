@@ -21,6 +21,7 @@ import hashlib
 import logging
 import math
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -64,6 +65,7 @@ class SpeakerEmbeddingTooShortError(SpeakerEmbeddingBackendError):
 
 
 class SpeakerEmbeddingBackend(Protocol):
+
     """Backend interface for :class:`SpeakerEmbeddingExtractor`."""
 
     @property
@@ -85,6 +87,21 @@ class SpeakerEmbeddingBackend(Protocol):
 # ---------------------------------------------------------------------------
 # SpeechBrain ECAPA-TDNN backend
 # ---------------------------------------------------------------------------
+
+def _nearest_existing_ancestor_writable(path: str) -> bool:
+    """True when ``path`` can be created: its nearest existing ancestor is
+    writable. Walks up until an existing directory is found — no side effects.
+    """
+    probe = path
+    while True:
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        if os.path.isdir(probe):
+            return os.access(probe, os.W_OK)
+        probe = parent
+    return os.path.isdir(probe) and os.access(probe, os.W_OK)
+
 
 class SpeechBrainECAPABackend:
     """speechbrain/spkrec-ecapa-voxceleb (192-dim ECAPA-TDNN).
@@ -109,13 +126,39 @@ class SpeechBrainECAPABackend:
     ) -> None:
         self._model_name = model or self.DEFAULT_MODEL
         self._device = device
-        self._savedir = savedir or os.path.join(
-            os.path.expanduser("~"),
-            ".cache",
-            "speechbrain",
-            self._model_name.replace("/", "_"),
-        )
+        self._savedir = savedir or self._default_savedir()
         self._classifier: Any = None
+
+    def _default_savedir(self) -> str:
+        """Resolve a writable speechbrain model cache directory.
+
+        The legacy default ``~/.cache/speechbrain/<model>`` breaks in
+        containers that ship ``HOME=/`` (the m3-runner image does): it
+        resolves to ``/.cache/...``, which is not writable, and every
+        ECAPA embed then fails with ``[Errno 13] Permission denied``
+        (observed: 71/79 clips failed before an explicit ``HOME`` was
+        set). Probe the legacy path first, then ``XDG_CACHE_HOME``, then
+        ``HF_HOME`` (the m3 runners mount a persistent HF cache there),
+        then the tempdir — first candidate whose nearest existing
+        ancestor is writable wins. Nothing is created here; probing is
+        side-effect free so ``__init__`` stays cheap and test-friendly.
+        """
+        dirname = self._model_name.replace("/", "_")
+        home = os.path.expanduser("~")
+        candidates: list[str] = []
+        if home and home != os.path.sep:
+            candidates.append(os.path.join(home, ".cache", "speechbrain", dirname))
+        for env in ("XDG_CACHE_HOME", "HF_HOME"):
+            base = os.environ.get(env)
+            if base:
+                candidates.append(os.path.join(base, "speechbrain", dirname))
+        candidates.append(os.path.join(tempfile.gettempdir(), "speechbrain", dirname))
+        for candidate in candidates:
+            if _nearest_existing_ancestor_writable(candidate):
+                return candidate
+        # Nothing probed writable (unusual) — keep the legacy path so the
+        # speechbrain load-time error names a familiar location.
+        return os.path.join(home, ".cache", "speechbrain", dirname)
 
     @property
     def name(self) -> str:
