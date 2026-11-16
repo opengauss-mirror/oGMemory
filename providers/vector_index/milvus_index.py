@@ -611,6 +611,13 @@ class MilvusVectorIndex(VectorIndex):
             if heads.get(key) == row["id"]:
                 yield row
 
+    def check_migration_target(self) -> None:
+        from pymilvus import DataType
+
+        self._validate_schema(DataType)
+        if self.count():
+            raise ValueError("target vector index is not empty")
+
     def get_record(self, record_id: str) -> IndexRecord | None:
         if not record_id:
             return None

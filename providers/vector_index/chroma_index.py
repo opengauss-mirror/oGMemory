@@ -15,14 +15,16 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from core.projection_ownership import check_projection_owner
 from core.interfaces import VectorIndex
 from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
+from core.projection_ownership import check_projection_owner
 from core.resource_identity import CODE_INDEX_METADATA_FIELDS
 from core.vector_math import cosine_similarity
 
 logger = logging.getLogger(__name__)
+
+_RECORD_FILTER_FIELDS = ("account_id", "owner_space", "category", "context_type", "resource_type")
 
 DEFAULT_CHROMA_BATCH_SIZE = 5_000
 _CHROMA_LOCKS: dict[str, threading.RLock] = {}
@@ -99,6 +101,8 @@ class ChromaVectorIndex(VectorIndex):
     ):
         import chromadb
 
+        if not persist_directory:
+            raise ValueError("Chroma persist_directory is required")
         self._dimension = dimension
         self._persist_directory = str(Path(persist_directory))
         Path(self._persist_directory).mkdir(parents=True, exist_ok=True)
@@ -353,6 +357,10 @@ class ChromaVectorIndex(VectorIndex):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
                 meta[key] = val
+        # Filters are authoritative even when metadata contains an old copy.
+        for key in _RECORD_FILTER_FIELDS:
+            if key in record.filters:
+                meta[key] = record.filters[key]
         if isinstance((record.metadata or {}).get("grounding"), list):
             meta["agent_memory_grounding_json"] = json.dumps(record.metadata["grounding"], ensure_ascii=False)
         sanitized: dict[str, str | int | float | bool] = {}
@@ -418,6 +426,20 @@ class ChromaVectorIndex(VectorIndex):
             result = self._collection.get(where=self._build_where(filters), include=[])
             return len(result.get("ids") or [])
 
+    def check_migration_target(self) -> None:
+        with self._locked():
+            if self._collection.count():
+                raise ValueError("target vector index is not empty")
+            # A read-only query validates a retained collection dimension even
+            # after every row was deleted; it does not create probe records.
+            try:
+                self._collection.query(
+                    query_embeddings=[[0.0] * self._dimension], n_results=1,
+                    include=["distances"],
+                )
+            except Exception as exc:
+                raise ValueError("target Chroma index dimension could not be validated") from exc
+
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Fetch one :class:`IndexRecord` by id.
 
@@ -443,14 +465,16 @@ class ChromaVectorIndex(VectorIndex):
         doc = ((result.get("documents") or [""])[0]) or ""
         embeddings = result.get("embeddings")
         emb = embeddings[0] if embeddings is not None and len(embeddings) else []
-        # Mirror the OpenGauss path: surface a stable ``filters``
-        # shape with account_id / owner_space so callers can re-derive
-        # the scope without inspecting raw metadata.
+        # Restore the same filter contract used by record builders and migration
+        # verification, including optional resource scope when present.
         filters = {
-            "account_id": meta.get("account_id", ""),
-            "owner_space": meta.get("owner_space", ""),
+            key: meta.get(key, "")
+            for key in _RECORD_FILTER_FIELDS
+            if key in meta or key in {"account_id", "owner_space"}
         }
         metadata = dict(meta)
+        if "agent_memory_grounding_json" in metadata:
+            metadata["grounding"] = json.loads(metadata["agent_memory_grounding_json"])
         if len(emb) and "_embedding" not in metadata:
             metadata["_embedding"] = [float(x) for x in emb]
         return IndexRecord(

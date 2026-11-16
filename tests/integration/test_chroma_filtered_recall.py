@@ -27,3 +27,21 @@ def test_exact_filtered_ranking_across_pages(tmp_path, size):
     assert result["distances"][0] == pytest.approx([1 - 1 / 2**0.5, 1 - 1 / 5**0.5])
     assert result["documents"] == [[f"item {size - 1}", f"item {size - 2}"]]
     assert [row["account_id"] for row in result["metadatas"][0]] == ["acct", "acct"]
+
+
+@pytest.mark.parametrize("resource_type", [None, "code_chunk"])
+def test_record_filters_survive_persistent_roundtrip(tmp_path, resource_type):
+    pytest.importorskip("chromadb")
+    filters = {"account_id": "acct", "owner_space": "user:alice",
+               "category": "document", "context_type": "RESOURCE"}
+    if resource_type:
+        filters["resource_type"] = resource_type
+    index = ChromaVectorIndex(persist_directory=str(tmp_path), dimension=2)
+    record = IndexRecord("contract", "ctx://acct/resources/document", 0, "document", filters,
+                         {"_embedding": [1.0, 0.0], "category": "stale", "context_type": "MEMORY"})
+    index.upsert([record])
+    reopened = ChromaVectorIndex(persist_directory=str(tmp_path), dimension=2)
+    restored = reopened.get_record(record.id)
+    assert restored.filters == filters
+    assert restored.text == record.text
+    assert len(reopened.search_by_vector([1.0, 0.0], filters, 10)) == 1

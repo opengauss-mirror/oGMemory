@@ -431,7 +431,13 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 embedding_str = _vec_literal(embedding)
                 filters_json = Json(record.filters)
-                metadata_json = Json(indexed_metadata(record.metadata))
+                # Legacy SQL predicates read these fields from metadata; keep
+                # that projection aligned with the canonical filter values.
+                metadata = {**record.metadata, **{
+                    key: record.filters[key] for key in ("category", "context_type")
+                    if key in record.filters
+                }}
+                metadata_json = Json(indexed_metadata(metadata))
 
                 # Extract explicit security columns from filters
                 acct = record.filters.get("account_id")
@@ -575,6 +581,24 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         ) for row in rows]
         # Reject inconsistent source_end_sec and invalid legacy provenance too.
         return [record for record in records if contains_time(record.metadata, timestamp)]
+
+    def check_migration_target(self) -> None:
+        if self.count():
+            raise ValueError("target vector index is not empty")
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                    "WHERE attrelid=%s::regclass AND attname='embedding' AND NOT attisdropped",
+                    (self._table_name,),
+                )
+                row = cur.fetchone()
+                if not row or row[0] != f"vector({self._dimension})":
+                    raise ValueError("target stored vector dimension differs from configuration")
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Fetch one :class:`IndexRecord` by id.
