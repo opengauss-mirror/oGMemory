@@ -8,8 +8,9 @@ from datetime import datetime
 import pytest
 
 from core.model_stage import stage_digest
+from core.errors import ExtractionOutputError, LLMOutputTruncatedError
 from extraction.tools import ExtractionRuntime, _Span
-from tests.unit.extraction.test_node_processing import card, node_payload, operation, setup
+from tests.unit.extraction.test_node_processing import card, node_payload, node_response, operation, setup
 from tests.unit.extraction.test_node_read_cache import record_storage_threads
 
 
@@ -30,6 +31,72 @@ class Stages:
         self.saved.append(name)
 
 
+@pytest.mark.parametrize("error_type", [ExtractionOutputError, LLMOutputTruncatedError], ids=["protocol", "truncated"])
+@pytest.mark.parametrize("with_context", [False, True])
+def test_span_selection_recovery_commits_original_source(error_type, with_context, caplog):
+    ctx, fs, llm, api = setup(lambda _: [])
+    source = [{"id": "source", "role": "user", "content": "Grandmother gave Caroline a necklace."}]
+    if with_context:
+        source += [{"id": "reply", "role": "assistant", "content": "What does it look like?"},
+                   {"id": "detail", "role": "user", "content": "The necklace has a heart charm."}]
+    identified, native, decisions = [], [], []
+
+    def complete_json(prompt, schema):
+        if "spans" in schema["properties"]:
+            identified.append(prompt)
+            raise error_type("Invalid JSON response: Missing required property: spans")
+        return {"categories": ["entity"]}
+
+    def complete_tools(**kwargs):
+        if kwargs["tools"][0]["name"] == "process_memory_nodes":
+            decisions.append(kwargs)
+            return [{"tool": "process_memory_nodes", "input": node_response(kwargs, [operation([0])])}]
+        native.append(kwargs)
+        return [{"tool": "extract_entity", "input": {
+            "routing_key": "necklace", "object_name": "necklace", "abstract": "Caroline's necklace.",
+            "overview": "Grandmother's gift.", "content": source[0]["content"], "confidence": .95}}]
+
+    llm.complete_json = complete_json
+    llm.complete_with_tools = complete_tools
+    result = api.commit_session(source, ctx)
+    assert result["writes_completed"] == 1
+    assert len(identified) == len(native) == len(decisions) == 1
+    assert "Gift from Caroline's grandma." in next(iter(fs.nodes.values())).content
+    assert all(message["content"] in native[0]["prompt"] for message in source)
+    assert "continuing full-conversation extraction" in caplog.text
+
+
+def test_full_source_span_checkpoint_reuses_selection_and_native_extraction():
+    ctx, fs, llm, api = setup(lambda _: [])
+    source = [{"id": "source", "role": "user", "content": "Grandmother gave Caroline a necklace."}]
+    identified, native = [], []
+
+    def complete_json(prompt, schema):
+        if "spans" in schema["properties"]:
+            identified.append(prompt)
+            raise ExtractionOutputError("Invalid JSON response: Missing required property: spans")
+        return {"categories": ["entity"]}
+
+    def complete_tools(**kwargs):
+        native.append(kwargs)
+        return [{"tool": "extract_entity", "input": {
+            "routing_key": "necklace", "object_name": "necklace", "abstract": "Caroline's necklace.",
+            "overview": "Grandmother's gift.", "content": source[0]["content"], "confidence": .95}}]
+
+    llm.complete_json = complete_json
+    llm.complete_with_tools = complete_tools
+    stages, results = Stages(), []
+    for _ in range(2):
+        runtime = ExtractionRuntime(stages)
+        with runtime.activate():
+            results.append(api._pipeline.extract(source, ctx, parallel=False,
+                                                 session_time=datetime(2026, 10, 3), archive_id="archive"))
+        assert runtime.entries[0][1].span.message_ids == ["source"]
+    assert len(results[0]) == 1 and results[0] == results[1]
+    assert len(identified) == len(native) == 1
+    assert stages.saved == ["span_identification", "native_extraction"]
+
+
 def test_event_and_independent_node_groups_overlap_after_one_native_pass():
     owner = threading.get_ident()
     ctx, fs, llm, api = setup(lambda _: [])
@@ -41,8 +108,8 @@ def test_event_and_independent_node_groups_overlap_after_one_native_pass():
         if tools[0]["name"] == "process_memory_nodes":
             model_threads.append(threading.get_ident())
             rendezvous.wait(5)
-            return [{"tool": "process_memory_nodes", "input": {
-                "operations": [operation([0])], "related_reconciliations": []}}]
+            return [{"tool": "process_memory_nodes", "input": node_response(
+                {"prompt": prompt}, [operation([0])])}]
         native.append(temperature)
         topics = [{"tool": "extract_entity", "input": {
             "routing_key": "necklace", "object_name": "necklace", "scope_ref": scope,
@@ -115,7 +182,7 @@ def test_saved_groups_reuse_then_refresh_source_and_node_version():
 
 def test_natural_input_split_preserves_pending_sequence_and_reuses_stages():
     ctx, fs, llm, api = setup(lambda _: [])
-    drafts = [card(f"alias_{index}", content="# Item\n\n## Details\n- " + "Source detail. " * 2300
+    drafts = [card(f"alias_{index}", object_name="necklace", content="# Item\n\n## Details\n- " + "Source detail. " * 2300
                    + f"\n- Fact {index}.") for index in range(4)]
     snapshots = []
 
@@ -130,7 +197,7 @@ def test_natural_input_split_preserves_pending_sequence_and_reuses_stages():
             assert "Fact 0." in payload["nodes"][0]["content"]
             assert "Fact 1." in payload["nodes"][0]["content"]
         else:
-            op.update(routing_key="alias_0", object_name="alias_0")
+            op.update(routing_key="alias_0", object_name="necklace")
         return [op]
 
     llm.decide = decide
@@ -376,8 +443,8 @@ def test_same_target_acknowledgements_commit_complete_card_once_and_reuse_stage(
                                fact for fact in facts if fact in known),
                            "routing_key": "caroline", "object_name": "Caroline", "abstract": old.abstract,
                            "overview": known, "edits": [], "sections": []}
-        return [{"tool": "process_memory_nodes", "input": {
-            "operations": operations, "related_reconciliations": [acknowledgement]}}]
+        return [{"tool": "process_memory_nodes", "input": node_response(
+            kwargs, operations, [acknowledgement])}]
 
     llm.complete_with_tools = decide
     stages = Stages()
@@ -446,10 +513,10 @@ def test_same_target_acknowledgement_stages_updated_body_for_the_next_batch():
         response = None
         while True:
             try:
-                prompt = generator.send(response)
+                prompt, tool = generator.send(response)
             except StopIteration as done:
                 return done.value
-            response = llm.complete_with_tools(prompt=prompt)
+            response = llm.complete_with_tools(prompt=prompt, tools=[tool])
 
     first = process_chain()
     assert process_chain() == first

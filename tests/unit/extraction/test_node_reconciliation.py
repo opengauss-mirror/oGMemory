@@ -8,7 +8,7 @@ import pytest
 from core.models import CandidateMemory, ContextNode, SeedHit
 from extraction.prefetch import MemoryPrefetcher
 from tests.unit.commit.test_memory_identity import MemoryFS
-from tests.unit.extraction.test_node_processing import node_payload, setup
+from tests.unit.extraction.test_node_processing import node_payload, node_response, related_targets, setup
 
 SOURCE = "更新我的 Atlas 项目发布习惯：从今天起，周四的发布时间由北京时间20点改为21点，包管理工具继续使用 uv。"
 
@@ -52,7 +52,9 @@ class ReconciliationLLM:
     def complete_with_tools(self, **kwargs):
         self.calls.append(kwargs)
         assert kwargs["tools"][0]["input_schema"]["required"] == ["operations", "related_reconciliations"]
-        return [{"tool": "process_memory_nodes", "input": self.decide(node_payload(kwargs))}]
+        answer = self.decide(node_payload(kwargs))
+        return [{"tool": "process_memory_nodes", "input": node_response(
+            kwargs, answer["operations"], answer["related_reconciliations"])}]
 
 
 def prepare(entity_scope="Atlas"):
@@ -155,7 +157,7 @@ def test_atlas_annotated_owner_preference_updates_its_existing_card_and_alias():
     def decide(payload):
         nodes = {node["category"]: node for node in payload["nodes"]}
         assert set(payload["primary_candidate_targets"]) == {uri}
-        assert set(payload["related_targets"]) == {entity_uri}
+        assert set(related_targets(payload)) == {entity_uri}
         assert nodes["preference"]["who"] == ctx.user_id + "（用户）"
         return {"operations": [primary([0], nodes["preference"], category="preference")],
                 "related_reconciliations": [related(nodes["entity"])]}
@@ -375,12 +377,12 @@ def test_complete_l2_drives_update_summaries_and_noop_retains_the_stored_card(ca
     assert fs.read_node(target, ctx) == stored
 
 
-def test_joint_primary_updates_cover_related_targets_with_an_explicit_empty_array():
+def test_joint_primary_updates_answer_their_related_questions():
     ctx, fs, api, targets = prepare()
 
     def decide(payload):
         nodes = {node["category"]: node for node in payload["nodes"]}
-        assert set(payload["related_targets"]) == set(targets.values())
+        assert set(related_targets(payload)) == set(targets.values())
         return {"operations": [primary([index], nodes[draft["category"]], category=draft["category"])
                                for index, draft in enumerate(payload["drafts"])],
                 "related_reconciliations": []}
@@ -454,6 +456,7 @@ def test_atlas_primary_update_and_noops_accept_matching_unchanged_acknowledgemen
     saved = next(iter(stages.values.values()))[0]["input"]
     assert len(saved["operations"]) == 6
     assert len(saved["related_reconciliations"]) == 3
+    assert all(answer == {"decision": "unchanged"} for answer in saved["related_reconciliations"].values())
 
 
 def test_ben_new_command_preserves_acknowledged_existing_preferences():
@@ -478,7 +481,7 @@ def test_ben_new_command_preserves_acknowledged_existing_preferences():
                     source_contexts=[source], node_draft_indices=[0])
 
     def decide(payload):
-        assert payload["related_targets"] == []
+        assert related_targets(payload) == []
         assert set(payload["primary_candidate_targets"]) == set(previous)
         unchanged = [{"source_draft_ids": [0], "decision": "unchanged", "reason": "already_current",
                       "source_quote": source, "target": node["uri"], "routing_key": node["routing_key"],
@@ -500,8 +503,8 @@ def test_ben_new_command_preserves_acknowledged_existing_preferences():
     assert "npm test" in fs.read_node(stored, ctx).content
     assert all(fs.read_node(uri, ctx) == node for uri, node in previous.items())
     saved = next(iter(stages.values.values()))[0]["input"]
-    assert len(saved["operations"]) == 1 and len(saved["related_reconciliations"]) == 2
-    assert {entry["target"] for entry in saved["related_reconciliations"]} == set(previous)
+    assert len(saved["operations"]) == 1
+    assert saved["related_reconciliations"] == {}
 
 
 def test_atlas_combined_preference_acknowledges_candidates_with_both_roles():
@@ -525,7 +528,7 @@ def test_atlas_combined_preference_acknowledges_candidates_with_both_roles():
                       content="# Atlas 发布与工具链偏好\n\n- " + facts, source_contexts=[source])]
 
     def decide(payload):
-        assert set(previous) <= set(payload["related_targets"])
+        assert set(previous) <= set(related_targets(payload))
         assert set(previous) <= set(payload["primary_candidate_targets"])
         nodes = {node["uri"]: node for node in payload["nodes"]}
         entity = nodes[entity_uri]
@@ -555,7 +558,9 @@ def test_atlas_combined_preference_acknowledges_candidates_with_both_roles():
                    for fact in ("21点", "uv", "pytest", "上海", "Python 3.12")) for result in results)
     assert all(fs.read_node(uri, ctx) == node for uri, node in previous.items())
     saved = next(iter(stages.values.values()))[0]["input"]
-    assert len(saved["operations"]) == 2 and len(saved["related_reconciliations"]) == 2
+    assert len(saved["operations"]) == 2 and len(saved["related_reconciliations"]) == 3
+    assert sorted(answer["decision"] for answer in saved["related_reconciliations"].values()) == [
+        "unchanged", "unchanged", "unchanged"]
 
 
 def test_accepted_related_target_replans_from_its_latest_complete_snapshot():

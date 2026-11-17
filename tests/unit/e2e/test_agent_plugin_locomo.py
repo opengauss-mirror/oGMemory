@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -14,10 +15,162 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "tests" / "e2e"))
 
 from agent_plugin_locomo import ReadOnlyQaProxy  # noqa: E402
-from eval import build_parser  # noqa: E402
+from eval import build_parser, main, memory_headers  # noqa: E402
 from run_claude_code_plugin_locomo import ClaudeCodeHost  # noqa: E402
 from run_opencode_plugin_locomo import OpenCodeHost  # noqa: E402
 from run_qwenpaw_plugin_locomo import QwenPawHost  # noqa: E402
+
+
+@pytest.mark.usefixtures("service_threading")
+def test_conversation_workers_use_registered_admin_account(monkeypatch, tmp_path):
+    from importlib import import_module
+
+    from core.models import RequestContext
+    from server.control_plane_store import ControlPlaneStore
+    from tests.unit.commit.test_memory_identity import MemoryFS
+    from tests.unit.server.test_extraction_batch_recovery import setup_service
+
+    ctx = RequestContext("eval-account", "admin", "", "setup", "proof")
+    fs = MemoryFS()
+    service, _, _ = setup_service(fs, ctx)
+    service._cfg.role_control_enabled = True
+    service._cfg.admin_api_keys = ["eval-account:fixture-admin-key"]
+    service._control_store = ControlPlaneStore(mount_prefix="", local_root=str(tmp_path / "control"))
+    module = import_module("server.app")
+    monkeypatch.setattr(module, "_service", service)
+    monkeypatch.setenv("OGMEM_EVAL_KEY", "fixture-admin-key")
+    headers = {"X-API-Key": "fixture-admin-key", "X-Account-ID": "eval-account", "X-User-ID": "admin"}
+    client = module.app.test_client()
+    for index in (1, 2):
+        user, agent = f"reader-s{index:02d}", f"helper-s{index:02d}"
+        for kind, body in (("users", {"user_id": user, "role": "user"}),
+                           ("agents", {"agent_id": agent, "owner_user_id": user})):
+            path = f"/api/v1/admin/accounts/eval-account/{kind}"
+            response = client.post(path, json=body, headers=headers)
+            print("POST", path, body, "HTTP", response.status_code)
+            assert response.status_code == 200
+
+    dataset = tmp_path / "dataset.json"
+    dataset.write_text(json.dumps([
+        {"sample_id": f"conversation-{index}", "sessions": [
+            {"session_id": "1", "message": f"I repaired receiver {index}."}],
+         "questions": [{"question": "What did I repair?", "answer": f"receiver {index}"}]}
+        for index in (1, 2)
+    ]), encoding="utf-8")
+    simultaneous = threading.Barrier(2)
+    requests = []
+
+    class Adapter:
+        description = {"transport": "plugin", "agent": "openclaw"}
+
+        def __init__(self, args):
+            self.args = args
+
+        def open(self, phase):
+            pass
+
+        def ingest(self, text, key):
+            simultaneous.wait(timeout=5)
+            body = {"accountId": self.args.account_id, "userId": self.args.user_id,
+                    "agentId": self.args.memory_agent_id, "sessionId": key,
+                    "clientRequestId": key, "wait": True,
+                    "messages": [{"role": "user", "content": text}]}
+            request_headers = memory_headers(self.args)
+            response = module.app.test_client().post("/api/v1/after_turn", json=body, headers=request_headers)
+            requests.append(body)
+            print("POST /api/v1/after_turn", request_headers, body,
+                  "HTTP", response.status_code, response.get_json())
+            assert response.status_code == 200
+            assert response.get_json()["request_status"] == "SUCCEEDED"
+            return "Saved.", {}, [key]
+
+        def close(self):
+            pass
+
+    output = tmp_path / "run"
+    assert main(["ingest", str(dataset), "--transport", "plugin", "--conversation-parallel", "2",
+                 "--account-id", ctx.account_id, "--user-id", "reader", "--memory-agent-id", "helper",
+                 "--ogmemory-api-key-env", "OGMEM_EVAL_KEY", "--output-dir", str(output)],
+                agent="openclaw", adapter_factory=Adapter) == 0
+    assert {(row["accountId"], row["userId"], row["agentId"]) for row in requests} == {
+        (ctx.account_id, f"reader-s{index:02d}", f"helper-s{index:02d}") for index in (1, 2)}
+    assert {node.owner_space for node in fs.nodes.values() if node.category == "event"} == {
+        "user:reader-s01", "user:reader-s02"}
+    progress = json.loads((output / "ingest-progress.json").read_text(encoding="utf-8"))
+    assert progress["completed"] == progress["planned"] == 2
+
+
+@pytest.mark.parametrize("split_ingest", [False, True])
+def test_openclaw_conversation_workers_settle_each_source_in_order(tmp_path, split_ingest):
+    dataset = tmp_path / "dataset.json"
+    dataset.write_text(json.dumps([
+        {"sample_id": f"conversation-{sample}", "sessions": [
+            {"session_id": str(turn), "message": f"Source {sample}/{turn}"} for turn in (1, 2)
+        ], "questions": [{"question": "What source?", "answer": str(sample)}]}
+        for sample in (1, 2)
+    ]), encoding="utf-8")
+    simultaneous = threading.Barrier(2)
+    outputs = tmp_path / "run"
+    ingested = []
+
+    class Adapter:
+        description = {"transport": "plugin", "agent": "openclaw"}
+
+        def __init__(self, args):
+            self.args = args
+            self.settled = []
+
+        def open(self, phase):
+            self.phase = phase
+
+        def ingest(self, text, key):
+            turn = int(key.rsplit("-s", 1)[1])
+            if self.settled:
+                assert self.settled[-1].endswith(f"-s{turn - 1}")
+            assert text == f"Source {int(self.args.user_id[-2:])}/{turn}"
+            if not self.settled:
+                simultaneous.wait(timeout=5)
+            ingested.append(text)
+            return "Saved.", {}, [key]
+
+        def settle(self, sid):
+            self.settled.append(sid)
+            return {"session_id": sid, "archive_count": 1, "pending_tokens": 0}
+
+        def answer(self, prompt, key):
+            assert self.phase == "qa" and self.args.read_only_qa
+            assert key.startswith("qa-")
+            simultaneous.wait(timeout=5)
+            return str(int(self.args.user_id[-2:])), {}
+
+        def close(self):
+            assert len(set(self.settled)) == len(self.settled)
+
+    common = [str(dataset), "--transport", "plugin", "--conversation-parallel", "2",
+              "--run-id", "fixture", "--output-dir", str(outputs)]
+    ingest = ["ingest", *common, "--verify-writes", "--settle-each-source"]
+    if split_ingest:
+        for turn in (1, 2):
+            assert main([*ingest, "--sessions", str(turn)],
+                        agent="openclaw", adapter_factory=Adapter) == 0
+            progress = json.loads((outputs / "ingest-progress.json").read_text(encoding="utf-8"))
+            assert progress["completed"] == progress["planned"] == 2
+    assert main(ingest, agent="openclaw", adapter_factory=Adapter) == 0
+    assert sorted(ingested) == [f"Source {sample}/{turn}" for sample in (1, 2) for turn in (1, 2)]
+    progress = json.loads((outputs / "ingest-progress.json").read_text(encoding="utf-8"))
+    assert progress["complete"] is True
+    assert progress["completed"] == progress["planned"] == 4
+    assert [lane["user_id"] for lane in progress["lanes"]] == ["eval-1-s01", "eval-1-s02"]
+    assert [lane["gateway_port"] for lane in progress["lanes"]] == [18791, 18792]
+    for index, lane in enumerate(progress["lanes"], start=1):
+        assert lane["account_id"] == "locomo-agent-eval"
+        assert lane["memory_agent_id"] == f"openclaw-s{index:02d}"
+        completion = json.loads((Path(lane["output_dir"]) / "source-completion.json").read_text(encoding="utf-8"))
+        assert completion["complete"] and len(completion["sources"]) == 2
+    assert main(["qa", *common, "--qa-parallel", "1", "--read-only-qa"],
+                agent="openclaw", adapter_factory=Adapter) == 0
+    with (outputs / "qa_results.csv").open(newline="", encoding="utf-8") as stream:
+        assert [(row["sample_idx"], row["response"]) for row in csv.DictReader(stream)] == [("1", "1"), ("2", "2")]
 
 
 @pytest.mark.parametrize("reply_fields", [{"reply_id": "current"}, {"reply_context": {"reply_id": "current"}}])

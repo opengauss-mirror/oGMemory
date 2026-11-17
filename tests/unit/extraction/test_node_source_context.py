@@ -9,7 +9,7 @@ import pytest
 
 from service.extraction_checkpoint import CandidateCheckpoint
 from core.model_stage import stage_digest
-from tests.unit.extraction.test_node_processing import card, node_payload, operation, setup
+from tests.unit.extraction.test_node_processing import card, node_payload, node_response, operation, setup
 
 
 class Journal:
@@ -37,7 +37,8 @@ def source_pipeline(mode="eager", same_target=False):
     messages = [{"role": "user", "content": f"Message {i}: " + "Source detail. " * 310}
                 for i in range(48)]
     for i, position in enumerate(positions):
-        messages[position]["content"] += f" MARKER_{i}: Receiver {i} operates at {37+i} MHz."
+        subject = f"Receiver mode {i}" if same_target else f"Receiver {i}"
+        messages[position]["content"] += f" MARKER_{i}: {subject} operates at {37+i} MHz."
     llm.complete_json = lambda *args, **kwargs: {"spans": [
         {"start": i, "end": i, "categories": ["entity"]} for i in positions]}
     native_calls, node_calls = [], []
@@ -49,7 +50,8 @@ def source_pipeline(mode="eager", same_target=False):
         i = selected[0]
         native_calls.append(i)
         return {"tool": "extract_entity", "input": {
-            "owner_scope": "user", "routing_key": f"receiver_{i}", "object_name": f"receiver_{i}",
+            "owner_scope": "user", "routing_key": f"receiver_{i}",
+            "object_name": "receiver" if same_target else f"receiver_{i}",
             "abstract": f"Receiver {i}.", "overview": f"- It operates at {37+i} MHz.",
             "content": f"# Receiver {i}\n\n## Detail\n- It operates at {37+i} MHz.", "confidence": .99}}
 
@@ -71,8 +73,7 @@ def source_pipeline(mode="eager", same_target=False):
             op.update(routing_key=group[0]["routing_key"], object_name=group[0]["object_name"])
             op["sections"][0]["facts"] = [d["content"].splitlines()[-1][2:] for d in group]
             operations.append(op)
-        return [{"tool": "process_memory_nodes", "input": {
-            "operations": operations, "related_reconciliations": []}}]
+        return [{"tool": "process_memory_nodes", "input": node_response(call, operations)}]
 
     llm.complete_with_tools = complete
 
@@ -124,6 +125,11 @@ def test_cas_replays_original_spans_after_combining_one_target():
     assert len(accepted.source_contexts) == 4
     assert restored.record["revisions"]["0"] == 1
     revisions = [node_payload(call) for call in processed if node_payload(call)["fixed_target"]]
+    for call in processed:
+        if node_payload(call)["fixed_target"]:
+            operations = call["tools"][0]["input_schema"]["properties"]["operations"]
+            assert operations["minItems"] == operations["maxItems"] == 1
+            assert operations["items"]["properties"]["draft_ids"]["minItems"] == 2
     assert len(revisions) == 2
     assert all(payload["fixed_target"] == target and len(payload["drafts"]) == 2
                and payload["nodes"][0]["version"] == 2 for payload in revisions)

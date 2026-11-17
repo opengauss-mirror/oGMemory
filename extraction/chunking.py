@@ -308,7 +308,7 @@ class ConversationChunker:
             return len(messages)
 
         # Start with message limit (leave at least 1 for next iteration)
-        candidate = min(self._max_messages - 1, len(messages) - 1)
+        candidate = max(1, min(self._max_messages - 1, len(messages) - 1))
 
         # Reduce if token limit exceeded
         while (

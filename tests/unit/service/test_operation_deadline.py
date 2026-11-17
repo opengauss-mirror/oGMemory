@@ -314,6 +314,7 @@ def test_extraction_expiry_does_not_accept_or_write_candidates(clock):
     checkpoint = Mock()
     checkpoint.journal.batch = {"archive_id": "archive"}
     checkpoint.load.return_value = None
+    checkpoint.partial_checkpoints.return_value = []
     def extract(*args, **kwargs):
         assert kwargs["parallel"] is False
         clock[0] += 2

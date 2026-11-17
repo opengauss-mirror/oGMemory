@@ -85,15 +85,12 @@ def enable(service, writer):
     (("operations",), "update"),
     (("operations", 0), None),
     (("operations", 0, "abstract"), None),
-    (("operations", 0, "abstract"), "A" * 201),
     (("operations", 0, "overview"), "Blue"),
     (("operations", 0, "overview", 0), None),
     (("operations", 0, "overview"), ["A topic."] * 9),
-    (("operations", 0, "overview", 0), "A" * 201),
     (("operations", 0, "sections"), None),
     (("operations", 0, "sections", 0), None),
     (("operations", 0, "sections", 0, "heading"), None),
-    (("operations", 0, "sections", 0, "facts"), "Blue"),
     (("operations", 0, "sections", 0, "facts", 0), False),
     (("operations", 0, "routing_key"), None),
     (("operations", 0, "object_name"), {}),
@@ -113,7 +110,7 @@ def test_node_output_contract_recovers_saved_drafts(update, path, value):
     enable(service, writer)
     service._cfg.node_processing_enabled = writer._node_processing_enabled = True
     payload = {"operations": [operation([0], target=target, action="update" if update else "create")],
-               "related_reconciliations": []}
+               "related_reconciliations": {}}
     parent = payload
     for part in path[:-1]:
         parent = parent[part]
@@ -141,6 +138,41 @@ def test_node_output_contract_recovers_saved_drafts(update, path, value):
     assert writer._pipeline.extract.call_count == 1
     assert service.after_turn(params(ctx))["status"] == "duplicate"
     assert service.wait_until_idle({"sessionId": ctx.session_id, "_ctx": ctx})["idle"] is True
+
+
+@pytest.mark.parametrize("update", [False, True])
+@pytest.mark.parametrize("field", ["abstract", "overview", "facts"])
+def test_normalized_node_output_completes_source_directly(update, field):
+    ctx = RequestContext("normalized-card", "reader", "agent", "source", "proof")
+    fs = MemoryFS()
+    service, writer, manager = setup_service(fs, ctx, entries=[card()])
+    target = writer.write_memory(card(), ctx)["target_uri"] if update else ""
+    enable(service, writer)
+    service._cfg.node_processing_enabled = writer._node_processing_enabled = True
+    op = operation([0], target=target, action="update" if update else "create")
+    if field == "abstract":
+        op["abstract"] = "A" * 201
+    elif field == "overview":
+        op["overview"] = ["A" * 201]
+    else:
+        op["sections"][0]["facts"] = "Blue"
+    writer._llm = NodeLLM(lambda call: [op])
+
+    response = service.after_turn(params(ctx))
+
+    assert response["status"] == "completed"
+    stored, = nodes(fs, "entity")
+    validate_memory_card(stored)
+    assert stored.metadata["version"] == (2 if update else 1)
+    if field == "abstract":
+        assert stored.abstract == "A" * 200
+    elif field == "overview":
+        assert stored.overview == "- " + "A" * 200
+    else:
+        assert "- Blue" in stored.content
+    assert len(writer._llm.calls) == writer._pipeline.extract.call_count == 1
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
+    assert service.after_turn(params(ctx))["status"] == "duplicate"
 
 
 @pytest.mark.parametrize("category", ["entity", "preference"])
@@ -292,7 +324,7 @@ def test_cas_retry_operational_failure_resumes_accepted_node(fault, monkeypatch)
 def test_cas_revision_recovers_the_accepted_target(category, decision, monkeypatch):
     ctx = RequestContext("cas-identity", "reader", "agent", "source", "proof")
     fs = MemoryFS()
-    original = replace(card(), category=category)
+    original = replace(card(), category=category, verified_object_aliases=["radio engineer"])
     if category == "preference":
         original = replace(original, content="# Radio work\n\n- Prefers a quiet room.")
     draft = replace(original, routing_key="radio_engineer", object_name="radio engineer")
