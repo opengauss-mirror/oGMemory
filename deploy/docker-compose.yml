@@ -425,10 +425,15 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.m3-runner
+      # Build-level dependency on the ogmem service's image: the named
+      # context `ogmem` resolves to that service's image (built first by
+      # Compose), and OGMEM_BASE_IMAGE=ogmem makes the Dockerfile's FROM
+      # consume it. depends_on alone only orders runtime start — parallel
+      # builds could still race the base image in a fresh environment.
+      additional_contexts:
+        ogmem: service:ogmem
       args:
-        # Chain onto the same ogmem image the ogmem service builds/uses —
-        # parameterized so non-default OGMEM_IMAGE / project names work.
-        OGMEM_BASE_IMAGE: ${OGMEM_IMAGE:-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}
+        OGMEM_BASE_IMAGE: ogmem
     image: ${OGMEM_M3_RUNNER_IMAGE:-ogmemory-m3-runner:${COMPOSE_PROJECT_NAME:-ogmem}-local}
     container_name: ${OGMEM_M3_RUNNER_CONTAINER_NAME:-ogmem-m3runner}
     profiles: ["with-m3runner"]

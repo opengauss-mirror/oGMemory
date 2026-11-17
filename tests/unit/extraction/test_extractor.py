@@ -1406,3 +1406,27 @@ class TestTotalSpanFailureIsRetryable:
                 language="en", session_time=None, session_summary="",
                 tool_stats_text="", ctx=self._ctx(),
             )
+
+    def test_pool_path_backoff_is_capped_to_remaining_budget(self):
+        """The retry backoff never sleeps past the request deadline — an
+        expired request frees its worker thread immediately instead of
+        sleeping the full multi-second delay."""
+        import time as _time
+
+        from core.errors import OperationDeadlineExceededError
+        from core.operation_deadline import operation_deadline
+
+        extractor = Extractor(Mock())
+        extractor._span_retries = 1
+        prepared = self._prepared(0)
+        extractor._structure_prepared_span = Mock(
+            side_effect=LLMCallError("outage"))
+
+        start = _time.monotonic()
+        with operation_deadline(0.1):
+            with pytest.raises(OperationDeadlineExceededError):
+                extractor._run_native_pass_with_retries(
+                    prepared, self._ctx(), None, temperature=None)
+        # The uncapped backoff would be 2 s; the capped one must return
+        # roughly at the deadline.
+        assert _time.monotonic() - start < 1.0

@@ -628,10 +628,12 @@ def test_prepare_can_retry_before_first_credentials_are_published(tmp_path,monke
 
 def test_m3runner_declares_ogmem_build_dependency():
     """The runner's FROM is the ogmem service's output image, so the build
-    must be ordered: Compose builds in depends_on order, and without ogmem
-    declared a fresh environment can build the runner before the base
-    image exists."""
+    needs a build-level dependency: the `ogmem` additional context resolves
+    to that service's image (built first by Compose), and OGMEM_BASE_IMAGE
+    points the Dockerfile's FROM at it. depends_on alone only orders
+    runtime start, not parallel builds."""
     compose = yaml.safe_load((ROOT / 'deploy/docker-compose.yml').read_text())
-    deps = compose['services']['m3runner']['depends_on']
-    assert 'ogmem' in deps
-    assert deps['ogmem']['condition'] == 'service_started'
+    svc = compose['services']['m3runner']
+    assert svc['build']['additional_contexts']['ogmem'] == 'service:ogmem'
+    assert svc['build']['args']['OGMEM_BASE_IMAGE'] == 'ogmem'
+    assert 'ogmem' in svc['depends_on']

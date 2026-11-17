@@ -53,7 +53,7 @@ from core.interfaces import LLM
 from core.memory_names import candidate_identity_key
 from core.model_stage import run_model_call
 from core.models import CandidateMemory, RequestContext
-from core.operation_deadline import check_deadline
+from core.operation_deadline import check_deadline, remaining_seconds
 from core.validation import (
     MAX_ABSTRACT_LEN,
     MAX_OVERVIEW_LEN,
@@ -1237,7 +1237,16 @@ class Extractor:
                         type(exc).__name__, exc, attempt, attempts - 1,
                         delay,
                     )
-                    time.sleep(delay)
+                    # Cap the backoff to the remaining request budget and
+                    # re-check right after sleeping — an expired request
+                    # must not keep occupying its worker thread through a
+                    # multi-second sleep during a service outage.
+                    remaining = remaining_seconds()
+                    if remaining is not None:
+                        delay = min(delay, max(remaining, 0.0))
+                    if delay > 0:
+                        time.sleep(delay)
+                    check_deadline()
                     continue
                 raise
         raise AssertionError("unreachable")  # pragma: no cover
@@ -1328,7 +1337,14 @@ class Extractor:
                             type(exc).__name__, exc, attempt, attempts - 1,
                             delay,
                         )
-                        time.sleep(delay)
+                        # Same budget cap as the pool path: never sleep
+                        # past the request deadline.
+                        remaining = remaining_seconds()
+                        if remaining is not None:
+                            delay = min(delay, max(remaining, 0.0))
+                        if delay > 0:
+                            time.sleep(delay)
+                        check_deadline()
                         continue
                     if temperature is None:
                         logger.error(
