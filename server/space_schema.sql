@@ -330,6 +330,64 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_space_content_text ON context_nodes USING GIN (to_tsvector('simple',abstract||' '||content)) WHERE owner_space LIKE 'space:%';
 
 ALTER TABLE space_item_sources ADD COLUMN IF NOT EXISTS source_epoch CHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE space_items ADD COLUMN IF NOT EXISTS checked_rule_rev BIGINT;
+
+CREATE OR REPLACE FUNCTION ogmemory_space_source_revision() RETURNS trigger AS $$
+DECLARE
+    source_epoch text;
+BEGIN
+    IF NEW.uri ~ '^ctx://[^/]+/(users|agents)/[^/]+/memories/' THEN
+        IF TG_OP = 'UPDATE' THEN
+            source_epoch := NULLIF(OLD.metadata->>'shared_source_epoch','');
+            NEW.version := GREATEST(NEW.version, OLD.version);
+            IF (NEW.uri, NEW.status, NEW.content, NEW.abstract, NEW.overview) IS DISTINCT FROM
+               (OLD.uri, OLD.status, OLD.content, OLD.abstract, OLD.overview)
+               OR (NEW.metadata->'agfs_content'->>'sha256') IS DISTINCT FROM
+                  (OLD.metadata->'agfs_content'->>'sha256') THEN
+                NEW.version := GREATEST(NEW.version, OLD.version + 1);
+            END IF;
+        END IF;
+        NEW.metadata := NEW.metadata || json_build_object(
+            'shared_source_epoch', COALESCE(source_epoch,md5(random()::text || clock_timestamp()::text || NEW.uri)),
+            'version', NEW.version)::jsonb;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS ogmemory_space_source_revision ON context_nodes;
+CREATE TRIGGER ogmemory_space_source_revision BEFORE INSERT OR UPDATE ON context_nodes
+FOR EACH ROW EXECUTE PROCEDURE ogmemory_space_source_revision();
+
+CREATE INDEX IF NOT EXISTS idx_cn_agfs_origin
+ON context_nodes(account_id,(metadata->'agfs_content'->>'uri'))
+WHERE (metadata->'agfs_content'->>'uri') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_oe_agfs_reclaim
+ON outbox_events(account_id,seq)
+WHERE status='GC_PENDING' AND event_type IN ('RECLAIM_AGFS','RECLAIM_AGFS_STAGE');
+
+CREATE OR REPLACE FUNCTION ogmemory_queue_agfs_cleanup() RETURNS trigger AS $$
+DECLARE
+    origin_uri text := OLD.metadata->'agfs_content'->>'uri';
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF origin_uri IS NOT DISTINCT FROM (NEW.metadata->'agfs_content'->>'uri') THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+    IF left(origin_uri,6)='ctx://' AND split_part(origin_uri,'/',3)=OLD.account_id THEN
+        INSERT INTO outbox_events(event_id,event_type,uri,account_id,status)
+        VALUES(md5(random()::text || clock_timestamp()::text || OLD.uri),
+               'RECLAIM_AGFS',origin_uri,OLD.account_id,'GC_PENDING');
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS ogmemory_queue_agfs_cleanup ON context_nodes;
+CREATE TRIGGER ogmemory_queue_agfs_cleanup AFTER DELETE OR UPDATE OF metadata ON context_nodes
+FOR EACH ROW EXECUTE PROCEDURE ogmemory_queue_agfs_cleanup();
 
 ALTER TABLE space_rule_runtime ADD COLUMN IF NOT EXISTS source_after TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_jobs_completed_sources

@@ -1662,11 +1662,11 @@ class SQLContextFS(PoolAdapterMixin):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 # Same write order as projection workers: nodes, jobs, edges.
-                cur.execute("""SELECT uri FROM context_nodes WHERE account_id=%s
+                cur.execute("""SELECT uri,version FROM context_nodes WHERE account_id=%s
                     AND (uri=%s OR uri LIKE %s OR relations::text LIKE %s)
                     ORDER BY uri FOR UPDATE""",
                     (account_id,from_uri,from_prefix+"%","%"+from_uri+"%"))
-                cur.fetchall()
+                old_versions = dict(cur.fetchall())
                 cur.execute("""SELECT edge_id,source_uri,target_uri,relation_type
                     FROM edge_projection_jobs WHERE account_id=%s
                     AND (source_uri=%s OR source_uri LIKE %s OR target_uri=%s OR target_uri LIKE %s)
@@ -1675,20 +1675,23 @@ class SQLContextFS(PoolAdapterMixin):
                 projection_jobs = cur.fetchall()
                 # 1) Move the node itself
                 cur.execute(
-                    "UPDATE context_nodes SET uri = %s, updated_at = NOW() WHERE uri = %s",
+                    "UPDATE context_nodes SET uri = %s, updated_at = NOW() WHERE uri = %s RETURNING uri,version",
                     (to_uri, from_uri),
                 )
                 if cur.rowcount == 0:
                     raise NodeNotFoundError(from_uri)
+                new_versions = dict(cur.fetchall())
 
                 # 2) Cascade: update children with the old prefix
                 cur.execute(
                     "UPDATE context_nodes "
                     "SET uri = concat(%s, substring(uri from %s)), "
                     "    updated_at = NOW() "
-                    "WHERE uri LIKE %s",
+                    "WHERE uri LIKE %s RETURNING uri,version",
                     (to_prefix, len(from_prefix) + 1, from_prefix + "%"),
                 )
+
+                new_versions.update(cur.fetchall())
 
                 # 3) Cascade: update relation_edges (only if table exists)
                 if self.sql_dialect.table_exists(cur, "relation_edges"):
@@ -1736,11 +1739,17 @@ class SQLContextFS(PoolAdapterMixin):
                         return to_uri
                     return to_prefix+uri[len(from_prefix):] if uri.startswith(from_prefix) else uri
                 for old_id,source,target,relation in projection_jobs:
+                    source_version = old_versions.get(source) if moved(source) in new_versions else None
+                    target_version = old_versions.get(target) if moved(target) in new_versions else None
                     source,target=moved(source),moved(target)
                     new_id=canonical_edge_id(account_id,source,target,relation)
                     cur.execute("""UPDATE edge_projection_jobs SET edge_id=%s,source_uri=%s,target_uri=%s,
+                        source_revision=CASE WHEN source_revision=%s THEN %s ELSE source_revision END,
+                        target_revision=CASE WHEN target_revision=%s THEN %s ELSE target_revision END,
                         status='PENDING',claim_token=NULL,last_error=NULL,next_retry_at=NULL,updated_at=NOW()
-                        WHERE account_id=%s AND edge_id=%s""",(new_id,source,target,account_id,old_id))
+                        WHERE account_id=%s AND edge_id=%s""",
+                        (new_id,source,target,source_version,new_versions.get(source),
+                         target_version,new_versions.get(target),account_id,old_id))
                     cur.execute("""UPDATE relation_edges SET projection_edge_id=%s,edge_projection=NULL,updated_at=NOW()
                         WHERE account_id=%s AND projection_edge_id=%s""",(new_id,account_id,old_id))
                     cur.execute("""INSERT INTO outbox_events
