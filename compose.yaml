@@ -46,6 +46,7 @@ services:
     volumes:
       - ${STACK_DIR:-./data/ogmemory}/ogmemory.yaml:/etc/ogmem/config.yaml:ro
       - ${STACK_DIR:-./data/ogmemory}/agfs:/data/agfs
+      - ${STACK_DIR:-./data/ogmemory}/chroma:/data/chroma
       - ./deploy/compose/scripts:/opt/ogmem-deploy:ro
     healthcheck:
       test: [CMD, python3, /opt/ogmem-deploy/runtime.py, health]
