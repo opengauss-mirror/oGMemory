@@ -3,10 +3,11 @@
 import json
 import re
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from contextvars import copy_context
+from copy import deepcopy
 from dataclasses import asdict, replace
 from functools import wraps
 from uuid import NAMESPACE_URL, uuid5
@@ -22,7 +23,7 @@ from core.errors import (
     ValidationError,
 )
 from core.logging_config import get_logger
-from core.memory_names import canonical_memory_key, canonical_scope
+from core.memory_names import canonical_memory_key, canonical_object_name, canonical_scope
 from core.models import ContextNode
 from core.validation import validate_candidate
 from extraction.card_format import validate_memory_card
@@ -34,6 +35,55 @@ CATEGORIES = frozenset({"entity", "preference"})
 _PROMPT_LIMIT = 110000
 _CATALOG_PAGE_SIZE = 24
 _READ_LIMIT = 12
+
+
+class NodeProcessingPartialError(MemoryCardFormatError):
+    """Retain independently validated decisions while their failed peers retry."""
+
+    def __init__(self, candidates, failures, *, others_complete=False):
+        self.candidates = list(candidates)
+        self.failures = failures
+        self.others_complete = others_complete
+        super().__init__("node_processing: " + json.dumps(failures, ensure_ascii=False))
+
+
+def _draft_indices(drafts):
+    return list(dict.fromkeys(index for draft in drafts for index in draft.node_draft_indices))
+
+
+def _entity_names(draft):
+    return {canonical_object_name(name) for name in (
+        draft.object_name or draft.routing_key, *draft.verified_object_aliases) if name}
+
+
+def _independent_candidates(candidates, failures):
+    """Keep decisions outside failed target and source dependency components."""
+    candidates = list(candidates)
+    failures = deepcopy(failures)
+    changed = True
+    while changed:
+        changed = False
+        for failure in failures:
+            indices = set(failure["draft_ids"])
+            for peer in failures:
+                if (indices.intersection(peer["draft_ids"])
+                        or failure["target"] and failure["target"] == peer["target"]):
+                    merged = indices.union(peer["draft_ids"])
+                    changed |= merged != indices or merged != set(peer["draft_ids"])
+                    indices = merged
+                    peer["draft_ids"] = sorted(merged)
+            for candidate in candidates[:]:
+                if (indices.intersection(candidate.node_draft_indices)
+                        or failure["target"] and candidate.target_uri == failure["target"]):
+                    indices.update(candidate.node_draft_indices)
+                    candidates.remove(candidate)
+                    if candidate.target_uri and candidate.target_uri != failure["target"]:
+                        failures.append({"target": candidate.target_uri,
+                                         "draft_ids": list(candidate.node_draft_indices),
+                                         "error": failure["error"]})
+                    changed = True
+            failure["draft_ids"] = sorted(indices)
+    return candidates, failures
 
 
 def serialized_topics(function):
@@ -61,7 +111,7 @@ _EDIT = {"type": "object", "properties": {
          "required": ["search", "replacement"], "additionalProperties": False}
 _OPERATION = {"type": "object", "properties": {
     "draft_ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1},
-    "action": {"type": "string", "enum": ["create", "update", "noop", "defer"]},
+    "action": {"type": "string", "enum": ["create", "update", "noop"]},
     "target": _STRING, "routing_key": _STRING, "object_name": _STRING,
     "scope_resolution": {"type": "object", "properties": {
         "stored_scope_role": {"type": "string", "enum": ["self", "external"]},
@@ -79,22 +129,11 @@ _OPERATION = {"type": "object", "properties": {
     "sections": {"type": "array", "items": _SECTION}},
     "required": ["draft_ids", "action", "target", "routing_key", "object_name",
                  "abstract", "overview", "edits", "sections"], "additionalProperties": False}
-_RELATED = {"type": "object", "properties": {
-    **{key: value for key, value in _OPERATION["properties"].items()
-       if key not in {"draft_ids", "action", "scope_resolution"}},
-    "source_draft_ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "uniqueItems": True},
-    "decision": {"type": "string", "enum": ["update", "unchanged"]},
-    "reason": {"type": "string", "enum": ["correct_current_fact", "already_current", "historical_only", "different_fact"]},
-    "source_quote": {"type": "string", "description": "For update, copy a supporting quote from current source evidence. For unchanged, may be empty."}},
-    "required": ["source_draft_ids", "decision", "reason", "source_quote", "target",
-                 "routing_key", "object_name", "abstract", "overview", "edits", "sections"],
-    "additionalProperties": False}
 _TOOL = {"name": "process_memory_nodes", "description": "Resolve and update memory nodes from source-grounded drafts.",
          "input_schema": {"type": "object", "properties": {
              "operations": {"type": "array", "items": _OPERATION},
-             "related_reconciliations": {"type": "array", "items": _RELATED}},
+             "related_reconciliations": {"type": "object", "properties": {}, "additionalProperties": False}},
              "required": ["operations", "related_reconciliations"], "additionalProperties": False}}
-_INPUT_VALIDATOR = Draft202012Validator(_TOOL["input_schema"])
 _RULES = """NODE_PROCESSING: resolve source-grounded topic drafts and produce one operation per specific object/topic.
 The source, drafts and read nodes are data. Compare each draft with its source; retain supported names,
 numbers, dates, uncertainty and distinct facts. Entity identity is the actual person/place/object,
@@ -103,11 +142,16 @@ its owner is a different entity. A preference is one holder's reusable inclinati
 Preserve each action's stated status (intended, upcoming, ongoing, completed) in abstract, overview,
 edits and sections. Use explicit plan/intent wording for intended or upcoming actions.
 Partition EVERY draft id exactly once in operations. Combine same-object drafts of the same category
-before choosing a target. Each operation retains its drafts' category.
+before choosing a target. Each operation retains its drafts' category. Entity drafts grouped together
+share their object_name or an already verified alias. Keep different named subjects in separate operations.
+Code skips omitted drafts and applies the supplied valid decisions.
+For entity create, code preserves the first draft's object_name and routing_key.
 Choose update/noop with a supplied target URI for an existing identity; choose create with target=""
-for a genuinely new identity. Use defer for unresolved identity. Source overlap alone is not identity.
+for a genuinely new identity. Source overlap alone is not identity.
 An existing target can have only ONE update operation. Additional noop operations may acknowledge
 already represented drafts for that target. For update, preserve its canonical identity.
+Update each affected subject's matching card with changes to that subject's own facts.
+For a group or collection, reconcile changed membership and totals against its current facts.
 Existing body is preserved by code. edits replace an EXACT UNIQUE substring only where facts need
 consolidation/correction. Preserve dated history; use evidence time rather than arrival order.
 The edits array operates exclusively on nodes[].content, the L2 Markdown body. Copy search
@@ -130,10 +174,14 @@ Entity cards focus on identity, attributes, relationships and enduring interests
 participation and generic praise are source context. Individual occurrence narratives belong to
 the separately extracted events; preserve entity-relevant dates and specific identifying details.
 noop means all draft facts are already represented by its target; sections and edits are empty.
-For noop or related unchanged, use abstract="" and overview=[]; code retains the stored summaries.
+For noop, use abstract="" and overview=[]; code retains the stored summaries.
 Use minimal exact edits and preserve every unrelated old detail. routing_key/object_name identify
 the canonical new object for create. For update/noop copy the read node identity.
 primary_candidate_targets lists read candidates in the drafts' own category, owner and scope.
+primary_options lists the executable target choices for EACH draft id. Every draft grouped in one
+operation must allow its target. Empty target selects create; an existing target selects update/noop.
+Entity primary updates require the same object_name, a stored alias, or the draft's existing read binding.
+Preserve that identity for update/noop; a relationship between two entities belongs in related_reconciliations.
 scope_candidate_targets lists same-name entities of the same owner whose scope needs comparison.
 For each selected draft, compare the complete source statement, both scopes and the stored card.
 A self scope describes the entity itself (including an empty scope); an external scope identifies
@@ -141,30 +189,125 @@ its enclosing project, organization or other namespace. To update/noop a scope c
 scope_resolution with stored_scope_role=self and incoming_scope_role=self only when both scopes
 denote the same entity itself. Copy complete supporting source statements into source_quotes,
 including their factual assertions and covering every draft. Distinct external namespaces identify separate entities.
-If the source establishes a distinct entity, create its own card; use defer for unresolved identity.
-Use operations to resolve the drafts against these candidates. A same-category candidate, including
-one also listed in related_targets, may be acknowledged in related_reconciliations only with
-decision=unchanged and empty edits/sections. For a target used by a
-primary operation, source_draft_ids belong to that operation. The acknowledgement consumes no draft again.
-related_targets explicitly lists cross-category nodes of the same owner and confirmed subject.
-Compare their current facts against this source. For each related target outside
-the primary operations, return exactly one related_reconciliations entry. source_draft_ids reference
-the supporting drafts without consuming them again.
-Use decision=update and reason=correct_current_fact when the source corrects a fact also asserted
-as current in this node; copy a supporting source_quote verbatim from current source evidence,
-and update its abstract, overview and body together, keeping dated history.
-Use decision=unchanged with already_current, historical_only or different_fact for valid content.
-For unchanged, keep edits/sections empty to retain the complete read card; source_quote may be empty.
+If the source establishes a distinct entity, create its own card.
+Use operations to resolve the drafts against these candidates.
+related_questions contains the complete multiple-choice questionnaire for associated cards.
+Answer EVERY question id once in related_reconciliations, using its supplied decision options:
+update: update that card's own changed facts; supply source_draft_ids selected from the question,
+source_quote copied continuously and verbatim from current source, abstract, overview, edits and sections.
+unchanged: apply no additional related modification; return only {"decision":"unchanged"}.
+For a card handled by a primary operation, choose unchanged; that primary operation still takes effect.
+Keep all changes to that card in its primary operation.
+The code binds each answer to its question's target, identity and version.
+An update whose quote cannot be found in current source is skipped; its card remains as stored.
+Use unchanged for already-current, historical-only or unrelated facts.
 Same scope or similar names select candidates; compare the actual fact, holder, conditions and time.
 Related updates retain the read target's category, identity and unrelated facts.
 When fixed_target is supplied, return one primary update/noop for that exact target containing all
-draft ids; reconcile the source against its latest snapshot. Return related_reconciliations=[].
+draft ids; reconcile the source against its latest snapshot. Return related_reconciliations={}.
 Return the process_memory_nodes tool once with operations and related_reconciliations. Keep the source language.
 """
 
 
 def _line(value):
     return " ".join(value.split())
+
+
+def _decision_tool(questions, primary_options, *, fixed_target="", related_only=False, protected_targets=()):
+    tool = deepcopy(_TOOL)
+    operations = tool["input_schema"]["properties"]["operations"]
+    operation = operations["items"]
+    if related_only:
+        operations["maxItems"] = 0
+    if fixed_target:
+        operations.update(minItems=1, maxItems=1)
+        fields = operation["properties"]
+        fields["target"] = {"const": fixed_target}
+        fields["action"]["enum"] = ["update", "noop"]
+        draft_ids = [choice["draft_id"] for choice in primary_options]
+        fields["draft_ids"].update(minItems=len(draft_ids), maxItems=len(draft_ids), uniqueItems=True,
+                                   items={"type": "integer", "enum": draft_ids})
+    operation["allOf"] = [
+        {"if": {"properties": {"target": {"const": ""}}},
+         "then": {"properties": {"action": {"const": "create"}}},
+         "else": {"properties": {"action": {"enum": ["update", "noop"]}}}},
+    ]
+    if protected_targets:
+        operation["allOf"].append({
+            "if": {"properties": {"target": {"enum": sorted(protected_targets)}}},
+            "then": {"properties": {"action": {"const": "noop"}}},
+        })
+    for choice in primary_options:
+        operation["allOf"].append({
+            "if": {"properties": {"draft_ids": {"contains": {"const": choice["draft_id"]}}}},
+            "then": {"properties": {"target": {"enum": choice["targets"]}}},
+        })
+        if choice["scope_targets"]:
+            operation["allOf"].append({
+                "if": {"properties": {"draft_ids": {"contains": {"const": choice["draft_id"]}},
+                                       "target": {"enum": choice["scope_targets"]}}},
+                "then": {"required": ["scope_resolution"], "properties": {"scope_resolution": {
+                    "properties": {"stored_scope_role": {"const": "self"},
+                                   "incoming_scope_role": {"const": "self"}}}}},
+            })
+    answers = tool["input_schema"]["properties"]["related_reconciliations"]
+    for key, question in questions.items():
+        update = {name: _OPERATION["properties"][name]
+                  for name in ("abstract", "overview", "edits", "sections")}
+        update.update(decision={"const": "update"}, source_quote=_STRING,
+                      source_draft_ids={"type": "array", "minItems": 1, "uniqueItems": True,
+                                        "items": {"type": "integer", "enum": question["source_draft_ids"]}})
+        answers["properties"][key] = {"oneOf": [
+            {"type": "object", "properties": {"decision": {
+                "enum": [value for value in question["decisions"] if value != "update"]}},
+             "required": ["decision"], "additionalProperties": False},
+            {"type": "object", "properties": update,
+             "required": list(update), "additionalProperties": False},
+        ]}
+        if question["target"] in protected_targets:
+            answers["properties"][key]["oneOf"] = answers["properties"][key]["oneOf"][:1]
+        tool["input_schema"].setdefault("allOf", []).append({
+            "if": {"properties": {"operations": {"contains": {
+                "properties": {"target": {"const": question["target"]}}, "required": ["target"]}}}},
+            "then": {"properties": {"related_reconciliations": {"properties": {
+                key: {"properties": {"decision": {"const": "unchanged"}}}}}}},
+        })
+    answers["required"] = list(questions)
+    return tool
+
+
+def _normalize_node_payload(payload):
+    payload = deepcopy(payload)
+    if not isinstance(payload, dict):
+        return payload
+    primary = payload.get("operations", [])
+    related = payload.get("related_reconciliations", {})
+    operations = (primary if isinstance(primary, list) else []) + (
+        list(related.values()) if isinstance(related, dict) else [])
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        if isinstance(op.get("abstract"), str):
+            op["abstract"] = _line(op["abstract"])[:200]
+        if isinstance(op.get("overview"), list):
+            op["overview"] = [_line(item)[:200] if isinstance(item, str) else item for item in op["overview"]]
+        sections = op.get("sections")
+        for section in sections if isinstance(sections, list) else []:
+            if not isinstance(section, dict):
+                continue
+            facts = section.get("facts")
+            if isinstance(facts, str):
+                facts = [facts]
+            if isinstance(facts, list):
+                facts = [fact for item in facts for fact in (
+                    item if isinstance(item, list) and all(isinstance(value, str) for value in item)
+                    else [item])]
+                section["facts"] = facts
+                replacement = section.get("replacement")
+                if isinstance(replacement, str) and (
+                        not replacement.strip() or replacement in facts):
+                    del section["replacement"]
+    return payload
 
 
 def _text_values(value):
@@ -293,10 +436,27 @@ class NodeProcessor:
                 and self.resolver._names_match(node, candidate)
                 and self.resolver._in_scope(node, replace(candidate, scope_ref=node.metadata.get("scope_ref", "")), ctx))
 
+    def _primary_in_scope(self, node, candidate, ctx):
+        return self.resolver._in_scope(node, candidate, ctx) and (
+            candidate.category != "entity" or self.resolver._names_match(node, candidate)
+            or (candidate.target_uri == node.uri
+                and candidate.expected_version == node.metadata.get("version")))
+
+    @staticmethod
+    def _mentions_subject(node, sources):
+        quote = canonical_object_name("\n".join(sources))
+        names = [node.metadata.get("object_name", ""), *node.metadata.get("object_name_aliases", [])]
+        return any(name and (re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", quote)
+                             if name.isascii() else name in quote)
+                   for value in names if (name := canonical_object_name(value)))
+
     def _related_in_scope(self, node, candidate, ctx, reads=None):
-        if (node.category not in CATEGORIES or node.category == candidate.category
-                or not self._own_holder(candidate, ctx)):
+        if node.category not in CATEGORIES or not self._own_holder(candidate, ctx):
             return False
+        if node.category == candidate.category:
+            return (node.category == "entity" and self.resolver._in_scope(node, candidate, ctx)
+                    and not self._primary_in_scope(node, candidate, ctx)
+                    and self._mentions_subject(node, candidate.source_contexts))
         if candidate.category == "preference":
             subject = canonical_scope(candidate.scope_ref)
             names = [node.metadata.get("object_name", ""), *node.metadata.get("object_name_aliases", [])]
@@ -320,8 +480,24 @@ class NodeProcessor:
                    and self.resolver._names_match(node, c))
                    for c in drafts)
 
-    def _prompt(self, drafts, messages, recalled, ctx, *, fixed_target="", related_target=""):
+    def _primary_options(self, drafts, nodes, ctx):
+        choices = []
+        for index, draft in enumerate(drafts):
+            targets = [node.uri for node in nodes
+                       if self._primary_in_scope(node, draft, ctx) or self._scope_candidate(node, draft, ctx)]
+            if draft.target_uri:
+                targets = [draft.target_uri]
+            elif not any(self._primary_in_scope(node, draft, ctx) and self.resolver._names_match(node, draft)
+                         for node in nodes):
+                targets.insert(0, "")
+            choices.append({"draft_id": index, "targets": targets,
+                            "scope_targets": [node.uri for node in nodes if node.uri in targets
+                                              and not self._primary_in_scope(node, draft, ctx)]})
+        return choices
+
+    def _prompt(self, drafts, messages, recalled, ctx, *, fixed_target="", related_target="", scope_reads=None):
         reads = {node.uri: node for node in recalled}
+        questions = {}
         sources = list(dict.fromkeys(source for c in drafts for source in c.source_contexts))
         payload = {"source": sources if all(c.source_contexts for c in drafts) else messages,
                    "drafts": [{"id": i, **{k: v for k, v in asdict(c).items()
@@ -331,34 +507,55 @@ class NodeProcessor:
         rules = _RULES
         if related_target:
             rules += ("This request only reconciles the supplied related_target. "
-                      "Return operations=[] and one related_reconciliations entry for it. "
+                      "Return operations=[] and answer its related question. "
                       "Use the source drafts as evidence without resolving their primary targets.\n")
             payload["related_target"] = related_target
         prefix = rules + "\n" + json.dumps(payload, ensure_ascii=False, default=str)[:-1]
         suffix = ', "fixed_target": ' + json.dumps(fixed_target, ensure_ascii=False) + "}"
         fragments = {"nodes": [], "related_targets": [], "primary_candidate_targets": [],
                      "scope_candidate_targets": []}
-        length = len(prefix) + len(suffix) + sum(len(', "' + name + '": []') for name in fragments)
+        length = (len(prefix) + len(suffix) + len(', "related_questions": {}')
+                  + sum(len(', "' + name + '": []') for name in fragments))
         entries = []
         for node in recalled:
-            related = (node.uri == related_target if related_target else
-                       any(self._related_in_scope(node, c, ctx, reads) for c in drafts))
-            primary = not related_target and any(self.resolver._in_scope(node, c, ctx) for c in drafts)
-            encoded = json.dumps({"uri": node.uri, "version": node.metadata.get("version"),
+            related_ids = ([i for i, c in enumerate(drafts)
+                            if self._related_in_scope(node, c, ctx, scope_reads or reads)]
+                           if not fixed_target else [])
+            related = bool(related_ids)
+            if related_target and node.uri != related_target:
+                related = False
+            primary = not related_target and any(self._primary_in_scope(node, c, ctx) for c in drafts)
+            scoped = not related_target and any(self._scope_candidate(node, c, ctx) for c in drafts)
+            if related:
+                question = {"target": node.uri, "source_draft_ids": related_ids,
+                            "decisions": ["update", "unchanged"]}
+                key = "q" + str(len(questions))
+                questions[key] = question
+                length += len(json.dumps({key: question}, ensure_ascii=False))
+            snapshot = {"uri": node.uri, "version": node.metadata.get("version"),
                                   "category": node.category, "scope_ref": node.metadata.get("scope_ref", ""),
                                   "who": node.metadata.get("who"),
                                   "routing_key": node.metadata.get("routing_key"),
                                   "object_name": node.metadata.get("object_name", ""),
-                                  "content": node.content}, ensure_ascii=False, default=str)
+                                  "content": node.content}
+            aliases = [name for name in node.metadata.get("object_name_aliases", [])
+                       if canonical_object_name(name) != canonical_object_name(snapshot["object_name"])]
+            if aliases:
+                snapshot["object_name_aliases"] = aliases
+            encoded = json.dumps(snapshot, ensure_ascii=False, default=str)
             uri = json.dumps(node.uri, ensure_ascii=False)
             values = {"nodes": encoded}
             if related:
                 values["related_targets"] = uri
             if primary:
                 values["primary_candidate_targets"] = uri
-            elif not related_target and any(self._scope_candidate(node, c, ctx) for c in drafts):
+            elif scoped:
                 values["scope_candidate_targets"] = uri
             entries.append((self._required(node, drafts, ctx) or related, node, values))
+        primary_options = self._primary_options(drafts, recalled, ctx)
+        length += len(', "primary_options": ') + len(json.dumps(primary_options, ensure_ascii=False))
+        length += len(json.dumps(_decision_tool(questions, primary_options, fixed_target=fixed_target,
+                                               related_only=bool(related_target)), ensure_ascii=False))
         nodes = []
         for required, node, values in sorted(entries, key=lambda item: not item[0]):
             added = sum(len(value) + (2 if fragments[name] else 0) for name, value in values.items())
@@ -368,10 +565,14 @@ class NodeProcessor:
                 for name, value in values.items():
                     fragments[name].append(value)
         prompt = prefix + "".join(', "' + name + '": [' + ", ".join(values) + "]"
-                                   for name, values in fragments.items()) + suffix
-        return prompt, nodes
+                                   for name, values in fragments.items())
+        primary_options = self._primary_options(drafts, nodes, ctx)
+        prompt += ', "related_questions": ' + json.dumps(questions, ensure_ascii=False)
+        prompt += ', "primary_options": ' + json.dumps(primary_options, ensure_ascii=False) + suffix
+        return prompt, nodes, questions, primary_options
 
-    def process(self, candidates, messages, ctx, *, checkpoint=None, reconcile=None, target_candidate=None):
+    def process(self, candidates, messages, ctx, *, checkpoint=None, reconcile=None, target_candidate=None,
+                protected_targets=()):
         from core.model_stage import collect_stage_results, stage_collector_scope
         if target_candidate is not None:
             return self._reprocess_target(candidates, messages, ctx, target_candidate)
@@ -411,25 +612,33 @@ class NodeProcessor:
             chains.append((batches, targets))
         results = [None] * len(chains)
         failures = []
+        others_complete = reconcile is None
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
 
             def advance(index, generator, value=None, error=None):
                 try:
-                    prompt = generator.throw(error) if error is not None else generator.send(value)
+                    prompt, tool = generator.throw(error) if error is not None else generator.send(value)
                 except StopIteration as done:
                     results[index] = done.value
                     return
                 except Exception as exc:
+                    if isinstance(exc, MemoryCardFormatError) and not isinstance(exc, NodeProcessingPartialError):
+                        drafts = [draft for batch, _ in chains[index][0] for draft in batch]
+                        exc = NodeProcessingPartialError([], [{"target": "", "draft_ids": _draft_indices(drafts),
+                                                               "error": str(exc)}])
                     failures.append(exc)
+                    if isinstance(exc, NodeProcessingPartialError):
+                        results[index] = exc.candidates
                     return
                 future = pool.submit(copy_context().run, observe_call, "postprocess", self.llm.complete_with_tools,
-                                     prompt=prompt, tools=[_TOOL],
+                                     prompt=prompt, tools=[tool],
                                      tool_choice="required", temperature=0)
                 futures[future] = (index, generator)
 
             for index, (batches, _) in enumerate(chains):
-                advance(index, self._process_chain(batches, messages, ctx, checkpoint, recall_cache))
+                advance(index, self._process_chain(batches, messages, ctx, checkpoint, recall_cache,
+                                                  protected_targets=protected_targets))
             def collect_nodes():
                 for future in [future for future in futures if future.done()]:
                     index, generator = futures.pop(future)
@@ -444,17 +653,24 @@ class NodeProcessor:
                 if reconcile is not None:
                     try:
                         others = reconcile()
+                        others_complete = True
                     except Exception as exc:
                         failures.append(exc)
                 while futures:
                     wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
                     collect_stage_results()
-            if failures:
-                raise failures[0]
+        global_failures = [failure for failure in failures if not isinstance(failure, NodeProcessingPartialError)]
+        if global_failures:
+            raise global_failures[0]
         for processed in results:
-            others.extend(processed)
+            others.extend(processed or [])
+        if failures:
+            others, unresolved = _independent_candidates(
+                others, [item for failure in failures for item in failure.failures])
         self._check_targets(others)
         attach(others, take([*proposal_sources, *others]))
+        if failures:
+            raise NodeProcessingPartialError(others, unresolved, others_complete=others_complete)
         return others
 
     def _reprocess_target(self, drafts, messages, ctx, accepted):
@@ -474,22 +690,31 @@ class NodeProcessor:
         response = None
         while True:
             try:
-                prompt = generator.send(response)
+                prompt, tool = generator.send(response)
             except StopIteration as done:
                 return [replace(candidate, node_reconciliation_role=accepted.node_reconciliation_role,
                                 node_reconciliation_group=accepted.node_reconciliation_group)
                         for candidate in done.value]
-            response = observe_call("postprocess", self.llm.complete_with_tools, prompt=prompt, tools=[_TOOL],
+            response = observe_call("postprocess", self.llm.complete_with_tools, prompt=prompt, tools=[tool],
                                                     tool_choice="required", temperature=0)
 
-    def _process_chain(self, batches, messages, ctx, checkpoint, recall_cache=None):
-        staged, pending, result = {}, set(), []
+    def _process_chain(self, batches, messages, ctx, checkpoint, recall_cache=None, *, protected_targets=()):
+        staged, pending, result, failures = {}, set(), [], []
         for drafts, recalled in batches:
-            result.extend((yield from self._process(drafts, messages, ctx, staged, pending, checkpoint,
-                                                   recalled=recalled if not staged else None,
-                                                   recall_cache=recall_cache)))
-        return [replace(c, target_uri="", expected_version=None) if c.target_uri in pending else c
-                for c in self._combine_updates(result)]
+            try:
+                result.extend((yield from self._process(drafts, messages, ctx, staged, pending, checkpoint,
+                                                       recalled=recalled if not staged else None,
+                                                       recall_cache=recall_cache,
+                                                       protected_targets=protected_targets)))
+            except NodeProcessingPartialError as exc:
+                result.extend(exc.candidates)
+                failures.extend(exc.failures)
+        result, failures = _independent_candidates(self._combine_updates(result), failures)
+        result = [replace(c, target_uri="", expected_version=None) if c.target_uri in pending else c
+                  for c in result]
+        if failures:
+            raise NodeProcessingPartialError(result, failures)
+        return result
 
     @staticmethod
     def _check_targets(candidates):
@@ -516,17 +741,25 @@ class NodeProcessor:
         return result
 
     def _split(self, drafts, messages, ctx, staged, pending, checkpoint, *, recalled=None, fixed_target="",
-               recall_cache=None):
+               recall_cache=None, protected_targets=()):
         middle = len(drafts) // 2
-        result = []
+        result, failures = [], []
         for batch in (drafts[:middle], drafts[middle:]):
             snapshots = [staged.get(node.uri, node) for node in recalled] if fixed_target else None
-            result.extend((yield from self._process(
-                batch, messages, ctx, staged, pending, checkpoint,
-                recalled=snapshots, fixed_target=fixed_target, recall_cache=recall_cache)))
-        return self._combine_updates(result)
+            try:
+                result.extend((yield from self._process(
+                    batch, messages, ctx, staged, pending, checkpoint,
+                    recalled=snapshots, fixed_target=fixed_target, recall_cache=recall_cache,
+                    protected_targets=protected_targets)))
+            except NodeProcessingPartialError as exc:
+                result.extend(exc.candidates)
+                failures.extend(exc.failures)
+        result, failures = _independent_candidates(self._combine_updates(result), failures)
+        if failures:
+            raise NodeProcessingPartialError(result, failures)
+        return result
 
-    def _split_related(self, drafts, messages, ctx, staged, pending, checkpoint, recalled):
+    def _split_related(self, drafts, messages, ctx, staged, pending, checkpoint, recalled, *, protected_targets=()):
         reads = {node.uri: node for node in recalled}
         related = [node for node in recalled
                    if self._related_in_scope(node, drafts[0], ctx, reads)]
@@ -537,27 +770,47 @@ class NodeProcessor:
         batch_staged, batch_pending = dict(staged), set(pending)
         result = yield from self._process(
             drafts, messages, ctx, batch_staged, batch_pending, checkpoint, recalled=primary,
+            protected_targets=protected_targets,
         )
         for node in related:
             result.extend((yield from self._process(
                 drafts, messages, ctx, batch_staged, batch_pending, checkpoint,
                 recalled=[node], related_target=node.uri, scope_reads=reads,
+                protected_targets=protected_targets,
             )))
         staged.update(batch_staged)
         pending.update(batch_pending)
         return result
 
     def _process(self, drafts, messages, ctx, staged, pending, checkpoint, *, recalled=None, fixed_target="",
-                 recall_cache=None, related_target="", scope_reads=None):
+                 recall_cache=None, related_target="", scope_reads=None, protected_targets=()):
         started = time.perf_counter()
         if recalled is None:
             recalled = self._recall(drafts, ctx, staged, recall_cache)
-        prompt, nodes = self._prompt(drafts, messages, recalled, ctx, fixed_target=fixed_target,
-                                     related_target=related_target)
+        bindings = {node.uri: node for node in recalled}
+        drafts = [replace(draft, expected_version=node.metadata["version"],
+                          routing_key=node.metadata["routing_key"],
+                          object_name=node.metadata.get("object_name", ""),
+                          verified_routing_aliases=list(dict.fromkeys([
+                              *node.metadata.get("routing_key_aliases", []), *draft.verified_routing_aliases])),
+                          verified_object_aliases=list(dict.fromkeys([
+                              *node.metadata.get("object_name_aliases", []), *draft.verified_object_aliases])))
+                  if (draft.category == "entity" and (node := bindings.get(draft.target_uri)) is not None
+                      and self.resolver._in_scope(node, draft, ctx)
+                      and not self.resolver._names_match(node, draft))
+                  else draft for draft in drafts]
+        prompt, nodes, questions, primary_options = self._prompt(
+            drafts, messages, recalled, ctx, fixed_target=fixed_target,
+            related_target=related_target, scope_reads=scope_reads)
+        tool = _decision_tool(questions, primary_options, fixed_target=fixed_target, related_only=bool(related_target),
+                              protected_targets=protected_targets)
+        if protected_targets:
+            prompt += "\nAlready committed read-only targets; use noop/unchanged: " + json.dumps(sorted(protected_targets))
+        tool_size = len(json.dumps(tool, ensure_ascii=False))
         from core.model_stage import model_signature
         cached = None
-        if checkpoint is not None and len(prompt) <= _PROMPT_LIMIT:
-            inputs = {"prompt": prompt, "tool": _TOOL, "model": model_signature(self.llm, temperature=0),
+        if checkpoint is not None and len(prompt) + tool_size <= _PROMPT_LIMIT:
+            inputs = {"prompt": prompt, "tool": tool, "model": model_signature(self.llm, temperature=0),
                       "drafts": [asdict(c) for c in drafts], "nodes": [asdict(n) for n in recalled],
                       "schemas": [asdict(schema) for c in sorted(CATEGORIES)
                                   if (schema := self.resolver.schemas.get_compatible(c)) is not None]}
@@ -565,120 +818,156 @@ class NodeProcessor:
         from service.extraction_retry import card_format_feedback
         feedback = card_format_feedback()
         request_prompt = prompt + ("\nPrevious processing error to correct: " + feedback if feedback else "")
-        if cached is None and len(request_prompt) > _PROMPT_LIMIT:
+        if cached is None and len(request_prompt) + tool_size > _PROMPT_LIMIT:
             if len(drafts) > 1:
                 return (yield from self._split(drafts, messages, ctx, staged, pending, checkpoint,
-                                              recalled=recalled, fixed_target=fixed_target, recall_cache=recall_cache))
+                                              recalled=recalled, fixed_target=fixed_target, recall_cache=recall_cache,
+                                              protected_targets=protected_targets))
             if not fixed_target and not related_target:
-                return (yield from self._split_related(drafts, messages, ctx, staged, pending, checkpoint, recalled))
+                return (yield from self._split_related(drafts, messages, ctx, staged, pending, checkpoint, recalled,
+                                                      protected_targets=protected_targets))
             raise ExtractionIncompleteError("node context exceeds processing budget")
         try:
-            calls = cached if cached is not None else (yield request_prompt)
+            calls = cached if cached is not None else (yield (request_prompt, tool))
         except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
             if isinstance(exc, LLMOutputTruncatedError) and len(drafts) > 1:
                 return (yield from self._split(drafts, messages, ctx, staged, pending, checkpoint,
-                                              recalled=recalled, fixed_target=fixed_target, recall_cache=recall_cache))
+                                              recalled=recalled, fixed_target=fixed_target, recall_cache=recall_cache,
+                                              protected_targets=protected_targets))
             raise MemoryCardFormatError("node_processing: " + str(exc)) from exc
         try:
             if (not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict)
                     or calls[0].get("tool") != "process_memory_nodes"):
                 raise ValueError("node processor requires one process_memory_nodes result")
-            payload = calls[0]["input"]
-            errors = [".".join(map(str, error.absolute_path)) + ": " + error.message
-                      for error in _INPUT_VALIDATOR.iter_errors(payload)]
-            if errors:
-                raise ValueError("Invalid node operations: " + "; ".join(errors))
+            payload = _normalize_node_payload(calls[0]["input"])
+            schema_errors, global_errors = {}, []
+            for error in Draft202012Validator(tool["input_schema"]).iter_errors(payload):
+                path = list(error.absolute_path)
+                message = ".".join(map(str, path)) + ": " + error.message
+                if len(path) < 2 or path[0] not in {"operations", "related_reconciliations"}:
+                    global_errors.append(message)
+                else:
+                    schema_errors.setdefault(tuple(path[:2]), []).append(message)
+            if global_errors:
+                raise ValueError("Invalid node operations: " + "; ".join([
+                    *global_errors, *(message for errors in schema_errors.values() for message in errors)]))
             operations = payload["operations"]
+            if any(not isinstance(op, dict) or not isinstance(op.get("draft_ids"), list)
+                   or not op["draft_ids"] or any(type(i) is not int for i in op["draft_ids"])
+                   for op in operations):
+                raise ValueError("node decisions require nonempty integer draft_ids: " + "; ".join(
+                    message for errors in schema_errors.values() for message in errors))
             ids = [i for op in operations for i in op["draft_ids"]]
             expected = [] if related_target else list(range(len(drafts)))
-            if any(type(i) is not int for i in ids) or sorted(ids) != expected:
-                counts = Counter(ids)
-                raise ValueError("node decisions must account for every draft exactly once. "
-                                 "Use integer draft_ids and preserve all source facts: " +
+            counts = Counter(ids)
+            if any(type(i) is not int or i not in expected for i in ids) or len(ids) != len(counts):
+                raise ValueError("node decisions must reference each supplied draft id at most once. "
+                                 "Use integer draft_ids from the current batch: " +
                                  json.dumps({"expected": expected,
-                                             "missing": [i for i in expected if i not in counts],
                                              "repeated": sorted(i for i, count in counts.items() if count > 1),
                                              "out_of_range": sorted(i for i in counts if i not in expected)},
                                             ensure_ascii=False, separators=(",", ":")))
             reads = {n.uri: n for n in nodes}
-            targets = [op["target"] for op in operations if op["target"]]
-            update_targets = [op["target"] for op in operations if op["action"] == "update" and op["target"]]
-            if len(set(update_targets)) != len(update_targets):
-                duplicates = [target for target, count in Counter(update_targets).items() if count > 1]
-                raise ValueError("node decisions require one update per target. "
-                                 "Combine same-object drafts into one complete operation preserving all facts "
-                                 "and whole-result abstract/overview: " +
-                                 json.dumps([{"target": target, "operations": [
-                                     {"draft_ids": op["draft_ids"], "action": op["action"]}
-                                     for op in operations if op["target"] == target]}
-                                     for target in duplicates], ensure_ascii=False, separators=(",", ":")))
-            related = payload.get("related_reconciliations", [])
-            offered = ({related_target} if related_target else
-                       {n.uri for n in nodes if any(self._related_in_scope(n, c, ctx, reads) for c in drafts)})
-            related_targets = [op["target"] for op in related]
-            required_related = offered - set(targets)
-            primary_drafts = {}
+            creations = defaultdict(list)
+            updates_by_target = defaultdict(list)
+            targets = []
             for op in operations:
-                if op["target"]:
-                    primary_drafts.setdefault(op["target"], set()).update(op["draft_ids"])
-            unchanged_candidates = {op["target"] for op in related if (op["target"] not in primary_drafts
-                                         or set(op["source_draft_ids"]) <= primary_drafts[op["target"]])
-                                    and self._unchanged_primary_candidate(op, drafts, reads, ctx)}
-            missing = required_related - set(related_targets)
-            unexpected = set(related_targets) - required_related - unchanged_candidates
-            duplicates = sorted(uri for uri, count in Counter(related_targets).items() if count > 1)
-            if duplicates or missing or unexpected:
-                raise ValueError("related decisions must cover every supplied related target once: " +
-                                 json.dumps({"related_decisions": [
-                                                {**{key: op[key] for key in
-                                                    ("target", "decision", "reason", "source_draft_ids")},
-                                                 "edits_count": len(op["edits"]),
-                                                 "sections_count": len(op["sections"]),
-                                                 "source_quote_chars": len(op["source_quote"])}
-                                                for op in related if op["target"] in unexpected or op["target"] in duplicates],
-                                             "missing": sorted(missing),
-                                             "unexpected": sorted(unexpected),
-                                             "duplicates": duplicates,
-                                             "primary_targets": sorted(targets),
-                                             "primary_operations": [{key: op[key] for key in
-                                                ("target", "action", "draft_ids")} for op in operations]}, ensure_ascii=False))
-            if fixed_target and (len(operations) != 1 or targets != [fixed_target]
+                action, target = op.get("action"), op.get("target")
+                if isinstance(target, str) and target:
+                    targets.append(target)
+                    if action == "update":
+                        updates_by_target[target].append(op["draft_ids"])
+                if action != "create":
+                    continue
+                selected = [drafts[i] for i in op["draft_ids"]]
+                first = selected[0]
+                if first.category == "entity":
+                    scope = canonical_scope(first.scope_ref)
+                    indices = _draft_indices(selected)
+                    for name in set().union(*(_entity_names(draft) for draft in selected)):
+                        creations[first.owner_scope, scope, name].append(indices)
+            conflicting_groups = sorted({
+                tuple(sorted({index for indices in groups for index in indices}))
+                for groups in creations.values() if len(groups) > 1
+            })
+            related = []
+            errors = [
+                {"target": "", "draft_ids": list(indices),
+                 "error": "combine this entity's drafts into one complete create operation"}
+                for indices in conflicting_groups
+            ]
+            errors.extend(
+                {"target": target, "draft_ids": _draft_indices(drafts[i] for group in groups for i in group),
+                 "error": "node decisions require one update per target. Combine same-object drafts into "
+                          "one complete operation preserving all facts and whole-result abstract/overview."}
+                for target, groups in updates_by_target.items() if len(groups) > 1
+            )
+            for key, answer in payload["related_reconciliations"].items():
+                target = questions[key]["target"]
+                if ("related_reconciliations", key) in schema_errors:
+                    local_ids = answer.get("source_draft_ids") if isinstance(answer, dict) else None
+                    if (not isinstance(local_ids, list) or not local_ids
+                            or any(type(i) is not int or i not in questions[key]["source_draft_ids"] for i in local_ids)):
+                        local_ids = questions[key]["source_draft_ids"]
+                    errors.append({"target": target, "draft_ids": _draft_indices([drafts[i] for i in local_ids]),
+                                   "error": "; ".join(schema_errors[("related_reconciliations", key)])})
+                    continue
+                if answer["decision"] == "update":
+                    node = reads[target]
+                    related.append({**answer, "target": target,
+                                    "routing_key": node.metadata["routing_key"],
+                                    "object_name": node.metadata.get("object_name", "")})
+            if fixed_target and (len(operations) != 1 or targets != [fixed_target] or len(ids) != len(expected)
                                  or operations[0]["action"] not in {"update", "noop"} or related):
-                raise ValueError(f"node revision requires one operation for its fixed target: {fixed_target}")
+                raise ValueError(f"node revision requires one operation covering every draft for {fixed_target}")
             group = uuid5(NAMESPACE_URL, json.dumps({
                 "account": ctx.account_id, "owner": (ctx.agent_space_name() if drafts[0].owner_scope == "agent"
                                                        else ctx.user_space_name()),
                 "scope": canonical_scope(drafts[0].scope_ref), "source": messages,
                 "provenance": sorted({source for c in drafts for source in c.provenance_ids}),
             }, sort_keys=True, ensure_ascii=False, default=str)).hex
-            result, errors, updates = [], [], {}
-            for op in operations:
+            result, updates = [], {}
+            for index, op in enumerate(operations):
                 try:
                     selected = [drafts[i] for i in op["draft_ids"]]
+                    if ("operations", index) in schema_errors:
+                        raise ValueError("; ".join(schema_errors[("operations", index)]))
                     if len({c.category for c in selected}) != 1:
                         raise ValueError("primary operation drafts must share their category")
                     candidate = self._materialize(op, selected, reads, ctx, messages=messages)
+                    if candidate is None:
+                        continue
+                    if candidate.target_uri in protected_targets:
+                        continue
                     candidate = replace(candidate, node_reconciliation_group=group)
                     result.append(candidate)
                     if op["action"] == "update":
                         updates[candidate.target_uri] = candidate
                 except (ValueError, KeyError, TypeError, IndexError, ValidationError,
                         MemoryCardFormatError, ToolCallProtocolError) as exc:
-                    errors.append({"target": op.get("target"), "error": str(exc)})
+                    target = op.get("target") if isinstance(op.get("target"), str) else ""
+                    matching = [node.uri for node in reads.values() if any(
+                        self.resolver._in_scope(node, draft, ctx) and self.resolver._names_match(node, draft)
+                        for draft in selected)]
+                    identities = {(self.resolver._directory(draft, ctx), self.resolver._proposed_key(draft, ctx))
+                                  for draft in selected}
+                    contributors = [draft for draft in drafts if (
+                        self.resolver._directory(draft, ctx), self.resolver._proposed_key(draft, ctx)) in identities]
+                    errors.append({"target": target or (matching[0] if len(matching) == 1 else ""),
+                                   "draft_ids": _draft_indices(contributors), "error": str(exc)})
             result = self._combine_updates(result, preferred=updates)
             for op in related:
                 try:
                     candidate = self._materialize_related(
-                        op, drafts, messages, scope_reads if related_target else reads, ctx,
-                        allow_same_category=op["target"] in unchanged_candidates)
+                        op, drafts, messages, scope_reads if related_target else reads, ctx)
                     if candidate is not None:
                         result.append(replace(candidate, node_reconciliation_group=group))
                 except (ValueError, KeyError, TypeError, IndexError, ValidationError,
                         MemoryCardFormatError, ToolCallProtocolError) as exc:
-                    errors.append({"target": op.get("target"), "error": str(exc)})
-            if errors:
-                raise ValueError("Correct these node operations together: " + json.dumps(errors, ensure_ascii=False))
-            if checkpoint is not None and cached is None:
+                    errors.append({"target": op["target"], "draft_ids": _draft_indices(
+                        [drafts[i] for i in op["source_draft_ids"]]), "error": str(exc)})
+            result, errors = _independent_candidates(result, errors)
+            if checkpoint is not None and cached is None and not errors:
                 checkpoint.save_stage("node_processing", inputs, calls)
             for index, candidate in enumerate(result):
                 if candidate.target_uri:
@@ -700,42 +989,25 @@ class NodeProcessor:
                     metadata[field] = list(dict.fromkeys([*metadata.get(field, []), *aliases]))
                 staged[node.uri] = replace(node, abstract=candidate.abstract, overview=candidate.overview,
                                            content=candidate.content, metadata=metadata)
-            logger.info("NODE_PROCESSING session=%s drafts=%d nodes=%d operations=%d elapsed_ms=%.1f",
-                        ctx.session_id, len(drafts), len(nodes), len(result), (time.perf_counter()-started)*1000)
+            logger.info("NODE_PROCESSING session=%s drafts=%d nodes=%d operations=%d skipped_drafts=%s elapsed_ms=%.1f",
+                        ctx.session_id, len(drafts), len(nodes), len(result),
+                        [i for i in expected if i not in counts], (time.perf_counter()-started)*1000)
+            if errors:
+                raise NodeProcessingPartialError(result, errors)
             return result
         except (ValueError, KeyError, TypeError, IndexError, ValidationError) as exc:
             raise MemoryCardFormatError("node_processing: " + str(exc)) from exc
 
-    def _unchanged_primary_candidate(self, op, drafts, reads, ctx):
-        if (op["decision"] != "unchanged" or op["reason"] == "correct_current_fact"
-                or op["edits"] or op["sections"]):
-            return False
-        node = reads.get(op["target"])
-        ids = op["source_draft_ids"]
-        return (node is not None and bool(ids) and all(type(index) is int and 0 <= index < len(drafts)
-                and self.resolver._in_scope(node, drafts[index], ctx) for index in ids))
-
-    def _materialize_related(self, op, drafts, messages, reads, ctx, *, allow_same_category=False):
-        ids = op["source_draft_ids"]
-        if any(type(index) is not int or not 0 <= index < len(drafts) for index in ids):
-            raise ValueError("related decision requires supplied source draft ids")
-        sources = [drafts[index] for index in ids]
+    def _materialize_related(self, op, drafts, messages, reads, ctx):
+        sources = [drafts[index] for index in op["source_draft_ids"]]
         node = reads[op["target"]]
-        if (not all(self._related_in_scope(node, source, ctx, reads) for source in sources)
-                and not (allow_same_category and self._unchanged_primary_candidate(op, drafts, reads, ctx))):
-            raise ValueError("related decision requires the same owner and confirmed subject scope")
-        if op["decision"] == "unchanged":
-            if op["reason"] == "correct_current_fact" or op["edits"] or op["sections"]:
-                raise ValueError("unchanged related decision must retain the complete current card")
-            return None
         evidence = [source for draft in sources for source in draft.source_contexts]
 
         if not all(source.source_contexts for source in sources):
             evidence.extend(_text_values(messages))
         if not op["source_quote"].strip() or not any(op["source_quote"] in value for value in evidence):
-            raise ValueError("related decision source quote must occur in current source evidence")
-        if op["reason"] != "correct_current_fact":
-            raise ValueError("related update requires a supported current-fact correction")
+            logger.info("NODE_PROCESSING skipped_update target=%s reason=source_quote_unmatched", node.uri)
+            return None
         source = sources[0]
         schema = self.resolver.schemas.get_compatible(node.category)
         seed = replace(source, category=node.category, owner_scope=schema.owner_scope,
@@ -755,8 +1027,8 @@ class NodeProcessor:
     def _materialize(self, op, drafts, reads, ctx, *, messages=()):
         candidate = drafts[0]
         action, target = op["action"], op["target"]
-        if action == "defer":
-            raise ValueError("identity unresolved for " + candidate.routing_key)
+        if any(draft.target_uri and draft.target_uri != target for draft in drafts):
+            raise ValueError("a bound draft must retain its read target")
         if action not in {"create", "update", "noop"}:
             raise ValueError("unsupported node action")
         sources = list(dict.fromkeys(s for c in drafts for s in c.provenance_ids))
@@ -766,16 +1038,24 @@ class NodeProcessor:
         if action == "create":
             if target or op["edits"]:
                 raise ValueError("new node requires fresh sections")
-            candidate = replace(candidate, routing_key=op["routing_key"], object_name=op["object_name"],
+            if any(self.resolver._in_scope(node, draft, ctx) and self.resolver._names_match(node, draft)
+                   for node in reads.values() for draft in drafts):
+                raise ValueError("a supplied matching identity requires update or noop with its target")
+            name, key = op["object_name"], op["routing_key"]
+            if candidate.category == "entity":
+                if not set.intersection(*(_entity_names(draft) for draft in drafts)):
+                    raise ValueError("entity drafts require one shared identity; use separate primary operations")
+                name, key = candidate.object_name or candidate.routing_key, candidate.routing_key
+            candidate = replace(candidate, routing_key=key, object_name=name,
                                 target_uri="", expected_version=None,
-                                content="# " + _line(op["object_name"] or op["routing_key"]) + "\n\n" + additions,
+                                content="# " + _line(name or key) + "\n\n" + additions,
                                 abstract=abstract, overview=overview)
         else:
             if target not in reads:
                 raise ValueError("update requires a supplied full snapshot")
             node = reads[target]
             for draft in drafts:
-                if self.resolver._in_scope(node, draft, ctx):
+                if self._primary_in_scope(node, draft, ctx):
                     continue
                 resolution = op.get("scope_resolution", {})
                 quotes = [quote.strip() for quote in resolution.get("source_quotes", [])]
@@ -786,10 +1066,12 @@ class NodeProcessor:
                     *node.metadata.get("object_name_aliases", []))}
                 if not (self._scope_candidate(node, draft, ctx)
                         and resolution.get("stored_scope_role") == "self"
-                        and resolution.get("incoming_scope_role") == "self"
-                        and any(quote and canonical_scope(quote) not in identity_labels
-                                and any(quote in source for source in evidence) for quote in quotes)):
+                        and resolution.get("incoming_scope_role") == "self"):
                     raise ValueError("update requires a source-grounded self-scope resolution for each draft")
+                if not any(quote and canonical_scope(quote) not in identity_labels
+                           and any(quote in source for source in evidence) for quote in quotes):
+                    logger.info("NODE_PROCESSING skipped_update target=%s reason=scope_quote_unmatched", node.uri)
+                    return None
             content = node.content
             if action == "noop":
                 if op["edits"] or additions:
@@ -817,7 +1099,7 @@ class NodeProcessor:
                                 content=content, abstract=abstract, overview=overview)
         candidate = replace(candidate, provenance_ids=sources,
                             source_contexts=list(dict.fromkeys(source for c in drafts for source in c.source_contexts)),
-                            node_draft_indices=list(dict.fromkeys(i for c in drafts for i in c.node_draft_indices)),
+                            node_draft_indices=_draft_indices(drafts),
                             verified_routing_aliases=list(dict.fromkeys(
                                 alias for c in drafts for alias in (c.routing_key, *c.verified_routing_aliases) if alias)),
                             verified_object_aliases=list(dict.fromkeys(

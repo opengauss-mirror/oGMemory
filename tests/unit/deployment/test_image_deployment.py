@@ -90,6 +90,29 @@ def test_prepare_preserves_keys_and_special_character_values(tmp_path):
     assert (Path(first['stack_dir']) / 'secrets.env').stat().st_mode & 0o777 == 0o600
 
 
+def test_compose_persists_chroma_separately_from_agfs():
+    compose = yaml.safe_load((ROOT / 'compose.yaml').read_text())
+    volumes = compose['services']['ogmemory']['volumes']
+    chroma = [value for value in volumes if value.endswith(':/data/chroma')]
+    assert chroma == ['${STACK_DIR:-./data/ogmemory}/chroma:/data/chroma']
+    assert '${STACK_DIR:-./data/ogmemory}/agfs:/data/agfs' in volumes
+
+
+def test_prepare_initializes_and_preserves_chroma_data(tmp_path):
+    prepare = module('prepare')
+    result = prepare.prepare(config(), tmp_path)
+    chroma = Path(result['stack_dir']) / 'chroma'
+    assert chroma.is_dir()
+    # Match the existing AGFS directory policy for the container's non-root UID.
+    assert chroma.stat().st_mode & 0o777 == 0o777
+    database = chroma / 'chroma.sqlite3'
+    database.write_bytes(b'existing index')
+    again = prepare.prepare(config(), tmp_path)
+    assert again['keys'] == result['keys']
+    assert database.read_bytes() == b'existing index'
+    assert chroma.stat().st_mode & 0o777 == 0o777
+
+
 def test_prepare_rejects_changed_embedding_space(tmp_path):
     prepare = module('prepare')
     prepare.prepare(config(), tmp_path)

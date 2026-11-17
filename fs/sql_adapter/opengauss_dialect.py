@@ -33,6 +33,7 @@ END $$;
 
 class OpenGaussDialect(PostgreSQLDialect):
     name = OPENGAUSS
+    # Select the polling outbox path and the graph queue's FOR UPDATE path.
     supports_batch_claim = False
     # Ordinary roles cannot set lockwait_timeout. statement_timeout also bounds
     # statements waiting for locks, without requiring an administrative role.

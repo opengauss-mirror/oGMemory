@@ -139,7 +139,7 @@ def _prepare_locked(env, root):
     if not key_file.exists():
         write_metadata(key_file, ''.join(k + '=' + v + '\n' for k, v in keys.items()))
     key_file.chmod(0o600)
-    for name in ['opengauss', 'agfs']:
+    for name in ['opengauss', 'agfs', 'chroma']:
         (stack / name).mkdir(exist_ok=True)
         (stack / name).chmod(0o777)
     private_write(stack / 'ogmemory.yaml', config_text)

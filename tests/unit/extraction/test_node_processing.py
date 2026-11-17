@@ -36,8 +36,7 @@ class NodeLLM:
 
     def complete_with_tools(self, **kwargs):
         self.calls.append(kwargs)
-        return [{"tool": "process_memory_nodes", "input": {
-            "operations": self.decide(kwargs), "related_reconciliations": []}}]
+        return [{"tool": "process_memory_nodes", "input": node_response(kwargs, self.decide(kwargs))}]
 
 
 def setup(decide, mode="eager"):
@@ -107,15 +106,19 @@ def test_fallback_locks_complete_concurrent_commits(monkeypatch, users, with_eve
 
 
 def test_same_object_participants_grouped_and_alias_saved():
-    ctx, fs, llm, api = setup(lambda _: [operation([0, 1])])
-    drafts = [card("cross_and_heart", who="Caroline; Melanie; Grandma"),
-              card("grandmas_necklace", who="Caroline; Grandma; Melanie")]
+    op = operation([0, 1])
+    op.update(routing_key="cross_and_heart", object_name="Caroline's necklace")
+    ctx, fs, llm, api = setup(lambda _: [op])
+    drafts = [card("cross_and_heart", object_name="Caroline's necklace",
+                   verified_object_aliases=["Grandma's necklace"], who="Caroline; Melanie; Grandma"),
+              card("grandmas_necklace", object_name="Grandma's necklace", who="Caroline; Grandma; Melanie")]
     api._pipeline.extract = lambda *a, **k: drafts
-    result = api.commit_session([{"role": "user", "content": "Grandma gave Caroline the necklace."}], ctx)
+    source = "Caroline: I call my necklace Grandma's necklace; it is the cross-and-heart necklace Grandma gave me."
+    result = api.commit_session([{"role": "user", "content": source}], ctx)
     node = next(iter(fs.nodes.values()))
     assert result["writes_completed"] == 1
     assert len(fs.nodes) == 1
-    assert set(node.metadata["object_name_aliases"]) >= {"cross_and_heart", "grandmas_necklace"}
+    assert set(node.metadata["object_name_aliases"]) == {"Caroline's necklace", "Grandma's necklace"}
     assert llm.calls[0]["temperature"] == 0
     resolver = api._writer._identity_resolver
     assert resolver._names_match(node, drafts[1])
@@ -176,10 +179,11 @@ def test_preference_only_registry_processes_its_configured_topic(tmp_path, entit
 
 def test_update_retains_old_facts_and_replaces_whole_summary():
     ctx, fs, llm, api = setup(lambda _: [])
-    uri = api.write_memory(card(), ctx)["target_uri"]
+    uri = api.write_memory(card(verified_object_aliases=["Grandma's necklace"]), ctx)["target_uri"]
     llm.decide = lambda _: [operation([0], target=uri, action="update", fact="It has a heart charm.")]
-    api._pipeline.extract = lambda *a, **k: [card("grandmas_necklace", who="Caroline; Grandma")]
-    api.commit_session([{"role": "user", "content": "The necklace has a heart charm."}], ctx)
+    api._pipeline.extract = lambda *a, **k: [card("grandmas_necklace", object_name="Grandma's necklace",
+                                               who="Caroline; Grandma")]
+    api.commit_session([{"role": "user", "content": "Grandma's necklace has a heart charm."}], ctx)
     node = fs.read_node(uri, ctx)
     assert "Gift from Caroline's grandma." in node.content
     assert "It has a heart charm." in node.content
@@ -206,12 +210,34 @@ def node_payload(call):
     return json.JSONDecoder().raw_decode(prompt[prompt.index('\n{"source":') + 1:])[0]
 
 
+def related_targets(payload):
+    return [question["target"] for question in payload["related_questions"].values()]
+
+
+def node_response(call, operations, reconciliations=()):
+    questions = node_payload(call)["related_questions"]
+    primary = {op["target"] for op in operations if op["target"]}
+    related = {op["target"]: op for op in reconciliations}
+    answers = {}
+    for key, question in questions.items():
+        target = question["target"]
+        if target in primary:
+            answers[key] = {"decision": "unchanged"}
+        elif target in related:
+            op = related[target]
+            answers[key] = {"decision": op["decision"]}
+            if op["decision"] == "update":
+                answers[key].update({field: op[field] for field in (
+                    "source_draft_ids", "source_quote", "abstract", "overview", "edits", "sections")})
+    return {"operations": operations, "related_reconciliations": answers}
+
+
 @pytest.mark.parametrize("category", ["entity", "preference"])
 @pytest.mark.parametrize("action", ["update", "edit", "noop"])
 @pytest.mark.parametrize("budget", ["input", "output"])
 def test_split_new_identity_commits_composed_card_once(category, action, budget):
     ctx, fs, llm, api = setup(lambda _: [])
-    drafts = [card(f"alias_{i}", category=category, provenance_ids=[f"source:{i}"],
+    drafts = [card(f"alias_{i}", object_name="necklace", category=category, provenance_ids=[f"source:{i}"],
                    content="# Item\n\n## Details\n- " + "Source detail. " * (2300 if budget == "input" else 1)
                    + f"\n- Fact {i}.")
               for i in range(4)]
@@ -234,7 +260,7 @@ def test_split_new_identity_commits_composed_card_once(category, action, budget)
                 op.update(action="noop", sections=[])
         else:
             key = payload["drafts"][0]["routing_key"]
-            op.update(routing_key=key, object_name=key)
+            op.update(routing_key=key, object_name=payload["drafts"][0]["object_name"])
         return [op]
 
     llm.decide = decide
@@ -243,7 +269,7 @@ def test_split_new_identity_commits_composed_card_once(category, action, budget)
     assert len(llm.calls) == (2 if budget == "input" else 3)
     assert len(fs.nodes) == result["writes_completed"] == 1
     assert stored.metadata["version"] == 1
-    assert stored.uri.endswith("/alias_0")
+    assert stored.uri.endswith("/necklace" if category == "entity" else "/alias_0")
     expected = ["Fact 0.", "Fact 1."] if action == "noop" else [f"Fact {i}." for i in range(4)]
     if action == "edit":
         expected[0] = "Verified fact 0."
@@ -287,7 +313,8 @@ def test_large_optional_history_leaves_room_for_complete_target(binding):
 @pytest.mark.parametrize("budget", ["input", "output"])
 def test_split_drafts_update_one_shared_snapshot(last_action, budget):
     ctx, fs, llm, api = setup(lambda _: [])
-    original = card(content="# Necklace\n\n## History\n- " + "Archived attribute. " * 1000)
+    original = card(content="# Necklace\n\n## History\n- " + "Archived attribute. " *
+                    (1000 if budget == "input" else 100))
     uri = api.write_memory(original, ctx)["target_uri"]
     drafts = [replace(original, routing_key=f"alias_{i}", target_uri=uri, expected_version=1,
                       provenance_ids=[f"source:{i}"], verified_object_aliases=[f"name {i}"],
@@ -413,7 +440,7 @@ def test_checkpoint_revision_commits_against_refreshed_snapshot(category):
         def mutate(self, function):
             function(self.batch)
     ctx, fs, llm, api = setup(lambda _: [])
-    original = card(category=category)
+    original = card(category=category, verified_object_aliases=["Grandmother's gift", "Heart necklace"])
     if category == "preference":
         original = replace(original, content="# Necklace\n\n- Prefers wearing her grandmother's necklace.")
     uri = api.write_memory(original, ctx)["target_uri"]
@@ -480,7 +507,7 @@ def test_split_stage_b_resume_commits_one_complete_new_node():
     from tests.unit.server.test_memory_card_recovery import enable
 
     ctx, fs, _, _ = setup(lambda _: [])
-    drafts = [card(f"alias_{i}", content="# Item\n\n## Details\n- " + "Source detail. " * 2300
+    drafts = [card(f"alias_{i}", object_name="necklace", content="# Item\n\n## Details\n- " + "Source detail. " * 2300
                    + f"\n- Fact {i}.") for i in range(4)]
     service, writer, manager = setup_service(fs, ctx, entries=drafts)
     enable(service, writer)

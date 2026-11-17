@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -11,7 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -331,6 +332,13 @@ def positive_int(value: str) -> int:
     return result
 
 
+def llm_temperature(value: str) -> float:
+    result = float(value)
+    if not 0 <= result <= 2:
+        raise argparse.ArgumentTypeError("must be between 0 and 2")
+    return result
+
+
 def plugin_timeout_ms(value: str) -> int:
     result = int(value)
     if not 100 <= result <= 60000:
@@ -360,6 +368,11 @@ def build_parser(
     parser.add_argument("--clear-ingest-record", action="store_true")
     parser.add_argument("--ingest-record", type=Path, default=Path(".ingest_record.json"))
     parser.add_argument("--verify-writes", action="store_true")
+    parser.add_argument("--settle-each-source", action="store_true",
+                        help="Use a separate ingest session and verify its settled writes before advancing")
+    parser.add_argument("--conversation-parallel", type=positive_int, default=1,
+                        help="Run OpenClaw lanes in one account; user and memory-agent IDs get -sNN suffixes. "
+                             "Register these identities before using account-scoped credentials")
     parser.add_argument("--read-only-qa", action="store_true")
     parser.add_argument("--ogmemory-url", default="http://127.0.0.1:8090")
     parser.add_argument("--account-id", default="locomo-agent-eval")
@@ -370,6 +383,7 @@ def build_parser(
     parser.add_argument("--llm-api-key-env", default="OGMEM_API_KEY")
     parser.add_argument("--llm-base-url", default="https://api.openai.com/v1")
     parser.add_argument("--llm-model", default="gpt-4o-mini")
+    parser.add_argument("--llm-temperature", type=llm_temperature)
     parser.add_argument("--claude-base-url")
     parser.add_argument("--claude-auth-token", action="store_true")
     parser.add_argument("--judge-api-key-env", default="OGMEM_API_KEY")
@@ -445,6 +459,8 @@ def session_key(sample_id: str, label: str, args) -> str:
     identity = (args.account_id, args.user_id, args.memory_agent_id, args.run_id, sample_id)
     namespace = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
     if label.startswith("ingest-"):
+        if getattr(args, "settle_each_source", False):
+            return f"ingest-{namespace}-s{label.removeprefix('ingest-')}"
         return f"ingest-{namespace}"
     return f"qa-{namespace}-q{label.removeprefix('qa-')}"
 
@@ -878,6 +894,12 @@ def ingest(args, samples, adapter):
     session_range = parse_session_range(args.sessions) if args.sessions else None
     prior_path = args.output_dir / "ingest.json"
     rows = json.loads(prior_path.read_text(encoding="utf-8")) if prior_path.exists() else []
+    settle_each = getattr(args, "settle_each_source", False)
+    completion_path = args.output_dir / "source-completion.json"
+    settled = {}
+    if settle_each and completion_path.exists() and not args.clear_ingest_record:
+        settled = {check["session_id"]: check for check in json.loads(
+            completion_path.read_text(encoding="utf-8")).get("sources", [])}
     selected_source_ids = set()
     selected_record_keys = set()
     adapter.open("ingest")
@@ -885,14 +907,15 @@ def ingest(args, samples, adapter):
         sid = item["sample_id"]
         for session in build_session_messages(item, session_range):
             name = session["meta"]["session_key"]
-            key = session_key(sid, "ingest-1", args)
+            key = session_key(sid, f"ingest-{session['meta']['session_index']}", args)
             source_sha256 = hashlib.sha256(session["message"].encode("utf-8")).hexdigest()
             record_key = f"{args.transport}:{args.agent}:{args.account_id}:{args.memory_agent_id}:{args.agent_id}:{args.user_id}:{sid}:{name}"
             selected_record_keys.add(record_key)
             prior = record.get(record_key, {})
-            if not args.force_ingest and (
+            reused = not args.force_ingest and (
                 prior.get("success") or (args.verify_writes and prior.get("write_verified"))
-            ):
+            )
+            if reused:
                 if prior.get("adapter", adapter.description) != adapter.description:
                     raise RuntimeError(
                         f"Ingest adapter changed for {sid}/{name}; use a fresh identity and ingest record"
@@ -906,79 +929,116 @@ def ingest(args, samples, adapter):
                         "use a fresh identity and --force-ingest"
                     )
                 selected_source_ids.update(prior.get("source_ids", []))
-                continue
+                if not settle_each or prior.get("success"):
+                    continue
             before = time.monotonic()
             source_ids, usage = [], {}
             failure = None
-            record.pop(record_key, None)
-            try:
-                reply, usage, source_ids = adapter.ingest(session["message"], key)
-                if not reply.strip():
-                    raise RuntimeError("Agent returned empty ingest response")
-                if args.verify_writes and not source_ids:
-                    raise RuntimeError("Verified ingest returned no source sessions")
-                record[record_key] = {
-                    "success": not args.verify_writes, "session_key": key, "source_ids": source_ids,
-                    "write_verified": args.verify_writes,
-                    "source_sha256": source_sha256,
-                    "adapter": adapter.description,
-                }
-                selected_source_ids.update(source_ids)
-            except Exception as error:
-                failure = error
-                reply = f"[ERROR] {error}"
-                print(f"{sid}/{name}: {error}", file=sys.stderr)
-            write_json(record_path, record)
-            row = {
-                "sample_id": sid,
-                "sample_idx": index,
-                "session": name,
-                "session_key": key,
-                "user": args.user_id,
-                "source_ids": source_ids,
-                "reply": reply,
-                "usage": usage,
-                "write_seconds": time.monotonic() - before,
-                "observation_status": getattr(failure, "status", "ERROR") if failure else (
-                    "AWAITING_SETTLEMENT" if args.verify_writes else "COMPLETED"),
-                "request_status": getattr(failure, "request_status", None),
-                "http_observations": getattr(failure, "http_observations", []) if failure else [],
-            }
             previous = next(
                 (i for i, prior in enumerate(rows)
                  if prior["sample_id"] == sid and prior["session"] == name), None
             )
-            if previous is None:
-                rows.append(row)
+            if reused:
+                if previous is None:
+                    raise RuntimeError(f"Saved ingest lacks its host response for {sid}/{name}")
+                row = rows[previous]
+                source_ids = prior["source_ids"]
             else:
-                rows[previous] = row
-            write_json(args.output_dir / "ingest.json", rows)
+                record.pop(record_key, None)
+                try:
+                    reply, usage, source_ids = adapter.ingest(session["message"], key)
+                    if not reply.strip():
+                        raise RuntimeError("Agent returned empty ingest response")
+                    if args.verify_writes and not source_ids:
+                        raise RuntimeError("Verified ingest returned no source sessions")
+                    record[record_key] = {
+                        "success": not args.verify_writes, "session_key": key, "source_ids": source_ids,
+                        "write_verified": args.verify_writes,
+                        "source_sha256": source_sha256,
+                        "adapter": adapter.description,
+                    }
+                    selected_source_ids.update(source_ids)
+                except Exception as error:
+                    failure = error
+                    reply = f"[ERROR] {error}"
+                    print(f"{sid}/{name}: {error}", file=sys.stderr)
+                row = {
+                    "sample_id": sid,
+                    "sample_idx": index,
+                    "session": name,
+                    "session_key": key,
+                    "user": args.user_id,
+                    "source_ids": source_ids,
+                    "reply": reply,
+                    "usage": usage,
+                    "write_seconds": time.monotonic() - before,
+                    "observation_status": getattr(failure, "status", "ERROR") if failure else (
+                        "AWAITING_SETTLEMENT" if args.verify_writes else "COMPLETED"),
+                    "request_status": getattr(failure, "request_status", None),
+                    "http_observations": getattr(failure, "http_observations", []) if failure else [],
+                }
+                if previous is None:
+                    rows.append(row)
+                else:
+                    rows[previous] = row
+                write_json(prior_path, rows)
+                write_json(record_path, record)
+            if settle_each and failure is None:
+                settlement_started = time.monotonic()
+                try:
+                    checks = []
+                    for source_id in source_ids:
+                        check = adapter.settle(source_id)
+                        settled[source_id] = check
+                        checks.append(check)
+                    degraded = any(check.get("degraded_writes") or any(
+                        request.get("request_status") == "DEGRADED"
+                        for request in check.get("requests", [])) for check in checks)
+                    row.update(observation_status="DEGRADED" if degraded else "COMPLETED",
+                               request_status="DEGRADED" if degraded else "SUCCEEDED",
+                               http_observations=[], settlement_seconds=time.monotonic() - settlement_started)
+                    record[record_key]["success"] = True
+                except Exception as error:
+                    failure = error
+                    row.update(observation_status=getattr(error, "status", "ERROR"),
+                               request_status=getattr(error, "request_status", None),
+                               http_observations=getattr(error, "http_observations", []),
+                               settlement_seconds=time.monotonic() - settlement_started)
+                write_json(completion_path, {"complete": False, "sources": list(settled.values())})
+                write_json(prior_path, rows)
+                write_json(record_path, record)
             print(f"ingest {sid}/{name}", flush=True)
             if failure is not None:
                 raise RuntimeError(f"Ingest failed for {sid}/{name}") from failure
     if args.verify_writes:
         if not selected_source_ids:
             raise RuntimeError("Write verification requires at least one source session")
-        checks = []
-        try:
-            for sid in sorted(selected_source_ids):
-                checks.append(adapter.settle(sid))
-        except Exception as error:
-            write_json(args.output_dir / "source-completion.json", {
-                "complete": False, "sources": checks,
-                "observation_status": getattr(error, "status", "ERROR"),
-                "request_status": getattr(error, "request_status", None),
-                "http_observations": getattr(error, "http_observations", []),
-            })
-            raise
-        write_json(args.output_dir / "source-completion.json", {"complete": True, "sources": checks})
-        for key in selected_record_keys:
-            record[key]["success"] = True
-        write_json(record_path, record)
-        for row in rows:
-            if set(row.get("source_ids", [])) & selected_source_ids:
-                row["observation_status"] = "COMPLETED"
-        write_json(args.output_dir / "ingest.json", rows)
+        if settle_each:
+            if selected_source_ids - settled.keys():
+                raise RuntimeError("Saved ingest lacks per-source settlement proof")
+            write_json(completion_path, {"complete": True,
+                                        "sources": [settled[sid] for sid in sorted(settled)]})
+        else:
+            checks = []
+            try:
+                for sid in sorted(selected_source_ids):
+                    checks.append(adapter.settle(sid))
+            except Exception as error:
+                write_json(completion_path, {
+                    "complete": False, "sources": checks,
+                    "observation_status": getattr(error, "status", "ERROR"),
+                    "request_status": getattr(error, "request_status", None),
+                    "http_observations": getattr(error, "http_observations", []),
+                })
+                raise
+            write_json(completion_path, {"complete": True, "sources": checks})
+            for key in selected_record_keys:
+                record[key]["success"] = True
+            write_json(record_path, record)
+            for row in rows:
+                if set(row.get("source_ids", [])) & selected_source_ids:
+                    row["observation_status"] = "COMPLETED"
+            write_json(prior_path, rows)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
@@ -989,7 +1049,113 @@ def ingest(args, samples, adapter):
     return rows
 
 
-def run(args, adapter_factory=None, judge_fn=judge):
+def run_conversations(args, samples, adapter_factory):
+    """Give each conversation its own host, memory identity and phase files."""
+    lanes = []
+    runtime_root = args.runtime_root or args.output_dir / "runtime"
+    session_range = parse_session_range(args.sessions) if args.sessions else None
+    for index, sample in samples:
+        lane_name = f"sample-{index:02d}"
+        suffix = f"-s{index:02d}"
+        child = copy.copy(args)
+        child.output_dir = args.output_dir / "lanes" / lane_name
+        child.runtime_root = runtime_root / lane_name
+        child.ingest_record = child.output_dir / "ingest-record.json"
+        child.output = None
+        child.openclaw_port = args.openclaw_port + index - 1
+        for field in ("user_id", "memory_agent_id", "run_id"):
+            setattr(child, field, getattr(args, field) + suffix)
+        if not 1 <= child.openclaw_port <= 65535:
+            raise ValueError(f"Gateway port out of range for {lane_name}: {child.openclaw_port}")
+        selected_sessions = (
+            {session["meta"]["session_key"] for session in build_session_messages(sample, session_range)}
+            if args.mode == "ingest" else set()
+        )
+        planned = len(selected_sessions) if args.mode == "ingest" else len(sample["questions"][:args.count])
+        lanes.append((child, (index, sample), planned, selected_sessions))
+
+    def read_progress(lane):
+        child, (index, item), planned, selected_sessions = lane
+        if args.mode == "ingest":
+            path = child.output_dir / "ingest.json"
+            rows = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+            rows = [row for row in rows if row["sample_id"] == item["sample_id"]
+                    and row["session"] in selected_sessions]
+            completed = sum(row["observation_status"] == "COMPLETED" for row in rows)
+            degraded = sum(row["observation_status"] == "DEGRADED" for row in rows)
+            settling = sum(row["observation_status"] == "AWAITING_SETTLEMENT" for row in rows)
+        else:
+            rows = read_csv(child.output_dir / "qa_results.csv")
+            completed = sum(successful_answer(row["response"]) for row in rows)
+            degraded = settling = 0
+        return {
+            "sample_idx": index, "sample_id": item["sample_id"], "gateway_port": child.openclaw_port,
+            "account_id": child.account_id, "user_id": child.user_id, "memory_agent_id": child.memory_agent_id,
+            "output_dir": str(child.output_dir), "planned": planned, "observed": len(rows),
+            "completed": completed, "degraded": degraded, "settling": settling,
+            "failed": len(rows) - completed - degraded - settling,
+        }, rows
+
+    started = time.monotonic()
+    errors = {}
+    previous = None
+    with ThreadPoolExecutor(max_workers=args.conversation_parallel) as pool:
+        futures = {pool.submit(run, lane[0], adapter_factory=adapter_factory, samples=[lane[1]]): lane
+                   for lane in lanes}
+        pending = set(futures)
+        while True:
+            details, all_rows = [], []
+            for future, lane in futures.items():
+                row, rows = read_progress(lane)
+                if future in errors:
+                    row.update(state="FAILED", error=errors[future])
+                elif future not in pending:
+                    row["state"] = "COMPLETE"
+                else:
+                    row["state"] = "RUNNING" if future.running() or future.done() else "PENDING"
+                details.append(row)
+                all_rows.extend(rows)
+            if details != previous or not pending:
+                totals = {key: sum(row[key] for row in details) for key in (
+                    "planned", "observed", "completed", "degraded", "settling", "failed")}
+                report = {"phase": args.mode, **totals, "done": not pending,
+                          "complete": not pending and not errors and totals["completed"] == totals["planned"],
+                          "lanes": details, "elapsed_seconds": time.monotonic() - started}
+                write_json(args.output_dir / f"{args.mode}-progress.json", report)
+                print(f"[{args.mode}] {totals['completed']}/{totals['planned']} completed, "
+                      f"{totals['degraded']} degraded, {totals['failed']} failed, "
+                      f"{sum(row['state'] == 'RUNNING' for row in details)} active lanes", flush=True)
+                previous = details
+            if not pending:
+                break
+            finished, pending = wait(pending, return_when=FIRST_COMPLETED, timeout=1)
+            for future in finished:
+                try:
+                    future.result()
+                except Exception as error:
+                    errors[future] = str(error)
+
+    if args.mode == "ingest":
+        write_json(args.output_dir / "ingest.json", all_rows)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text("\n".join(
+                f"[{row['sample_id']}/{row['session']}] {row['reply']}" for row in all_rows) + "\n", encoding="utf-8")
+            write_json(Path(str(args.output) + ".json"), all_rows)
+    else:
+        qa_path = Path(str(args.output) + ".csv") if args.output else args.output_dir / "qa_results.csv"
+        write_csv(qa_path, all_rows)
+        if args.output:
+            write_json(args.output, {"questions": len(all_rows), "errors": report["failed"],
+                                     "complete": report["complete"],
+                                     "lane_errors": {row["sample_id"]: row["error"] for row in details
+                                                     if row["state"] == "FAILED"},
+                                     "empty_responses": sum(not row["response"].strip() for row in all_rows)})
+    write_json(args.output_dir / f"{args.mode}-timing.json", {"seconds": time.monotonic() - started})
+    return 0 if report["complete"] else 1
+
+
+def run(args, adapter_factory=None, judge_fn=judge, *, samples=None):
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.mode == "judge":
         output = args.output or args.dataset.with_name(args.dataset.stem + "_judged.csv")
@@ -1004,7 +1170,10 @@ def run(args, adapter_factory=None, judge_fn=judge):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    samples = selected_samples(args)
+    if samples is None:
+        samples = selected_samples(args)
+        if getattr(args, "conversation_parallel", 1) > 1:
+            return run_conversations(args, samples, adapter_factory)
     adapter = (adapter_factory or create_adapter)(args)
     settings = {
         key: str(value) if isinstance(value, Path) else value
@@ -1028,6 +1197,7 @@ def run(args, adapter_factory=None, judge_fn=judge):
             "ogmemory_url", "base_url", "llm_model", "llm_base_url", "claude_base_url",
             "disable_host_tools", "read_only_qa", "openclaw_provider_api",
             "compose_timeout_ms", "trace_timeout_ms",
+            "llm_temperature",
             "sample", "all_samples", "count", "verify_writes", "adapter",
         )
         changed = [key for key in fields if previous.get(key) != settings.get(key)]
@@ -1079,6 +1249,12 @@ def main(argv=None, *, agent=None, transports=None, parser=None, adapter_factory
     args.transport = args.transport or ("ce" if args.agent == "openclaw" else "plugin")
     if args.read_only_qa and args.transport not in ("plugin", "mcp"):
         parser.error("--read-only-qa requires --transport plugin or mcp")
+    if args.conversation_parallel > 1 and (args.transport != "plugin" or args.agent != "openclaw"
+                                           or args.mode not in ("ingest", "qa") or args.sample is not None
+                                           or args.preflight_only):
+        parser.error("--conversation-parallel requires OpenClaw plugin ingest or QA across all samples")
+    if args.settle_each_source and (args.mode != "ingest" or not args.verify_writes):
+        parser.error("--settle-each-source requires ingest with --verify-writes")
     args.ogmemory_api_key = os.environ.get(args.ogmemory_api_key_env, "")
     args.llm_api_key = os.environ.get(args.llm_api_key_env, "")
     if args.transport in ("ce", "mcp", "gateway") and args.agent != "openclaw":

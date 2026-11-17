@@ -169,6 +169,8 @@ cache:
 | `storage.connection_string` | `STORAGE_DB_CONNECTION_STRING`（旧名 `SQL_CONNECTION_STRING` 仍生效） | 无 | **必填** | PostgreSQL libpq DSN，例如 `host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres` |
 | `storage.pool_size` | `STORAGE_DB_POOL_SIZE`（旧名 `SQL_POOL_SIZE`） | `5` | 否 | SQL storage 连接池大小 |
 
+团队任务与 AGFS 正文存储采用 openGauss 7.0.0-RC3、PG/UTF8 基线；版本能力和实际请求见[团队记忆 SQL 存储兼容性](deployment/team-memory-sql-compatibility.md)。
+
 ### 服务配置
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |

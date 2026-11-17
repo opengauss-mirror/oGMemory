@@ -23,7 +23,7 @@ from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
 from core.operation_deadline import check_deadline, remaining_seconds
 from extraction import Extractor
-from extraction.node_processing import NodeProcessor, serialized_topics
+from extraction.node_processing import NodeProcessor, NodeProcessingPartialError, serialized_topics
 
 logger = get_logger(__name__)
 
@@ -251,7 +251,35 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 raise ExtractionIncompleteError("profile refresh requires one complete source candidate")
             return refreshed[0]
 
+        def preflight(candidates):
+            resolver = self._writer._identity_resolver
+            if resolver is not None:
+                prepared = [candidate for candidate in candidates
+                            if self._writer.prewrite_skip(candidate, ctx) is None]
+                try:
+                    resolver.preflight_new_batch(prepared, ctx)
+                except ExtractionIncompleteError as exc:
+                    candidate_checkpoint.invalidate_unaccepted_preparation()
+                    raise MemoryCardFormatError(str(exc)) from exc
+
         check_deadline()
+        partial_candidates, partial_plans = [], []
+        partial_extracted = partial_filtered = 0
+        others_complete = False
+        partial_error = None
+        partial_checkpoints = candidate_checkpoint.partial_checkpoints() if candidate_checkpoint is not None else []
+        for partial in partial_checkpoints:
+            stored, extracted, filtered_count = partial.load()
+            if before_write is not None:
+                before_write()
+            completed = self._write_checkpointed_candidates(stored, ctx, partial, refresh_profile=refresh_profile)
+            if len(completed) != len(stored):
+                raise ExtractionIncompleteError("accepted partial writes require recovery")
+            partial_plans.extend(completed)
+            partial_candidates.extend(partial.load()[0])
+            partial_extracted += extracted
+            partial_filtered += filtered_count
+            others_complete |= partial.record["others_complete"]
         accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
         if accepted is None:
             # Extraction must finish before the first accepted candidate is written.
@@ -259,7 +287,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             runtime = ExtractionRuntime(candidate_checkpoint)
             candidates = (candidate_checkpoint.load_drafts() if self._node_processing_enabled
                           and candidate_checkpoint is not None
-                          and not candidate_checkpoint.has_stage("native_extraction") else None)
+                          and (others_complete or not candidate_checkpoint.has_stage("native_extraction")) else None)
             if candidates is None:
                 if self._node_processing_enabled:
                     with runtime.activate():
@@ -277,6 +305,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             if self._node_processing_enabled:
                 def reconcile():
                     nonlocal extracted_count, filtered_count
+                    if others_complete:
+                        return []
                     others = runtime.reconcile(messages, ctx, archive_id)
                     drafts = [c for c in candidates if c.category in {"entity", "preference"}]
                     complete = self._pipeline._validate_candidates([*drafts, *others], ctx)
@@ -286,9 +316,32 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                         candidate_checkpoint.save_drafts(complete, messages)
                     return [c for c in selected if c.category not in {"entity", "preference"}]
 
-                filtered = self._node_processor().process(
-                    filtered, messages, ctx, checkpoint=candidate_checkpoint,
-                    reconcile=reconcile if runtime.entries else None)
+                completed_drafts = {index for candidate in partial_candidates
+                                    for index in candidate.node_draft_indices}
+                filtered = [candidate for candidate in filtered
+                            if not completed_drafts.intersection(candidate.node_draft_indices)
+                            and (not others_complete or candidate.category in {"entity", "preference"})]
+                try:
+                    filtered = self._node_processor().process(
+                        filtered, messages, ctx, checkpoint=candidate_checkpoint,
+                        reconcile=reconcile if runtime.entries else None,
+                        protected_targets=[plan.target_uri for plan in partial_plans if plan.target_uri])
+                except NodeProcessingPartialError as exc:
+                    if candidate_checkpoint is None:
+                        if not exc.candidates:
+                            raise
+                        filtered, partial_error = exc.candidates, exc
+                    else:
+                        prepared = sorted(exc.candidates, key=lambda candidate: not bool(candidate.target_uri))
+                        preflight(prepared)
+                        if before_write is not None:
+                            before_write()
+                        partial = candidate_checkpoint.accept_partial(
+                            prepared, extracted_count, filtered_count, exc.failures,
+                            others_complete=exc.others_complete or others_complete)
+                        self._write_checkpointed_candidates(partial.load()[0], ctx, partial,
+                                                            refresh_profile=refresh_profile)
+                        raise
             else:
                 from commit.topic_aliases import reconcile_topic_aliases
                 filtered = reconcile_topic_aliases(
@@ -314,16 +367,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             if before_write is not None:
                 before_write()
             if candidate_checkpoint is not None:
-                resolver = self._writer._identity_resolver
-                if resolver is not None:
-                    prepared = [candidate for candidate in filtered
-                                if self._writer.prewrite_skip(candidate, ctx) is None]
-                    try:
-                        resolver.preflight_new_batch(prepared, ctx)
-                    except ExtractionIncompleteError as exc:
-                        candidate_checkpoint.invalidate_unaccepted_preparation()
-                        raise MemoryCardFormatError(str(exc)) from exc
+                preflight(filtered)
                 check_deadline()
+                if partial_checkpoints:
+                    extracted_count = filtered_count = 0
                 filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
         else:
             filtered, extracted_count, filtered_count = accepted
@@ -350,8 +397,14 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                          deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
                      if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
 
+        deduplicated = [*partial_candidates, *deduplicated]
+        plans = [*partial_plans, *plans]
+        extracted_count += partial_extracted
+        filtered_count += partial_filtered
+        extraction_proposals.extend(take(partial_candidates))
+
         graph_diagnostics = None
-        if self._graph_enabled:
+        if self._graph_enabled and partial_error is None:
             from extraction.cross_prompt_relations import run_integrated_relations
             from extraction.relation_proposals import resolve_edges, union_edges
             native_edges, native_rejections = resolve_edges(
@@ -374,20 +427,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                                      native_relation_rejections=native_rejections)
             if lookup_error:
                 graph_diagnostics["historical_recommendation_failure"] = lookup_error
-            tracking_relation_write = (
-                bool(edges) and candidate_checkpoint is not None
-                and candidate_checkpoint.begin_relation_write()
-            )
-            try:
-                self._relation_store.upsert_edges(edges,ctx)
-            except Exception as exc:
-                graph_diagnostics.update(status="persistence_failed",relation_persisted=0,
-                                         persistence_error=type(exc).__name__)
-                logger.exception("Graph relation persistence failed")
-            else:
-                if tracking_relation_write:
-                    candidate_checkpoint.complete_relation_write()
-                graph_diagnostics["relation_persisted"] = len(edges)
+            graph_diagnostics.update(self._store_relations(edges, ctx, candidate_checkpoint))
+        elif self._graph_enabled:
+            graph_diagnostics = self.finish_partial_relations(
+                deduplicated, plans, ctx, proposals=extraction_proposals)
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")
@@ -413,6 +456,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
         if graph_diagnostics is not None:
             result["graph"] = graph_diagnostics
+        if partial_error is not None:
+            result.update(degraded=True, recovery_mode="partial",
+                          failed_nodes=partial_error.failures,
+                          reason=str(partial_error))
 
         # For async mode, return task_id
         if not wait:
@@ -423,6 +470,27 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             result["status"] = "completed"
 
         return result
+
+    def _store_relations(self, edges, ctx, checkpoint=None):
+        tracking = bool(edges) and checkpoint is not None and checkpoint.begin_relation_write()
+        try:
+            self._relation_store.upsert_edges(edges, ctx)
+        except Exception as exc:
+            logger.exception("Graph relation persistence failed")
+            return {"status": "persistence_failed", "relation_persisted": 0,
+                    "persistence_error": type(exc).__name__}
+        if tracking:
+            checkpoint.complete_relation_write()
+        return {"relation_persisted": len(edges)}
+
+    def finish_partial_relations(self, candidates, plans, ctx, *, checkpoint=None, proposals=None):
+        if not self._graph_enabled:
+            return {}
+        from extraction.relation_proposals import resolve_edges, take
+        proposals = take(candidates) if proposals is None else proposals
+        edges, rejected = resolve_edges(proposals, candidates, plans, ctx, fs=self._fs)
+        return {"native_relation_accepted": len(edges), "native_relation_rejections": rejected,
+                **self._store_relations(edges, ctx, checkpoint)}
 
     def _node_processor(self):
         from extraction.prefetch import MemoryPrefetcher

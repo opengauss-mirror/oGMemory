@@ -95,6 +95,11 @@ class OpenClawHost(AgentHost):
                 },
             },
         }
+        if getattr(self.args, "conversation_parallel", 1) > 1:
+            config["agents"]["defaults"]["skipBootstrap"] = True
+        temperature = getattr(self.args, "llm_temperature", None)
+        if temperature is not None:
+            config["agents"]["defaults"]["params"]["temperature"] = temperature
         _write_json(self.state / "openclaw.json", config)
         command = [self.args.openclaw_command, "--profile", self.profile]
         self._run(command + ["config", "validate"], "prepare-validate", record=False)

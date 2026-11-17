@@ -7,7 +7,7 @@ from core.models import CandidateMemory
 from extraction import Extractor
 from extraction.relation_proposals import KEY, parse_proposal
 from extraction.tools import ExtractionRuntime, _Span
-from tests.unit.extraction.test_node_processing import node_payload, operation, setup
+from tests.unit.extraction.test_node_processing import node_payload, node_response, operation, setup
 from tests.unit.extraction.test_parallel_node_stages import Stages
 
 
@@ -23,8 +23,8 @@ def test_graph_source_and_node_stages_replay_complete_annotations():
             node_calls.append(kwargs)
             draft = node_payload(kwargs)["drafts"][0]
             assert draft["metadata"]["update_activation"] == activation
-            return [{"tool": "process_memory_nodes", "input": {
-                "operations": [operation([0], fact=activation)], "related_reconciliations": []}}]
+            return [{"tool": "process_memory_nodes", "input": node_response(
+                kwargs, [operation([0], fact=activation)])}]
         native_calls.append(kwargs)
         offered = {tool["name"]: tool for tool in kwargs["tools"]}
         assert "update_activation" in offered["extract_entity"]["input_schema"]["required"]

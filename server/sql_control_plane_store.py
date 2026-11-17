@@ -382,6 +382,9 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         try:
             with conn.cursor() as cur:
                 if entity in ("accounts", "users", "agents"):
+                    from server.space_locks import lock_space_account
+
+                    lock_space_account(cur, account_id or "__accounts__")
                     self._write_registry(cur, entity, account_id, data.get(entity, {}))
 
                 elif entity == "audit_logs":

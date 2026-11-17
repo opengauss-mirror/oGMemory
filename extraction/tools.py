@@ -767,7 +767,17 @@ class Extractor:
         try:
             check_deadline()
             cached = checkpoint.load_stage("span_identification", inputs) if checkpoint is not None else None
-            result = cached if cached is not None else run_model_call(observe_call, "phase1", self._llm.complete_json, prompt, schema=schema)
+            if cached is not None:
+                result = cached
+            else:
+                try:
+                    result = run_model_call(observe_call, "phase1", self._llm.complete_json, prompt, schema=schema)
+                except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
+                    result = {"spans": [{"start": 0, "end": len(messages) - 1,
+                                         "reason": "fallback: span identification output invalid",
+                                         "categories": []}]}
+                    logger.warning("Phase 1 output invalid; continuing full-conversation extraction "
+                                   "messages=%d error=%s", len(messages), type(exc).__name__)
             check_deadline()
             spans: list[_Span] = []
             n = len(messages)
@@ -1733,7 +1743,11 @@ class Extractor:
                 prompt = self._with_prefetch_context(span, prompt, ctx)
         if getattr(self, "_node_processing_enabled", False):
             draft_instruction = ("\nTOPIC_DRAFTS: For entity/preference extract source facts for the later node processor. "
-                                 "Use source-grounded object names. In eager mode abstract identifies the subject/topic; "
+                                 "Use source-grounded object names consistently for the same subject throughout this batch. "
+                                 "When supplied context or a read establishes the existing subject's canonical name, reuse it. "
+                                 "Resolve source pronouns to that subject. Extract each affected subject's own changed facts "
+                                 "in its own draft when the source supports them. "
+                                 "In eager mode abstract identifies the subject/topic; "
                                  "content lists every supported atomic source fact once. The node processor builds final cards.")
             prompt += draft_instruction
             if span.fallback_read_prompt_parts is not None:
