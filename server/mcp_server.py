@@ -47,6 +47,7 @@ from server.mcp_security import (
 from server.mcp_tools import delete_memory as delete_memory_tool
 from server.mcp_tools import delete_skill as delete_skill_tool
 from server.mcp_tools import edit_file as edit_file_tool
+from server.mcp_tools import get_write_request_status as get_write_request_status_tool
 from server.mcp_tools import install_skill as install_skill_tool
 from server.mcp_tools import list_memories as list_memories_tool
 from server.mcp_tools import list_skill_candidates as list_skill_candidates_tool
@@ -57,17 +58,18 @@ from server.mcp_tools import read_memory as read_memory_tool
 from server.mcp_tools import read_skill as read_skill_tool
 from server.mcp_tools import read_tool_result_artifact as read_tool_result_artifact_tool
 from server.mcp_tools import search_code as search_code_tool
+from server.mcp_tools import search_shared_memory as search_shared_memory_tool
 from server.mcp_tools import search_skills as search_skills_tool
 from server.mcp_tools import search_tool_result_artifacts as search_tool_result_artifacts_tool
 from server.mcp_tools import update_skill as update_skill_tool
 from server.mcp_tools import validate_write_arguments
 from server.mcp_tools import write_memory as write_memory_tool
-from server.mcp_tools import get_write_request_status as get_write_request_status_tool
 from server.memory_service import MemoryService
 from service.tool_output import parse_tool_output_uri
 
 logger = logging.getLogger("ogmem.mcp")
 
+SEARCH_SHARED_MEMORY_TOOL_NAME = "search_shared_memory"
 QUERY_MEMORY_TOOL_NAME = "ogm_query_memory"
 LIST_MEMORY_TOOL_NAME = "ogm_list_memories"
 SEARCH_CODE_TOOL_NAME = "ogm_search_code"
@@ -447,6 +449,28 @@ def create_mcp_server(
     if not code_toolset:
         mcp.tool(name=QUERY_MEMORY_TOOL_NAME)(query_memory)
         mcp.tool(name=LIST_MEMORY_TOOL_NAME)(list_memories)
+
+    if cfg.shared_spaces_enabled:
+        @mcp.tool(name=SEARCH_SHARED_MEMORY_TOOL_NAME)
+        def search_shared_memory(
+            query: str,
+            space_ids: list[str],
+            kind: str | None = None,
+            top_k: int = 10,
+            max_context_tokens: int = 4096,
+            mode: Literal["hybrid", "keyword", "semantic"] = "hybrid",
+            limit: int | None = None,
+            cursor: str | None = None,
+            agent_id: str | None = None,
+            ctx: Context | None = None,
+        ) -> dict[str, Any]:
+            """Search authorized team memories and return current text content."""
+            return search_shared_memory_tool(
+                service, query=query, space_ids=space_ids, kind=kind, top_k=top_k,
+                max_context_tokens=max_context_tokens, agent_id=agent_id,
+                mode=mode, limit=limit, cursor=cursor,
+                **_auth_kwargs_from_context(ctx),
+            )
 
     @mcp.tool(name=SEARCH_CODE_TOOL_NAME)
     def search_code(

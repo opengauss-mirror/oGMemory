@@ -2211,3 +2211,35 @@ def _public_write_stats(result: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (str, int, float, bool)) or value is None:
             stats[field] = value
     return stats
+
+
+def search_shared_memory(
+    service,
+    *,
+    query: str,
+    space_ids: list[str],
+    kind: str | None = None,
+    top_k: int = 10,
+    max_context_tokens: int = 4096,
+    mode: str = "hybrid",
+    limit: int | None = None,
+    cursor: str | None = None,
+    agent_id: str | None = None,
+    transport_headers=None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity=None,
+) -> dict:
+    """Retrieve system-maintained team memories as text."""
+    if not service.get_auth_service().role_control_active():
+        from server.auth import ControlPlaneDisabledError
+
+        raise ControlPlaneDisabledError("Shared spaces require role control")
+    ctx = build_mcp_context(
+        service, {"agent_id": agent_id}, transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth, resolved_identity=resolved_identity,
+    )
+    return service.search_shared_memory(
+        ctx, query=query, space_ids=space_ids, kind=kind, top_k=top_k,
+        max_context_tokens=max_context_tokens,
+        mode=mode, limit=limit, cursor=cursor,
+    )

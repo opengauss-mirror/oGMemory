@@ -108,6 +108,9 @@ class SeedRetriever:
                         global_results, bm25_results
                     )
 
+        shared_prefix = f"ctx://{ctx.account_id}/spaces/"
+        global_results = [hit for hit in global_results if not hit.uri.startswith(shared_prefix)]
+
         if not self.config.expand_hierarchy:
             return SeedResult(
                 initial_candidates=[hit for hit in global_results if hit.level == 2],
