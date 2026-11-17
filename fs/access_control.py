@@ -48,6 +48,8 @@ def check_uri_access(
     # Step 2: Extract owner info
     owner_id = components.get("owner_id", "")
     owner_type = components.get("owner_type", "")
+    if owner_type == "spaces":
+        return False
 
     # No owner restriction (e.g., session-level URIs, resources)
     if not owner_id:

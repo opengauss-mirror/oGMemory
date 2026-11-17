@@ -417,8 +417,10 @@ END $$;
 CREATE TABLE IF NOT EXISTS cp_accounts (
     account_id   VARCHAR(128) PRIMARY KEY,
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    status       VARCHAR(16)  NOT NULL DEFAULT 'active'
+    status       VARCHAR(16)  NOT NULL DEFAULT 'active',
+    authz_rev    BIGINT       NOT NULL DEFAULT 1
 );
+ALTER TABLE cp_accounts ADD COLUMN IF NOT EXISTS authz_rev BIGINT NOT NULL DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS cp_users (
     account_id   VARCHAR(128) NOT NULL,
@@ -436,8 +438,10 @@ CREATE TABLE IF NOT EXISTS cp_agents (
     agent_id       VARCHAR(128) NOT NULL,
     owner_user_id  VARCHAR(128) NOT NULL,
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    status         VARCHAR(16)  NOT NULL DEFAULT 'active',
     PRIMARY KEY (account_id, agent_id)
 );
+ALTER TABLE cp_agents ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'active';
 
 CREATE TABLE IF NOT EXISTS cp_audit_logs (
     log_id      VARCHAR(36)  PRIMARY KEY,
