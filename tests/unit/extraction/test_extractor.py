@@ -1281,3 +1281,128 @@ class TestTotalSpanFailureIsRetryable:
             tool_stats_text="", ctx=self._ctx(),
         )
         assert result == [ok]
+
+    def test_pool_path_transient_error_is_retried_within_budget(self):
+        """A transient LLM transport error retries within span_retries
+        instead of failing the whole chunk on the first attempt."""
+        extractor = Extractor(Mock())
+        extractor._span_retries = 1
+        extractor._dual_pass_enabled = False  # one native pass per span
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        calls = []
+
+        def flaky(prepared_span, _ctx, _archive_id, *, temperature):
+            calls.append(prepared_span.span.start)
+            if prepared_span.span.start == 0 and calls.count(0) == 1:
+                raise LLMCallError("service timeout")
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=flaky)
+        extractor._finalize_span_outcome = Mock(return_value=[])
+        extractor._merge_span_results = Mock(return_value=[])
+
+        extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+
+        # span 0 burned one retry after the transient error, then passed.
+        assert calls.count(0) == 2
+        assert calls.count(1) == 1
+
+    def test_pool_path_default_pass_failure_drops_span_keeps_others(self):
+        """A default pass that exhausts its retry budget drops only its own
+        span; the other spans' results survive."""
+        from core.errors import ToolCallProtocolError
+
+        extractor = Extractor(Mock())
+        extractor._span_retries = 1
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        calls = []
+
+        def persistent_outage(prepared_span, _ctx, _archive_id, *, temperature):
+            calls.append(prepared_span.span.start)
+            if prepared_span.span.start == 0:
+                raise LLMCallError("persistent outage")
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=persistent_outage)
+        ok = object()
+
+        def finalize(outcome, _ctx, _archive_id):
+            assert outcome.prepared.span.start == 1, (
+                "dropped span must not be finalized"
+            )
+            return [ok]
+
+        extractor._finalize_span_outcome = Mock(side_effect=finalize)
+        extractor._merge_span_results = Mock(return_value=[ok])
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+
+        assert result == [ok]
+        # span 0 exhausted the full budget (1 + 1 retries) before dropping.
+        assert calls.count(0) == 2
+        assert calls.count(1) == 1
+
+    def test_pool_path_temp0_failure_keeps_default_output(self):
+        """Dual-run degradation semantics in the pool path: the temp=0
+        pass failing after retries keeps the default-pass output (a
+        partial dual-run beats losing the span)."""
+        extractor = Extractor(Mock())
+        extractor._span_retries = 0
+        # dual pass enabled: temperatures (None, 0)
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        def flaky_temp0(prepared_span, _ctx, _archive_id, *, temperature):
+            if prepared_span.span.start == 0 and temperature == 0:
+                raise LLMCallError("temp0 outage")
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=flaky_temp0)
+        ok = object()
+        extractor._finalize_span_outcome = Mock(return_value=[ok])
+        extractor._merge_span_results = Mock(return_value=[ok, ok])
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+
+        # Both spans finalized — span 0 kept its default-pass output.
+        assert extractor._finalize_span_outcome.call_count == 2
+        assert result == [ok, ok]
+
+    def test_pool_path_deadline_error_propagates_unswallowed(self):
+        """Deadline expiry must unwind the chunk — never be degraded to a
+        dropped span or masked as partial success."""
+        from core.errors import OperationDeadlineExceededError
+
+        extractor = Extractor(Mock())
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span = Mock(
+            side_effect=OperationDeadlineExceededError("deadline exceeded")
+        )
+
+        with pytest.raises(OperationDeadlineExceededError):
+            extractor._structure_spans(
+                spans=[p.span for p in prepared],
+                messages=[{"role": "user", "content": "memory"}] * 2,
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )

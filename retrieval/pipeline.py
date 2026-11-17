@@ -36,7 +36,7 @@ from retrieval.identity import memory_identity
 from retrieval.query_planner import QueryPlanner
 from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.scene_stage import SceneRetrievalStage
-from retrieval.seed_retriever import SeedRetriever
+from retrieval.seed_retriever import RetrievalConfigError, SeedRetriever
 from retrieval.trace import RetrievalTrace, TraceTimer
 from scene.retrieval import SceneRanker, SceneSearchSource, select_scene_evidence
 
@@ -467,6 +467,11 @@ class RetrievalPipeline:
             try:
                 options = {"query_vector": query_vector} if query_vector is not None else {}
                 result = self.seed_retriever.search(tq, ctx, mode=mode, **options)
+            except RetrievalConfigError:
+                # Config errors must surface: degrading them to an empty
+                # seed would report a misconfigured deployment as "no
+                # memories".
+                raise
             except Exception as exc:
                 # Do not re-raise: during embedder/vector-index outages
                 # every turn would otherwise fail. Fall back to a seed

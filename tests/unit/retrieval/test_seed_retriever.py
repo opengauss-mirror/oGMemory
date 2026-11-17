@@ -879,3 +879,25 @@ class TestDegradeOnEmbedFailure:
         assert all(
             hit.uri in result.root_uris for hit in result.starting_points
         )
+
+    def test_pipeline_run_seed_propagates_config_error(self, cfg, ctx, tq):
+        """Config errors surface from the public pipeline instead of being
+        degraded to an empty seed ("no memories")."""
+        from unittest.mock import Mock
+
+        import pytest
+        from retrieval.pipeline import RetrievalPipeline
+        from retrieval.seed_retriever import RetrievalConfigError
+
+        class MisconfiguredRetriever:
+            def search(self, tq, ctx, mode="quick", **_kwargs):
+                raise RetrievalConfigError(
+                    "hybrid mode requires a lexical backfill coordinator"
+                )
+
+        pipeline = RetrievalPipeline.__new__(RetrievalPipeline)
+        pipeline.seed_retriever = MisconfiguredRetriever()
+        trace = Mock()
+
+        with pytest.raises(RetrievalConfigError, match="backfill coordinator"):
+            pipeline._run_seed(tq, ctx, trace, mode="quick")

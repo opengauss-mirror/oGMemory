@@ -624,3 +624,14 @@ def test_prepare_can_retry_before_first_credentials_are_published(tmp_path,monke
     result=m.prepare(config(),tmp_path)
     assert (Path(result['stack_dir'])/'secrets.env').is_file()
     assert (tmp_path/'.env.compose').is_file()
+
+
+def test_m3runner_declares_ogmem_build_dependency():
+    """The runner's FROM is the ogmem service's output image, so the build
+    must be ordered: Compose builds in depends_on order, and without ogmem
+    declared a fresh environment can build the runner before the base
+    image exists."""
+    compose = yaml.safe_load((ROOT / 'deploy/docker-compose.yml').read_text())
+    deps = compose['services']['m3runner']['depends_on']
+    assert 'ogmem' in deps
+    assert deps['ogmem']['condition'] == 'service_started'

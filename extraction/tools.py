@@ -919,7 +919,7 @@ class Extractor:
                 check_deadline()
                 for temperature in self._native_temperatures():
                     future = pool.submit(
-                        copy_context().run, self._structure_prepared_span,
+                        copy_context().run, self._run_native_pass_with_retries,
                         prepared, ctx, archive_id, temperature=temperature,
                     )
                     futures[future] = (span_index, temperature)
@@ -954,15 +954,34 @@ class Extractor:
                             exc,
                         )
                         continue
-                    except Exception as exc:
-                        logger.error(
-                            "Span %d-%d structuring FAILED: %s",
-                            span.start,
-                            span.end,
-                            exc,
-                            exc_info=True,
-                        )
+                    except OperationDeadlineExceededError:
+                        # Never degrade a deadline expiry — the request is
+                        # out of budget and must unwind, not retry later.
                         raise
+                    except _SpanProgrammingError:
+                        # Bugs in our parsing code must crash loudly (dev
+                        # contract) — not be degraded to a dropped span.
+                        raise
+                    except Exception as exc:
+                        # Transient failure that exhausted its per-pass retry
+                        # budget inside the worker. Same degradation
+                        # semantics as _structure_prepared_span_dual: default
+                        # pass failing drops the span (others keep their
+                        # results); temp=0 failing keeps the default output.
+                        if temperature is None:
+                            logger.error(
+                                "Span %d-%d default native pass FAILED after "
+                                "retries: %s",
+                                span.start, span.end, exc, exc_info=True,
+                            )
+                            failed.append(span)
+                        else:
+                            logger.warning(
+                                "Span %d-%d temp=0 native pass FAILED after "
+                                "retries (%s: %s) — keeping default-pass output",
+                                span.start, span.end, type(exc).__name__, exc,
+                            )
+                        continue
                     outcome.candidates.extend(result)
                     outcome.native_runs[temperature] = result
             if dropped_stragglers:
@@ -1178,6 +1197,50 @@ class Extractor:
 
     def _native_temperatures(self):
         return (None, 0) if getattr(self, "_dual_pass_enabled", True) else (None,)
+
+    def _run_native_pass_with_retries(
+        self,
+        prepared: _PreparedSpan,
+        ctx: RequestContext,
+        archive_id: str | None,
+        *,
+        temperature: float | None,
+    ) -> list[CandidateMemory]:
+        """One native pass with the span retry budget (thread-pool path).
+
+        Transient failures (LLM transport errors, service timeouts) retry
+        with capped backoff up to ``1 + span_retries`` attempts. Protocol
+        failures are not retried (the JSON fallback is their recovery);
+        deadline expiry and programming errors always propagate.
+        """
+        attempts = 1 + self._span_retries
+        for attempt in range(1, attempts + 1):
+            check_deadline()
+            try:
+                return self._structure_prepared_span(
+                    prepared, ctx, archive_id, temperature=temperature
+                )
+            except (
+                ToolCallProtocolError,
+                LLMOutputTruncatedError,
+                OperationDeadlineExceededError,
+                _SpanProgrammingError,
+            ):
+                raise
+            except Exception as exc:
+                if attempt < attempts:
+                    delay = min(2.0 ** attempt, 8.0)
+                    logger.warning(
+                        "Span %d-%d pass (temperature=%s) failed "
+                        "(%s: %s) — retrying %d/%d in %.1fs",
+                        prepared.span.start, prepared.span.end, temperature,
+                        type(exc).__name__, exc, attempt, attempts - 1,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _structure_prepared_span_dual(
         self,

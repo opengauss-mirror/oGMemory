@@ -318,8 +318,25 @@ class ContextWriter:
                 # identity-resolved plans keep their hard CAS semantics and
                 # are NOT re-planned under the lock.
                 replan_in_lock = not candidate.write_operation_id and identity_plan is None
-                with self._lock_for_uri(plan.target_uri):
+                # Bounded lock wait: the holder may be inside a seconds-long
+                # LLM merge, so waiters acquire with the remaining request
+                # budget (None = no deadline, block as before) and fail fast
+                # with the typed write-timeout instead of pinning their
+                # request thread past the deadline.
+                lock = self._lock_for_uri(plan.target_uri)
+                lock_budget = remaining_seconds()
+                if lock_budget is None:
+                    lock.acquire()
+                elif not lock.acquire(timeout=max(lock_budget, 0.0)):
+                    raise OperationDeadlineExceededError(
+                        f"per-URI write lock for {plan.target_uri} could not "
+                        f"be acquired within the remaining request budget"
+                    )
+                try:
                     if replan_in_lock:
+                        # The budget may have been consumed waiting for the
+                        # lock — re-check before re-planning.
+                        _check_prewrite_deadline()
                         # Re-plan against fresh node state acquired under
                         # the lock (the plan above may be stale after
                         # waiting for another writer to release the lock).
@@ -481,6 +498,8 @@ class ContextWriter:
                                 )
 
                     return plan
+                finally:
+                    lock.release()
 
             except ConcurrentModificationError as e:
                 if identity_plan is not None or candidate.target_uri:

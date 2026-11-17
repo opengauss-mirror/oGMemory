@@ -441,6 +441,14 @@ services:
     depends_on:
       cv:
         condition: service_healthy
+      # Build order: the runner's FROM is the ogmem service's output image
+      # (OGMEM_BASE_IMAGE above); declaring ogmem makes Compose build the
+      # base image first in fresh environments. service_started, not
+      # _healthy: the runner only needs the image, and ogmem's health gates
+      # on DB profiles the runner flow may not enable.
+      ogmem:
+        condition: service_started
+        required: false
     environment:
       # ---- Config: the committed M3 runtime YAML, mounted ro below. ----
       OGMEM_CONFIG: /etc/ogmem/config.yaml
