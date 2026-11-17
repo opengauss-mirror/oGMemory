@@ -23,7 +23,7 @@ RUN apt-get update && \
 RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     pydantic python-dotenv json-repair "jsonschema>=4.20.0" rank-bm25 nltk \
-    "mcp[cli]==2.0.0" "volcengine-ark-runtime==5.0.54"
+    "mcp[cli]==2.0.0" "volcengine-ark-runtime==5.0.54" "chromadb==1.5.7"
 
 FROM agfs-deps AS agfs-builder
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /out/agfs-server ./cmd/server
@@ -59,7 +59,7 @@ RUN sed -i 's/\r$//' /opt/entrypoint.sh && chmod 755 /opt/entrypoint.sh /opt/agf
 COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
 
 # Create data directory
-RUN mkdir -p /data/agfs && useradd -m ogmem && chown -R ogmem:ogmem /data/agfs /opt/agfs /opt/ogmem /etc/ogmem
+RUN mkdir -p /data/agfs /data/chroma && useradd -m ogmem && chown -R ogmem:ogmem /data/agfs /data/chroma /opt/agfs /opt/ogmem /etc/ogmem
 RUN chmod -R 755 /opt/agfs /opt/ogmem
 
 # Environment defaults (kept for backward compat; YAML config takes priority)
@@ -69,6 +69,7 @@ ENV AGFS_BASE_URL=http://127.0.0.1:1833
 ENV AGFS_MOUNT_PREFIX=/local/plugin
 ENV CONTEXTENGINE_PROVIDER=openai
 ENV VECTOR_DB_TYPE=opengauss
+ENV CHROMA_PERSIST_DIR=/data/chroma
 ENV INDEX_INTERVAL=15
 ENV OG_ACCOUNT_ID=acct-demo
 ENV OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
