@@ -913,7 +913,18 @@ def _audio_driver_result(stage, output_jsonl, output_key, rc, segment_count):
     ratio = float(os.environ.get("OGMEM_ASR_FAIL_RATIO", "0.15"))
     attempted = diagnostics.get("attempted_audio") or 0
     failed_audio = diagnostics.get("failed_audio") or 0
-    max_allowed = 0 if not attempted else max(1, int(attempted * ratio))
+    if not attempted or ratio <= 0:
+        # Zero-tolerance config must take effect (ratio=0 tolerates
+        # nothing), and no inputs means nothing to tolerate.
+        max_allowed = 0
+    else:
+        # Single-clip resilience floor: tolerate one failure only when one
+        # clip is within the configured ratio (attempted >= 1/ratio) — for
+        # tiny inputs the floor would tolerate a share far beyond the
+        # ratio (1 of 2 = 50% at the default 15%), and all-failed must
+        # never pass.
+        floor = 1 if attempted * ratio >= 1 else 0
+        max_allowed = min(max(int(attempted * ratio), floor), attempted - 1)
     failed = rc not in (0, 2) or failed_audio > max_allowed
     return StageResult(
         stage_id=stage.id, stage_type=stage.type, ok=not failed,

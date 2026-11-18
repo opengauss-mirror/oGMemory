@@ -305,3 +305,41 @@ def test_write_candidate_rechecks_deadline_before_replan_under_lock(
     # never have been reached.
     assert policy_router.plan.call_count == 1
     fs.write_node.assert_not_called()
+
+
+def test_cas_retry_backoff_is_capped_to_request_budget(candidate, node, ctx):
+    """Consecutive CAS conflicts must not sleep past the request deadline —
+    the backoff is capped to the remaining budget and the deadline is
+    re-checked right after sleeping."""
+    import time as _time
+
+    from commit.policy_router import PolicyRouter
+    from commit.write_receipts import WriteDeadlineExceededError
+    from core.errors import ConcurrentModificationError
+    from core.operation_deadline import operation_deadline
+    from extraction.schemas.registry import SchemaRegistry
+
+    fs = Mock()
+    plan = WritePlan(action="create", target_uri=node.uri)
+    registry = SchemaRegistry()
+    policy_router = PolicyRouter(fs, registry=registry)
+    # Every attempt conflicts: the retry loop must exhaust the *budget*,
+    # not the full 12.7s backoff schedule.
+    policy_router.plan = Mock(
+        side_effect=ConcurrentModificationError(node.uri, 1, 2)
+    )
+    writer = ContextWriter(
+        fs,
+        llm=MockLLM(),
+        policy_router=policy_router,
+        archive_builder=Mock(),
+        outbox_store=Mock(),
+    )
+
+    start = _time.monotonic()
+    with operation_deadline(1.0):
+        with pytest.raises(WriteDeadlineExceededError):
+            writer.write_candidate(candidate, ctx)
+    # Uncapped, the schedule sleeps 0.1+0.2+0.4+0.8 = 1.5s before the
+    # loop-top check fires; capped, the write unwinds at ~the deadline.
+    assert _time.monotonic() - start < 1.25

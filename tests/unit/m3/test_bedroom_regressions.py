@@ -477,3 +477,78 @@ def test_spectral_voice_clusters_are_not_reported_as_verified_identity(tmp_path,
     result = voice_clustering_stage(context, stage)
     assert result.to_dict()["status"] == "degraded"
     assert "verified speakers" in result.warnings[0]
+
+
+def test_single_audio_input_all_failed_fails_the_stage(tmp_path, monkeypatch):
+    """Boundary regression: one AUDIO node, zero successes must not pass —
+    the old max(1, ...) floor tolerated the only input failing, letting a
+    zero-output stage continue downstream."""
+    from m3.pipeline.stages import speaker_diarization_stage
+    output = tmp_path / "speaker_turns.jsonl"
+    output.write_text("")
+    diagnostics = {
+        "status": "failed",
+        "failed_audio_nodes": 1,
+        "attempted_audio": 1,
+        "failed_audio": 1,
+        "turns": 0,
+    }
+    output.with_suffix(".summary.json").write_text(json.dumps(diagnostics))
+    monkeypatch.setattr("m3.speaker_diarization.run_speaker_diarization", lambda *a, **kw: 2)
+    context = SimpleNamespace(
+        work_dir=tmp_path, graph_store="memory", connection_string=None,
+        graph=Mock(), video_id="bedroom_03", account_id="m3-bench",
+    )
+    stage = SimpleNamespace(id="speaker_diarization", type="speaker_diarization", params={})
+    result = speaker_diarization_stage(context, stage)
+    assert not result.ok
+    assert result.to_dict()["status"] == "failed"
+
+
+def test_zero_tolerance_ratio_config_takes_effect(tmp_path, monkeypatch):
+    """OGMEM_ASR_FAIL_RATIO=0 must tolerate nothing — the old max(1, ...)
+    floor kept tolerating one failure even with the ratio set to zero."""
+    from m3.pipeline.stages import speaker_diarization_stage
+    output = tmp_path / "speaker_turns.jsonl"
+    output.write_text("")
+    diagnostics = {
+        "status": "failed",
+        "failed_audio_nodes": 1,
+        "attempted_audio": 8,
+        "failed_audio": 1,
+        "turns": 3,
+    }
+    output.with_suffix(".summary.json").write_text(json.dumps(diagnostics))
+    monkeypatch.setattr("m3.speaker_diarization.run_speaker_diarization", lambda *a, **kw: 2)
+    monkeypatch.setenv("OGMEM_ASR_FAIL_RATIO", "0")
+    context = SimpleNamespace(
+        work_dir=tmp_path, graph_store="memory", connection_string=None,
+        graph=Mock(), video_id="bedroom_03", account_id="m3-bench",
+    )
+    stage = SimpleNamespace(id="speaker_diarization", type="speaker_diarization", params={})
+    result = speaker_diarization_stage(context, stage)
+    assert not result.ok
+
+
+def test_single_clip_failure_still_tolerated_in_multi_clip_run(tmp_path, monkeypatch):
+    """The resilience floor survives: one failed clip among many is still
+    tolerated at the default ratio."""
+    from m3.pipeline.stages import speaker_diarization_stage
+    output = tmp_path / "speaker_turns.jsonl"
+    output.write_text("{}\n")
+    diagnostics = {
+        "status": "ok",
+        "failed_audio_nodes": 1,
+        "attempted_audio": 8,
+        "failed_audio": 1,
+        "turns": 3,
+    }
+    output.with_suffix(".summary.json").write_text(json.dumps(diagnostics))
+    monkeypatch.setattr("m3.speaker_diarization.run_speaker_diarization", lambda *a, **kw: 0)
+    context = SimpleNamespace(
+        work_dir=tmp_path, graph_store="memory", connection_string=None,
+        graph=Mock(), video_id="bedroom_03", account_id="m3-bench",
+    )
+    stage = SimpleNamespace(id="speaker_diarization", type="speaker_diarization", params={})
+    result = speaker_diarization_stage(context, stage)
+    assert result.ok

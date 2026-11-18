@@ -505,14 +505,22 @@ class ContextWriter:
                 if identity_plan is not None or candidate.target_uri:
                     raise
                 if attempt < max_retries - 1:
-                    # Retry with exponential backoff
+                    # Retry with exponential backoff, capped to the
+                    # remaining request budget — consecutive CAS conflicts
+                    # must not sleep past an expiring deadline (the loop-top
+                    # check would only fire on the next attempt).
                     delay = retry_delays[attempt]
                     logger.info(
                         "Concurrent modification detected for %s (attempt %d), "
                         "retrying after %.1fs: expected v%d, found v%d",
                         candidate.routing_key, attempt + 1, delay, e.expected_version, e.actual_version
                     )
-                    time.sleep(delay)
+                    remaining = remaining_seconds()
+                    if remaining is not None:
+                        delay = min(delay, max(remaining, 0.0))
+                    if delay > 0:
+                        time.sleep(delay)
+                    _check_prewrite_deadline()
                     # Re-plan on retry (will read fresh version)
                     continue
                 else:

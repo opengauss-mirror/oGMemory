@@ -395,3 +395,39 @@ def test_seed_where_from_episodic_boundary_seeds_all_memories():
     assert "node_type = 'memory'" in where
     assert "topic LIKE" not in where
     assert "'episodic' = ANY(tags)" not in where
+
+
+def test_run_file_only_range_skips_node_sql_and_cleans_files(tmp_path):
+    """--wipe-from m3.qa / m3.eval own only result files: the node SQL is
+    skipped (it used to raise "wipe range owns no graph nodes" before any
+    file cleanup could run) and the file operations still execute."""
+    stages = ws.stages_from("m3.qa")
+    assert [s.stage_id for s in stages] == ["m3.qa", "m3.eval"]
+
+    qa_dir = tmp_path / "qa"
+    qa_dir.mkdir()
+    (qa_dir / "m3_qa_results.jsonl").write_text("{}\n")
+    (qa_dir / "m3_eval_summary.json").write_text("{}")
+
+    conn = type("C", (), {})()
+    conn.cursor = lambda: _FakeCursor([])
+    conn.commit = lambda: None
+
+    # Dry-run: no raise, files listed, zero doomed nodes.
+    report = ws.run(
+        conn, account="m3bench", stages=stages, execute=False,
+        clear_qa_dir=qa_dir,
+    )
+    assert report["doomed_total"] == 0
+    assert report["qa_files"] == [
+        str(qa_dir / "m3_eval_summary.json"),
+        str(qa_dir / "m3_qa_results.jsonl"),
+    ]
+
+    # Execute: files removed, still no raise.
+    report = ws.run(
+        conn, account="m3bench", stages=stages, execute=True,
+        clear_qa_dir=qa_dir,
+    )
+    assert not (qa_dir / "m3_qa_results.jsonl").exists()
+    assert not (qa_dir / "m3_eval_summary.json").exists()

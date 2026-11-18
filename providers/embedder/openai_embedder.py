@@ -102,6 +102,11 @@ def _is_transient(exc: BaseException) -> bool:
             return True
         if isinstance(exc, httpx.HTTPStatusError):
             status = getattr(exc.response, "status_code", None)
+            # 429 is rate limiting — transient, same as the SDK path's
+            # RateLimitError (parallel load trips it; failing the request
+            # here would bypass the retry budget entirely).
+            if status == 429:
+                return True
             return isinstance(status, int) and status >= 500
     except ImportError:  # pragma: no cover
         pass

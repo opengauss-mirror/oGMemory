@@ -343,7 +343,19 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
     # faster-whisper numpy bugs) must not kill the whole video: tolerate
     # a bounded failure ratio instead of failing on the first error.
     ratio = float(os.environ.get("OGMEM_ASR_FAIL_RATIO", "0.15"))
-    max_allowed = 0 if not audio_nodes else max(1, int(len(audio_nodes) * ratio))
+    attempted = len(audio_nodes)
+    if not attempted or ratio <= 0:
+        # Zero-tolerance config must take effect, and no inputs means
+        # nothing to tolerate.
+        max_allowed = 0
+    else:
+        # Single-clip resilience floor: tolerate one failure only when one
+        # clip is within the configured ratio (attempted >= 1/ratio) — for
+        # tiny inputs the floor would tolerate a share far beyond the
+        # ratio (1 of 2 = 50% at the default 15%), and all-failed must
+        # never pass.
+        floor = 1 if attempted * ratio >= 1 else 0
+        max_allowed = min(max(int(attempted * ratio), floor), attempted - 1)
     if failed and failed > max_allowed:
         logger.error(
             "voice_asr: %d/%d AUDIO nodes failed (>%.0f%% tolerated) — failing run",

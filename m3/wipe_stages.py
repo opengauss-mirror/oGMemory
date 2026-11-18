@@ -442,7 +442,13 @@ def run(
     if not account:
         raise ValueError("account_id is mandatory — refusing an unscoped wipe")
 
-    plan, params = plan_sql(stages)
+    try:
+        plan, params = plan_sql(stages)
+    except ValueError:
+        # File-only ranges (qa / eval) own no graph nodes: skip the node
+        # SQL entirely and continue with the range's file operations —
+        # refusing the whole run would make --wipe-from m3.qa unusable.
+        plan, params = None, {}
     params = {**params, "account_id": account}
 
     report: dict[str, Any] = {
@@ -454,17 +460,23 @@ def run(
         "doomed_total": 0,
     }
 
-    with conn.cursor() as cur:
-        cur.execute(plan, params)
-        rows = cur.fetchall()
-    for node_type, extractor_type, raw_type, count in rows:
-        report["doomed_by_kind"].append({
-            "node_type": node_type,
-            "extractor_type": extractor_type,
-            "raw_type": raw_type,
-            "count": count,
-        })
-        report["doomed_total"] += count
+    if plan is not None:
+        with conn.cursor() as cur:
+            cur.execute(plan, params)
+            rows = cur.fetchall()
+        for node_type, extractor_type, raw_type, count in rows:
+            report["doomed_by_kind"].append({
+                "node_type": node_type,
+                "extractor_type": extractor_type,
+                "raw_type": raw_type,
+                "count": count,
+            })
+            report["doomed_total"] += count
+    else:
+        logger.info(
+            "wipe range owns no graph nodes — file cleanup only for %s",
+            account,
+        )
 
     ops = post_ops(stages, vector_table=vector_table, wipe_vector=wipe_vector)
     report["post_ops"] = [
@@ -484,11 +496,14 @@ def run(
         return report
 
     # --- execute ---------------------------------------------------------
-    delete_stmt, del_params = delete_sql(stages)
-    del_params = {**del_params, "account_id": account}
-    with conn.cursor() as cur:
-        cur.execute(delete_stmt, del_params)
-        report["deleted_nodes"] = cur.rowcount
+    if plan is not None:
+        delete_stmt, del_params = delete_sql(stages)
+        del_params = {**del_params, "account_id": account}
+        with conn.cursor() as cur:
+            cur.execute(delete_stmt, del_params)
+            report["deleted_nodes"] = cur.rowcount
+    else:
+        report["deleted_nodes"] = 0
     for op in ops:
         # drop_vector_rows runs on vector_conn below when one is provided —
         # executing it on conn too would self-deadlock (conn's uncommitted

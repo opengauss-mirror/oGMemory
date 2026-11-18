@@ -475,6 +475,18 @@ class TestEmbedRetryAndConcurrency:
         assert openai_embedder_module._is_transient(httpx.TransportError("t"))
         assert not openai_embedder_module._is_transient(ValueError("nope"))
 
+    def test_is_transient_treats_raw_http_429_as_transient(self):
+        """The multimodal path uses raw httpx: a 429 surfaces as
+        HTTPStatusError, not the SDK's RateLimitError — it must classify
+        as transient or parallel-load rate limiting bypasses the retry
+        budget entirely."""
+        import httpx
+
+        resp_429 = httpx.Response(429, request=httpx.Request("POST", "http://x"))
+        assert openai_embedder_module._is_transient(
+            httpx.HTTPStatusError("429", request=resp_429.request, response=resp_429)
+        )
+
     def test_embed_texts_semaphore_bounds_in_flight(self, fake_client, monkeypatch):
         import threading
 
