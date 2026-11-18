@@ -392,6 +392,12 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
         argv.extend(["--audio-manifest", str(audio_manifest)])
     if no_audio:
         argv.append("--no-audio")
+    if stage.params.get("use_video"):
+        argv.append("--use-video")
+    if stage.params.get("video_fps"):
+        argv.extend(["--video-fps", str(stage.params["video_fps"])])
+    if stage.params.get("video_width"):
+        argv.extend(["--video-width", str(stage.params["video_width"])])
     asr_manifest = ctx.artifact("voice_asr", optional=True)
     if asr_manifest is not None and asr_manifest.exists():
         argv.extend(["--asr-manifest", str(asr_manifest)])
@@ -899,7 +905,27 @@ def _audio_driver_result(stage, output_jsonl, output_key, rc, segment_count):
         json.loads(summary_path.read_text(encoding="utf-8"))
         if summary_path.exists() else {}
     )
-    failed = rc != 0 or bool(diagnostics.get("failed_audio"))
+    # A bounded share of per-AUDIO-node failures is tolerated
+    # (OGMEM_ASR_FAIL_RATIO): a single corrupt/silent clip must not fail
+    # the whole stage. The driver returns rc=2 when over the ratio; the
+    # belt-and-suspenders recheck here recomputes the tolerance from the
+    # summary's own failed_audio count so a stale rc cannot mask it.
+    ratio = float(os.environ.get("OGMEM_ASR_FAIL_RATIO", "0.15"))
+    attempted = diagnostics.get("attempted_audio") or 0
+    failed_audio = diagnostics.get("failed_audio") or 0
+    if not attempted or ratio <= 0:
+        # Zero-tolerance config must take effect (ratio=0 tolerates
+        # nothing), and no inputs means nothing to tolerate.
+        max_allowed = 0
+    else:
+        # Single-clip resilience floor: tolerate one failure only when one
+        # clip is within the configured ratio (attempted >= 1/ratio) — for
+        # tiny inputs the floor would tolerate a share far beyond the
+        # ratio (1 of 2 = 50% at the default 15%), and all-failed must
+        # never pass.
+        floor = 1 if attempted * ratio >= 1 else 0
+        max_allowed = min(max(int(attempted * ratio), floor), attempted - 1)
+    failed = rc not in (0, 2) or failed_audio > max_allowed
     return StageResult(
         stage_id=stage.id, stage_type=stage.type, ok=not failed,
         outputs={output_key: output_jsonl, "audio_diagnostics": diagnostics},
@@ -941,6 +967,10 @@ def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
+    # Always scope the driver to this account — the account-level (no
+    # video_id) flow previously fell back to the driver's legacy default
+    # account and silently transcribed the wrong tenant's AUDIO nodes.
+    argv.extend(["--account-id", ctx.account_id])
     if stage.params.get("backend"):
         argv.extend(["--backend", str(stage.params["backend"])])
     if stage.params.get("model"):
@@ -1014,6 +1044,10 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
+    # Always scope the driver to this account (see voice_asr_stage): the
+    # account-level flow previously fell back to the legacy default
+    # account and diarized the wrong tenant's AUDIO nodes.
+    argv.extend(["--account-id", ctx.account_id])
     if stage.params.get("backend"):
         argv.extend(["--backend", str(stage.params["backend"])])
     if stage.params.get("model"):
@@ -1074,6 +1108,8 @@ def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResu
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
+    # Always scope the driver to this account (see voice_asr_stage).
+    argv.extend(["--account-id", ctx.account_id])
     if stage.params.get("backend"):
         argv.extend(["--backend", str(stage.params["backend"])])
     if stage.params.get("model"):

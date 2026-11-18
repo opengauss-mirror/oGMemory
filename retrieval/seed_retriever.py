@@ -27,6 +27,16 @@ from retrieval.owner_scope import allowed_owner_space_filter, visible_agent_ids
 logger = logging.getLogger(__name__)
 
 
+class RetrievalConfigError(RuntimeError):
+    """Retrieval is misconfigured (missing lexical backfill coordinator,
+    backfill not ready, lexical provider lacking mandatory security filters).
+
+    Raised — not degraded — so a broken deployment fails fast instead of
+    silently returning vector-only results forever. Subclasses
+    ``RuntimeError`` so pre-existing catch sites keep working.
+    """
+
+
 class SeedRetriever:
     """Global search with optional BM25 hybrid fusion and direct L2 mode."""
 
@@ -56,15 +66,35 @@ class SeedRetriever:
             not self.config.hybrid_enabled or self.config.semantic_weight > 0
         )
         if semantic_enabled:
-            if query_vector is None:
-                query_vector = self.embedder.embed_texts([typed_query.text])[0]
+            # Root URIs are the hierarchical seeds _merge_starting_points
+            # walks; they do not depend on the embedder, so compute them
+            # unconditionally (when hierarchy expansion is enabled) — an
+            # embedder failure degrades the vector search, not the root
+            # starting points.
             root_uris = (
                 self._get_root_uris(typed_query.context_type, ctx)
                 if self.config.expand_hierarchy else []
             )
-            global_results = self._global_vector_search(
-                query_vector, typed_query, ctx
-            )
+            if query_vector is None:
+                try:
+                    query_vector = self.embedder.embed_texts([typed_query.text])[0]
+                except Exception as exc:
+                    # Degrade instead of emptying the working set: when the
+                    # embedder is saturated/down, continue with BM25-only
+                    # retrieval so downstream score-threshold filtering still
+                    # behaves conservatively.
+                    logger.warning(
+                        "SeedRetriever: embed failed for query (%s: %s) — "
+                        "degrading to keyword/BM25-only retrieval",
+                        type(exc).__name__, exc,
+                    )
+                    query_vector = []
+            if query_vector:
+                global_results = self._global_vector_search(
+                    query_vector, typed_query, ctx
+                )
+            else:
+                global_results = []
         else:
             query_vector = []
             root_uris = []
@@ -80,20 +110,37 @@ class SeedRetriever:
             self.config.hybrid_enabled
             or getattr(self.bm25_index, "doc_count", 0) > 0
         ):
-            if self.config.hybrid_enabled:
-                owner_spaces = self._hybrid_owner_spaces(typed_query, ctx)
-                if not owner_spaces:
-                    bm25_results = []
+            try:
+                if self.config.hybrid_enabled:
+                    owner_spaces = self._hybrid_owner_spaces(typed_query, ctx)
+                    if not owner_spaces:
+                        bm25_results = []
+                    else:
+                        if self.lexical_backfill is None:
+                            raise RetrievalConfigError(
+                                "hybrid retrieval requires a lexical backfill coordinator"
+                            )
+                        if not self.lexical_backfill.ensure_ready(ctx, owner_spaces):
+                            raise RetrievalConfigError("required lexical backfill is not ready")
+                        bm25_results = self._bm25_search(typed_query, ctx)
                 else:
-                    if self.lexical_backfill is None:
-                        raise RuntimeError(
-                            "hybrid retrieval requires a lexical backfill coordinator"
-                        )
-                    if not self.lexical_backfill.ensure_ready(ctx, owner_spaces):
-                        raise RuntimeError("required lexical backfill is not ready")
                     bm25_results = self._bm25_search(typed_query, ctx)
-            else:
-                bm25_results = self._bm25_search(typed_query, ctx)
+            except RetrievalConfigError:
+                # Misconfiguration must fail fast — silently degrading to
+                # vector-only results would hide a broken deployment forever.
+                # Operational failures (any other exception, including a
+                # RuntimeError from the index itself) still degrade below.
+                raise
+            except Exception as exc:
+                # A transient/operational BM25 failure must not raise: log and
+                # continue with whatever the vector side produced (possibly
+                # nothing — the caller degrades rather than failing the turn).
+                logger.warning(
+                    "SeedRetriever: BM25 search failed (%s: %s) — "
+                    "continuing without lexical results",
+                    type(exc).__name__, exc,
+                )
+                bm25_results = []
             if bm25_results:
                 if self.config.hybrid_enabled:
                     global_results = self._weighted_rrf(
@@ -111,7 +158,14 @@ class SeedRetriever:
         shared_prefix = f"ctx://{ctx.account_id}/spaces/"
         global_results = [hit for hit in global_results if not hit.uri.startswith(shared_prefix)]
 
-        if not self.config.expand_hierarchy:
+        if not self.config.expand_hierarchy or not query_vector:
+            # Hierarchy expansion is vector-driven: _merge_starting_points
+            # yields starting points that HierarchicalSearcher resolves via
+            # search_children, which builds cosine-distance SQL against the
+            # query vector — pgvector cannot execute a match against
+            # []::vector. Without a usable query vector (embedder degraded,
+            # or lexical-only mode) return the lexical L2 hits directly and
+            # skip the semantic traversal.
             return SeedResult(
                 initial_candidates=[hit for hit in global_results if hit.level == 2],
                 query_vector=query_vector,
@@ -229,13 +283,17 @@ class SeedRetriever:
             getattr(self.bm25_index, "supported_filters", filters)
         )
         if "memory_directory" in filters and "memory_directory" not in supported_filters:
-            raise RuntimeError("typed memory retrieval requires a lexical provider with a memory_directory filter")
+            # Provider-capability mismatches are misconfiguration, not
+            # operational failures: raise RetrievalConfigError so the
+            # caller's degrade-to-BM25 catch re-raises them (dev contract:
+            # fail fast) instead of silently returning vector-only results.
+            raise RetrievalConfigError("typed memory retrieval requires a lexical provider with a memory_directory filter")
         if not self.config.expand_hierarchy and "level" not in supported_filters:
-            raise RuntimeError("direct L2 retrieval requires a lexical provider with a level filter")
+            raise RetrievalConfigError("direct L2 retrieval requires a lexical provider with a level filter")
         if self.config.hybrid_enabled and not {
             "account_id", "owner_space"
         }.issubset(supported_filters):
-            raise RuntimeError(
+            raise RetrievalConfigError(
                 "lexical provider must support account_id and owner_space security filters"
             )
         provider_filters = {

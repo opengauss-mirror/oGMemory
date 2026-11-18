@@ -340,9 +340,71 @@ class TestExtractorToolCallFallback:
             self._prepared(), self._ctx(), archive_id=None
         )
 
+        # Dev contract: the dual run merges its two passes inside
+        # _structure_prepared_span_dual (cross-span reconciliation still
+        # happens in _structure_spans / _merge_span_results).
         assert len(result) == 1
+        assert all(c.routing_key == "coffee" for c in result)
         assert llm.complete_with_tools.call_count == 2
         llm.complete_json.assert_not_called()
+
+    def test_single_span_path_merges_dual_run_once(self):
+        """Pin: the single-span fast path merges the dual-run output once,
+        so callers always receive the merged candidate list."""
+        llm = Mock()
+        llm.complete_with_tools.return_value = [self._preference()]
+        extractor = Extractor(llm)
+        prepared = [self._prepared()]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        result = extractor._structure_spans(
+            spans=[prepared[0].span],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+
+        assert len(result) == 1
+        assert result[0].routing_key == "coffee"
+        assert llm.complete_with_tools.call_count == 2
+
+    def test_multi_span_duplicates_merge_once_globally(self):
+        """Pin (B2): the dual returns unmerged candidates and the ONE global
+        merge in _structure_spans collapses dual-run duplicates across all
+        spans — preserving the pre-parallel single-merge semantics."""
+        llm = Mock()
+        llm.complete_with_tools.return_value = [self._preference()]
+        extractor = Extractor(llm)
+        prepared = [
+            _PreparedSpan(
+                span=_Span(start=i, end=i, message_ids=[f"msg-{i}"]),
+                prompt=f"span {i}",
+                prompt_sha=chr(ord("a") + i) * 64,
+            )
+            for i in range(2)
+        ]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+
+        # 2 spans × 2 passes, all producing the same (category, routing_key)
+        # → a single candidate after the one global merge.
+        assert llm.complete_with_tools.call_count == 4
+        assert len(result) == 1
+        assert result[0].routing_key == "coffee"
 
     def test_one_native_success_skips_json_fallback(self):
         llm = Mock()
@@ -458,17 +520,178 @@ class TestExtractorToolCallFallback:
         assert llm.complete_with_tools.call_count == 4
         llm.complete_json.assert_called_once()
 
-    def test_real_api_errors_are_not_hidden_when_both_native_runs_fail(self):
+    def test_llm_api_errors_drop_the_span_instead_of_raising(self):
+        """WS 4: real API errors must not abort the chunk.
+
+        The default pass exhausts its retry budget -> the span is dropped
+        (None) so the caller keeps the other spans; the error is logged,
+        not hidden. No JSON fallback fires (the JSON path is reserved for
+        tool-call protocol failures).
+        """
         llm = Mock()
         llm.complete_with_tools.side_effect = RuntimeError("rate limited")
+        extractor = Extractor(llm, span_retries=1)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert result is None
+        # 1 + 1 retry attempts on the default pass; the temp=0 pass is
+        # never reached once the default pass exhausts its budget.
+        assert llm.complete_with_tools.call_count == 2
+        llm.complete_json.assert_not_called()
+
+    def test_temp0_pass_failure_keeps_default_pass_output(self):
+        """WS 4: a partial dual-run beats losing the span."""
+        llm = Mock()
+        llm.complete_with_tools.side_effect = [
+            [self._preference("coffee")],
+            RuntimeError("rate limited"),
+            RuntimeError("rate limited"),
+        ]
+        extractor = Extractor(llm, span_retries=1)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert result is not None
+        assert result[0].routing_key == "coffee"
+        # default pass (1) + temp=0 pass (2 attempts) = 3 calls.
+        assert llm.complete_with_tools.call_count == 3
+        llm.complete_json.assert_not_called()
+
+    def test_multiple_spans_one_failing_span_is_dropped_not_fatal(self):
+        """WS 4: one span's total failure is logged and skipped; the rest
+        of the chunk keeps its candidates (partial extraction). On the
+        dev (!341) outcome architecture a span fails totally inside
+        _finalize_span_outcome (all native passes failed, recovery raised)."""
+        from unittest.mock import MagicMock
+
+        from core.errors import ToolCallProtocolError
+
+        extractor = Extractor(Mock(), span_retries=0)
+        prepared = [
+            _PreparedSpan(
+                span=_Span(start=0, end=0, message_ids=["msg-1"]),
+                prompt="failed span",
+                prompt_sha="a" * 64,
+            ),
+            _PreparedSpan(
+                span=_Span(start=1, end=1, message_ids=["msg-2"]),
+                prompt="successful span",
+                prompt_sha="b" * 64,
+            ),
+        ]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span = Mock(return_value=[])
+        tea = MagicMock()
+        tea.routing_key = "tea"
+
+        def finalize(outcome, ctx, archive_id):
+            if outcome.prepared.prompt == "failed span":
+                raise ToolCallProtocolError("all native passes failed")
+            return [tea]
+
+        extractor._finalize_span_outcome = Mock(side_effect=finalize)
+        extractor._merge_span_results = Mock(
+            side_effect=lambda span_results, ctx, archive_id:
+                [c for _, batch in span_results for c in batch])
+
+        result = extractor._structure_spans(
+            spans=[item.span for item in prepared],
+            messages=[{"role": "user", "content": "memory"}],
+            language="en",
+            session_time=None,
+            session_summary="",
+            tool_stats_text="",
+            ctx=self._ctx(),
+            archive_id=None,
+        )
+
+        assert {candidate.routing_key for candidate in result} == {"tea"}
+
+    def test_straggler_spans_are_dropped_after_timeout_budget(self):
+        """WS 4: spans that never complete within the pool budget are
+        dropped, not awaited forever."""
+        import threading
+        import time as _time
+
+        release = threading.Event()
+
+        def hanging(*args, **kwargs):
+            release.wait(timeout=30)
+            return []
+
+        extractor = Extractor(Mock(), span_retries=0, span_timeout_seconds=0.2)
+        extractor._structure_prepared_span = Mock(side_effect=hanging)
+        # Two spans: only the multi-span path uses the pool + wait budget
+        # (a single span runs the dual directly with no pool).
+        prepared = [
+            _PreparedSpan(
+                span=_Span(start=0, end=0, message_ids=["msg-1"]),
+                prompt="slow span",
+                prompt_sha="a" * 64,
+            ),
+            _PreparedSpan(
+                span=_Span(start=1, end=1, message_ids=["msg-2"]),
+                prompt="slow span 2",
+                prompt_sha="b" * 64,
+            ),
+        ]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        from core.errors import ExtractionIncompleteError
+        started = _time.monotonic()
+        try:
+            # All spans dropped as stragglers = nothing extracted: the
+            # chunk must fail retryably (review item 1), not report a
+            # successful empty extraction.
+            with pytest.raises(ExtractionIncompleteError,
+                               match="no successful span"):
+                extractor._structure_spans(
+                    spans=[item.span for item in prepared],
+                    messages=[{"role": "user", "content": "memory"}],
+                    language="en",
+                    session_time=None,
+                    session_summary="",
+                    tool_stats_text="",
+                    ctx=self._ctx(),
+                    archive_id=None,
+                )
+            assert _time.monotonic() - started < 10
+        finally:
+            release.set()
+
+    def test_phase1_failure_falls_back_to_full_conversation_span(self):
+        """WS 4: Phase 1 LLM failure degrades to the fallback span instead
+        of aborting extract()."""
+        llm = Mock()
+        llm.complete_json.side_effect = [
+            RuntimeError("phase 1 down"),  # span identification fails
+            # dev !351: the fallback span runs an assembly selection with a
+            # format/schema retry (run_selection_request) before extraction;
+            # invalid selections degrade to scope="full" after 2 attempts.
+            {"operations": [self._preference("coffee")]},  # selection attempt 1 (invalid)
+            {"operations": [self._preference("coffee")]},  # selection attempt 2 (invalid)
+            {"operations": [self._preference("coffee")]},  # JSON fallback
+            {"operations": [self._preference("coffee")]},  # summary repair (dev flow)
+        ]
+        llm.complete_with_tools.side_effect = ToolCallProtocolError(
+            "empty native result"
+        )
         extractor = Extractor(llm)
 
-        with pytest.raises(RuntimeError, match="rate limited"):
-            extractor._structure_prepared_span_dual(
-                self._prepared(), self._ctx(), archive_id=None
-            )
+        messages = [
+            {"role": "user", "content": "I drink coffee every morning " * 30},
+        ]
+        result = extractor.extract(
+            messages, self._ctx(), session_time=None, archive_id=None
+        )
 
-        llm.complete_json.assert_not_called()
+        # Phase 1 degraded to the fallback span; the JSON fallback ran.
+        assert result and result[0].routing_key == "coffee"
 
     def test_fallback_candidates_still_use_public_confidence_filter(self):
         llm = Mock()
@@ -983,3 +1206,290 @@ class TestExtractorLanguageDetection:
         assert "zh-CN" in self.llm._last_prompt
         # The prompt instructs to output fields "in zh-CN" or similar
         assert "zh-cn" in self.llm._last_prompt.lower()
+
+
+class TestTotalSpanFailureIsRetryable:
+    """Review item 1: exhausted extraction must raise the typed retryable
+    signal, not return [] — an empty list is accepted as a *successful*
+    extraction by the write path, which then removes the source messages
+    from the journal and marks the request complete."""
+
+    @staticmethod
+    def _ctx() -> RequestContext:
+        return RequestContext(
+            account_id="test-account", user_id="user-123", agent_id="agent-456",
+            session_id="session-789", trace_id="trace-abc",
+        )
+
+    @staticmethod
+    def _prepared(i: int = 0) -> _PreparedSpan:
+        return _PreparedSpan(
+            span=_Span(start=i, end=i, message_ids=[f"msg-{i}"]),
+            prompt="Extract memory from this conversation",
+            prompt_sha="a" * 64,
+        )
+
+    def test_single_span_total_failure_raises(self):
+        from core.errors import ExtractionIncompleteError
+        extractor = Extractor(Mock())
+        prepared = [self._prepared()]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span_dual = Mock(return_value=None)
+
+        with pytest.raises(ExtractionIncompleteError, match="no successful span"):
+            extractor._structure_spans(
+                spans=[prepared[0].span],
+                messages=[{"role": "user", "content": "memory"}],
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )
+
+    def test_pool_path_total_failure_raises(self):
+        from core.errors import ExtractionIncompleteError, ToolCallProtocolError
+        extractor = Extractor(Mock())
+        prepared = [self._prepared(0), self._prepared(1), self._prepared(2)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span = Mock(return_value=[])
+        extractor._finalize_span_outcome = Mock(
+            side_effect=ToolCallProtocolError("all native passes failed"))
+
+        with pytest.raises(ExtractionIncompleteError, match="no successful span"):
+            extractor._structure_spans(
+                spans=[p.span for p in prepared],
+                messages=[{"role": "user", "content": "memory"}] * 3,
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )
+
+    def test_partial_failure_still_returns_successful_spans(self):
+        """Some spans succeed -> partial candidates, no raise (unchanged)."""
+        from unittest.mock import MagicMock
+        from core.errors import ToolCallProtocolError
+        extractor = Extractor(Mock())
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        ok = MagicMock()
+        extractor._structure_prepared_span = Mock(return_value=[])
+        extractor._finalize_span_outcome = Mock(
+            side_effect=[[ok], ToolCallProtocolError("all native passes failed")])
+        extractor._merge_span_results = Mock(return_value=[ok])
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+        assert result == [ok]
+
+    def test_pool_path_transient_error_is_retried_within_budget(self):
+        """A transient LLM transport error retries within span_retries
+        instead of failing the whole chunk on the first attempt."""
+        extractor = Extractor(Mock())
+        extractor._span_retries = 1
+        extractor._dual_pass_enabled = False  # one native pass per span
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        calls = []
+
+        def flaky(prepared_span, _ctx, _archive_id, *, temperature):
+            calls.append(prepared_span.span.start)
+            if prepared_span.span.start == 0 and calls.count(0) == 1:
+                raise LLMCallError("service timeout")
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=flaky)
+        extractor._finalize_span_outcome = Mock(return_value=[])
+        extractor._merge_span_results = Mock(return_value=[])
+
+        extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+
+        # span 0 burned one retry after the transient error, then passed.
+        assert calls.count(0) == 2
+        assert calls.count(1) == 1
+
+    def test_pool_path_default_pass_failure_drops_span_keeps_others(self):
+        """A default pass that exhausts its retry budget drops only its own
+        span; the other spans' results survive."""
+        from core.errors import ToolCallProtocolError
+
+        extractor = Extractor(Mock())
+        extractor._span_retries = 1
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        calls = []
+
+        def persistent_outage(prepared_span, _ctx, _archive_id, *, temperature):
+            calls.append(prepared_span.span.start)
+            if prepared_span.span.start == 0:
+                raise LLMCallError("persistent outage")
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=persistent_outage)
+        ok = object()
+
+        def finalize(outcome, _ctx, _archive_id):
+            assert outcome.prepared.span.start == 1, (
+                "dropped span must not be finalized"
+            )
+            return [ok]
+
+        extractor._finalize_span_outcome = Mock(side_effect=finalize)
+        extractor._merge_span_results = Mock(return_value=[ok])
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+
+        assert result == [ok]
+        # span 0 exhausted the full budget (1 + 1 retries) before dropping.
+        assert calls.count(0) == 2
+        assert calls.count(1) == 1
+
+    def test_pool_path_temp0_failure_keeps_default_output(self):
+        """Dual-run degradation semantics in the pool path: the temp=0
+        pass failing after retries keeps the default-pass output (a
+        partial dual-run beats losing the span)."""
+        extractor = Extractor(Mock())
+        extractor._span_retries = 0
+        # dual pass enabled: temperatures (None, 0)
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        def flaky_temp0(prepared_span, _ctx, _archive_id, *, temperature):
+            if prepared_span.span.start == 0 and temperature == 0:
+                raise LLMCallError("temp0 outage")
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=flaky_temp0)
+        ok = object()
+        extractor._finalize_span_outcome = Mock(return_value=[ok])
+        extractor._merge_span_results = Mock(return_value=[ok, ok])
+
+        result = extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+
+        # Both spans finalized — span 0 kept its default-pass output.
+        assert extractor._finalize_span_outcome.call_count == 2
+        assert result == [ok, ok]
+
+    def test_pool_path_deadline_error_propagates_unswallowed(self):
+        """Deadline expiry must unwind the chunk — never be degraded to a
+        dropped span or masked as partial success."""
+        from core.errors import OperationDeadlineExceededError
+
+        extractor = Extractor(Mock())
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span = Mock(
+            side_effect=OperationDeadlineExceededError("deadline exceeded")
+        )
+
+        with pytest.raises(OperationDeadlineExceededError):
+            extractor._structure_spans(
+                spans=[p.span for p in prepared],
+                messages=[{"role": "user", "content": "memory"}] * 2,
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )
+
+    def test_pool_path_backoff_is_capped_to_remaining_budget(self):
+        """The retry backoff never sleeps past the request deadline — an
+        expired request frees its worker thread immediately instead of
+        sleeping the full multi-second delay."""
+        import time as _time
+
+        from core.errors import OperationDeadlineExceededError
+        from core.operation_deadline import operation_deadline
+
+        extractor = Extractor(Mock())
+        extractor._span_retries = 1
+        prepared = self._prepared(0)
+        extractor._structure_prepared_span = Mock(
+            side_effect=LLMCallError("outage"))
+
+        start = _time.monotonic()
+        with operation_deadline(0.1):
+            with pytest.raises(OperationDeadlineExceededError):
+                extractor._run_native_pass_with_retries(
+                    prepared, self._ctx(), None, temperature=None)
+        # The uncapped backoff would be 2 s; the capped one must return
+        # roughly at the deadline.
+        assert _time.monotonic() - start < 1.0
+
+    def test_pool_path_finalize_propagates_programming_error(self):
+        """A _SpanProgrammingError raised during finalize (e.g. from the
+        JSON fallback's parsing) must crash loudly — the generic span-drop
+        handler would mask an internal code fault as graceful degradation."""
+        from extraction.tools import _SpanProgrammingError
+
+        extractor = Extractor(Mock())
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span = Mock(return_value=[])
+
+        def finalize(outcome, _ctx, _archive_id):
+            if outcome.prepared.span.start == 0:
+                raise _SpanProgrammingError("parser bug")
+            return []
+
+        extractor._finalize_span_outcome = Mock(side_effect=finalize)
+
+        with pytest.raises(_SpanProgrammingError, match="parser bug"):
+            extractor._structure_spans(
+                spans=[p.span for p in prepared],
+                messages=[{"role": "user", "content": "memory"}] * 2,
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )
+
+    def test_pool_path_honors_instance_max_workers(self):
+        """max_workers / OGMEM_EXTRACT_MAX_WORKERS throttles the pool:
+        max_workers=1 must serialize the native calls instead of the
+        fixed 4-worker default."""
+        import threading
+        import time as _time
+
+        extractor = Extractor(Mock(), max_workers=1)
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        lock = threading.Lock()
+        state = {"current": 0, "peak": 0}
+
+        def slow_pass(_prepared, _ctx, _archive_id, *, temperature):
+            with lock:
+                state["current"] += 1
+                state["peak"] = max(state["peak"], state["current"])
+            _time.sleep(0.15)
+            with lock:
+                state["current"] -= 1
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=slow_pass)
+        extractor._finalize_span_outcome = Mock(return_value=[])
+        extractor._merge_span_results = Mock(return_value=[])
+
+        extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+        assert state["peak"] == 1

@@ -124,8 +124,16 @@ class OpenAILLM(LLM):
         reasoning_effort: str | None = None,
         is_reasoning_model: bool | None = None,
         extra_body: dict[str, Any] | None = None,
-        request_timeout_seconds: float = 120.0,
+        request_timeout_seconds: float | None = None,
     ):
+        # OGMEM_LLM_TIMEOUT (seconds): the default is too tight when many
+        # video pipelines hit the endpoint concurrently (queue wait +
+        # decode exceeds 120s -> non-retryable "Request timed out" ->
+        # per-clip flash failures). Explicit config still wins.
+        if request_timeout_seconds is None:
+            request_timeout_seconds = float(
+                os.environ.get("OGMEM_LLM_TIMEOUT", "120.0")
+            )
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise ValueError(
@@ -861,6 +869,10 @@ class OpenAILLM(LLM):
 
                 if effective_tool_choice == "required":
                     self._required_tool_choice_capability = "supported"
+                # ``usage`` was already computed (and recorded) upfront
+                # right after _create_completion — dev contract: one record
+                # per LLM attempt, failed or not (see
+                # test_failed_normalization_and_retry_each_record_usage_once).
                 parsed_tool_calls = [
                     {
                         "tool": call.function.name,

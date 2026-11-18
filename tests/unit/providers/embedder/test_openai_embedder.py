@@ -121,10 +121,12 @@ class TestOpenAIEmbedder:
         options = fake_client.with_options.call_args.kwargs
         assert 0 < options['timeout'] <= 4.5
         assert options['max_retries'] == 0
-        deadline_client.embeddings.create.assert_called_once_with(
-            input=["hello"],
-            model="custom-model",
-        )
+        create_kwargs = deadline_client.embeddings.create.call_args.kwargs
+        assert create_kwargs["input"] == ["hello"]
+        assert create_kwargs["model"] == "custom-model"
+        # Review item 6: the per-request timeout is recomputed per attempt
+        # and never exceeds the caller's remaining budget.
+        assert 0 < create_kwargs["timeout"] <= 4.5
 
     def test_deadline_aware_embedder_rejects_expired_budget_before_provider_call(
         self,
@@ -399,3 +401,186 @@ class TestCachedOpenAIEmbedder:
         embedder.clear_cache()
 
         assert embedder.cache_size == 0
+
+
+class TestEmbedRetryAndConcurrency:
+    """WS 3.3: bounded in-flight requests + jittered transient retry."""
+
+    def test_run_with_retry_retries_transient_then_succeeds(self, monkeypatch):
+        import httpx
+
+        monkeypatch.setenv("OGMEM_EMBED_RETRIES", "2")
+        monkeypatch.setenv("OGMEM_EMBED_BASE_DELAY", "0")
+
+        calls = []
+
+        def flaky(remaining):
+            calls.append(1)
+            if len(calls) < 2:
+                raise httpx.TimeoutException("transient")
+            return "ok"
+
+        assert openai_embedder_module._run_with_retry(flaky, "unit") == "ok"
+        assert len(calls) == 2
+
+    def test_run_with_retry_fails_fast_on_non_transient(self, monkeypatch):
+        monkeypatch.setenv("OGMEM_EMBED_RETRIES", "3")
+        monkeypatch.setenv("OGMEM_EMBED_BASE_DELAY", "0")
+
+        calls = []
+
+        def denied(remaining):
+            calls.append(1)
+            raise PermissionError("auth")
+
+        with pytest.raises(PermissionError):
+            openai_embedder_module._run_with_retry(denied, "unit")
+        assert len(calls) == 1
+
+    def test_run_with_retry_gives_up_after_budget(self, monkeypatch):
+        import httpx
+
+        monkeypatch.setenv("OGMEM_EMBED_RETRIES", "1")
+        monkeypatch.setenv("OGMEM_EMBED_BASE_DELAY", "0")
+
+        calls = []
+
+        def always_transient(remaining):
+            calls.append(1)
+            raise httpx.TimeoutException("still down")
+
+        with pytest.raises(httpx.TimeoutException):
+            openai_embedder_module._run_with_retry(always_transient, "unit")
+        assert len(calls) == 2  # 1 + 1 retry
+
+    def test_is_transient_classifies_openai_errors(self):
+        import httpx
+        from openai import APIConnectionError, APITimeoutError
+
+        req = httpx.Request("POST", "http://x")
+        assert openai_embedder_module._is_transient(APITimeoutError(request=req))
+        assert openai_embedder_module._is_transient(
+            APIConnectionError(message="c", request=req)
+        )
+
+        resp_500 = httpx.Response(500, request=httpx.Request("POST", "http://x"))
+        resp_401 = httpx.Response(401, request=httpx.Request("POST", "http://x"))
+        assert openai_embedder_module._is_transient(
+            httpx.HTTPStatusError("5xx", request=resp_500.request, response=resp_500)
+        )
+        assert not openai_embedder_module._is_transient(
+            httpx.HTTPStatusError("401", request=resp_401.request, response=resp_401)
+        )
+        assert openai_embedder_module._is_transient(httpx.TimeoutException("t"))
+        assert openai_embedder_module._is_transient(httpx.TransportError("t"))
+        assert not openai_embedder_module._is_transient(ValueError("nope"))
+
+    def test_is_transient_treats_raw_http_429_as_transient(self):
+        """The multimodal path uses raw httpx: a 429 surfaces as
+        HTTPStatusError, not the SDK's RateLimitError — it must classify
+        as transient or parallel-load rate limiting bypasses the retry
+        budget entirely."""
+        import httpx
+
+        resp_429 = httpx.Response(429, request=httpx.Request("POST", "http://x"))
+        assert openai_embedder_module._is_transient(
+            httpx.HTTPStatusError("429", request=resp_429.request, response=resp_429)
+        )
+
+    def test_embed_texts_semaphore_bounds_in_flight(self, fake_client, monkeypatch):
+        import threading
+
+        monkeypatch.setenv("OGMEM_EMBED_MAX_CONCURRENCY", "2")
+        # The module-level semaphore was sized at import; replace it for
+        # this test with a 2-slot one.
+        monkeypatch.setattr(
+            openai_embedder_module,
+            "_EMBED_SEMAPHORE",
+            threading.BoundedSemaphore(2),
+        )
+        fake_client.embeddings.create.return_value = _embedding_response([[0.1, 0.2]])
+
+        embedder = openai_embedder_module.OpenAIEmbedder(
+            api_key="test-key", model="custom-model", dimension=2,
+        )
+
+        in_flight = []
+        peak = []
+        lock = threading.Lock()
+
+        original = fake_client.embeddings.create
+
+        def tracking(*args, **kwargs):
+            with lock:
+                in_flight.append(1)
+                peak.append(len(in_flight))
+            import time as _t
+            _t.sleep(0.05)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                with lock:
+                    in_flight.pop()
+
+        fake_client.embeddings.create = tracking
+
+        threads = [
+            threading.Thread(target=lambda: embedder.embed_texts(["x"]))
+            for _ in range(6)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert max(peak) <= 2
+
+
+class TestEmbedDeadlineBudget:
+    """Review item 6: concurrency waits and retry backoff must respect the
+    caller's absolute deadline; no API call may start after expiry."""
+
+    def test_contended_slot_with_tiny_budget_fails_fast_without_api_call(
+        self, fake_client, monkeypatch
+    ):
+        import time as _time
+        # Occupy every concurrency slot so the caller must queue.
+        slots = openai_embedder_module._embed_max_concurrency()
+        held = [openai_embedder_module._EMBED_SEMAPHORE.acquire()
+                for _ in range(slots)]
+        try:
+            embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
+            started = _time.monotonic()
+            with pytest.raises(TimeoutError, match="concurrency slot"):
+                embedder.embed_texts_with_timeout(["hello"], timeout_seconds=0.01)
+            # Failed fast instead of queueing unboundedly.
+            assert _time.monotonic() - started < 1.0
+        finally:
+            for ok in held:
+                if ok:
+                    openai_embedder_module._EMBED_SEMAPHORE.release()
+        # The API was never called — the budget died in the queue.
+        fake_client.with_options.assert_not_called()
+
+    def test_backoff_never_sleeps_past_the_deadline(
+        self, fake_client, monkeypatch
+    ):
+        import time as _time
+        from openai import APITimeoutError
+        import httpx
+        monkeypatch.setenv("OGMEM_EMBED_RETRIES", "2")
+        monkeypatch.setenv("OGMEM_EMBED_BASE_DELAY", "30")  # >> the budget
+        deadline_client = Mock()
+        request = httpx.Request("POST", "http://embed/embeddings")
+        deadline_client.embeddings.create.side_effect = APITimeoutError(request)
+        fake_client.with_options.return_value = deadline_client
+        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
+
+        started = _time.monotonic()
+        with pytest.raises(TimeoutError, match="deadline"):
+            embedder.embed_texts_with_timeout(["hello"], timeout_seconds=0.05)
+        # The 30s backoff was truncated to the remaining budget: the call
+        # ended within a second, not after a full sleep.
+        assert _time.monotonic() - started < 1.0
+        # Only the first attempt ran; the retry never started (no budget).
+        assert deadline_client.embeddings.create.call_count == 1
