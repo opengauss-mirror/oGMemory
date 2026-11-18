@@ -571,7 +571,7 @@ export async function pollWriteRequest(baseUrl, params, cfg, initial, deadline) 
 }
 
 export async function callHttp(baseUrl, method, params, cfg = {}) {
-  const timeoutMs = cfg.requestTimeoutMs ?? (method === "after_turn" ? 300_000
+  const timeoutMs = cfg.requestTimeoutMs ?? (method === "after_turn" || method === "prepare_compaction" ? 300_000
     : method === "govern_first_view_tool_result" ? 10_000 : 120_000);
   const deadline = performance.now() + timeoutMs;
   if (method === "after_turn" && !params.clientRequestId) {
