@@ -81,25 +81,20 @@ func (fs *LocalFS) Create(path string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		return fmt.Errorf("file already exists: %s", path)
-	}
-
 	// Check if parent directory exists
 	parentDir := filepath.Dir(localPath)
 	if _, err := os.Stat(parentDir); os.IsNotExist(err) {
 		return fmt.Errorf("parent directory does not exist: %s", filepath.Dir(path))
 	}
 
-	// Create empty file
-	f, err := os.Create(localPath)
+	f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
+	if os.IsExist(err) {
+		return fmt.Errorf("file already exists: %s", path)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	f.Close()
-
-	return nil
+	return f.Close()
 }
 
 func (fs *LocalFS) Mkdir(path string, perm uint32) error {
@@ -189,25 +184,23 @@ func (fs *LocalFS) Read(path string, offset int64, size int64) ([]byte, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 
-	// Check if exists and is not a directory
-	info, err := os.Stat(localPath)
+	f, err := os.Open(localPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, filesystem.NewNotFoundError("read", path)
 		}
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
 		return nil, fmt.Errorf("failed to stat: %w", err)
 	}
 
 	if info.IsDir() {
 		return nil, fmt.Errorf("is a directory: %s", path)
 	}
-
-	// Open file
-	f, err := os.Open(localPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
-	}
-	defer f.Close()
 
 	// Get file size
 	fileSize := info.Size()
@@ -220,22 +213,16 @@ func (fs *LocalFS) Read(path string, offset int64, size int64) ([]byte, error) {
 		return []byte{}, io.EOF
 	}
 
-	// Seek to offset
-	_, err = f.Seek(offset, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to seek: %w", err)
-	}
-
 	// Determine read size
 	readSize := size
-	if size < 0 || offset+size > fileSize {
+	if size < 0 || size > fileSize-offset {
 		readSize = fileSize - offset
 	}
 
 	// Read data
 	data := make([]byte, readSize)
-	n, err := io.ReadFull(f, data)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+	n, err := f.ReadAt(data, offset)
+	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("failed to read: %w", err)
 	}
 

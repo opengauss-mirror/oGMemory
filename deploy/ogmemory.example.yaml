@@ -161,7 +161,7 @@ mcp:
 
 # ---- Optional external AGFS (unused with storage.backend: sql) ----
 agfs:
-  base_url: "http://127.0.0.1:1833"
+  # base_url: "http://127.0.0.1:1833"  # Set for HTTP, including existing deployments.
   mount_prefix: "/local/plugin"
 
 # ---- 索引服务 ----

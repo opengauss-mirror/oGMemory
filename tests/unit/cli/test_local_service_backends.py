@@ -187,6 +187,24 @@ def test_sql_foreground_shutdown_does_not_stop_agfs(setup_local, monkeypatch):
     assert calls == []
 
 
+def test_native_agfs_start_and_status_use_service_health(setup_local, monkeypatch):
+    root, write_config = setup_local
+    write_config("agfs")
+    monkeypatch.setenv("AGFS_TRANSPORT", "native")
+    launches = []
+    monkeypatch.setattr(local_runtime, "ensure_service", lambda project, cfg, **kw: launches.append(cfg.agfs_transport) or 123)
+    assert start.run(arguments()) == 0
+    assert launches == ["native"]
+
+    health = {"backend": "og-memory", "status": "ok", "storage_backend": "agfs",
+              "agfs_transport": "native", "agfs": True, "agfs_url": "agfs-native:///opt/agfs/libagfsbinding.so"}
+    monkeypatch.setattr(status, "running_state", lambda project: {"port": 28090})
+    monkeypatch.setattr(status, "check_ogmem", lambda **kw: health)
+    state = status._check_local_mode(root)
+    assert state["healthy"] and state["agfs"]
+    assert state["agfs_url"] == health["agfs_url"]
+
+
 def test_agfs_still_starts_and_stops_both_services(setup_local, monkeypatch):
     root, write_config = setup_local
     write_config("agfs")

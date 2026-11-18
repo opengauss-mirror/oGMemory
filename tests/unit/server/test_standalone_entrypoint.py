@@ -90,7 +90,7 @@ def test_dsn_password_round_trips_regex_yaml_and_libpq(tmp_path, password, prefi
 
 
 @pytest.mark.parametrize('storage,url,expected', [
-    (None, None, True),
+    (None, None, False),
     ('agfs', 'http://127.0.0.1:1833', True),
     ('agfs', 'http://localhost:1833', True),
     ('agfs', 'http://agfs.example:1833', False),
@@ -107,7 +107,7 @@ def test_storage_compatibility_decision_uses_resolved_config(tmp_path, storage, 
     source.write_text(yaml.safe_dump(config))
     env = {key: val for key, val in os.environ.items()
            if not key.startswith(('OGMEM_', 'AGFS_', 'STORAGE_'))}
-    env['OGMEM_CONFIG'] = str(source)
+    env.update(OGMEM_CONFIG=str(source), AGFS_DEFAULT_TRANSPORT='native')
     result = subprocess.run([sys.executable, str(ROOT / 'scripts/yaml_to_env.py')],
                             env=env, check=True, capture_output=True, text=True)
     assert f'OGMEM_START_BUNDLED_AGFS="{str(expected).lower()}"' in result.stdout

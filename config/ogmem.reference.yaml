@@ -197,7 +197,10 @@ paths:
 
 # ---- AGFS (internal) [docker] ----
 agfs:
-  base_url: "http://127.0.0.1:1833"   # [all] AGFS server address
+  # base_url: "http://agfs-host:1833"  # [all] Use HTTP AGFS at this address
+  # transport: native                   # native or http
+  # native_library: /opt/agfs/libagfsbinding.so  # AGFS_NATIVE_LIBRARY
+  # native_config: /opt/agfs/config.yaml         # AGFS_NATIVE_CONFIG; defines plugin mounts
   mount_prefix: "/local/plugin"        # [docker]
 
 # ---- Index Service [all] ----

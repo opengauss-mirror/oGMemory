@@ -4,7 +4,8 @@
 
 Standalone **默认不编译或打包 AGFS**。需要内置 AGFS 的旧部署必须显式选择
 `standalone-agfs` 构建目标；该目标从仓库 `agfs/` 编译，无需宿主机预编译。
-配置加载后，仅当 `storage.backend=agfs` 且 `agfs.base_url` 为
+新部署保留 SQL 默认后端。选择 `storage.backend=agfs` 后，带绑定的镜像默认在进程内读写；
+已有 `agfs.base_url` 继续选择 HTTP。仅当使用 HTTP 且 `agfs.base_url` 为
 `http://127.0.0.1:1833`（或 `localhost:1833`）时启动内置服务，并等待其就绪；
 配置错误或服务启动失败时不会继续启动 API。
 
@@ -19,7 +20,7 @@ Standalone **默认不编译或打包 AGFS**。需要内置 AGFS 的旧部署必
 1. 停止旧应用写入，备份原 YAML、环境变量和 AGFS 宿主机数据目录。
 2. 构建时显式指定 `--target standalone-agfs`；Compose 用户在 `deploy/.env`
    设置 `OGMEM_BUILD_TARGET=standalone-agfs` 后重新构建。保留原数据卷和原配置。
-3. 检查启动日志中的 AGFS 就绪状态，在应用中读取一条原有记忆，再写入测试记忆。
+3. 查看 `/api/v1/health` 的 `agfs_transport`，读取一条原有记忆，再写入测试记忆。
 4. 重启容器，再次读取两条记忆，确认持久化。失败时用原镜像、原配置回滚，
    不要初始化或清空旧数据目录。
 

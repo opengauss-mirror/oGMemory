@@ -18,7 +18,6 @@ vector_db:
 storage:
   backend: agfs
 agfs:
-  base_url: http://127.0.0.1:1833
   mount_prefix: /local/plugin
 service:
   http_port: 8090

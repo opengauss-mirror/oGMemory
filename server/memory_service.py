@@ -127,6 +127,7 @@ from session.topic_buffer import SlotContent
 
 try:
     from pyagfs import AGFSClient
+    from fs.agfs_adapter.client import create_agfs_client
 
     from commit.outbox_store import OutboxStore
     from fs.agfs_adapter import AGFSContextFS, AGFSTraceEventStore
@@ -295,7 +296,7 @@ def _check_shared_agfs_storage(cfg):
 
     from fs.agfs_adapter.agfs_context_fs import _is_not_found_error
 
-    client = AGFSClient(api_base_url=cfg.agfs_base_url)
+    client = create_agfs_client(cfg, http_client_class=AGFSClient)
     prefix = cfg.agfs_mount_prefix.rstrip("/")
 
     def names(path):
@@ -734,6 +735,7 @@ class MemoryService:
         self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
 
         self._agfs_base_url = cfg.agfs_base_url
+        self._native_agfs_client = None
         self._mount_prefix = cfg.agfs_mount_prefix
         self._default_account_id = cfg.account_id
         self._default_user_id = cfg.user_id
@@ -875,7 +877,7 @@ class MemoryService:
 
                 self._space_content_store = AGFSSpaceBridge(
                     pool=self._get_shared_sql_pool(),
-                    client=AGFSClient(api_base_url=self._agfs_base_url),
+                    client=self._get_agfs_client(),
                     mount_prefix=self._mount_prefix,
                 )
             return self._space_content_store
@@ -897,7 +899,7 @@ class MemoryService:
             )
 
             return AGFSToolResultArtifactStore(
-                AGFSClient(api_base_url=self._agfs_base_url),
+                self._get_agfs_client(),
                 mount_prefix=self._mount_prefix,
             )
         raise RuntimeError("no configured SQL or AGFS artifact backend")
@@ -1009,7 +1011,7 @@ class MemoryService:
         if self._use_sql:
             return SQLContextFS(pool=self._get_shared_sql_pool())
         if _HAS_AGFS:
-            client = AGFSClient(api_base_url=self._agfs_base_url)
+            client = self._get_agfs_client()
             return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
         return None
 
@@ -1034,7 +1036,7 @@ class MemoryService:
                 fs=fs,
             )
         if _HAS_AGFS:
-            client = AGFSClient(api_base_url=self._agfs_base_url)
+            client = self._get_agfs_client()
             return OutboxStore(client=client, fs=fs, mount_prefix=self._mount_prefix)
         return None
 
@@ -1047,7 +1049,7 @@ class MemoryService:
                     self._cfg, "graph_projection_representation", "relation-target-v2",
                 ))
         if _HAS_AGFS:
-            client = AGFSClient(api_base_url=self._agfs_base_url)
+            client = self._get_agfs_client()
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
         return None
 
@@ -1109,7 +1111,7 @@ class MemoryService:
         elif self._trace_event_store is None and self._cfg.storage_backend == "agfs" and _HAS_AGFS:
             try:
                 self._trace_event_store = AGFSTraceEventStore(
-                    client=AGFSClient(api_base_url=self._agfs_base_url),
+                    client=self._get_agfs_client(),
                     mount_prefix=self._mount_prefix,
                     max_turn_events=self._cfg.trace_max_turn_events,
                 )
@@ -2258,7 +2260,7 @@ class MemoryService:
                     pool=self._get_shared_sql_pool(),
                 )
             elif _HAS_AGFS:
-                client = AGFSClient(api_base_url=self._agfs_base_url)
+                client = self._get_agfs_client()
                 self._control_store = ControlPlaneStore(
                     mount_prefix=self._mount_prefix,
                     client=client,
@@ -4169,13 +4171,21 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if _HAS_AGFS:
             try:
                 from session import SessionArchiveStore
-                client = AGFSClient(api_base_url=self._agfs_base_url)
+                client = self._get_agfs_client()
                 agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
                 return SessionArchiveStore(fs=agfs)
             except Exception as exc:
                 logger.error("Failed to create AGFS archive store: %s", exc)
                 return None
         return None
+
+    def _get_agfs_client(self):
+        if self._cfg.agfs_transport == "http":
+            return AGFSClient(api_base_url=self._agfs_base_url)
+        with self._init_lock:
+            if self._native_agfs_client is None:
+                self._native_agfs_client = create_agfs_client(self._cfg)
+            return self._native_agfs_client
 
     def _get_agfs_fs(self):
         """Create a fresh ContextFS instance for session operations."""
@@ -8427,8 +8437,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     raise RuntimeError(
                         "AGFS backend configured but AGFS client is unavailable"
                     )
-                AGFSClient(api_base_url=self._agfs_base_url).ls("/")
-                info["agfs_url"] = self._agfs_base_url
+                client = self._get_agfs_client()
+                client.ls("/")
+                info["agfs_transport"] = self._cfg.agfs_transport
+                info["agfs_url"] = client.api_base if self._cfg.agfs_transport == "native" else self._agfs_base_url
             elif sql_required:
                 dsn = self._cfg.sql_connection_string
                 if not dsn:

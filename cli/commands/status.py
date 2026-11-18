@@ -51,7 +51,11 @@ def _check_local_mode(root: Path) -> dict:
     required = backend == "agfs"
     agfs_health = None
     agfs_url = (health or {}).get("agfs_url") or os.environ.get("AGFS_BASE_URL", "http://127.0.0.1:1833")
-    if required:
+    transport = (health or {}).get("agfs_transport") or (cfg.agfs_transport if cfg else None)
+    if required and transport == "native":
+        agfs_url = (health or {}).get("agfs_url") or "native"
+        agfs_health = (health or {}).get("agfs")
+    elif required:
         url = urlsplit(agfs_url)
         agfs_port = url.port or (443 if url.scheme == "https" else 80)
         if not (health or {}).get("agfs_url"):

@@ -50,11 +50,11 @@ def _create_storage(cfg):
         fs = SQLContextFS(pool=pool)
         return fs, SQLOutboxStore(pool=pool, fs=fs), pool
 
-    from pyagfs import AGFSClient
+    from fs.agfs_adapter.client import create_agfs_client
     from commit.outbox_store import OutboxStore
     from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 
-    client = AGFSClient(api_base_url=cfg.agfs_base_url)
+    client = create_agfs_client(cfg)
     fs = AGFSContextFS(client=client, mount_prefix=cfg.agfs_mount_prefix)
     return fs, OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix), None
 
