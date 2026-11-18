@@ -168,7 +168,7 @@ def test_post_ops_face_clustering_boundary_drops_face_edges_only():
     # voice_clustering is also in the wiped range (after face_clustering),
     # so its speaker edges are dropped too; the *faces* themselves survive.
     assert edge_op["params"]["endpoint_types"] == [
-        "face_detection", "speaker_embedding",
+        "face_detection", "speaker_embedding", "voice_segmentation",
     ]
     # index_episodic is in range → embeddings cleared, vector rows need a flag.
     assert "clear_episodic_embeddings" in names
@@ -178,7 +178,13 @@ def test_post_ops_face_clustering_boundary_drops_face_edges_only():
 def test_post_ops_voice_clustering_boundary_drops_speaker_edges():
     ops = ws.post_ops(ws.stages_from("m3.voice_clustering"))
     edge_op = next(o for o in ops if o["name"] == "drop_same_identity_edges")
-    assert edge_op["params"]["endpoint_types"] == ["speaker_embedding"]
+    # Both endpoint types: ECAPA records when present, but spectral
+    # clustering falls back to voice_segmentation nodes — the delete SQL
+    # requires both endpoints to match, so speaker_embedding alone would
+    # leave spectral-cluster edges behind.
+    assert edge_op["params"]["endpoint_types"] == [
+        "speaker_embedding", "voice_segmentation",
+    ]
 
 
 def test_post_ops_detect_faces_boundary_keeps_faces_but_drops_edges():

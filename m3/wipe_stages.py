@@ -151,7 +151,13 @@ STAGE_SPECS: dict[str, StageWipe] = {
     ),
     "m3.voice_clustering": StageWipe(
         stage_id="m3.voice_clustering",
-        same_identity_endpoints=("speaker_embedding",),
+        # Both endpoint types: ECAPA records when present, but
+        # collect_voice_records falls back to voice_segmentation nodes
+        # for spectral clustering — the edge-delete SQL requires both
+        # endpoints to match, so listing only speaker_embedding leaves
+        # spectral-cluster edges behind and stale anchors then survive
+        # a re-cluster.
+        same_identity_endpoints=("speaker_embedding", "voice_segmentation"),
         notes="emits same_identity edges between speaker nodes",
     ),
     "m3.episodic_memory": StageWipe(

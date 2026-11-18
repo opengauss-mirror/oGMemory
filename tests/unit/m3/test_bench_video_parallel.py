@@ -145,12 +145,19 @@ def test_serial_default_single_threaded_and_ordered(monkeypatch, tmp_path):
     assert [s["video_id"] for s in result] == videos
 
 
-def _install_fake_judge(monkeypatch):
-    calls: list[str] = []
+class _JudgeCalls(list):
+    """Call list that also records the ``resume`` kwarg per call."""
 
-    def fake_run_judge(*, annotations, merged_jsonl, output_dir, args, subset):
+
+def _install_fake_judge(monkeypatch):
+    calls: _JudgeCalls = _JudgeCalls()
+    resumes: list[bool | None] = []
+
+    def fake_run_judge(*, annotations, merged_jsonl, output_dir, args, subset,
+                       resume=None):
         vid = subset[0]
         calls.append(vid)
+        resumes.append(resume)
         output_dir.mkdir(parents=True, exist_ok=True)
         rows = [
             _question_row(vid, f"{vid}_Q1"),
@@ -175,6 +182,7 @@ def _install_fake_judge(monkeypatch):
         }
 
     monkeypatch.setattr(driver, "run_judge", fake_run_judge)
+    calls.resumes = resumes
     return calls
 
 
@@ -453,3 +461,41 @@ def test_aggregate_jsonl_malformed_and_noid_rows_pass_through(tmp_path):
     # error field and keeps the legacy "answered" classification.
     assert result["answered"] == 2
     assert result["failed"] == 1
+
+
+def test_live_judge_rejudge_disables_resume_on_digest_mismatch(monkeypatch, tmp_path):
+    """A re-judge after a digest mismatch must not forward --resume:
+    m3.eval --resume skips by question id without re-checking whether
+    the prediction changed, so stale per-question results would shadow
+    the re-judge."""
+    videos = ["v1"]
+    _install_fake_runner(monkeypatch, tmp_path)
+    judge_calls = _install_fake_judge(monkeypatch)
+    annotations_path = tmp_path / "robot.json"
+
+    args = _args(tmp_path, judge=True)
+    args.resume = True
+    driver.run_videos(
+        subset=videos, args=args,
+        annotations=_annotations(videos), annotations_path=annotations_path,
+        project_root=tmp_path, videos_root=tmp_path,
+    )
+    assert judge_calls == ["v1"]
+    # First judge: no summary yet, but resume is still disabled — the
+    # per-question results (if any) are not digest-verified.
+    assert judge_calls.resumes == [False]
+
+    # Change predictions -> digest mismatch -> re-judge without resume.
+    jsonl = tmp_path / "v1" / "m3_qa_results.jsonl"
+    rows = [json.loads(l) for l in jsonl.read_text(encoding="utf-8").splitlines() if l]
+    rows[0]["predicted_answer"] = "repaired answer"
+    jsonl.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    _install_resume_runner(monkeypatch, tmp_path)
+    driver.run_videos(
+        subset=videos, args=args,
+        annotations=_annotations(videos), annotations_path=annotations_path,
+        project_root=tmp_path, videos_root=tmp_path,
+    )
+    assert judge_calls == ["v1", "v1"]
+    assert judge_calls.resumes == [False, False]

@@ -733,6 +733,7 @@ def run_judge(
     output_dir: Path,
     args: argparse.Namespace,
     subset: list[str] | None = None,
+    resume: bool | None = None,
 ) -> dict[str, Any]:
     """Invoke ``python -m m3.eval`` to judge the merged JSONL.
 
@@ -744,6 +745,12 @@ def run_judge(
     question in ``annotations`` and scores un-answered ones as 0,
     producing a misleading ``overall_mean_score`` (e.g. 0.005 over
     all 1276 questions when only 26 had predictions).
+
+    ``resume`` overrides ``args.resume`` for this invocation: pass
+    ``False`` when the inputs changed since the last judge pass —
+    ``m3.eval --resume`` skips by question id without checking whether
+    the prediction changed, so stale per-question results would
+    otherwise shadow the re-judge.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     python_argv = shlex.split(args.python)
@@ -783,7 +790,8 @@ def run_judge(
         cmd.extend(["--judge-base-url", str(args.judge_base_url)])
     if args.judge_api_key:
         cmd.extend(["--judge-api-key", str(args.judge_api_key)])
-    if args.resume:
+    judge_resume = args.resume if resume is None else resume
+    if judge_resume:
         cmd.append("--resume")
     logger.info("judge: %s", " ".join(shlex.quote(c) for c in cmd))
     log_path = output_dir / "judge.log"
@@ -918,12 +926,18 @@ def live_judge_video(
             )
     # Reuse the existing judge driver, scoped to this one video: the
     # ``--video`` filter keeps m3.eval from scoring other videos' questions.
+    # Resume is always disabled here: every path reaching this call has
+    # either a digest mismatch, --force, or no verified summary — the old
+    # per-question results were judged against different inputs, and
+    # ``--resume`` would skip those question ids without re-checking the
+    # predictions.
     result = run_judge(
         annotations=annotations_path,
         merged_jsonl=jsonl,
         output_dir=work_dir,
         args=args,
         subset=[video_id],
+        resume=False,
     )
     if result.get("returncode") == 0 and result.get("summary_path"):
         _write_judge_digest(

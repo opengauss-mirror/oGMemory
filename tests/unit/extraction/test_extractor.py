@@ -1430,3 +1430,66 @@ class TestTotalSpanFailureIsRetryable:
         # The uncapped backoff would be 2 s; the capped one must return
         # roughly at the deadline.
         assert _time.monotonic() - start < 1.0
+
+    def test_pool_path_finalize_propagates_programming_error(self):
+        """A _SpanProgrammingError raised during finalize (e.g. from the
+        JSON fallback's parsing) must crash loudly — the generic span-drop
+        handler would mask an internal code fault as graceful degradation."""
+        from extraction.tools import _SpanProgrammingError
+
+        extractor = Extractor(Mock())
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+        extractor._structure_prepared_span = Mock(return_value=[])
+
+        def finalize(outcome, _ctx, _archive_id):
+            if outcome.prepared.span.start == 0:
+                raise _SpanProgrammingError("parser bug")
+            return []
+
+        extractor._finalize_span_outcome = Mock(side_effect=finalize)
+
+        with pytest.raises(_SpanProgrammingError, match="parser bug"):
+            extractor._structure_spans(
+                spans=[p.span for p in prepared],
+                messages=[{"role": "user", "content": "memory"}] * 2,
+                language="en", session_time=None, session_summary="",
+                tool_stats_text="", ctx=self._ctx(),
+            )
+
+    def test_pool_path_honors_instance_max_workers(self):
+        """max_workers / OGMEM_EXTRACT_MAX_WORKERS throttles the pool:
+        max_workers=1 must serialize the native calls instead of the
+        fixed 4-worker default."""
+        import threading
+        import time as _time
+
+        extractor = Extractor(Mock(), max_workers=1)
+        extractor._dual_pass_enabled = False
+        prepared = [self._prepared(0), self._prepared(1)]
+        extractor._prepare_unique_spans = Mock(return_value=prepared)
+
+        lock = threading.Lock()
+        state = {"current": 0, "peak": 0}
+
+        def slow_pass(_prepared, _ctx, _archive_id, *, temperature):
+            with lock:
+                state["current"] += 1
+                state["peak"] = max(state["peak"], state["current"])
+            _time.sleep(0.15)
+            with lock:
+                state["current"] -= 1
+            return []
+
+        extractor._structure_prepared_span = Mock(side_effect=slow_pass)
+        extractor._finalize_span_outcome = Mock(return_value=[])
+        extractor._merge_span_results = Mock(return_value=[])
+
+        extractor._structure_spans(
+            spans=[p.span for p in prepared],
+            messages=[{"role": "user", "content": "memory"}] * 2,
+            language="en", session_time=None, session_summary="",
+            tool_stats_text="", ctx=self._ctx(),
+        )
+        assert state["peak"] == 1

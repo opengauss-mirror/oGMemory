@@ -911,7 +911,10 @@ class Extractor:
         #   dropped while the rest keeps its candidates, and a chunk where
         #   every span failed raises the typed retryable signal instead of
         #   returning [] as success (review item 1).
-        pool = ThreadPoolExecutor(max_workers=_SPAN_WORKERS)
+        # Instance-configured concurrency (max_workers /
+        # OGMEM_EXTRACT_MAX_WORKERS): lowering it throttles concurrent
+        # native calls when the model service is saturating.
+        pool = ThreadPoolExecutor(max_workers=self._max_workers)
         try:
             futures = {}
             outcomes = [_NativeSpanOutcome(prepared=prepared) for prepared in prepared_spans]
@@ -1000,6 +1003,14 @@ class Extractor:
                 continue
             try:
                 candidates = self._finalize_span_outcome(outcome, ctx, archive_id)
+            except _SpanProgrammingError:
+                # Bugs in our parsing code (e.g. wrapped inside the JSON
+                # fallback) must crash loudly — the future-collection loop
+                # propagates them, and the finalize path must not become a
+                # hole that masks an internal fault as graceful degradation.
+                raise
+            except OperationDeadlineExceededError:
+                raise
             except Exception as exc:
                 # Partial-chunk resilience: one span's total failure (all
                 # native passes failed and recovery raised) must not abort
