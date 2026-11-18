@@ -26,8 +26,8 @@ from flask import Flask, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
-from core.write_contract import error_fields, normalize_write_result, write_http_status
 from core.logging_config import configure_third_party_loggers
+from core.write_contract import error_fields, normalize_write_result, write_http_status
 from features.tool_result_externalization.store_base import (
     ArtifactNotVisibleError,
     ArtifactStoreUnavailableError,
@@ -44,6 +44,7 @@ from server.mcp_tools import (
 from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
 from server.scene_api import create_scene_blueprint
+from server.space_management import create_shared_search_blueprint
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
@@ -163,9 +164,9 @@ def _get_operator_service():
     with _operator_service_lock:
         if _operator_service is not None:
             return _operator_service
-        from service.operator_service import OperatorService
-        from service.graph_service import GraphService
         from extraction.operators import default_registry
+        from service.graph_service import GraphService
+        from service.operator_service import OperatorService
 
         cfg = get_config()
         if cfg.storage_backend == "sql":
@@ -488,6 +489,9 @@ def _emit_perf_stage(
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+app.register_blueprint(create_shared_search_blueprint(_get_service, _error_response))
+
 
 @app.route("/api/v1/compose", methods=["POST"])
 def handle_compose():

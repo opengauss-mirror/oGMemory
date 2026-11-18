@@ -317,3 +317,4 @@ class ExtractionRetryWorker:
         self._stop.set()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout)
+        return self._thread is None or not self._thread.is_alive()

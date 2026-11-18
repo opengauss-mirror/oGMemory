@@ -79,6 +79,33 @@ def test_agent_memory_checkpoint_and_completion_receipt(mock_sql_outbox_store):
     assert conn.commit.call_count == 2
 
 
+def test_shared_projection_completion_publishes_matching_revision(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        "shared-projection", "UPSERT_CONTEXT", "ctx://acme/spaces/ops/memories/pool",
+        {"content_rev": 3}, "PROCESSING",
+    )
+    claimed_at = datetime(2026, 11, 6, 10, 0, tzinfo=UTC)
+    event._outbox_claim = ("worker", claimed_at)
+    cursor.rowcount = 1
+    cursor.fetchone.return_value = ("acme",)
+
+    store.mark_done(event, event.uri)
+
+    receipt_sql, receipt_params = cursor.execute.call_args_list[0].args
+    assert "status = 'DONE'" in receipt_sql
+    assert receipt_params == (event.event_id, event.uri, "worker", claimed_at)
+    ready_sql, ready_params = cursor.execute.call_args.args
+    assert "version = %s" in ready_sql
+    assert "metadata->>'shared_projection_event_id'" in ready_sql
+    assert ready_params == (
+        {"shared_projection_ready": True, "indexed_content_rev": 3},
+        event.uri, event.event_id, 3,
+    )
+    assert cursor.execute.call_args_list[1].args[1] == ("acme",)
+    conn.commit.assert_called_once()
+
+
 def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
     created_at = datetime(2026, 4, 17, 10, 0, tzinfo=UTC)

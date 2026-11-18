@@ -831,10 +831,20 @@ class SQLOutboxStore(PoolAdapterMixin):
                     cur.execute(
                         f"UPDATE outbox_events SET status = 'DONE', payload = {PROJECTION_RECEIPT_SQL}, "
                         "worker_id = NULL, locked_at = NULL "
-                        "WHERE event_id = %s AND uri = %s" + ownership,
+                        "WHERE event_id = %s AND uri = %s" + ownership + " RETURNING account_id",
                         (event.event_id, node_uri, *claim),
                     )
                 self._check_claim_update(cur, event, node_uri)
+                if (cur.rowcount and event.event_type == EventType.UPSERT_CONTEXT.value
+                        and event.payload.get("content_rev") is not None):
+                    account_id = cur.fetchone()[0]
+                    cur.execute("SELECT set_config('app.account_id', %s, true)", (account_id,))
+                    cur.execute("""UPDATE context_nodes SET metadata = metadata || %s::jsonb
+                        WHERE uri = %s AND owner_space LIKE 'space:%%' AND status = 'ACTIVE'
+                          AND metadata->>'shared_projection_event_id' = %s AND version = %s""",
+                        (Json({"shared_projection_ready": True,
+                               "indexed_content_rev": event.payload["content_rev"]}),
+                         node_uri, event.event_id, event.payload["content_rev"]))
             conn.commit()
         except Exception:
             conn.rollback()

@@ -758,6 +758,7 @@ class OgMemConfig:
 
     # Explicit opt-in, independent of the generative LLM and eager/lazy mode.
     decision: DecisionConfig | None = None
+    shared_spaces_enabled: bool = False
 
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
@@ -1087,6 +1088,11 @@ class OgMemConfig:
             raise ValueError(
                 "skill sedimentation requires storage.backend=agfs or sql"
             )
+        if self.shared_spaces_enabled:
+            if self.storage_backend not in {"sql", "agfs"} or not self.sql_connection_string:
+                raise ValueError("shared spaces require SQL metadata connection and sql or agfs storage")
+            if not self.role_control_enabled or not (self.root_api_key or self.admin_api_keys):
+                raise ValueError("shared spaces require role control and configured privileged keys")
         if (self.skill_sedimentation_enabled and self.storage_backend == "sql"
                 and not self.sql_connection_string):
             raise ValueError("skill sedimentation requires storage.sql.connection_string")
@@ -1966,6 +1972,10 @@ class OgMemConfig:
             # Storage backend. STORAGE_DB_CONNECTION_STRING is the canonical
             # env name (paired with the STORAGE_DB_* deploy vars); the older
             # SQL_CONNECTION_STRING spelling remains as a legacy alias.
+            shared_spaces_enabled=_resolve_bool(
+                (raw.get("shared_spaces") or {}).get("enabled"),
+                "OGMEM_SHARED_SPACES_ENABLED", False,
+            ),
             storage_backend=_resolve(
                 storage.get("backend"),
                 "STORAGE_BACKEND",

@@ -1,6 +1,7 @@
 """Control-plane writes preserve team-space references on real SQL storage."""
 import json
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -52,6 +53,7 @@ def control_store(registry_connection):
     store = SQLControlPlaneStore.__new__(SQLControlPlaneStore)
     store._get_connection = lambda: conn
     store._return_connection = lambda connection: None
+    store._snapshots = threading.local()
     store._dialect = resolve_sql_dialect('opengauss' if os.environ.get('TEST_OPENGAUSS_CONNECTION_STRING') else 'postgresql')
     return store
 
@@ -73,7 +75,7 @@ def test_registry_writes_with_space_references(registry_connection, control_stor
         ({'method': 'create_account', 'account_id': 'second', 'admin_user_id': 'admin'}, lambda: manager.create_account('second', 'admin')),
         ({'method': 'register_user', 'account_id': 'tenant', 'user_id': 'bob'}, lambda: manager.register_user('tenant', 'bob')),
         ({'method': 'set_role', 'account_id': 'tenant', 'user_id': 'alice', 'role': 'root'}, lambda: manager.set_role('tenant', 'alice', 'root')),
-        ({'method': 'write_agents', 'account_id': 'tenant', 'agent_ids': ['bot', 'helper']}, lambda: store.write_json(store.agents_path('tenant'), {'agents': {key: {'owner_user_id': 'alice', 'created_at': '2026-11-14T00:00:00Z'} for key in ['bot', 'helper']}})),
+        ({'method': 'write_agents', 'account_id': 'tenant', 'agent_ids': ['helper']}, lambda: store.write_json(store.agents_path('tenant'), {'agents': {'helper': {'owner_user_id': 'alice', 'created_at': '2026-11-14T00:00:00Z'}}})),
     ]:
         try:
             call()
@@ -83,7 +85,7 @@ def test_registry_writes_with_space_references(registry_connection, control_stor
         print(json.dumps({'request': request, 'response': response}))
         assert response == {'success': True}
     cur.execute("SELECT authz_rev FROM cp_accounts WHERE account_id='tenant'")
-    assert cur.fetchone()[0] == 7
+    assert cur.fetchone()[0] == 10
     assert {row['account_id'] for row in manager.get_accounts()} == {'tenant', 'second'}
     assert {row['user_id']: row['role'] for row in manager.get_users('tenant')} == {'alice': 'root', 'bob': 'user'}
     cur.execute("SELECT agent_id FROM cp_agents WHERE account_id='tenant' ORDER BY agent_id")
@@ -93,7 +95,7 @@ def test_registry_writes_with_space_references(registry_connection, control_stor
     assert manager.set_role('tenant', 'bob', 'admin')
     assert manager.delete_user('tenant', 'bob')
     assert [u['user_id'] for u in manager.get_users('tenant')] == ['alice']
-    print(json.dumps({'account_authz_rev': 7, 'deleted_user': 'bob', 'remaining_users': ['alice']}))
+    print(json.dumps({'account_authz_rev': 10, 'deleted_user': 'bob', 'remaining_users': ['alice']}))
 
 
 @pytest.mark.parametrize('reference', ['member', 'owner', 'grantor'])

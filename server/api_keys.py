@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from server.control_plane_store import ControlPlaneStore
 
@@ -25,7 +25,7 @@ class APIKeyManager:
         payload.setdefault("accounts", {})
         if account_id in payload["accounts"]:
             raise ValueError(f"account already exists: {account_id}")
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         payload["accounts"][account_id] = {"created_at": now, "status": "active"}
         self._store.write_json(self._store.global_accounts_path(), payload)
         return self.register_user(account_id, admin_user_id, "admin")
@@ -39,7 +39,7 @@ class APIKeyManager:
         ]
 
     def register_user(self, account_id: str, user_id: str, role: str = "user") -> str:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         key = secrets.token_hex(16)
         path = self._store.users_path(account_id)
         payload = self._store.read_json(path, {"users": {}})
@@ -76,6 +76,9 @@ class APIKeyManager:
         return True
 
     def resolve_user_key(self, api_key: str, account_hint: str | None = None) -> dict | None:
+        lookup = getattr(self._store, "resolve_user_key", None)
+        if lookup is not None:
+            return lookup(api_key, account_hint)
         accounts = [account_hint] if account_hint else [row["account_id"] for row in self.get_accounts()]
         for account_id in filter(None, accounts):
             payload = self._store.read_json(self._store.users_path(account_id), {"users": {}})

@@ -155,6 +155,9 @@ class SeedRetriever:
                         global_results, bm25_results
                     )
 
+        shared_prefix = f"ctx://{ctx.account_id}/spaces/"
+        global_results = [hit for hit in global_results if not hit.uri.startswith(shared_prefix)]
+
         if not self.config.expand_hierarchy or not query_vector:
             # Hierarchy expansion is vector-driven: _merge_starting_points
             # yields starting points that HierarchicalSearcher resolves via
@@ -162,7 +165,7 @@ class SeedRetriever:
             # query vector — pgvector cannot execute a match against
             # []::vector. Without a usable query vector (embedder degraded,
             # or lexical-only mode) return the lexical L2 hits directly and
-            # skip the semantic traversal (review item 7).
+            # skip the semantic traversal.
             return SeedResult(
                 initial_candidates=[hit for hit in global_results if hit.level == 2],
                 query_vector=query_vector,
