@@ -207,10 +207,10 @@ class AGFSStorage:
     RUNTIME_DIRS = {".outbox-done", "_system", ".trace"}
 
     def __init__(self, cfg, client=None):
-        from pyagfs import AGFSClient
+        from fs.agfs_adapter.client import create_agfs_client
 
         self.cfg = cfg
-        self.client = client or AGFSClient(api_base_url=cfg.agfs_base_url)
+        self.client = client if client is not None else create_agfs_client(cfg)
         self.prefix = cfg.agfs_mount_prefix.rstrip("/")
 
     def description(self):

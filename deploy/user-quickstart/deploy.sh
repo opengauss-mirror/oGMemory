@@ -661,7 +661,6 @@ mcp:
   allowed_hosts: ["ogmemory", "localhost", "127.0.0.1"]
 
 agfs:
-  base_url: "http://127.0.0.1:1833"
   mount_prefix: "/local/plugin"
 
 index:

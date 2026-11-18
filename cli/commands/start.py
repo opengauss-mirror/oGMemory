@@ -31,7 +31,7 @@ def start_headless(args) -> int:
     ensure_data_dirs(root)
     env, d = os.environ, root / ".ogmem_data"
     ce_port = cfg.http_port
-    uses_agfs = cfg.storage_backend == "agfs"
+    uses_agfs_server = cfg.storage_backend == "agfs" and cfg.agfs_transport == "http"
     dry, daemon = getattr(args, "dry_run", False), getattr(args, "daemon", False)
     def start(name, cmd, pidf, logf, port, kind, cwd):
         if dry:
@@ -44,7 +44,7 @@ def start_headless(args) -> int:
         except RuntimeError as e:
             print(fail(str(e)))
             return False
-    if uses_agfs:
+    if uses_agfs_server:
         agfs_dir = Path(env.get("AGFS_SERVER_DIR", str(root / "agfs")))
         agfs_bin = Path(getattr(args, "agfs_bin", None) or env.get("AGFS_SERVER_BIN", str(agfs_dir / "build" / "agfs-server")))
         agfs_cfg = Path(env.get("AGFS_SERVER_CONFIG", str(agfs_dir / "config.yaml")))
@@ -60,7 +60,7 @@ def start_headless(args) -> int:
             return 1
         elif not start("AGFS", [str(agfs_bin), "-c", str(agfs_cfg), "-addr", f":{agfs_port}"], d / "agfs.pid", d / "logs" / "agfs.log", agfs_port, "agfs", agfs_dir):
             return 1
-    else:
+    elif cfg.storage_backend == "sql":
         from cli.lib.db_setup import check_postgresql
 
         if not cfg.sql_connection_string:
@@ -84,11 +84,11 @@ def start_headless(args) -> int:
             return 1
         print(ok(f"ContextEngine started (PID {pid})"))
     status = "PLANNED" if dry else "UP"
-    if uses_agfs:
+    if uses_agfs_server:
         print(f"\n  AGFS            http://127.0.0.1:{agfs_port}  {status}")
     print(f"\n  ContextEngine   http://127.0.0.1:{ce_port}  {status}\n")
     if not dry:
-        agfs_log = f"{CYAN}.ogmem_data/logs/agfs.log{NC}  " if uses_agfs else ""
+        agfs_log = f"{CYAN}.ogmem_data/logs/agfs.log{NC}  " if uses_agfs_server else ""
         print(f"  Logs: {agfs_log}{CYAN}.ogmem_data/logs/context_engine.log{NC}\n  Stop: {YELLOW}ogmem stop local{NC}")
     if daemon or dry:
         print(ok("Started in daemon mode" if daemon else "Dry run complete"))
@@ -97,7 +97,7 @@ def start_headless(args) -> int:
     def shutdown(s, f):
         print("\nShutting down...")
         from cli.lib.process import stop_service
-        if uses_agfs:
+        if uses_agfs_server:
             stop_service(d / "agfs.pid", agfs_port)
         from cli.lib.local_runtime import stop_recorded_service
         stop_recorded_service(root)

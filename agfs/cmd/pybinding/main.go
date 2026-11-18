@@ -3,7 +3,6 @@ package main
 /*
 #include <stdlib.h>
 #include <stdint.h>
-#include <string.h>
 */
 import "C"
 
@@ -200,9 +199,7 @@ func AGFS_Read(clientID int64, path *C.char, offset C.int64_t, size C.int64_t, o
 	}
 
 	if len(data) > 0 {
-		buf := C.malloc(C.size_t(len(data)))
-		C.memcpy(buf, unsafe.Pointer(&data[0]), C.size_t(len(data)))
-		*outData = (*C.char)(buf)
+		*outData = (*C.char)(C.CBytes(data))
 		*outSize = C.int64_t(len(data))
 	} else {
 		*outData = nil

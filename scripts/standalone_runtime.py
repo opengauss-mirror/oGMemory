@@ -134,10 +134,11 @@ def main():
         # This entrypoint includes AGFS and its standalone index runner.
         if cfg.storage_backend != 'agfs' or cfg.retrieval_hybrid_enabled:
             raise ValueError('standalone runtime requires AGFS storage without SQL hybrid retrieval')
-        Path('/data/agfs').mkdir(parents=True, exist_ok=True)
         os.chdir('/opt/ogmem')
-        supervisor.start('AGFS', ['/opt/agfs/agfs-server', '-c', '/opt/agfs/config.yaml'])
-        supervisor.wait_ready(cfg.agfs_base_url.rstrip('/') + '/api/v1/files?path=/serverinfo/version')
+        if cfg.uses_bundled_agfs_server:
+            Path('/data/agfs').mkdir(parents=True, exist_ok=True)
+            supervisor.start('AGFS', ['/opt/agfs/agfs-server', '-c', '/opt/agfs/config.yaml'])
+            supervisor.wait_ready(cfg.agfs_base_url.rstrip('/') + '/api/v1/files?path=/serverinfo/version')
         supervisor.start('IndexService', [sys.executable, '/opt/ogmem/scripts/run_index_service.py'])
         if cfg.mcp_enabled:
             supervisor.start('MCP', [sys.executable, '-m', 'cli.main', 'mcp',

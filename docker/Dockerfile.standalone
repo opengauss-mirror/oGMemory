@@ -111,7 +111,11 @@ WORKDIR /src/agfs
 COPY agfs/ ./
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /agfs-server ./cmd/server
 
+RUN CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags="-w -s" -o /libagfsbinding.so ./cmd/pybinding
+
 FROM runtime AS standalone-agfs
+ENV AGFS_DEFAULT_TRANSPORT=native
+COPY --from=agfs-builder /libagfsbinding.so /opt/agfs/libagfsbinding.so
 COPY --chown=ogmem:ogmem --from=agfs-builder /agfs-server /opt/agfs/agfs-server
 COPY --chown=ogmem:ogmem config/agfs/config.reference.yaml /opt/agfs/config.yaml
 USER root

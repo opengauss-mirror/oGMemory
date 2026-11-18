@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --timeout 120 \
 
 FROM agfs-deps AS agfs-builder
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /out/agfs-server ./cmd/server
+RUN CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags="-w -s" -o /out/libagfsbinding.so ./cmd/pybinding
 
 FROM python-deps AS runtime
 
@@ -50,6 +51,7 @@ COPY scene/      /opt/ogmem/scene/
 
 # Copy AGFS binary and config
 COPY --from=agfs-builder /out/agfs-server /opt/agfs/agfs-server
+COPY --from=agfs-builder /out/libagfsbinding.so /opt/agfs/libagfsbinding.so
 COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
 
 # Copy entrypoint
@@ -66,7 +68,7 @@ RUN chmod -R 755 /opt/agfs /opt/ogmem
 # Environment defaults (kept for backward compat; YAML config takes priority)
 ENV PYTHONPATH=/opt/ogmem
 ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
-ENV AGFS_BASE_URL=http://127.0.0.1:1833
+ENV AGFS_DEFAULT_TRANSPORT=native
 ENV AGFS_MOUNT_PREFIX=/local/plugin
 ENV CONTEXTENGINE_PROVIDER=openai
 ENV VECTOR_DB_TYPE=opengauss

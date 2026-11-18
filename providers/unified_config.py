@@ -20,6 +20,7 @@ import subprocess  # nosec B404
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from providers.decision.config import DecisionConfig
 
@@ -654,6 +655,9 @@ class OgMemConfig:
     skill_sync_target: str | None = None
 
     # -- AGFS (used when storage_backend=agfs) ---------------------------------
+    agfs_transport: str = "http"
+    agfs_native_library: str = "/opt/agfs/libagfsbinding.so"
+    agfs_native_config: str = "/opt/agfs/config.yaml"
     agfs_base_url: str = "http://127.0.0.1:1833"
     agfs_mount_prefix: str = "/local"
 
@@ -764,7 +768,16 @@ class OgMemConfig:
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
+    @property
+    def uses_bundled_agfs_server(self) -> bool:
+        if self.storage_backend != "agfs" or self.agfs_transport != "http":
+            return False
+        url = urlsplit(self.agfs_base_url)
+        return url.scheme == "http" and url.hostname in {"127.0.0.1", "localhost"} and url.port == 1833
+
     def __post_init__(self) -> None:
+        if self.agfs_transport not in {"http", "native"}:
+            raise ValueError("agfs.transport must be http or native")
         if isinstance(self.decision, dict):
             self.decision = DecisionConfig.from_mapping(self.decision)
         elif self.decision is not None and not isinstance(self.decision, DecisionConfig):
@@ -1209,6 +1222,8 @@ class OgMemConfig:
         storage = raw.get("storage") or {}
         graph = raw.get("graph") or {}
         agfs = raw.get("agfs") or {}
+        agfs_url = _resolve(agfs.get("base_url"), "AGFS_BASE_URL", None)
+        agfs_default_transport = "http" if agfs_url else os.getenv("AGFS_DEFAULT_TRANSPORT", "http")
         idx = raw.get("index") or {}
         ident = raw.get("identity") or {}
         auth = raw.get("auth") or {}
@@ -2103,11 +2118,10 @@ class OgMemConfig:
                 sedimentation.get("sync_target"), "OGMEM_SKILL_SYNC_TARGET", None,
             ),
             # AGFS
-            agfs_base_url=_resolve(
-                agfs.get("base_url"),
-                "AGFS_BASE_URL",
-                "http://127.0.0.1:1833",
-            ),
+            agfs_base_url=agfs_url or "http://127.0.0.1:1833",
+            agfs_transport=_resolve(agfs.get("transport"), "AGFS_TRANSPORT", agfs_default_transport),
+            agfs_native_library=_resolve(agfs.get("native_library"), "AGFS_NATIVE_LIBRARY", cls.agfs_native_library),
+            agfs_native_config=_resolve(agfs.get("native_config"), "AGFS_NATIVE_CONFIG", cls.agfs_native_config),
             agfs_mount_prefix=_resolve(
                 agfs.get("mount_prefix"),
                 "AGFS_MOUNT_PREFIX",

@@ -10,7 +10,6 @@ Usage (in shell):
 
 import os
 import sys
-from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,16 +26,7 @@ except Exception:
     sys.exit(1)
 
 print(f'export OGMEM_HTTP_PORT="{cfg.http_port}"')
-# Only the legacy local default is managed by this image. External AGFS
-# endpoints and SQL deployments must not spawn an unrelated local server.
-agfs_url = urlsplit(cfg.agfs_base_url)
-bundled_agfs = (
-    cfg.storage_backend == "agfs"
-    and agfs_url.scheme == "http"
-    and agfs_url.hostname in {"127.0.0.1", "localhost"}
-    and agfs_url.port == 1833
-)
-print(f'export OGMEM_START_BUNDLED_AGFS="{str(bundled_agfs).lower()}"')
+print(f'export OGMEM_START_BUNDLED_AGFS="{str(cfg.uses_bundled_agfs_server).lower()}"')
 print(f'export OGMEM_WORKERS="{cfg.workers}"')
 print(f'export OGMEM_THREADS="{cfg.threads}"')
 print(f'export OGMEM_MCP_ENABLED="{str(cfg.mcp_enabled).lower()}"')
