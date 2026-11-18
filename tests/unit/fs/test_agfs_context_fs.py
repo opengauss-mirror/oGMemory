@@ -3,6 +3,7 @@
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import replace
 from threading import Barrier, Event, RLock
 from types import SimpleNamespace
@@ -2081,6 +2082,95 @@ class TestReadNode:
         assert node.content == "# Alice's Profile\n\nFull content"
         assert node.metadata["ogmemory_managed"] is True
         assert node.metadata["package_files"] == [{"path": "scripts/run.py"}]
+
+    def test_read_nodes_preserves_canonical_fields_and_unique_reads(self):
+        uris = [f"ctx://acme/users/alice/memories/entities/person_{i}" for i in range(2)]
+
+        def read(path):
+            value = self._mock_read(path)
+            if path.endswith(self.fs.FILE_META):
+                meta = json.loads(value)
+                meta["uri"] = next(uri for uri in uris if uri.rsplit("/", 1)[-1] in path)
+                value = json.dumps(meta).encode()
+            return value
+
+        self.mock_client.read.side_effect = read
+        expected = {uri: self.fs.read_node(uri, self.ctx) for uri in uris}
+        self.mock_client.read.reset_mock()
+
+        actual = self.fs.read_nodes(uris + uris, self.ctx)
+
+        assert actual == expected
+        metadata_reads = [call.args[0] for call in self.mock_client.read.call_args_list
+                          if call.args[0].endswith(self.fs.FILE_META)]
+        assert len(metadata_reads) == 4
+
+    def test_read_nodes_shares_eight_workers_and_preserves_request_context(self):
+        context = ContextVar("read_batch_context")
+        barrier = Barrier(8, timeout=10)
+        state_lock = RLock()
+        active = peak = 0
+        active_by_batch = {"first": 0, "second": 0}
+        peak_by_batch = dict(active_by_batch)
+        read_node = self.fs.read_node
+
+        def read(uri, ctx):
+            nonlocal active, peak
+            label = context.get()
+            assert label == uri.rsplit("/", 1)[-1].split("_")[0]
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+                active_by_batch[label] += 1
+                peak_by_batch[label] = max(peak_by_batch[label], active_by_batch[label])
+            try:
+                barrier.wait()
+                return read_node(uri, ctx)
+            finally:
+                with state_lock:
+                    active -= 1
+                    active_by_batch[label] -= 1
+
+        self.fs.read_node = read
+
+        def batch(label):
+            context.set(label)
+            uris = [f"ctx://acme/users/alice/memories/entities/{label}_{i}" for i in range(16)]
+            return self.fs.read_nodes(uris, self.ctx)
+
+        with ThreadPoolExecutor(max_workers=2) as requests:
+            results = list(requests.map(batch, ["first", "second"]))
+
+        assert peak == 8
+        assert peak_by_batch == {"first": 4, "second": 4}
+        assert all(len(batch) == 16 for batch in results)
+        assert all(isinstance(node, ContextNode) for batch in results for node in batch.values())
+
+    def test_read_nodes_preserves_sql_mutation_thread_ownership(self):
+        from fs.sql_adapter.session_mutation import _ACTIVE, SQLSessionGuard, active_session_guard
+
+        guard = SQLSessionGuard(SimpleNamespace(closed=False), "dbname=memory", self.ctx, 42)
+        read_node = self.fs.read_node
+        checked_uris = []
+
+        def read(uri, ctx):
+            assert active_session_guard() is guard
+            guard.check_context(ctx)
+            checked_uris.append(uri)
+            return read_node(uri, ctx)
+
+        self.fs.read_node = read
+        uris = [f"ctx://acme/users/alice/memories/entities/person_{i}" for i in range(8)]
+        token = _ACTIVE.set(guard)
+        try:
+            results = self.fs.read_nodes(uris, self.ctx)
+            guard.check_active()
+        finally:
+            _ACTIVE.reset(token)
+
+        assert checked_uris == uris
+        assert list(results) == uris
+        assert all(isinstance(node, ContextNode) for node in results.values())
 
     def test_read_node_not_found(self):
         """Test that reading non-existent node raises NodeNotFoundError."""

@@ -66,6 +66,20 @@ def unit_memory():
     return ctx, node, user, fs
 
 
+@pytest.mark.parametrize("storage_backend", ["agfs", "sql"])
+def test_batch_read_projects_units_from_one_canonical_node(unit_memory, storage_backend):
+    ctx, node, user, fs = unit_memory
+    fs.read_nodes = Mock(side_effect=lambda uris, ctx: {uri: fs.nodes[uri] for uri in uris})
+    reader = ContextReader(fs, storage_backend=storage_backend)
+    requests = [(node.uri, "batch"), (node.uri, "cursor"), (user.uri, None)]
+    expected = {key: reader.read(key[0], ctx, unit_key=key[1]) for key in requests}
+
+    actual = reader.read_many(requests + requests, ctx)
+
+    assert actual == expected
+    fs.read_nodes.assert_called_once_with([node.uri, user.uri], ctx)
+
+
 @pytest.mark.parametrize("expand_hierarchy", [False, True])
 def test_mixed_query_retains_each_tool_unit_and_user_memory(unit_memory, expand_hierarchy):
     ctx, node, user, fs = unit_memory

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from itertools import islice
 from typing import Protocol
 
 from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
@@ -229,13 +230,16 @@ class ResultRanker:
                 seen_uris[identity] = hit
         l2_only = list(seen_uris.values())
 
-        is_visible = getattr(context_reader, "is_visible", None)
-        if ctx is not None and callable(is_visible):
-            l2_only = [hit for hit in l2_only if is_visible(hit.uri, ctx)]
-
         graph_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") == "graph_neighbor"]
         vector_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") != "graph_neighbor"]
         ranked = self._ranker.rank(typed_query, vector_hits)
+        is_visible = getattr(context_reader, "is_visible", None)
+        if ctx is not None and callable(is_visible):
+            visible = (item for item in ranked if is_visible(item.hit.uri, ctx))
+            ranked = list(islice(visible, typed_query.top_k)) if (
+                direct_evidence_reserve is None and typed_query.top_k >= 0
+            ) else list(visible)
+            graph_hits = [hit for hit in graph_hits if is_visible(hit.uri, ctx)]
         top = select_scene_evidence(
             ranked, typed_query.top_k, direct_evidence_reserve,
             lambda item: bool(item.hit.metadata.get("scene_expanded")),
@@ -271,12 +275,26 @@ class ResultRanker:
         unavailable = set()
         if fill_content_for_top_k > 0 and context_reader and ctx:
             top_k_to_fill = min(fill_content_for_top_k, len(blocks))
+            filled = None
+            read_many = getattr(context_reader, "read_many", None)
+            if callable(read_many):
+                requests = [(block.uri, memory_unit_key(block.metadata) or None)
+                            for block in blocks[:top_k_to_fill]]
+                try:
+                    filled = read_many(requests, ctx)
+                except Exception as exc:
+                    logger.debug("batch content fill failed: %s", exc)
             for i in range(top_k_to_fill):
                 block = blocks[i]
                 try:
                     unit_key = memory_unit_key(block.metadata)
-                    content_block = context_reader.read(
-                        block.uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
+                    if filled is None:
+                        content_block = context_reader.read(
+                            block.uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
+                    else:
+                        content_block = filled[block.uri, unit_key or None]
+                        if isinstance(content_block, Exception):
+                            raise content_block
                     block.metadata.update(content_block.metadata or {})
                     block.context_type = content_block.context_type
                     if content_block.overview:

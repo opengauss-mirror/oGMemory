@@ -12,9 +12,11 @@ Returns a pure structured SearchMemoryResult.
 
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import copy_context
 
 from core.errors import RetrievalError
 from core.models import (
@@ -26,14 +28,21 @@ from core.models import (
     SearchMemoryResult,
     SeedHit,
     SeedResult,
-    SeedHit,
     TypedQuery,
 )
+from core.uri_parser import strip_l2_suffix
 from retrieval.candidate_pool import candidate_top_k
+from retrieval.edge_retrieval_contract import (
+    GraphExpansionOutcome,
+    RetrievalOrigin,
+    graph_snapshot_matches,
+    matches_context_type,
+)
+from retrieval.graph_retriever import GraphRetrievalReport, OneHopRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.hotness import blend_hotness
 from retrieval.identity import memory_identity
-from retrieval.query_planner import QueryPlanner
+from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.scene_stage import SceneRetrievalStage
 from retrieval.seed_retriever import RetrievalConfigError, SeedRetriever
@@ -41,11 +50,7 @@ from retrieval.trace import RetrievalTrace, TraceTimer
 from scene.retrieval import SceneRanker, SceneSearchSource, select_scene_evidence
 
 logger = logging.getLogger(__name__)
-from core.uri_parser import strip_l2_suffix
-from retrieval.graph_retriever import GraphRetrievalReport, OneHopRetriever
-from retrieval.edge_retrieval_contract import (
-    GraphExpansionOutcome, RetrievalOrigin, graph_snapshot_matches, matches_context_type,
-)
+_SEED_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="retrieval-seed")
 
 
 class RetrievalPipeline:
@@ -98,6 +103,7 @@ class RetrievalPipeline:
         collect_graph_supplement: bool = False,
         use_scene: bool | None = None,
         final_top_k: int | None = None,
+        query_vector: list[float] | None = None,
     ) -> SearchMemoryResult:
         if use_scene is not None and not isinstance(use_scene, bool):
             raise ValueError("use_scene must be boolean")
@@ -115,16 +121,14 @@ class RetrievalPipeline:
         )
 
         # Stage 2
-        all_seed_results: list[SeedResult] = []
-        query_vectors: dict[str, list[float]] = {}
-        level_counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0}
         for tq in typed_queries:
             tq.memory_directories = memory_directories
-            sr = self._run_seed(
-                tq, ctx, trace, mode=mode, query_vector=query_vectors.get(tq.text),
-            )
-            query_vectors[tq.text] = sr.query_vector
-            all_seed_results.append(sr)
+        all_seed_results = self._run_seeds(
+            typed_queries, ctx, trace, mode=mode,
+            query_vectors={sanitize_query(query): query_vector} if query_vector is not None else {},
+        )
+        level_counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0}
+        for sr in all_seed_results:
             for h in sr.starting_points:
                 level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
             for h in sr.initial_candidates:
@@ -461,6 +465,44 @@ class RetrievalPipeline:
         trace.add_stage(st)
         return queries
 
+    def _run_seeds(self, queries, ctx, trace, *, mode, query_vectors):
+        from fs.sql_adapter.session_mutation import active_session_guard
+
+        embed_query = getattr(self.seed_retriever, "embed_query", None)
+        if len(queries) < 2 or not callable(embed_query) or active_session_guard() is not None:
+            results = []
+            for tq in queries:
+                result = self._run_seed(
+                    tq, ctx, trace, mode=mode, query_vector=query_vectors.get(tq.text),
+                )
+                query_vectors[tq.text] = result.query_vector
+                results.append(result)
+            return results
+
+        with TraceTimer("query_embedding") as st:
+            for tq in queries:
+                if tq.text not in query_vectors:
+                    query_vectors[tq.text] = embed_query(tq.text)
+                    st.input_count += 1
+            st.output_count = st.input_count
+        trace.add_stage(st)
+        branch_traces = [RetrievalTrace(request_id=trace.request_id) for _ in queries]
+        futures = [
+            _SEED_POOL.submit(
+                copy_context().run, self._run_seed, tq, ctx, branch_trace,
+                mode=mode, query_vector=query_vectors[tq.text],
+            )
+            for tq, branch_trace in zip(queries, branch_traces)
+        ]
+        try:
+            results = [future.result() for future in futures]
+        finally:
+            wait(futures)
+        for branch_trace in branch_traces:
+            for stage in branch_trace.stages:
+                trace.add_stage(stage)
+        return results
+
     def _run_seed(self, tq, ctx, trace, *, mode, query_vector=None) -> SeedResult:
         with TraceTimer("seed_retrieval") as st:
             st.input_count = 1
@@ -572,6 +614,9 @@ class RetrievalPipeline:
                 (tq, leaf_hits, merged_seed, None)
                 for tq in (typed_queries or [TypedQuery(text="", context_type="", categories=[])])
             ]
+            if query_results is None and type(self.assembly) is ResultRanker:
+                inputs = list({(tq.text, tq.top_k): (tq, hits, seed, reserve)
+                               for tq, hits, seed, reserve in inputs}.values())
             for tq, query_hits, query_seed, reserve in inputs:
                 if query_results is not None and str(tq.context_type).upper() == "MEMORY":
                     # Scene candidates keep their per-query reserve. Graph

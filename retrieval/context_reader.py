@@ -98,7 +98,7 @@ class ContextReader:
     ) -> dict[tuple[str, str | None], RetrievedBlock | Exception]:
         results = {}
         read_nodes = getattr(self._fs, "read_nodes", None)
-        if self._storage_backend == "sql" and callable(read_nodes):
+        if callable(read_nodes):
             read_uris = {}
             for uri, unit_key in requests:
                 key = (uri, unit_key)

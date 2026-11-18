@@ -117,6 +117,15 @@ def test_compose_scores_only_successfully_hydrated_acl_checked_memories():
 
     reader = Mock()
     reader.read_memory.side_effect = read
+    def read_many(requests, ctx):
+        results = {}
+        for uri, unit_key in requests:
+            try:
+                results[uri, unit_key] = reader.read_memory(uri, ctx)
+            except Exception as exc:
+                results[uri, unit_key] = exc
+        return results
+    reader.read_memories.side_effect = read_many
     svc.get_read_api = Mock(return_value=reader)
     svc._decision_client = client([0.2, 0.8])
     ctx = RequestContext("a", "u", "agent", "session", "trace")
