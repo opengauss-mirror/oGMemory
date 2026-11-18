@@ -1,0 +1,18 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["server/memory_viewer_static"],
+  "locale": "zh-CN",
+  "canonicalMap": "tests/e2e/shared_spaces_ux_contract.md",
+  "requiredCapabilities": ["Select/Listbox", "Date", "Form", "Scrollbar", "Toast", "CRUD"],
+  "ownership": {"Select/Listbox": "native", "Date": "native"},
+  "requiredCommands": ["syntax", "layout", "permissions", "design"],
+  "commands": {
+    "syntax": "node --check server/memory_viewer_static/spaces.js",
+    "layout": "node --test tests/e2e/shared_spaces_browser.cjs",
+    "permissions": "node --test tests/e2e/shared_spaces_permissions.cjs",
+    "design": "npx -y -p @google/design.md designmd lint docs/shared_spaces_ui_design.md"
+  },
+  "evidence": {
+    "crudFullFlow": "tests/e2e/shared_spaces_permissions.cjs"
+  }
+}
