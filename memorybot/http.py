@@ -27,7 +27,7 @@ from server.auth import AuthenticationError, AuthorizationError
 logger = logging.getLogger("ogmem.memorybot.http")
 
 
-def create_blueprint(get_service):
+def create_blueprint(get_service, *, inherit_upload_limit=True):
     bp = Blueprint("memorybot", __name__, static_folder="static", static_url_path="/bot/static")
     prefix = "/api/v1/bot"
 
@@ -41,7 +41,7 @@ def create_blueprint(get_service):
             )
         if request.path == prefix + "/files" and request.method == "POST":
             upload_limit = 51 * 1024 * 1024
-            configured_limit = request.max_content_length
+            configured_limit = request.max_content_length if inherit_upload_limit else None
             limit = upload_limit if configured_limit is None else min(upload_limit, configured_limit)
             request.stream = get_input_stream(request.environ, max_content_length=limit)
 
