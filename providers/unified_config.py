@@ -718,6 +718,9 @@ class OgMemConfig:
     tool_result_cache_hit_price_ratio: float = 0.1
 
     # -- Retrieval ------------------------------------------------------------
+    retrieval_mode: str = "default"
+    retrieval_agfs_fts_enabled: bool = True
+    retrieval_agfs_fts_ranker: str = "literal"
     retrieval_max_top_k: int = 50
     retrieval_default_top_k: int = 10
     retrieval_global_search_topk: int = 30
@@ -1116,6 +1119,19 @@ class OgMemConfig:
             )
         if not isinstance(self.retrieval_expand_hierarchy, bool):
             raise ValueError("retrieval_expand_hierarchy must be a boolean")
+        if self.retrieval_mode not in {"default", "agfs"}:
+            raise ValueError("retrieval.mode must be default or agfs")
+        if self.retrieval_agfs_fts_ranker not in {"literal", "sqlite_bm25"}:
+            raise ValueError("retrieval.agfs_fts_ranker must be literal or sqlite_bm25")
+        if self.agfs_retrieval_enabled:
+            if self.retrieval_agfs_fts_ranker == "sqlite_bm25" and not self.retrieval_agfs_fts_enabled:
+                raise ValueError("retrieval.agfs_fts_ranker=sqlite_bm25 requires agfs_fts_enabled")
+            if self.storage_backend != "agfs":
+                raise ValueError("retrieval.mode=agfs requires storage.backend=agfs")
+            if self.shared_spaces_enabled or self.code_retrieval_enabled or self.scene_enabled or self.skill_sedimentation_enabled:
+                raise ValueError(
+                    "retrieval.mode=agfs requires shared spaces, code retrieval, Scene and skill sedimentation to be disabled"
+                )
         if self.retrieval_hybrid_enabled and self.storage_backend != "sql":
             raise ValueError(
                 "hybrid retrieval requires storage.backend=sql for canonical backfill"
@@ -2401,6 +2417,13 @@ class OgMemConfig:
                 "OGMEM_RETRIEVAL_OWNER_SCOPE_FILTER_ENABLED",
                 False,
             ),
+            retrieval_mode=_resolve(retrieval.get("mode"), "OGMEM_RETRIEVAL_MODE", "default"),
+            retrieval_agfs_fts_enabled=_resolve_bool(
+                retrieval.get("agfs_fts_enabled"), "OGMEM_RETRIEVAL_AGFS_FTS_ENABLED", True,
+            ),
+            retrieval_agfs_fts_ranker=_resolve(
+                retrieval.get("agfs_fts_ranker"), "OGMEM_RETRIEVAL_AGFS_FTS_RANKER", "literal",
+            ),
             retrieval_hybrid_enabled=_resolve_bool(
                 retrieval.get("hybrid_enabled"),
                 "OGMEM_RETRIEVAL_HYBRID_ENABLED",
@@ -2480,6 +2503,10 @@ class OgMemConfig:
     # -------------------------------------------------------------------------
     # Convenience helpers
     # -------------------------------------------------------------------------
+
+    @property
+    def agfs_retrieval_enabled(self) -> bool:
+        return self.retrieval_mode == "agfs"
 
     @property
     def effective_code_retrieval_semantic_enabled(self) -> bool:

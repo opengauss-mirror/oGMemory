@@ -381,6 +381,7 @@ class SearchMemoryResult:
     typed_queries: list[TypedQuery] = field(default_factory=list)
     hits: list[RetrievedBlock] = field(default_factory=list)
     trace: Any = None
+    partial: bool = False
 
 
 @dataclass

@@ -67,8 +67,9 @@ def check_models(cfg):
         )
         if result.get('ok') is not True:
             raise ValueError('LLM did not return the expected JSON')
-    validate_embedding(providers.create_embedder().embed_texts(['deployment connectivity check']),
-                       cfg.opengauss_dimension)
+    if not cfg.agfs_retrieval_enabled:
+        validate_embedding(providers.create_embedder().embed_texts(['deployment connectivity check']),
+                           cfg.opengauss_dimension)
 
 
 def config_path(resolved=Path("/tmp/ogmem.resolved.yaml")):
@@ -85,7 +86,9 @@ def main():
         from providers.unified_config import OgMemConfig
         os.environ["OGMEM_CONFIG"] = config_path()
         cfg = OgMemConfig.load(os.environ["OGMEM_CONFIG"])
-        checks = {'http_agfs': lambda: check_http(cfg), 'database_vector': lambda: check_database(cfg)}
+        checks = {'http_agfs': lambda: check_http(cfg)}
+        if not cfg.agfs_retrieval_enabled:
+            checks['database_vector'] = lambda: check_database(cfg)
         if cfg.mcp_enabled:
             checks['mcp_listener'] = lambda: check_mcp(cfg)
         if args.models:

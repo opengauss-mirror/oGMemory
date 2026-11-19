@@ -321,6 +321,11 @@ skills:
 
 # ---- Retrieval [all] ----
 retrieval:
+  # AGFS file retrieval uses storage.backend=agfs.
+  # mode: agfs
+  # SQLite FTS5 candidate index for AGFS mode; builds per scope on first eligible query.
+  agfs_fts_enabled: true
+  agfs_fts_ranker: literal       # AGFS only: literal / sqlite_bm25
   # Opt-in Jev-compatible evidence reranking; requires decision configuration.
   decision_rerank_enabled: false
   # Service-instance setting; restart every worker after changing it.

@@ -10,6 +10,7 @@ Phase 1 implementation:
 - P1-W4: read_node/exists/list_children/delete_node
 """
 
+import codecs
 import hashlib
 import json
 import logging
@@ -565,7 +566,7 @@ class AGFSContextFS:
         "session_state_layout",
     }
 
-    def __init__(self, client: AGFSClient, mount_prefix: str = "/local"):
+    def __init__(self, client: AGFSClient, mount_prefix: str = "/local", *, on_node_change=None):
         """Initialize AGFS context filesystem adapter.
 
         Args:
@@ -575,6 +576,7 @@ class AGFSContextFS:
         """
         self._client = client
         self._mount_prefix = mount_prefix.rstrip("/")
+        self._on_node_change = on_node_change
         self._ensure_mount_prefix()
 
     def recovery_account_ids(self):
@@ -1909,6 +1911,8 @@ class AGFSContextFS:
                     expected_version,
                     lease,
                 )
+                if self._on_node_change is not None:
+                    self._on_node_change(node.uri)
                 return
 
             try:
@@ -1952,6 +1956,8 @@ class AGFSContextFS:
                 expected_version,
                 lease,
             )
+            if self._on_node_change is not None:
+                self._on_node_change(node.uri)
 
     def _remove_empty_code_resource_destination(
         self,
@@ -2219,6 +2225,8 @@ class AGFSContextFS:
         create_only = expected_version == 0
         if expected_version is not None and not create_only:
             self._replace_node(final_node_path, node, expected_version)
+            if self._on_node_change is not None:
+                self._on_node_change(node.uri)
             return
 
         staging_path = None
@@ -2258,6 +2266,8 @@ class AGFSContextFS:
         finally:
             if staging_path:
                 self._remove_tree_if_present(staging_path)
+        if self._on_node_change is not None:
+            self._on_node_change(node.uri)
 
     def _replace_node(
         self,
@@ -2733,7 +2743,15 @@ class AGFSContextFS:
             raise ValueError("level must be one of: abstract, overview, content, all")
         return self._read_node_snapshot(uri, ctx, lambda: self._read_node_fields_once(uri, ctx, level))
 
-    def _read_node_fields_once(self, uri: str, ctx: RequestContext, level: str) -> tuple[ContextNode, str]:
+    def read_search_node(self, uri: str, ctx: RequestContext, max_field_bytes: int) -> ContextNode:
+        """Read an authorized AGFS snapshot with bounded searchable fields."""
+        return self._read_node_snapshot(
+            uri, ctx, lambda: self._read_node_fields_once(uri, ctx, "all", max_field_bytes=max_field_bytes)
+        )
+
+    def _read_node_fields_once(
+        self, uri: str, ctx: RequestContext, level: str, *, max_field_bytes: int | None = None,
+    ) -> tuple[ContextNode, str]:
         self._ensure_accessible(uri, ctx)
         if self.is_tombstoned(uri, ctx):
             raise NodeNotFoundError(uri)
@@ -2752,21 +2770,40 @@ class AGFSContextFS:
         if status != NodeStatus.ACTIVE.value:
             raise NodeNotFoundError(uri)
 
+        truncated = False
+
+        def read_field(filename: str, managed_text: str | None = None) -> str:
+            nonlocal truncated
+            path = node_path + filename
+            if max_field_bytes is None:
+                return self._read_file(path) if managed_text is None else managed_text
+            try:
+                raw = (self._client.read(path, size=max_field_bytes + 1)
+                       if managed_text is None else managed_text.encode("utf-8"))
+            except AGFSClientError as exc:
+                if _is_not_found_error(exc):
+                    raise NodeNotFoundError(uri) from exc
+                raise
+            if len(raw) > max_field_bytes:
+                truncated = True
+                return codecs.utf_8_decode(raw[:max_field_bytes], "strict", False)[0]
+            return raw.decode("utf-8")
+
         if level in {"abstract", "all"}:
             abstract = meta.get("package_description") if meta.get("ogmemory_managed") else None
-            if abstract is None:
-                abstract = self._read_file(node_path + self.FILE_ABSTRACT)
+            abstract = read_field(self.FILE_ABSTRACT, abstract)
         else:
             abstract = ""
-        overview = self._read_file(node_path + self.FILE_OVERVIEW) if level in {"overview", "all"} else ""
+        overview = read_field(self.FILE_OVERVIEW) if level in {"overview", "all"} else ""
         if level in {"content", "all"}:
             content = meta.get("package_skill_md") if meta.get("ogmemory_managed") else None
-            if content is None:
-                content = self._read_file(node_path + self.FILE_CONTENT)
+            content = read_field(self.FILE_CONTENT, content)
         else:
             content = ""
 
         metadata = self._context_metadata(meta, has_content=True)
+        if truncated:
+            metadata["_search_truncated"] = True
 
         return ContextNode(
             uri=meta["uri"],
@@ -3040,6 +3077,8 @@ class AGFSContextFS:
             if _is_not_found_error(e):
                 raise NodeNotFoundError(uri)
             raise
+        if self._on_node_change is not None:
+            self._on_node_change(uri, subtree=True)
 
     def move_node(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
         """Move/rename a node in AGFS.
@@ -3066,3 +3105,6 @@ class AGFSContextFS:
 
         # Move the directory
         self._client.mv(from_path, to_path)
+        if self._on_node_change is not None:
+            self._on_node_change(from_uri, subtree=True)
+            self._on_node_change(to_uri, subtree=True)

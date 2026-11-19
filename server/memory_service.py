@@ -746,6 +746,7 @@ class MemoryService:
         self._decision_client_lock = threading.Lock()
         self._write_api = None
         self._read_api = None
+        self._agfs_fts = None
         self._code_resource_lifecycle_service: CodeResourceLifecycleService | None = None
         self._code_workspace_sync_service: CodeWorkspaceSyncService | None = None
         self._code_retrieval_service: CodeRetrievalService | None = None
@@ -1012,8 +1013,16 @@ class MemoryService:
             return SQLContextFS(pool=self._get_shared_sql_pool())
         if _HAS_AGFS:
             client = self._get_agfs_client()
+            if self._agfs_retrieval_enabled and getattr(self._cfg, "retrieval_agfs_fts_enabled", True):
+                return AGFSContextFS(client=client, mount_prefix=self._mount_prefix,
+                                     on_node_change=self._on_agfs_node_change)
             return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    def _on_agfs_node_change(self, uri: str, *, subtree: bool = False) -> None:
+        index = self._agfs_fts
+        if index is not None:
+            index.changed(uri, subtree=subtree)
 
     @_serialize_lazy_initialization("_model_usage_store")
     def _get_model_usage_store(self):
@@ -1052,6 +1061,10 @@ class MemoryService:
             client = self._get_agfs_client()
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    @property
+    def _agfs_retrieval_enabled(self) -> bool:
+        return getattr(self._cfg, "retrieval_mode", "default") == "agfs"
 
     def _graph_enabled(self):
         return getattr(self._cfg,"graph_backend","none") == "sql"
@@ -2367,7 +2380,7 @@ class MemoryService:
 
 
     def _search_working_set(self, query: str, ctx: RequestContext) -> tuple[list[dict], list[dict], dict]:
-        """Two-round vector search for memory nodes.
+        """Two-round search for memory nodes using the configured retrieval pipeline.
 
         Round 1: All categories → structured items for retrievedEvidence.
         Round 2: session_summary only, top_k=1 → historical retrieval evidence.
@@ -2394,6 +2407,8 @@ class MemoryService:
                     **graph_kwargs,
                     hints={"include_all_memories": True},
                 )
+            if self._agfs_retrieval_enabled and result is not None:
+                stats["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
             if self._graph_enabled() and result is not None and result.trace is not None:
                 stats["graph_expansion"] = dict(result.trace.graph_expansion)
             if result and result.hits:
@@ -2419,7 +2434,7 @@ class MemoryService:
                     vector_items = [i for i in items if i["metadata"].get("retrieval_origin") != "graph_neighbor"]
                     graph_items = [i for i in items if i["metadata"].get("retrieval_origin") == "graph_neighbor"]
                     items = self._truncate_by_score_gap(vector_items) + graph_items
-                else:
+                elif not self._agfs_retrieval_enabled:
                     items = self._truncate_by_score_gap(items)
 
             if getattr(self._cfg, "code_retrieval_enabled", False):
@@ -2453,6 +2468,8 @@ class MemoryService:
                     categories=["session_summary"],
                     fill_content_for_top_k=0, mode="QUICK",
                 )
+                if self._agfs_retrieval_enabled and summary_result is not None and summary_result.partial:
+                    stats["retrieval"] = {"mode": "agfs", "status": "partial"}
                 if summary_result and summary_result.hits:
                     summary_items = [
                         {
@@ -2675,9 +2692,10 @@ class MemoryService:
         if ordinary_items:
             reserved_chars = len("\n".join(ws_lines)) + 1
             ordinary_budget = max(0, max_chars - reserved_chars)
+            embedder_factory = None if getattr(self, "_agfs_retrieval_enabled", False) else self._get_shared_embedder
             evidence, selection_stats = select_evidence(
                 ordinary_items, query, ordinary_budget,
-                embedder_factory=self._get_shared_embedder,
+                embedder_factory=embedder_factory,
             )
             if delivery_stats is not None:
                 delivery_stats.update(selection_stats)
@@ -2999,6 +3017,28 @@ class MemoryService:
                 logger.info("Shared BM25 index ready")
             return bm25_index
 
+    def _create_outbox_worker(self, fs):
+        from index.outbox_worker import OutboxWorker
+
+        agfs_retrieval = self._agfs_retrieval_enabled
+        directory_summary_enabled = bool(getattr(self._cfg, "directory_summary_enabled", False))
+        return OutboxWorker(
+            vector_index=None if agfs_retrieval else self._get_shared_projection_index(),
+            embedder=None if agfs_retrieval else self._get_shared_embedder(),
+            fs=fs,
+            llm=self.get_llm() if directory_summary_enabled else None,
+            directory_summary_enabled=directory_summary_enabled,
+            agent_memory_handler=self._process_agent_memory,
+            edge_projection_components=self._graph_projection_components(),
+            memory_projection_handler=self._scene_projection_changed
+                if self._cfg.scene_enabled and self._cfg.scene_generation_enabled else None,
+            bm25_index=(
+                self._get_shared_bm25_index()
+                if getattr(self._cfg, "code_retrieval_enabled", False)
+                else None
+            ),
+        )
+
     @_serialize_lazy_initialization("_outbox_thread")
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
@@ -3011,11 +3051,6 @@ class MemoryService:
             logger.info("OutboxWorker skipped: no storage backend available")
             return
         try:
-            from index.outbox_worker import OutboxWorker
-
-            vector_index = self._get_shared_projection_index()
-            embedder = self._get_shared_embedder()
-
             fs = self._get_context_fs()
             if fs is None:
                 return
@@ -3023,25 +3058,7 @@ class MemoryService:
             if outbox_store is None:
                 return
 
-            directory_summary_enabled = bool(
-                getattr(self._cfg, "directory_summary_enabled", False)
-            )
-            worker = OutboxWorker(
-                vector_index=vector_index,
-                embedder=embedder,
-                fs=fs,
-                llm=self.get_llm() if directory_summary_enabled else None,
-                directory_summary_enabled=directory_summary_enabled,
-                agent_memory_handler=self._process_agent_memory,
-                edge_projection_components=self._graph_projection_components(),
-                memory_projection_handler=self._scene_projection_changed
-                    if self._cfg.scene_enabled and self._cfg.scene_generation_enabled else None,
-                bm25_index=(
-                    self._get_shared_bm25_index()
-                    if getattr(self._cfg, "code_retrieval_enabled", False)
-                    else None
-                ),
-            )
+            worker = self._create_outbox_worker(fs)
 
             # SQL backend: use notify-based listener for real-time processing
             if self._supports_batch_claim(outbox_store):
@@ -3141,11 +3158,6 @@ class MemoryService:
                     guard.check_active()
                 guard.post_commit_drain = True
                 return {"processed": 0, "succeeded": 0, "failed": 0, "deferred": True}
-            from index.outbox_worker import OutboxWorker
-
-            vector_index = self._get_shared_projection_index()
-            embedder = self._get_shared_embedder()
-
             fs = self._get_context_fs()
             if fs is None:
                 return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
@@ -3153,25 +3165,7 @@ class MemoryService:
             if outbox_store is None:
                 return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
 
-            directory_summary_enabled = bool(
-                getattr(self._cfg, "directory_summary_enabled", False)
-            )
-            worker = OutboxWorker(
-                vector_index=vector_index,
-                embedder=embedder,
-                fs=fs,
-                llm=self.get_llm() if directory_summary_enabled else None,
-                directory_summary_enabled=directory_summary_enabled,
-                agent_memory_handler=self._process_agent_memory,
-                edge_projection_components=self._graph_projection_components(),
-                memory_projection_handler=self._scene_projection_changed
-                    if self._cfg.scene_enabled and self._cfg.scene_generation_enabled else None,
-                bm25_index=(
-                    self._get_shared_bm25_index()
-                    if getattr(self._cfg, "code_retrieval_enabled", False)
-                    else None
-                ),
-            )
+            worker = self._create_outbox_worker(fs)
 
             account_ids = []
             if self._graph_enabled():
@@ -3203,6 +3197,9 @@ class MemoryService:
             self._shutdown_resources(join_timeout)
 
     def _shutdown_resources(self, join_timeout: float) -> None:
+        if self._agfs_fts is not None and not self._agfs_fts.close(join_timeout):
+            logger.warning("AGFS FTS backfill is still draining")
+            return
         if self._space_worker is not None:
             if not self._space_worker.stop(timeout=join_timeout):
                 logger.warning("Shared-space work is draining; service resources retained")
@@ -3474,10 +3471,12 @@ class MemoryService:
             except Exception as exc:
                 logger.warning("URIResolver initialization failed, prefetch disabled: %s", exc)
 
-            # Get shared vector_index and embedder for prefetch
-            vector_index = self._get_shared_vector_index()
-            embedder = self._get_shared_embedder()
-            self._ensure_scene_runtime()
+            vector_index = None
+            embedder = None
+            if not self._agfs_retrieval_enabled:
+                vector_index = self._get_shared_vector_index()
+                embedder = self._get_shared_embedder()
+                self._ensure_scene_runtime()
 
             graph_kwargs = {}
             if self._graph_enabled():
@@ -3595,6 +3594,28 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     @_serialize_lazy_initialization("_read_api")
     def get_read_api(self, *, start_outbox_worker: bool = True):
         """Return the shared read API without forcing worker startup for code reads."""
+        if self._read_api is None and self._agfs_retrieval_enabled:
+            from retrieval.agfs_retriever import AGFSRetrieval
+
+            fs = self._get_context_fs()
+            if fs is None:
+                raise RuntimeError("AGFS storage is unavailable")
+            cfg = RetrievalConfig(
+                include_agent_memories=self._cfg.agent_memory_enabled,
+                max_top_k=self._cfg.retrieval_max_top_k,
+                default_top_k=self._cfg.retrieval_default_top_k,
+            )
+            pipeline = AGFSRetrieval(
+                fs, cfg, fts_enabled=getattr(self._cfg, "retrieval_agfs_fts_enabled", True),
+                fts_ranker=getattr(self._cfg, "retrieval_agfs_fts_ranker", "literal"),
+            )
+            self._agfs_fts = pipeline.fts
+            self._read_api = ReadAPI(
+                pipeline=pipeline,
+                read_service=ContextReader(fs=fs, storage_backend="agfs"),
+                config=cfg,
+            )
+            logger.info("ReadAPI ready: AGFS file retrieval")
         if self._read_api is None:
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
@@ -4245,7 +4266,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             ]
             topic_buffer = self.get_session_manager().get_topic_buffer(session_id)
             topic_buffer.set_pending_injection(hits)
-            return {"ok": True, "prefetched": len(hits)}
+            response = {"ok": True, "prefetched": len(hits)}
+            if self._agfs_retrieval_enabled and result is not None:
+                response["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
+            return response
         except Exception as exc:
             logger.warning("prefetch failed: %s", exc, exc_info=True)
             return {"ok": False, "prefetched": 0, "error": str(exc)}
@@ -4818,10 +4842,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                             )
                         )
                 embedder = None
-                try:
-                    embedder = self._get_shared_embedder()
-                except Exception as exc:
-                    logger.debug("topic detection embedder unavailable: %s", exc)
+                if not self._agfs_retrieval_enabled:
+                    try:
+                        embedder = self._get_shared_embedder()
+                    except Exception as exc:
+                        logger.debug("topic detection embedder unavailable: %s", exc)
                 topic_changed = topic_buffer.update_topic(
                     TopicDetector(embedder=embedder).detect(
                         topic_messages,
@@ -5395,7 +5420,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 event, trace_store=self._get_trace_event_store(),
                 outbox=self._get_outbox_store(fs), fs=fs, llm=self.get_llm(),
                 directory_summary_enabled=self._cfg.directory_summary_enabled,
-                vector_index=self._get_shared_vector_index(), embedder=self._get_shared_embedder(),
+                vector_index=None if self._agfs_retrieval_enabled else self._get_shared_vector_index(),
+                embedder=None if self._agfs_retrieval_enabled else self._get_shared_embedder(),
             )
 
     def finalize_session_trace(self, params: dict) -> dict:
@@ -8188,13 +8214,15 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         llm_usage = model_usage.get("cumulative", {}).get("llm", {})
         embedding_usage = model_usage.get("cumulative", {}).get("embedding", {})
         retrieval = self.get_retrieval_monitoring_metrics(ctx.account_id, owner_spaces)
-        try:
-            vector_count = self._get_shared_vector_index().count({
-                "account_id": ctx.account_id,
-                **({"owner_space": list(owner_spaces)} if owner_spaces else {}),
-            })
-        except Exception:
-            vector_count = None
+        vector_count = None
+        if not self._agfs_retrieval_enabled:
+            try:
+                vector_count = self._get_shared_vector_index().count({
+                    "account_id": ctx.account_id,
+                    **({"owner_space": list(owner_spaces)} if owner_spaces else {}),
+                })
+            except Exception:
+                pass
         try:
             version = _metadata.version("context-engine")
         except _metadata.PackageNotFoundError:
@@ -8475,7 +8503,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     ):
                         info["status"] = "degraded"
                         info["error"] = "lexical historical projection is not ready"
-            if self._cfg.vector_db_type.strip().casefold() == "milvus":
+            if self._agfs_retrieval_enabled:
+                info["retrieval_mode"] = "agfs"
+            elif self._cfg.vector_db_type.strip().casefold() == "milvus":
                 info["vector_db"] = {"type": "milvus", "available": False}
                 # A cached client can outlive a failed server or revoked grant.
                 try:

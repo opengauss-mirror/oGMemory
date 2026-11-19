@@ -26,6 +26,25 @@
 - Claude Code、Codex、OpenCode、DeepSeek Harness、Hermes Agent、OpenClaw、QwenPaw：使用对应插件。
 - LangChain Deep Agents：使用 `OGMemoryMiddleware`。
 
+## 无 Embedding 模式
+
+在服务端启用 AGFS 检索。各 Agent 继续使用各自的接入方式，共用同一套记忆写入与检索配置。
+
+```yaml
+storage:
+  backend: agfs
+retrieval:
+  mode: agfs
+  agfs_fts_enabled: true
+  agfs_fts_ranker: literal
+```
+
+可以省略 `embedding` 和 `vector_db` 配置，保留 `llm` 供会话抽取使用。`agfs_fts_ranker` 默认用字面评分，设为 `sqlite_bm25` 后用 SQLite FTS5 对已索引的候选排序。`score` 和 `score_threshold` 沿用字面评分口径。索引冷建期间走 AGFS 字面扫描。
+
+配置支持 `native` 和 `http` 的 AGFS 存储。会话写入仍由 `after_turn` 抽取并归档，`compose`、`prefetch`、REST 记忆 API、Python `MemoryService` 和 MCP 工具都使用服务端的 AGFS 检索。SQLite FTS 索引 L0、L1、L2 和节点元数据，AGFS 负责权限校验和原文读取。现有写权限配置继续适用。配置项见[环境变量文档](../OGMEMORY_ENV.md)。
+
+独立部署可连接现有 AGFS，或用 `standalone-agfs` 镜像启动内置 AGFS。同一存储的服务进程与 Outbox Worker 应使用相同的检索模式。切回向量模式时，为 AGFS 模式下新增或更新的记忆重建向量索引。
+
 ## 共用身份字段
 
 | 字段 | 含义 |
