@@ -945,9 +945,56 @@ class BotStore:
             )
             return cast(dict, self.step_progress(tx, updated, state, attempt))
 
+    def _cancel_related_state(
+        self, tx: UnitOfWork, task: dict, result: dict | None
+    ) -> dict | None:
+        task_id = task["task_id"]
+        kind = task["kind"]
+        if kind == "ingest":
+            tx.update("bot_file", {"task_id": task_id, "state": "processing"}, {"state": "failed"})
+        elif kind == "delivery":
+            filters = {"task_id": task_id}
+            delivery = tx.get("bot_delivery", filters, for_update=True)
+            if delivery and delivery["state"] in {
+                "pending",
+                "sending",
+                "retry_wait",
+                "waiting_confirmation",
+            }:
+                tx.update("bot_delivery", filters, {"state": "cancelled"})
+        if kind != "memory_write":
+            return result
+
+        for related_id in (task_id, task.get("parent_task_id")):
+            if related_id and tx.get(
+                "bot_task", {"task_id": related_id, "memory_status": "pending"}, for_update=True
+            ):
+                self.set_memory_status(tx, related_id, "failed")
+
+        applied = tx.list(
+            "bot_step", {"task_id": task_id, "kind": "memory_apply", "state": "succeeded"}
+        )
+        forget_changes: dict[str, Any] = {"state": "failed"}
+        if applied:
+            forget_changes["state"] = "effective"
+            for step in applied:
+                output = step.get("output") or {}
+                if output.get("action") == "forget" and output.get("source_refs"):
+                    forget_changes["source_refs"] = output["source_refs"]
+                    break
+            result = result or {
+                "text": "已停止后续处理，已提交的记忆变更保留。",
+                "citations": [],
+                "file_ids": [],
+            }
+        tx.update("bot_forget", {"task_id": task_id, "state": "pending"}, forget_changes)
+        return result
+
     def _terminal(
         self, tx: UnitOfWork, task: dict, state: str, result: dict | None, error: dict | None
     ) -> dict:
+        if state == "cancelled":
+            result = self._cancel_related_state(tx, task, result)
         if state in {"cancelled", "failed"}:
             for step in tx.list(
                 "bot_step", {"task_id": task["task_id"]}, "step_no ASC", limit=10000
