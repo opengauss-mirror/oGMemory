@@ -47,6 +47,32 @@ def test_compose_queries_share_one_vector_and_request_context():
     assert stats["hit_count"] == 1
 
 
+def test_compose_keeps_agfs_searches_and_reports_partial_summary():
+    ctx = RequestContext("account", "user", "agent", "session", "trace")
+    calls = []
+
+    def run(query, read_ctx, *, top_k, categories, **options):
+        assert query == "Remember my preferences"
+        assert read_ctx is ctx
+        calls.append((top_k, categories, get_ident()))
+        category = "session_summary" if categories else "preference"
+        hit = RetrievedBlock(
+            uri=f"ctx://account/users/user/memories/{category}/one",
+            category=category, abstract=category, score=0.9,
+        )
+        return SearchMemoryResult(hits=[hit], partial=bool(categories))
+
+    api = ReadAPI(SimpleNamespace(run=run))
+    service = MemoryService(config=OgMemConfig(retrieval_mode="agfs"))
+    service.get_read_api = lambda: api
+    items, summaries, stats = service._search_working_set("Remember my preferences", ctx)
+
+    assert calls == [(15, None, get_ident()), (1, ["session_summary"], get_ident())]
+    assert [item["category"] for item in items] == ["preference"]
+    assert [item["category"] for item in summaries] == ["session_summary"]
+    assert stats["retrieval"] == {"mode": "agfs", "status": "partial"}
+
+
 def test_compose_preserves_sql_session_thread_ownership():
     from core.models import RetrievalConfig, SeedHit
     from fs.sql_adapter.session_mutation import _ACTIVE, SQLSessionGuard

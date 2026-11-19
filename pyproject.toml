@@ -135,6 +135,7 @@ Issues = "https://gitcode.com/opengauss/oGMemory/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = [
+    "memorybot",
     "cli",
     "core",
     "fs",
@@ -155,6 +156,7 @@ packages = [
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/memorybot",
     "/README.md",
     "/LICENSE",
     "/core",

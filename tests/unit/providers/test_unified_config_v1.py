@@ -9,6 +9,19 @@ import pytest
 from providers.unified_config import OgMemConfig
 
 
+def test_agfs_sqlite_bm25_loads_with_only_llm_and_agfs_config(tmp_path):
+    config = tmp_path / "ogmem.yaml"
+    config.write_text(
+        "llm:\n  provider: mock\nstorage:\n  backend: agfs\n"
+        "retrieval:\n  mode: agfs\n  agfs_fts_ranker: sqlite_bm25\n",
+        encoding="utf-8",
+    )
+    cfg = OgMemConfig.load(str(config))
+    assert cfg.agfs_retrieval_enabled
+    assert cfg.retrieval_agfs_fts_enabled
+    assert cfg.retrieval_agfs_fts_ranker == "sqlite_bm25"
+
+
 def test_explicit_model_overrides_take_priority_over_yaml(monkeypatch):
     from providers import unified_config as uc
 

@@ -36,6 +36,7 @@ from providers.token_tracker import (
     request_usage_scope,
     usage_scope,
 )
+from index.vector_projection import VectorProjection
 from retrieval.bm25_index import Bm25Index, build_code_bm25_document
 
 logger = logging.getLogger(__name__)
@@ -93,8 +94,8 @@ class OutboxWorker:
 
     def __init__(
         self,
-        vector_index: VectorIndex,
-        embedder: Embedder,
+        vector_index: VectorIndex | None,
+        embedder: Embedder | None,
         config: WorkerConfig | None = None,
         fs: ContextFS | None = None,
         llm: LLM | None = None,
@@ -107,8 +108,8 @@ class OutboxWorker:
         """Initialize the OutboxWorker.
 
         Args:
-            vector_index: Vector index for upsert
-            embedder: Embedder for generating embeddings
+            vector_index: Vector index for upsert when enabled
+            embedder: Embedder for generating embeddings when enabled
             config: Worker configuration (optional)
             fs: ContextFS for reading directory children (required for UPSERT_DIRECTORY)
             llm: LLM for generating directory summaries (required for UPSERT_DIRECTORY)
@@ -117,14 +118,23 @@ class OutboxWorker:
         """
         self._vector_index = vector_index
         self._embedder = embedder
+        self._projection = (
+            VectorProjection(vector_index, embedder)
+            if vector_index is not None and embedder is not None
+            else None
+        )
         self._config = config or WorkerConfig()
         self._fs = fs
         self._llm = llm
         self._directory_summary_enabled = directory_summary_enabled
-        self._bm25_index = bm25_index
+        self._bm25_index = bm25_index if self._projection is not None else None
         self._agent_memory_handler = agent_memory_handler
-        self._memory_projection_handler = memory_projection_handler
-        self._edge_projection_store, self._edge_projection_profile = edge_projection_components or (None,None)
+        self._memory_projection_handler = (
+            memory_projection_handler if self._projection is not None else None
+        )
+        self._edge_projection_store, self._edge_projection_profile = (
+            (edge_projection_components or (None, None)) if self._projection is not None else (None, None)
+        )
         self._graph_poll_accounts = ContextVar("graph_projection_poll_accounts", default=None)
 
     def _project_graph_account(self, account):
@@ -213,7 +223,7 @@ class OutboxWorker:
                     if (event.payload.get("agent_memory_version") == 1
                             and self._has_real_method(self._fs, "resource_mutation_lock")):
                         stack.enter_context(self._fs.resource_mutation_lock(event.uri, resolved_ctx))
-                    return self._process_upsert_context(event)
+                    return self._process_upsert_context(event, resolved_ctx)
             elif event_type == "UPSERT_DIRECTORY":
                 resolved_ctx = ctx or self._build_request_context(event)
                 usage_ctx = (
@@ -261,7 +271,9 @@ class OutboxWorker:
                 error_message=str(e),
             )
 
-    def _process_upsert_context(self, event: OutboxEvent) -> WorkerResult:
+    def _process_upsert_context(
+        self, event: OutboxEvent, ctx: RequestContext | None = None,
+    ) -> WorkerResult:
         """Process UPSERT_CONTEXT event for leaf node.
 
         Flow:
@@ -275,6 +287,10 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
+        if self._projection is None:
+            self._confirm_node_publication(event, ctx)
+            return WorkerResult(event_id=event.event_id, success=True)
+
         records = self._extract_records(event)
         if event.payload.get("agent_memory_version") == 1:
             if self._fs is None:
@@ -288,7 +304,7 @@ class OutboxWorker:
             current_ids = {record.id for record in records}
             obsolete = [key for key in event.payload.get("ids_to_delete", []) if key not in current_ids]
             if obsolete:
-                self._vector_index.delete(obsolete)
+                self._projection.delete(obsolete)
                 self._delete_bm25(obsolete)
         records = self._current_projection_records(event, records)
         if not records:
@@ -299,12 +315,11 @@ class OutboxWorker:
                 records_upserted=0,
             )
 
-        texts = [record.text for record in records]
         inputs = self._embedding_scope_inputs(event, records)
         with distributed_usage_scope(embedding_scope_weights(inputs), inputs=inputs):
-            embeddings = self._embedder.embed_texts(texts)
+            embeddings = self._projection.embed(records)
         augmented_records = self._augment_with_embeddings(records, embeddings)
-        self._vector_index.upsert(augmented_records)
+        self._projection.upsert(augmented_records)
         self._upsert_code_bm25(records)
 
         logger.info(
@@ -318,6 +333,24 @@ class OutboxWorker:
             success=True,
             records_upserted=len(records),
         )
+
+    def _confirm_node_publication(self, event: OutboxEvent, ctx: RequestContext | None) -> None:
+        if self._fs is None or ctx is None:
+            raise ValueError("Outbox publication confirmation requires storage and request context")
+        try:
+            if self._has_real_method(self._fs, "read_node_fields"):
+                self._fs.read_node_fields(event.uri, ctx, "abstract")
+            else:
+                self._fs.read_node(event.uri, ctx)
+        except NodeNotFoundError:
+            if self._has_real_method(self._fs, "is_tombstoned") and self._fs.is_tombstoned(event.uri, ctx):
+                return
+            if (
+                self._has_real_method(self._fs, "archived_node_version")
+                and self._fs.archived_node_version(event.uri, ctx) is not None
+            ):
+                return
+            raise
 
     @staticmethod
     def _projection_record_fingerprint(records: list[IndexRecord]) -> str:
@@ -506,29 +539,13 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
-        # Use pre-built ids when available (handles L2 /content.md suffix)
-        ids_to_delete = event.payload.get("ids_to_delete")
-        if not ids_to_delete:
-            from index.index_record_builder import build_record_id
-            l2_uri = event.uri.rstrip("/") + "/content.md"
-            ids_to_delete = [
-                build_record_id(event.uri, 0),
-                build_record_id(event.uri, 1),
-                build_record_id(l2_uri, 2),
-            ]
-
-        ids_to_delete = list(ids_to_delete)
-        activation_id = IndexRecord.generate_id(event.uri,3)
-        if activation_id not in ids_to_delete:
-            ids_to_delete.append(activation_id)
-        self._vector_index.delete(ids_to_delete)
-        self._delete_bm25(ids_to_delete)
+        deleted = self._delete_index_records(event)
         self._cleanup_tombstoned_payload(event, ctx)
 
         logger.info(
             "Successfully processed DELETE_CONTEXT %s, "
             "deleted %d records for URI %s",
-            event.event_id, len(ids_to_delete), event.uri,
+            event.event_id, deleted, event.uri,
         )
 
         return WorkerResult(
@@ -550,6 +567,17 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
+        deleted = self._delete_index_records(event)
+        logger.info(
+            "Successfully processed ARCHIVE_CONTEXT %s, "
+            "deleted %d records for URI %s",
+            event.event_id, deleted, event.uri,
+        )
+        return WorkerResult(event_id=event.event_id, success=True)
+
+    def _delete_index_records(self, event: OutboxEvent) -> int:
+        if self._projection is None:
+            return 0
         ids_to_delete = event.payload.get("ids_to_delete")
         if not ids_to_delete:
             from index.index_record_builder import build_record_id
@@ -564,20 +592,9 @@ class OutboxWorker:
         activation_id = IndexRecord.generate_id(event.uri,3)
         if activation_id not in ids_to_delete:
             ids_to_delete.append(activation_id)
-        self._vector_index.delete(ids_to_delete)
+        self._projection.delete(ids_to_delete)
         self._delete_bm25(ids_to_delete)
-
-        logger.info(
-            "Successfully processed ARCHIVE_CONTEXT %s, "
-            "deleted %d records for URI %s",
-            event.event_id, len(ids_to_delete), event.uri,
-        )
-
-        return WorkerResult(
-            event_id=event.event_id,
-            success=True,
-            records_upserted=0,
-        )
+        return len(ids_to_delete)
 
     def calculate_backoff(self, retry_count: int) -> timedelta:
         """Calculate exponential backoff delay.
@@ -934,9 +951,9 @@ class OutboxWorker:
         ids = [r["id"] for r in records_data if "id" in r]
 
         self._ensure_processing_owned(outbox_store, event, event.uri)
-        if ids:
+        if ids and self._projection is not None:
             with self._projection_owner(outbox_store, event, event.uri):
-                self._vector_index.delete(ids)
+                self._projection.delete(ids)
                 self._ensure_processing_owned(outbox_store, event, event.uri)
                 self._delete_bm25(ids)
             logger.info(
@@ -1147,6 +1164,8 @@ class OutboxWorker:
             )
 
     def _process_upsert_batch(self, batch, outbox_store, stats: dict) -> None:
+        projection = self._projection
+        assert projection is not None
         try:
             all_records = []
             boundaries = []
@@ -1160,9 +1179,7 @@ class OutboxWorker:
             bucket, bucket_token = push_bucket()
             try:
                 with usage_scope("", ""), distributed_usage_scope(scope_weights, inputs=inputs):
-                    all_embeddings = self._embedder.embed_texts(
-                        [record.text for record in all_records]
-                    )
+                    all_embeddings = projection.embed(all_records)
             finally:
                 pop_bucket(bucket_token)
                 tracker = getattr(self._embedder, "token_tracker", None)
@@ -1180,7 +1197,7 @@ class OutboxWorker:
                 try:
                     self._ensure_processing_owned(outbox_store, event, node_uri)
                     with self._projection_owner(outbox_store, event, node_uri):
-                        self._vector_index.upsert(augmented)
+                        projection.upsert(augmented)
                         self._ensure_processing_owned(outbox_store, event, node_uri)
                         self._upsert_code_bm25(records)
                     result = WorkerResult(
@@ -1410,7 +1427,11 @@ class OutboxWorker:
                     stats["skipped"] += 1
                     continue
 
-            if event.event_type == "UPSERT_CONTEXT" and event.payload.get("agent_memory_version") != 1:
+            if (
+                self._projection is not None
+                and event.event_type == "UPSERT_CONTEXT"
+                and event.payload.get("agent_memory_version") != 1
+            ):
                 try:
                     records = self._current_projection_records(event, self._extract_records(event))
                     if records:
@@ -1431,7 +1452,7 @@ class OutboxWorker:
         if upsert_batch:
             self._process_upsert_batch(upsert_batch, outbox_store, stats)
 
-        # Phase 2: Process non-UPSERT_CONTEXT events individually
+        # Phase 2: Process events that use the individual event path
         for event, node_uri in other_events:
             stats["processed"] += 1
             try:

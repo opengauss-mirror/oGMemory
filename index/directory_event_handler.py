@@ -24,6 +24,7 @@ from index.directory_summarizer import (
     is_directory_uri,
 )
 from index.index_record_builder import build_single_record
+from index.vector_projection import VectorProjection
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +88,8 @@ class DirectoryEventHandler:
         self,
         fs: ContextFS,
         llm: LLM,
-        embedder: Embedder,
-        vector_index: VectorIndex,
+        embedder: Embedder | None,
+        vector_index: VectorIndex | None,
         max_children: int = 50,
         max_concurrent_llm: int = 10,
         dag_timeout_seconds: float = 300.0,
@@ -106,8 +107,11 @@ class DirectoryEventHandler:
         """
         self._fs = fs
         self._llm = llm
-        self._embedder = embedder
-        self._vector_index = vector_index
+        self._projection = (
+            VectorProjection(vector_index, embedder)
+            if vector_index is not None and embedder is not None
+            else None
+        )
         self._max_children = max_children
         self._max_concurrent_llm = max_concurrent_llm
         self._dag_timeout_seconds = dag_timeout_seconds
@@ -432,7 +436,8 @@ class DirectoryEventHandler:
             self._stats.written_dir_uris.append(dir_uri)
             logger.info("Generated summary for directory %s", dir_uri)
 
-            await self._vectorize_directory(dir_uri, dir_node, summary, ctx)
+            if self._projection is not None:
+                await self._vectorize_directory(dir_uri, dir_node, summary, ctx)
 
             self._stats.completed_dirs += 1
             self._stats.pending_dirs = max(0, self._stats.pending_dirs - 1)
@@ -539,6 +544,8 @@ class DirectoryEventHandler:
         ctx: RequestContext,
     ) -> None:
         """Vectorize directory summary and upsert to index."""
+        projection = self._projection
+        assert projection is not None
         owner_space = dir_node.owner_space
         records: list[IndexRecord] = []
 
@@ -592,8 +599,7 @@ class DirectoryEventHandler:
             )
             records.append(l1_record)
 
-        texts = [r.text for r in records]
-        embeddings = await asyncio.to_thread(self._embedder.embed_texts, texts)
+        embeddings = await asyncio.to_thread(projection.embed, records)
 
         augmented_records = []
         for record, embedding in zip(records, embeddings):
@@ -608,6 +614,6 @@ class DirectoryEventHandler:
                 metadata=new_metadata,
             ))
 
-        await asyncio.to_thread(self._vector_index.upsert, augmented_records)
+        await asyncio.to_thread(projection.upsert, augmented_records)
         self._stats.record_ids.extend(r.id for r in augmented_records)
         logger.info("Vectorized directory %s with %d records", dir_uri, len(records))
