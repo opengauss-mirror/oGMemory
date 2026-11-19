@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from core.models import IndexRecord, SeedHit, TypedQuery
+from core.transcript_lexical import SEARCH_FIELD
 
 
 # Mock Json to just pass through the input value
@@ -153,7 +154,7 @@ class TestUpsert:
             level=0,
             text="Test abstract",
             filters={"account_id": "test", "owner_space": "users/u1"},
-            metadata={"_embedding": [0.1] * 1536},
+            metadata={"_embedding": [0.1] * 1536, "abstract": "Test abstract", "when": "2023-05-07"},
         )
 
         index.upsert([record])
@@ -162,7 +163,13 @@ class TestUpsert:
         # Implementation changed to MERGE INTO (openGauss compatible)
         assert "MERGE INTO" in mock_cursor.executed_sql[0]
         assert "t.account_id = s.account_id" in mock_cursor.executed_sql[0]
-        assert mock_cursor.executed_params[0][:2] == (record.id, "test")
+        params = mock_cursor.executed_params[0]
+        assert params[:2] == (record.id, "test")
+        assert params[5] == "[" + ",".join(["0.10000000"] * 1536) + "]"
+        assert params[7] == {
+            "abstract": "Test abstract", "when": "2023-05-07", SEARCH_FIELD: "",
+        }
+        assert record.metadata["_embedding"] == [0.1] * 1536
         update_clause = mock_cursor.executed_sql[0].split("WHEN MATCHED")[1].split("WHEN NOT MATCHED")[0]
         assert "account_id =" not in update_clause
         assert mock_conn.committed

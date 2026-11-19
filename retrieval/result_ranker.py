@@ -22,6 +22,7 @@ from core.models import (
     SeedResult,
     TypedQuery,
 )
+from retrieval.context_reader import ContextReader
 from retrieval.identity import memory_identity, memory_unit_key
 from scene.retrieval import select_scene_evidence
 
@@ -233,12 +234,21 @@ class ResultRanker:
         graph_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") == "graph_neighbor"]
         vector_hits = [h for h in l2_only if h.metadata.get("retrieval_origin") != "graph_neighbor"]
         ranked = self._ranker.rank(typed_query, vector_hits)
+        filled = None
         is_visible = getattr(context_reader, "is_visible", None)
         if ctx is not None and callable(is_visible):
-            visible = (item for item in ranked if is_visible(item.hit.uri, ctx))
-            ranked = list(islice(visible, typed_query.top_k)) if (
-                direct_evidence_reserve is None and typed_query.top_k >= 0
-            ) else list(visible)
+            if (direct_evidence_reserve is None and not graph_hits
+                    and not self.cfg.expand_hierarchy and not self.cfg.enable_graph_expansion
+                    and typed_query.top_k > 0 and fill_content_for_top_k > 0
+                    and isinstance(context_reader, ContextReader) and context_reader.uses_native_agfs):
+                ranked, filled = self._read_visible_prefix(
+                    ranked, typed_query.top_k, fill_content_for_top_k, context_reader, ctx,
+                )
+            else:
+                visible = (item for item in ranked if is_visible(item.hit.uri, ctx))
+                ranked = list(islice(visible, typed_query.top_k)) if (
+                    direct_evidence_reserve is None and typed_query.top_k >= 0
+                ) else list(visible)
             graph_hits = [hit for hit in graph_hits if is_visible(hit.uri, ctx)]
         top = select_scene_evidence(
             ranked, typed_query.top_k, direct_evidence_reserve,
@@ -275,9 +285,8 @@ class ResultRanker:
         unavailable = set()
         if fill_content_for_top_k > 0 and context_reader and ctx:
             top_k_to_fill = min(fill_content_for_top_k, len(blocks))
-            filled = None
             read_many = getattr(context_reader, "read_many", None)
-            if callable(read_many):
+            if filled is None and callable(read_many):
                 requests = [(block.uri, memory_unit_key(block.metadata) or None)
                             for block in blocks[:top_k_to_fill]]
                 try:
@@ -318,6 +327,28 @@ class ResultRanker:
                     logger.debug("relation fetch failed for %s: %s", block.uri, exc)
 
         return blocks
+
+    @staticmethod
+    def _read_visible_prefix(ranked, top_k, fill_count, reader, ctx):
+        """Use committed body reads to select the hydrated prefix in rank order."""
+        visible = []
+        filled = {}
+        cursor = 0
+        fill_count = min(fill_count, top_k)
+        while cursor < len(ranked) and len(visible) < fill_count:
+            batch = ranked[cursor:cursor + fill_count - len(visible)]
+            cursor += len(batch)
+            keys = [(item.hit.uri, memory_unit_key(item.hit.metadata) or None) for item in batch]
+            bodies = reader.read_many(keys, ctx)
+            for item, key in zip(batch, keys, strict=True):
+                block = bodies[key]
+                if ((isinstance(block, RetrievedBlock) and block.content_excerpt is not None)
+                        or reader.is_visible(item.hit.uri, ctx)):
+                    visible.append(item)
+                    filled[key] = block
+        remaining = (item for item in ranked[cursor:] if reader.is_visible(item.hit.uri, ctx))
+        visible.extend(islice(remaining, top_k - len(visible)))
+        return visible, filled
 
 
     @staticmethod

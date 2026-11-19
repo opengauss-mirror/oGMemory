@@ -368,6 +368,22 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         finally:
             self._return_connection(conn)
 
+    def trim_duplicate_embeddings(self) -> int:
+        """Compact existing metadata using the stored vector as the source."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    UPDATE {self._table_name}
+                    SET metadata = metadata - '_embedding'
+                    WHERE metadata ? '_embedding' AND embedding IS NOT NULL
+                """)
+                changed = cur.rowcount
+            conn.commit()
+            return changed
+        finally:
+            self._return_connection(conn)
+
     def _create_connection(self):
         """Open a connection using this module's psycopg2 reference.
 
@@ -450,10 +466,10 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 filters_json = Json(record.filters)
                 # Legacy SQL predicates read these fields from metadata; keep
                 # that projection aligned with the canonical filter values.
-                metadata = {**record.metadata, **{
-                    key: record.filters[key] for key in ("category", "context_type")
-                    if key in record.filters
-                }}
+                metadata = dict(record.metadata)
+                metadata.pop("_embedding")
+                metadata.update({key: record.filters[key] for key in ("category", "context_type")
+                                 if key in record.filters})
                 metadata_json = Json(indexed_metadata(metadata))
 
                 # Extract explicit security columns from filters
@@ -685,10 +701,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 emb_list = None
         elif isinstance(embedding, (list, tuple)):
             emb_list = [float(x) for x in embedding]
-        # Embedding lives in ``metadata["_embedding"]`` from the writer
-        # — surface it there so callers see what they upserted. The
-        # top-level ``embedding`` field on IndexRecord is reserved
-        # for whatever the VectorIndex Protocol adds later.
+        # Restore the IndexRecord embedding from the vector column.
         if emb_list is not None and "_embedding" not in meta:
             meta["_embedding"] = emb_list
         return IndexRecord(
@@ -973,6 +986,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         owner = row.get("owner_space") or filt.get("owner_space", "")
         node_id = row.get("node_id")
         hit_metadata: dict[str, Any] = dict(meta)
+        hit_metadata.pop("_embedding", None)
         if node_id is not None:
             hit_metadata["node_id"] = str(node_id)
         # M3 forward-channel: the M3 driver stamps
