@@ -573,6 +573,11 @@ def create_blueprint(get_service, *, inherit_upload_limit=True):
         get_service().get_object(g.bot_ctx, "schedule", {"schedule_id": schedule_id})
         return ok(pages("task", {"schedule_id": schedule_id, "state": request.args.get("state")}))
 
+    @bp.get(prefix + "/deliveries")
+    def deliveries():
+        filters = {key: request.args.get(key) for key in ("source_task_id", "task_id", "state")}
+        return ok(pages("delivery", filters))
+
     @bp.get(prefix + "/memories")
     def memories():
         svc, ctx = get_service(), g.bot_ctx
