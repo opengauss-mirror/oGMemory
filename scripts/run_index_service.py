@@ -2,7 +2,7 @@
 """Standalone IndexService runner.
 
 Starts the OutboxScheduler as a long-running process that periodically
-scans the configured SQL or AGFS outbox events, generates embeddings, and upserts into openGauss.
+scans the configured SQL or AGFS outbox events and processes their projections.
 
 Usage:
     python scripts/run_index_service.py                    # uses config.yaml or env vars
@@ -72,8 +72,10 @@ def main():
         )
     provider_cfg = ProviderConfig.from_ogmem_config(cfg)
 
-    embedder = provider_cfg.create_embedder()
-    vector_index = provider_cfg.create_vector_index()
+    embedder = vector_index = None
+    if not cfg.agfs_retrieval_enabled:
+        embedder = provider_cfg.create_embedder()
+        vector_index = provider_cfg.create_vector_index()
 
     fs, outbox_store, storage_pool = _create_storage(cfg)
 

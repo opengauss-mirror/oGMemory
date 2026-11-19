@@ -150,6 +150,16 @@ cache:
 | `embedding.api_key_command` | `OGMEM_EMBEDDING_API_KEY_CMD` / `OGMEM_EMBEDDING_API_KEY_COMMAND` | 回退到 `llm.api_key` | 否 | 惰性执行命令并读取 stdout 作为 Embedding API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
 | `embedding.multimodal` | `OGMEM_EMBEDDING_MULTIMODAL` | `false` | 否 | 使用 `/embeddings/multimodal` 端点。设为 `true` / `1` / `yes` 启用 |
 
+### 记忆检索模式
+
+| YAML 路径 | 环境变量 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `retrieval.mode` | `OGMEM_RETRIEVAL_MODE` | `default` | `default` 使用现有向量配置。`agfs` 要求 `storage.backend: agfs`，可省略 `embedding` 和 `vector_db`。 |
+| `retrieval.agfs_fts_enabled` | `OGMEM_RETRIEVAL_AGFS_FTS_ENABLED` | `true` | 在 AGFS 模式构建进程内 SQLite FTS5 索引，运行时需支持 FTS5 和 `trigram`。 |
+| `retrieval.agfs_fts_ranker` | `OGMEM_RETRIEVAL_AGFS_FTS_RANKER` | `literal` | `literal` 使用字面评分。`sqlite_bm25` 使用 SQLite FTS5 BM25 排序，要求启用 FTS。 |
+
+AGFS 模式的配置示例见 [Agent 对接文档](integrations/README.md#无-embedding-模式)。
+
 ### 向量数据库
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
