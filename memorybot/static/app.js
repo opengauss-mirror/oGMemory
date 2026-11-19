@@ -22,7 +22,8 @@
   const terminal = new Set(["succeeded", "cancelled", "failed"]);
   const state = {
     key: sessionStorage.getItem(embedded ? "ogmemory-viewer-api-key" : "memorybot.apiKey") || "", page: "chat", config: {}, session: null,
-    sessions: [], files: [], plans: [], memories: [], templates: [], agents: [], draftAgentId: "", cursors: {}, collectionRequests: {},
+    sessions: [], files: [], plans: [], memories: [], templates: [], agents: [], draftAgentId: "",
+    cursors: {}, collectionRequests: {}, collectionParams: {},
     tasks: new Map(), drafts: new Map(), progress: new Map(), streams: new Map(),
     attachments: new Map(), historyCursor: null, previewTask: null, sendRequest: null, sessionRequest: null,
     draftTitle: "", draftScope: null, sending: false, pendingSend: null, sessionListRequest: 0,
@@ -231,7 +232,7 @@
     form.addEventListener("submit", async event => {
       event.preventDefault();
       if (save.disabled) return;
-      const invalid = [...fields.querySelectorAll("input,select,textarea")].find(input => !input.validity.valid);
+      const invalid = [...fields.querySelectorAll("input,select,textarea")].find(input => input.willValidate && !input.validity.valid);
       if (invalid) {
         invalid.setAttribute("aria-invalid", "true");
         error.textContent = invalid.validity.valueMissing ? "请填写必填信息。" : invalid.type === "url" ? "请输入完整网页地址。" : "请检查输入格式和取值范围。";
@@ -322,6 +323,7 @@
     state.drafts.clear();
     state.progress.clear();
     state.cursors = {};
+    state.collectionParams = {};
     state.historyCursor = null;
     state.sendRequest = null;
     state.sessionRequest = null;
@@ -338,13 +340,30 @@
     renderConversation();
     for (const name of ["files", "plans", "memories", "templates"]) renderCollection(name);
   }
+  function resetPagination(name, moreButton) {
+    state.cursors[name] = null;
+    if (moreButton) moreButton.hidden = true;
+  }
   async function loadSessions(more = false) {
+    const moreButton = $("#session-more"), cursor = more ? state.cursors.sessions : null;
+    if (more && (!cursor || moreButton.disabled)) return;
+    if (!more) {
+      resetPagination("sessions", moreButton);
+      state.collectionParams.sessions = {limit: 30, q: $("#session-search").value.trim(), archived: $("#session-filter").value};
+    }
     const request = ++state.sessionListRequest;
-    const result = await api("/sessions" + query({limit: 30, q: $("#session-search").value.trim(), archived: $("#session-filter").value, cursor: more ? state.cursors.sessions : null}));
-    if (request !== state.sessionListRequest) return;
-    state.sessions = more ? [...new Map([...state.sessions, ...result.items].map(item => [item.session_id, item])).values()] : result.items;
-    state.cursors.sessions = result.next_cursor;
-    renderSessions();
+    moreButton.disabled = true;
+    try {
+      const result = await api("/sessions" + query({...state.collectionParams.sessions, cursor}));
+      if (request !== state.sessionListRequest) return;
+      state.sessions = more ? [...new Map([...state.sessions, ...result.items].map(item => [item.session_id, item])).values()] : result.items;
+      state.cursors.sessions = result.next_cursor;
+      renderSessions();
+    } catch (error) {
+      if (request === state.sessionListRequest) throw error;
+    } finally {
+      if (request === state.sessionListRequest) moreButton.disabled = false;
+    }
   }
   function renderSessions() {
     const list = $("#session-list");
@@ -566,7 +585,7 @@
       meta.dataset.signature = metaKey; meta.replaceChildren();
       if (text && task.task_id !== "pending") meta.append(iconButton("copy", "复制回复", "copy-answer", task.task_id));
       const time = el("time", task.created_at ? new Date(task.created_at).toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit", hour12: false}) : ""); time.title = formatTime(task.created_at); meta.append(time);
-      if (["failed", "cancelled"].includes(task.state)) meta.append(button("重试", "retry-task", task.task_id, "subtle"));
+      if (task.kind === "chat" && ["failed", "cancelled"].includes(task.state)) meta.append(button("重试", "retry-task", task.task_id, "subtle"));
     }
   }
   function formatDuration(milliseconds) {
@@ -804,5 +823,539 @@
       if (state.streams.get(task.task_id) === controller) state.streams.delete(task.task_id);
       if (state.page === "files") loadCollection("files").catch(report);
     }
+  }
+
+  const collectionPaths = {files: "/files", plans: "/schedules", memories: "/memories", templates: "/templates"};
+  async function loadCollection(name, more = false) {
+    const moreButton = $(`#${name}-more`);
+    const cursor = more ? state.cursors[name] : null;
+    if (more && (!cursor || moreButton?.disabled)) return;
+    const request = state.collectionRequests[name] = (state.collectionRequests[name] || 0) + 1;
+    if (!more) {
+      resetPagination(name, moreButton);
+      const params = {limit: 100};
+      if (name === "files") params.purpose = $("#file-filter").value;
+      if (name === "memories") {
+        params.q = $("#memory-query").value.trim();
+        params.memory_scope = $("#memory-scope").value;
+      }
+      if (name === "templates") {
+        if (!currentAgentId()) { state.templates = []; renderCollection(name); return; }
+        params.agent_id = currentAgentId();
+        const scope = state.session?.scope || state.draftScope || defaultScope();
+        params.memory_scope = scope.memory_scope; params.resource_uri = scope.resource_ids || [];
+      }
+      state.collectionParams[name] = params;
+    }
+    const loading = $(`#${name}-loading`);
+    const list = $({files: "#file-list", plans: "#plan-list", memories: "#memory-list"}[name] || "#chat-template");
+    if (loading) loading.hidden = false;
+    if (moreButton) moreButton.disabled = true;
+    list.setAttribute("aria-busy", "true");
+    try {
+      const result = await api(collectionPaths[name] + query({...state.collectionParams[name], cursor}));
+      if (request !== state.collectionRequests[name]) return;
+      state[name] = more ? [...state[name], ...result.items] : result.items;
+      state.cursors[name] = result.next_cursor;
+      renderCollection(name);
+      if (name === "templates" && result.next_cursor) return loadCollection(name, true);
+    } catch (error) {
+      if (request === state.collectionRequests[name]) throw error;
+    } finally {
+      if (request === state.collectionRequests[name]) {
+        if (loading) loading.hidden = true;
+        if (moreButton) moreButton.disabled = false;
+        list.setAttribute("aria-busy", "false");
+      }
+    }
+  }
+  function baseCard(title, status) {
+    const card = el("article", null, "card"), head = el("div", null, "card-header");
+    head.append(el("h3", title));
+    if (status) head.append(badge(status));
+    card.append(head);
+    return card;
+  }
+  function renderCollection(name) {
+    if (name === "templates") {
+      populateTemplates($("#chat-template"), $("#chat-template").value);
+      populateFormats($("#chat-format"), $("#chat-template").value, $("#chat-format").value);
+      updateTemplateDescription(); return;
+    }
+    const targets = {files: "file-list", plans: "plan-list", memories: "memory-list"};
+    const container = $("#" + targets[name]);
+    container.replaceChildren();
+    $(`#${name}-count`).textContent = `已载入 ${state[name].length} 项${state.cursors[name] ? " · 还有更多" : ""}`;
+    const memoryScope = $("#memory-scope").selectedOptions[0].textContent, memoryQuery = state.collectionParams.memories?.q;
+    if (name === "memories") $("#memory-results-label").textContent = `${memoryScope} · ${memoryQuery ? "相关结果" : "记忆列表"}`;
+    if (!state[name].length) empty(container, state.key ? {files: "暂无资料。上传文件或收录网页后，可用于对话。", plans: "暂无计划。创建提醒或周期任务，结果会回到会话。", memories: memoryQuery ? `${memoryScope}中暂无相关结果。` : `${memoryScope}中暂无记忆，可以先记住一条信息。`}[name] : "连接工作空间后查看。");
+    for (const item of state[name]) {
+      let card;
+      if (name === "files") {
+        card = baseCard(item.name, item.state);
+        card.append(el("p", item.metadata?.summary || (item.purpose === "source" ? item.state === "ready" ? "资料已就绪" : "资料处理中" : "工作成果"), "card-text"));
+        card.append(el("p", `${item.purpose === "source" ? "资料" : "成果"} · ${item.size_bytes === null ? "计算大小中" : `${Math.ceil(item.size_bytes / 1024)} KB`} · ${formatTime(item.created_at)}`, "meta"));
+        if (item.metadata?.parsed_ranges?.length) card.append(el("p", "读取范围：" + item.metadata.parsed_ranges.map(range => `${range.unit} ${range.start}–${range.end}`).join("，"), "meta"));
+        if (item.previous_file_id) card.append(el("p", `修订自 ${item.previous_file_id}`, "meta"));
+        const actions = el("div", null, "actions");
+        if (item.state === "ready") actions.append(button("用于对话", "attach", item.file_id), button("下载", "download", item.file_id));
+        actions.append(button("处理记录", "open-task", item.task_id));
+        card.append(actions);
+      } else if (name === "plans") {
+        card = baseCard(item.name, item.state);
+        card.append(el("p", item.task_input?.text, "card-text"));
+        card.append(el("p", ruleLabel(item), "meta"), el("p", `下次：${formatTime(item.next_run_at, item.timezone)} · ${item.timezone}`, "meta"));
+        const actions = el("div", null, "actions");
+        if (["active", "paused"].includes(item.state)) {
+          actions.append(button("编辑", "edit-plan", item.schedule_id), button(item.state === "active" ? "暂停" : "恢复", item.state === "active" ? "pause-plan" : "resume-plan", item.schedule_id), button("取消计划", "cancel-plan", item.schedule_id, "subtle danger"));
+        }
+        actions.append(button("打开会话", "open-session", item.session_id), button("执行记录", "plan-runs", item.schedule_id));
+        card.append(actions);
+      } else if (name === "memories") {
+        card = baseCard(item.title || "记忆");
+        const owner = item.owner_space || "";
+        const ownerLabel = owner.startsWith("user:") ? `用户 ${owner.slice(5)}` : owner.startsWith("agent:") ? `Agent ${owner.slice(6)}` : owner;
+        card.append(el("p", [memoryCategoryLabels[item.category] || item.category, ownerLabel].filter(Boolean).join(" · "), "memory-identity"));
+        card.append(el("p", item.text, "card-text"), el("p", formatTime(item.updated_at), "meta"));
+        if (item.source_refs?.length) card.append(citationNode(item.source_refs.map(ref => ({...ref, title: ref.file_id ? `资料 ${ref.file_id}` : "记忆来源", uri: ref.uri || ref.file_id || ref.task_id}))));
+        const actions = el("div", null, "actions");
+        actions.append(button("更正", "correct-memory", item.uri));
+        if (item.can_forget === true) actions.append(button("遗忘", "forget-memory", item.uri, "subtle danger"));
+        card.append(actions);
+      }
+      const content = el("div", null, "record-content");
+      const actions = $(".actions", card);
+      const marker = el("div", null, "record-marker");
+      marker.append(icon({files: "file", plans: "clock", memories: "memory"}[name]));
+      card.classList.add("record");
+      card.dataset.kind = name;
+      for (const child of [...card.childNodes]) if (child !== actions) content.append(child);
+      card.append(marker, content, actions);
+      container.append(card);
+    }
+    $("#" + name + "-more").hidden = !state.cursors[name];
+  }
+  function updateTemplateDescription() {
+    const template = state.templates.find(item => item.id === $("#chat-template").value);
+    $("#template-description").textContent = template ? `${template.description || template.instruction || template.name} 成果会显示在当前会话。` : "选择模板可生成周报、交接稿等成果，结果会显示在当前会话。";
+    updateComposer();
+  }
+  function uploadDialog(isUrl = false) {
+    const form = formDialog(isUrl ? "收录网页" : "上传资料", isUrl
+      ? '<label class="full">网页地址<input name="url" type="url" required placeholder="https://…"></label>'
+      : '<label class="full">选择文件<input name="file" type="file" accept=".txt,.md,.csv,text/plain,text/markdown,text/csv" required></label><p class="form-help full">支持 TXT、Markdown、CSV，每份最大 50 MiB。处理完成后可用于问答。</p>', isUrl ? "收录" : "上传并处理", async (form, key) => {
+      let body;
+      const scope = defaultScope();
+      if (isUrl) body = {source_kind: "url", source_url: form.elements.url.value, scope};
+      else {
+        const file = form.elements.file.files[0];
+        if (file.size > 50 * 1024 * 1024) throw new Error("请选择 50 MiB 以内的文件");
+        body = new FormData(); body.append("file", file); body.append("scope", JSON.stringify(scope));
+      }
+      const result = await api("/files" + query({agent_id: currentAgentId()}), {method: "POST", body, key, timeout: 120000});
+      closeDialog();
+      await navigate("files");
+      if (result.task) { updateTask(result.task); watchTask(result.task); }
+      toast("资料已接收，正在处理");
+    });
+  }
+  async function download(fileId) {
+    const file = state.files.find(item => item.file_id === fileId) || await api(`/files/${id(fileId)}`);
+    const response = await fetch(`${API}/files/${id(fileId)}/content`, {headers: headers(), credentials: "same-origin"});
+    if (!response.ok) throw await decodeError(response);
+    const url = URL.createObjectURL(await response.blob());
+    const link = el("a");
+    link.href = url; link.download = file.name || fileId;
+    document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+  function ruleLabel(plan) {
+    const rule = plan.rule;
+    if (rule.type === "once") return `一次提醒 · ${formatTime(rule.at, plan.timezone)}`;
+    if (rule.type === "interval") return `每 ${rule.interval_seconds} 秒执行`;
+    return `每周 ${rule.weekdays.map(day => ["一", "二", "三", "四", "五", "六", "日"][day - 1]).join("、")} ${rule.local_time}`;
+  }
+  function localDatetime(value) {
+    const date = value ? new Date(value) : new Date(Date.now() + 5 * 60 * 1000);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, value ? 19 : 16);
+  }
+  async function planDialog(scheduleId) {
+    const plan = scheduleId ? await api(`/schedules/${id(scheduleId)}`) : null;
+    const originalAt = plan?.rule?.at;
+    const firstPage = plan ? {items: [], next_cursor: null} : await api("/sessions?limit=100");
+    const sessions = new Map(firstPage.items.map(session => [session.session_id, session]));
+    let sessionCursor = firstPage.next_cursor;
+    const selectedSessionId = plan?.session_id || state.session?.session_id;
+    const [selectedSession, selectedFiles] = await Promise.all([
+      selectedSessionId && !sessions.has(selectedSessionId) ? api(`/sessions/${id(selectedSessionId)}?limit=1`) : null,
+      Promise.all((plan?.task_input?.file_ids || []).map(fileId => api(`/files/${id(fileId)}`))),
+    ]);
+    if (selectedSession) sessions.set(selectedSessionId, selectedSession.session);
+    const availableFiles = new Map(state.files.filter(item => item.state === "ready").map(file => [file.file_id, file]));
+    for (const file of selectedFiles) availableFiles.set(file.file_id, file);
+    let planTemplates = [];
+    const form = formDialog(plan ? "编辑计划" : "新建计划", '<label class="full">计划名称<input name="name" required maxlength="128" placeholder="例如：周五工作周报"></label><label class="full">归属会话<select name="session_id" required></select></label><label class="full" data-plan-agent>新会话 Agent<select name="agent_id"></select></label><label class="full">任务内容<textarea name="text" placeholder="到点需要完成什么？"></textarea></label><label>执行模板<select name="template_id"></select></label><label>成果格式<select name="output_format"><option value="markdown">Markdown</option><option value="csv">CSV</option></select></label><label class="full">引用资料（可多选）<select name="file_ids" multiple size="3"></select></label><label>执行频率<select name="rule_type"><option value="once">一次提醒</option><option value="weekly">每周</option><option value="interval">固定间隔</option></select></label><label>时区<input name="timezone" required></label><label class="full" data-rule="once">一次时间（本机时区）<input name="at" type="datetime-local"></label><label class="full" data-rule="interval" hidden>间隔秒数<input name="interval_seconds" type="number" min="60" max="31536000" value="3600"></label><div class="full" data-rule="weekly" hidden><p class="form-help">星期</p><div class="weekdays"></div><label class="form-field">当地时间<input name="local_time" type="time" value="09:00"></label></div><p class="form-help full">执行结果会显示在所选会话，可在会话中继续追问。</p>', plan ? "保存修改" : "创建计划", async (form, key) => {
+      const fields = form.elements;
+      const taskInput = {
+        text: fields.text.value, file_ids: [...fields.file_ids.selectedOptions].map(item => item.value),
+        template_id: fields.template_id.value || null, output_format: fields.output_format.value,
+      };
+      const template = planTemplates.find(item => item.id === taskInput.template_id);
+      const templateUnavailable = taskInput.template_id && !template;
+      if (templateUnavailable) {
+        const previous = plan?.task_input;
+        const previousFiles = previous?.file_ids || [];
+        const sameInputs = taskInput.template_id === previous?.template_id && taskInput.text === (previous.text || "") &&
+          taskInput.output_format === (previous.output_format || "markdown") &&
+          taskInput.file_ids.length === previousFiles.length && previousFiles.every(fileId => taskInput.file_ids.includes(fileId));
+        if (!sameInputs) throw new Error("原执行模板不可用。修改任务内容时，请选择其他模板或自由对话。");
+      }
+      if (!taskInput.text && !taskInput.file_ids.length && !taskInput.template_id) throw new Error("请填写任务内容、选择资料或选择执行模板。");
+      if (template?.input?.text_required && !taskInput.text.trim()) throw new Error("所选模板需要填写任务内容。");
+      let rule;
+      if (fields.rule_type.value === "once") {
+        if (!fields.at.value) throw new Error("请选择提醒时间");
+        const at = originalAt && fields.at.value === initialAtValue ? originalAt : new Date(fields.at.value).toISOString();
+        rule = {type: "once", at};
+      } else if (fields.rule_type.value === "interval") rule = {type: "interval", interval_seconds: Number(fields.interval_seconds.value)};
+      else {
+        const weekdays = [...form.querySelectorAll('[name="weekday"]:checked')].map(item => Number(item.value));
+        if (!weekdays.length) throw new Error("请选择执行星期");
+        rule = {type: "weekly", weekdays, local_time: fields.local_time.value.length === 5 ? fields.local_time.value + ":00" : fields.local_time.value};
+      }
+      const body = {name: fields.name.value.trim(), rule, timezone: fields.timezone.value};
+      if (!templateUnavailable) body.task_input = taskInput;
+      if (plan) { body.action = "update"; body.expected_revision = plan.revision; }
+      else if (fields.session_id.value === "new") {
+        const session = await api("/sessions", {method: "POST", key: key + "-session", body: {title: fields.name.value.trim(), scope: defaultScope(), agent_id: fields.agent_id.value}});
+        body.session_id = session.session_id;
+      } else body.session_id = fields.session_id.value;
+      await api(plan ? `/schedules/${id(plan.schedule_id)}` : "/schedules", {method: plan ? "PATCH" : "POST", body, key});
+      closeDialog(); await navigate("plans"); toast(plan ? "计划已更新" : "计划已创建");
+    });
+    const fields = form.elements;
+    function renderSessionOptions(selected) {
+      fields.session_id.replaceChildren();
+      for (const session of sessions.values()) {
+        option(fields.session_id, session.session_id, session.title, session.session_id === selected);
+      }
+      if (!plan) option(fields.session_id, "new", "新建计划会话", selected === "new" || !sessions.size);
+    }
+    renderSessionOptions(selectedSessionId);
+    fields.session_id.disabled = !!plan;
+    if (sessionCursor) {
+      const loadMore = el("button", "加载更多会话", "subtle full");
+      loadMore.type = "button";
+      loadMore.dataset.planMoreSessions = "";
+      fields.session_id.closest("label").after(loadMore);
+      loadMore.addEventListener("click", async () => {
+        loadMore.disabled = true;
+        try {
+          const page = await api("/sessions" + query({limit: 100, cursor: sessionCursor}));
+          for (const session of page.items) sessions.set(session.session_id, session);
+          sessionCursor = page.next_cursor;
+          renderSessionOptions(fields.session_id.value);
+          loadMore.hidden = !sessionCursor;
+          loadMore.textContent = "加载更多会话";
+        } catch {
+          loadMore.textContent = "重试加载会话";
+        } finally { loadMore.disabled = false; }
+      });
+    }
+    populateAgents(fields.agent_id, currentAgentId());
+    const save = $("button[type=submit]", form);
+    const templateFeedback = el("div", null, "full");
+    const templateError = el("p", "模板加载失败。", "form-error");
+    templateError.setAttribute("role", "alert");
+    const retryTemplates = el("button", "重试加载模板", "subtle");
+    retryTemplates.type = "button";
+    retryTemplates.dataset.planRetryTemplates = "";
+    templateFeedback.hidden = true;
+    templateFeedback.append(templateError, retryTemplates);
+    fields.output_format.closest("label").after(templateFeedback);
+    let planTemplatesRequest = 0;
+    async function refreshPlanTemplates() {
+      const request = ++planTemplatesRequest;
+      save.disabled = fields.template_id.disabled = true;
+      templateFeedback.hidden = true;
+      $("[data-plan-agent]", form).hidden = fields.session_id.value !== "new";
+      const session = sessions.get(fields.session_id.value);
+      const agentId = session?.agent_id || fields.agent_id.value;
+      const scope = session?.scope || defaultScope();
+      const selected = fields.template_id.value || plan?.task_input?.template_id;
+      const templates = []; let cursor = null;
+      try {
+        do {
+          const page = await api("/templates" + query({agent_id: agentId, memory_scope: scope.memory_scope, resource_uri: scope.resource_ids || [], limit: 100, cursor}));
+          if (request !== planTemplatesRequest) return;
+          templates.push(...page.items); cursor = page.next_cursor;
+        } while (cursor);
+      } catch {
+        if (request !== planTemplatesRequest) return;
+        templateFeedback.hidden = false;
+        return;
+      }
+      planTemplates = templates;
+      fields.template_id.replaceChildren(); option(fields.template_id, "", "自由对话", !selected);
+      for (const item of templates) option(fields.template_id, item.id, item.name || item.id, item.id === selected);
+      if (selected && selected === plan?.task_input?.template_id && fields.template_id.value !== selected) {
+        option(fields.template_id, selected, "原执行模板（不可用）", true);
+        fields.template_id.selectedOptions[0].disabled = true;
+      }
+      fields.template_id.disabled = save.disabled = false;
+      updatePlanFormats();
+    }
+    function updatePlanFormats() {
+      const preferred = fields.output_format.value || plan?.task_input?.output_format;
+      const template = planTemplates.find(item => item.id === fields.template_id.value);
+      fields.output_format.closest("label").hidden = !template;
+      fields.output_format.replaceChildren();
+      const originalFormat = fields.template_id.value && plan?.task_input?.output_format;
+      for (const format of template?.output?.formats || [originalFormat || "markdown"]) {
+        option(fields.output_format, format, format.toUpperCase(), format === preferred);
+      }
+    }
+    retryTemplates.addEventListener("click", refreshPlanTemplates);
+    fields.agent_id.addEventListener("change", refreshPlanTemplates);
+    fields.session_id.addEventListener("change", refreshPlanTemplates);
+    fields.template_id.addEventListener("change", updatePlanFormats);
+    for (const file of availableFiles.values()) option(fields.file_ids, file.file_id, file.name, plan?.task_input?.file_ids?.includes(file.file_id));
+    for (const [index, day] of ["一", "二", "三", "四", "五", "六", "日"].entries()) {
+      const label = el("label", day), check = el("input"); check.type = "checkbox"; check.name = "weekday"; check.value = index + 1;
+      check.checked = (plan?.rule?.weekdays || [5]).includes(index + 1); label.prepend(check); $(".weekdays", form).append(label);
+    }
+    fields.name.value = plan?.name || ""; fields.text.value = plan?.task_input?.text || "";
+    fields.output_format.value = plan?.task_input?.output_format || "markdown";
+    fields.timezone.value = plan?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
+    fields.rule_type.value = plan?.rule?.type || "once";
+    fields.at.step = "1";
+    fields.at.value = localDatetime(originalAt);
+    const initialAtValue = fields.at.value;
+    fields.interval_seconds.value = plan?.rule?.interval_seconds || 3600;
+    fields.local_time.step = "1";
+    fields.local_time.value = plan?.rule?.local_time || "09:00";
+    const ruleGroups = form.querySelectorAll("[data-rule]");
+    const showRule = () => {
+      for (const group of ruleGroups) {
+        group.hidden = group.dataset.rule !== fields.rule_type.value;
+        for (const input of group.querySelectorAll("input")) input.disabled = group.hidden;
+      }
+    };
+    fields.rule_type.addEventListener("change", showRule); showRule();
+    await refreshPlanTemplates();
+  }
+  async function changePlan(scheduleId, action) {
+    const plan = state.plans.find(item => item.schedule_id === scheduleId) || await api(`/schedules/${id(scheduleId)}`);
+    await api(`/schedules/${id(scheduleId)}`, {method: "PATCH", body: {action, expected_revision: plan.revision}});
+    await loadCollection("plans");
+    toast({pause: "计划已暂停", resume: "计划已恢复", cancel: "计划已取消"}[action]);
+  }
+  async function planRuns(scheduleId, cursor = null, existing = []) {
+    const page = await api(`/schedules/${id(scheduleId)}/runs` + query({cursor, limit: 30}));
+    const list = el("div", null, "runs-list");
+    const items = [...existing, ...page.items];
+    for (const task of items) {
+      state.tasks.set(task.task_id, task);
+      const row = button("", "open-task", task.task_id, "run-row");
+      row.append(el("span", formatTime(task.scheduled_at || task.created_at)), badge(task.state)); list.append(row);
+    }
+    if (!items.length) list.append(el("p", "首次执行后，这里会显示任务结果。", "form-help"));
+    if (page.next_cursor) {
+      const more = el("button", "加载更多", "secondary"); more.type = "button";
+      more.onclick = () => planRuns(scheduleId, page.next_cursor, items).catch(report); list.append(more);
+    }
+    dialog("计划执行记录", list);
+  }
+  function memoryDialog(action, uri) {
+    const memory = state.memories.find(item => item.uri === uri);
+    const markup = action === "forget" ? '<p class="form-help full">遗忘后，该条记忆将从后续问答、上下文和自动整理中排除。原始资料继续保留，处理结果可在任务中查看。</p>' : '<label class="full">信息内容<textarea name="text" required maxlength="32768" placeholder="填写需要记住的事实或新的正确内容"></textarea></label><label class="full">来源 URI（可选）<input name="source" placeholder="ctx://…"></label>' + (action === "remember" ? '<label class="full">重新记住的原记忆 URI（可选）<input name="memory_uri" placeholder="填写已遗忘条目的 ctx://… 地址"></label>' : '');
+    const form = formDialog({remember: "记住信息", correct: "更正记忆", forget: "遗忘记忆"}[action], markup, action === "forget" ? "确认遗忘" : "保存", async (form, key) => {
+      const body = {action, source_refs: [], fact_scope: {mode: "entry"}};
+      if (uri) body.memory_uri = uri;
+      if (action === "remember" && form.elements.memory_uri.value.trim()) body.memory_uri = form.elements.memory_uri.value.trim();
+      if (action !== "forget") {
+        body.new_text = form.elements.text.value;
+        if (form.elements.source.value.trim()) body.source_refs = [{file_id: null, task_id: null, uri: form.elements.source.value.trim(), quote: ""}];
+      }
+      const result = await api("/memory-actions" + query({agent_id: currentAgentId()}), {method: "POST", body, key});
+      closeDialog(); updateTask(result.task); await openTask(result.task.task_id);
+      toast("记忆操作已接收");
+    });
+    if (memory && action === "correct") form.elements.text.value = memory.text;
+    if (uri && action === "forget") form.prepend(el("code", uri, "form-help full"));
+  }
+  async function sendMessage(event) {
+    event.preventDefault();
+    if (state.sending || activeTask()) return;
+    if (!state.key) { connectDialog(); return; }
+    if (!currentAgentId()) { report(new Error("请先选择已授权 Agent")); return; }
+    const submittedText = $("#message").value;
+    const submittedAttachments = new Map(state.attachments);
+    const input = {text: submittedText.trim(), file_ids: [...submittedAttachments.keys()], template_id: $("#chat-template").value || null, output_format: $("#chat-format").value};
+    if (!input.text && !input.file_ids.length && !input.template_id) return;
+    const version = state.workspaceVersion;
+    state.sending = true; state.followBottom = true;
+    state.pendingSend = {task_id: "pending", state: "queued", kind: "chat", input, created_at: new Date().toISOString()}; renderConversation();
+    try {
+      if (!state.session) {
+        const title = state.draftTitle || (input.text || "资料处理").slice(0, 32);
+        const body = {title, scope: state.draftScope || defaultScope(), agent_id: currentAgentId()};
+        const fingerprint = JSON.stringify(body);
+        if (state.sessionRequest?.fingerprint !== fingerprint) state.sessionRequest = {fingerprint, key: requestId()};
+        const session = await api("/sessions", {method: "POST", key: state.sessionRequest.key, body});
+        if (version !== state.workspaceVersion) return;
+        state.sessionRequest = null; state.session = session; sessionStorage.setItem("memorybot.session", session.session_id);
+        renderAgentPicker();
+      }
+      const fingerprint = JSON.stringify({session: state.session.session_id, input});
+      if (state.sendRequest?.fingerprint !== fingerprint) state.sendRequest = {fingerprint, key: requestId()};
+      const task = await api(`/sessions/${id(state.session.session_id)}/tasks`, {method: "POST", body: input, key: state.sendRequest.key});
+      if (version !== state.workspaceVersion) return;
+      state.sendRequest = null; state.pendingSend = null;
+      if ($("#message").value === submittedText) $("#message").value = "";
+      for (const [fileId, name] of submittedAttachments) if (state.attachments.get(fileId) === name) state.attachments.delete(fileId);
+      updateTask(task); watchTask(task); $("#status-banner").hidden = true; resizeComposer();
+      await loadSessions();
+    } catch (error) { if (version === state.workspaceVersion) report(error); }
+    finally { if (version === state.workspaceVersion) { state.sending = false; state.pendingSend = null; renderConversation(); } }
+  }
+  async function copyText(text) {
+    await navigator.clipboard.writeText(text || ""); toast("已复制");
+  }
+  function retryTask(taskId) {
+    const task = state.tasks.get(taskId); if (!task?.input || activeTask()) return;
+    const template = $("#chat-template"), templateId = task.input.template_id;
+    if (templateId && !state.templates.some(item => item.id === templateId)) {
+      report(new Error("原执行模板不可用。请选择可用模板后重新发送。"));
+      return;
+    }
+    $("#message").value = task.input.text || ""; state.attachments.clear();
+    for (const fileId of task.input.file_ids || []) state.attachments.set(fileId, state.files.find(item => item.file_id === fileId)?.name || "资料");
+    template.value = templateId || ""; populateFormats($("#chat-format"), templateId, task.input.output_format);
+    updateTemplateDescription(); resizeComposer(); renderAttachments(); $("#composer").requestSubmit();
+  }
+  async function action(name, target) {
+    const value = target.dataset.id;
+    if (name === "connect") return connectDialog();
+    if (name === "close-dialog") return closeDialog();
+    if (name === "disconnect") return disconnect();
+    if (name === "open-sidebar") return setSidebar(true);
+    if (name === "close-sidebar") return setSidebar(false);
+    if (name === "toggle-options") { const options = $("#composer-options"); options.hidden = !options.hidden; target.setAttribute("aria-expanded", String(!options.hidden)); return; }
+    if (name === "jump-latest") return scrollBottom();
+    if (name === "copy-code") return copyText($("code", target.closest("pre"))?.textContent);
+    if (name === "copy-input") return copyText(state.tasks.get(value)?.input?.text);
+    if (name === "copy-answer") return copyText(state.tasks.get(value)?.result?.text || state.drafts.get(value)?.text);
+    if (name === "new-session") return newSession();
+    if (!state.key) return connectDialog();
+    if (name === "session-settings") return sessionSettings();
+    if (name === "rename-session") return sessionSettings(value);
+    if (name === "archive-session") return archiveSession(value);
+    if (name === "retry-task") return retryTask(value);
+    if (name === "stop-current") { const task = activeTask(); if (task) return action("cancel-task", {dataset: {id: task.task_id}}); return; }
+    if (name === "open-session") return openSession(value);
+    if (name === "refresh-sessions") return loadSessions();
+    if (name === "more-sessions") return loadSessions(true);
+    if (name === "more-history") return openSession(state.session.session_id, true);
+    if (name === "refresh") return loadPage();
+    if (name.startsWith("more-")) return loadCollection(name.slice(5), true);
+    if (name === "suggest") { showPage("chat"); $("#message").value = target.dataset.text; resizeComposer(); $("#message").focus(); return; }
+    if (name === "upload") return uploadDialog();
+    if (name === "add-url") return uploadDialog(true);
+    if (name === "download") return download(value);
+    if (name === "attach") { const file = state.files.find(item => item.file_id === value); state.attachments.set(value, file.name); showPage("chat"); renderAttachments(); updateComposer(); toast("资料已加入下一条消息"); return; }
+    if (name === "remove-attachment") { state.attachments.delete(value); renderAttachments(); updateComposer(); return; }
+    if (name === "open-task") return openTask(value);
+    if (name === "refresh-task") return getTask(value);
+    if (name === "cancel-task") { const task = await api(`/tasks/${id(value)}/cancel`, {method: "POST", body: {}}); updateTask(task); watchTask(task); return; }
+    if (name === "confirm-task") { const task = state.tasks.get(value); updateTask(await api(`/tasks/${id(value)}/confirm`, {method: "POST", body: {operation_id: task.confirmation.operation_id, decision: "recheck"}})); watchTask(state.tasks.get(value)); return; }
+    if (name === "cancel-confirmation") { const task = state.tasks.get(value); updateTask(await api(`/tasks/${id(value)}/confirm`, {method: "POST", body: {operation_id: task.confirmation.operation_id, decision: "cancel"}})); watchTask(state.tasks.get(value)); return; }
+    if (name === "new-plan") return planDialog();
+    if (name === "edit-plan") return planDialog(value);
+    if (["pause-plan", "resume-plan", "cancel-plan"].includes(name)) return changePlan(value, name.split("-")[0]);
+    if (name === "plan-runs") return planRuns(value);
+    if (name === "remember") return memoryDialog("remember");
+    if (name === "correct-memory") return memoryDialog("correct", value);
+    if (name === "forget-memory") return memoryDialog("forget", value);
+    if (name === "source-memory") {
+      const result = await api("/memories" + query({uri: value, limit: 100}));
+      const content = el("div");
+      for (const memory of result.items) { content.append(el("h3", memory.title || "来源记忆"), el("p", memory.text, "answer-text"), el("p", memory.uri, "meta")); }
+      if (!result.items.length) content.append(el("p", "当前授权范围内的来源内容已更新，请刷新记忆列表。", "form-help"));
+      dialog("原始来源", content); return;
+    }
+  }
+
+  document.addEventListener("click", event => {
+    const target = event.target.closest("[data-action],[data-page]");
+    if (!target) return;
+    event.preventDefault();
+    Promise.resolve(target.dataset.page ? navigate(target.dataset.page) : action(target.dataset.action, target)).catch(report);
+  });
+  $("#composer").addEventListener("submit", sendMessage);
+  $("#message").addEventListener("keydown", event => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#composer").requestSubmit(); }
+  });
+  $("#file-filter").addEventListener("change", () => loadCollection("files").catch(report));
+  $("#memory-search").addEventListener("submit", event => { event.preventDefault(); loadCollection("memories").catch(report); });
+  $("#memory-scope").addEventListener("change", () => loadCollection("memories").catch(report));
+  $("#chat-template").addEventListener("change", () => {
+    populateFormats($("#chat-format"), $("#chat-template").value); updateTemplateDescription();
+  });
+  $("#chat-agent").addEventListener("change", () => {
+    state.draftAgentId = $("#chat-agent").value; state.sessionRequest = null;
+    state.templates = []; renderCollection("templates"); updateComposer();
+    loadCollection("templates").catch(report);
+  });
+  $("#message").addEventListener("input", resizeComposer);
+  $("#chat-scroll").addEventListener("scroll", () => { state.followBottom = nearBottom(); $("#jump-latest").hidden = state.followBottom; }, {passive: true});
+  let searchTimer;
+  let searchComposing = false;
+  function queueSessionSearch() {
+    clearTimeout(searchTimer);
+    state.sessionListRequest += 1;
+    resetPagination("sessions", $("#session-more"));
+    $("#clear-session-search").hidden = !$("#session-search").value;
+    if (searchComposing) return;
+    searchTimer = setTimeout(() => loadSessions().catch(report), 180);
+  }
+  $("#session-search").addEventListener("input", queueSessionSearch);
+  $("#session-search").addEventListener("compositionstart", () => { searchComposing = true; queueSessionSearch(); });
+  $("#session-search").addEventListener("compositionend", () => { searchComposing = false; queueSessionSearch(); });
+  $("#clear-session-search").addEventListener("click", () => {
+    clearTimeout(searchTimer);
+    $("#session-search").value = "";
+    $("#clear-session-search").hidden = true;
+    $("#session-search").focus();
+    if (state.key) loadSessions().catch(report);
+  });
+  $("#memory-query").addEventListener("input", () => { $("#clear-memory-query").hidden = !$("#memory-query").value; });
+  $("#clear-memory-query").addEventListener("click", () => {
+    $("#memory-query").value = "";
+    $("#clear-memory-query").hidden = true;
+    $("#memory-query").focus();
+    if (state.key) loadCollection("memories").catch(report);
+  });
+  $("#session-filter").addEventListener("change", () => loadSessions().catch(report));
+  document.addEventListener("keydown", event => { if (event.key === "Escape") setSidebar(false); });
+  for (const node of document.querySelectorAll("[data-icon]")) node.replaceWith(icon(node.dataset.icon));
+  resizeComposer();
+  const executionTimer = setInterval(updateExecutionTimes, 1000);
+  window.addEventListener("pagehide", () => clearInterval(executionTimer));
+  window.addEventListener("pagehide", stopStreams);
+  window.addEventListener("message", event => {
+    if (!embedded || event.origin !== location.origin || event.source !== window.parent) return;
+    if (event.data?.type === "memorybot:theme" && ["light", "dark"].includes(event.data.theme)) {
+      document.documentElement.dataset.theme = event.data.theme;
+    }
+    if (event.data?.type === "memorybot:refresh") {
+      Promise.resolve(state.key ? loadPage() : connectDialog()).catch(report);
+    }
+  });
+  if (state.key) connect().catch(error => { report(error); if (!embedded) connectDialog(); });
+  else {
+    renderConversation();
+    for (const name of Object.keys(collectionPaths)) renderCollection(name);
+    if (embedded) report(new Error("在连接设置中填写用户 API Key，开始使用 memoryBot。"));
   }
 })();
