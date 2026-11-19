@@ -844,3 +844,383 @@ def test_queued_followups_preserve_prior_completed_conversation(runtime):
     runtime.llm.stream_hook = streamed
     result = execute(runtime, current)
     assert result["result"]["text"] == "林悦负责青禾项目。"
+
+
+def test_schedule_new_risk_updates_baseline_and_delivers(runtime):
+    uri = memory_node(runtime, "青禾风险：接口联调延期一天。")
+    ctx = runtime.ctx
+    schedule_id = new_id("schedule")
+    with runtime.store.transaction(ctx.account_id, ctx.user_id) as tx:
+        tx.insert(
+            "bot_schedule",
+            {
+                "schedule_id": schedule_id,
+                "session_id": ctx.session_id,
+                "name": "青禾风险",
+                "task_input": ChatInput(text="检查青禾风险").model_dump(mode="json"),
+                "accepted_authz": {
+                    "agent_id": ctx.agent_id,
+                    "memory_session_id": ctx.session_id,
+                    "session_generation": 1,
+                },
+                "rule": {"type": "interval", "interval_seconds": 60},
+                "timezone": "Asia/Shanghai",
+                "condition": {"type": "new_risk", "project": "青禾"},
+                "next_run_at": tx.now() - timedelta(seconds=1),
+            },
+        )
+    runtime.worker.run_once()
+    baseline = runtime.store.get(ctx.account_id, "bot_schedule", {"schedule_id": schedule_id})[
+        "baseline"
+    ]
+    assert len(baseline["items"]) == 1
+    execute(
+        runtime,
+        task(
+            runtime,
+            "memory_write",
+            {
+                "action": "correct",
+                "memory_uri": uri,
+                "new_text": "青禾风险：接口联调延期一天。\n青禾风险：测试环境待确认。",
+                "source_refs": [],
+            },
+        ),
+    )
+    with runtime.store.transaction(ctx.account_id) as tx:
+        tx.update(
+            "bot_schedule",
+            {"schedule_id": schedule_id},
+            {"next_run_at": tx.now() - timedelta(seconds=1)},
+        )
+    runtime.worker.run_once()
+    tasks = runtime.store.list(
+        ctx.account_id,
+        "bot_task",
+        {"schedule_id": schedule_id},
+        order_by="created_at DESC",
+    )
+    result = execute(runtime, tasks[0])
+    deliveries = runtime.store.list(
+        ctx.account_id, "bot_delivery", {"source_task_id": result["task_id"]}
+    )
+    assert len(deliveries) == 1
+    execute(runtime, runtime.store.get_task(ctx.account_id, deliveries[0]["task_id"]))
+    sent = runtime.store.get(
+        ctx.account_id, "bot_delivery", {"delivery_id": deliveries[0]["delivery_id"]}
+    )
+    assert sent["state"] == "sent" and sent["provider_receipt"]["provider"] == "web"
+    assert (
+        len(
+            runtime.store.get(ctx.account_id, "bot_schedule", {"schedule_id": schedule_id})[
+                "baseline"
+            ]["items"]
+        )
+        == 2
+    )
+
+
+def test_conversation_creates_reminder_and_pauses_it(runtime):
+    due = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    runtime.llm.planned_calls.append(
+        {
+            "tool": "create_schedule",
+            "input": {
+                "name": "青禾上线检查",
+                "task_input": {"text": "检查青禾上线"},
+                "rule": {"type": "once", "at": due},
+            },
+        }
+    )
+    first = execute(
+        runtime,
+        task(
+            runtime,
+            "chat",
+            ChatInput(text="明天提醒我检查青禾上线").model_dump(mode="json"),
+        ),
+    )
+    schedules = runtime.store.list(runtime.ctx.account_id, "bot_schedule")
+    assert (
+        schedules[0]["timezone"] == "Asia/Shanghai"
+        and schedules[0]["session_id"] == first["session_id"]
+    )
+    runtime.llm.planned_calls.append(
+        {
+            "tool": "update_schedule",
+            "input": {
+                "schedule_id": schedules[0]["schedule_id"],
+                "expected_revision": 1,
+                "action": "pause",
+            },
+        }
+    )
+    execute(
+        runtime,
+        task(
+            runtime,
+            "chat",
+            ChatInput(text="暂停青禾上线检查提醒").model_dump(mode="json"),
+        ),
+    )
+    updated = runtime.store.get(
+        runtime.ctx.account_id,
+        "bot_schedule",
+        {"schedule_id": schedules[0]["schedule_id"]},
+    )
+    assert updated["state"] == "paused" and updated["revision"] == 2
+
+
+def test_conversation_correction_queues_real_memory_action(runtime):
+    uri = memory_node(runtime)
+    runtime.llm.planned_calls.append(
+        {
+            "tool": "memory_action",
+            "input": {
+                "action": "correct",
+                "memory_uri": uri,
+                "new_text": "青禾项目周四发布。",
+            },
+        }
+    )
+    conversation = execute(
+        runtime,
+        task(
+            runtime,
+            "chat",
+            ChatInput(text="更正青禾发布时间为周四").model_dump(mode="json"),
+        ),
+    )
+    children = runtime.store.list(
+        runtime.ctx.account_id,
+        "bot_task",
+        {"parent_task_id": conversation["task_id"], "kind": "memory_write"},
+    )
+    assert len(children) == 1 and children[0]["input"]["action"] == "correct"
+    execute(runtime, children[0])
+    assert runtime.gateway.read_memory(runtime.ctx, uri)["text"] == "青禾项目周四发布。"
+    assert (
+        runtime.store.get_task(runtime.ctx.account_id, conversation["task_id"])["memory_status"]
+        == "searchable"
+    )
+
+
+def test_conversation_read_tools_use_authorized_memory_and_persist_budget(runtime):
+    uri = memory_node(runtime)
+    runtime.llm.planned_calls.extend(
+        [
+            {"tool": "search_memory", "input": {"query": "青禾"}},
+            {"tool": "read_memory", "input": {"uri": uri}},
+        ]
+    )
+    result = execute(
+        runtime,
+        task(runtime, "chat", ChatInput(text="青禾什么时候发布").model_dump(mode="json")),
+    )
+    budget = runtime.store.get(
+        runtime.ctx.account_id, "bot_step", {"task_id": result["task_id"], "step_no": 1}
+    )["output"]
+    assert budget["model_calls"] == 3 and budget["tool_calls"] == 2
+    assert uri in {citation["uri"] for citation in result["result"]["citations"]}
+
+
+def test_archived_memory_cancellation_keeps_receipt_and_can_be_remembered(runtime, monkeypatch):
+    uri = memory_node(runtime)
+    app = BotService(
+        runtime.store,
+        runtime.memory,
+        runtime.files,
+        runtime.worker.config,
+        gateway=runtime.gateway,
+    )
+    with runtime.store.transaction(runtime.ctx.account_id, runtime.ctx.user_id) as tx:
+        _, accepted = app.memory_action(
+            runtime.ctx,
+            tx,
+            {
+                "action": "forget",
+                "memory_uri": uri,
+                "source_refs": [],
+                "fact_scope": {"mode": "entry"},
+            },
+            new_id("request"),
+        )
+    item = accepted["task"]
+    projection = runtime.gateway.projection_ready
+    monkeypatch.setattr(runtime.gateway, "projection_ready", lambda *_: False)
+    runtime.worker.run_once()
+    monkeypatch.setattr(runtime.gateway, "projection_ready", projection)
+    pending = runtime.store.get_task(runtime.ctx.account_id, item["task_id"])
+    assert pending["state"] == "retry_wait", pending.get("error")
+    with runtime.store.transaction(runtime.ctx.account_id, runtime.ctx.user_id) as tx:
+        app.cancel_task(runtime.ctx, tx, item["task_id"])
+    forgotten = runtime.store.get(
+        runtime.ctx.account_id, "bot_forget", {"task_id": item["task_id"]}
+    )
+    assert forgotten["state"] == "effective" and forgotten["source_refs"]
+    runtime.llm.extract = True
+    with runtime.store.transaction(runtime.ctx.account_id, runtime.ctx.user_id) as tx:
+        _, accepted = app.memory_action(
+            runtime.ctx,
+            tx,
+            {
+                "action": "remember",
+                "memory_uri": uri,
+                "new_text": "我负责青禾项目。",
+                "source_refs": [],
+                "fact_scope": {"mode": "entry"},
+            },
+            new_id("request"),
+        )
+    execute(runtime, accepted["task"])
+    assert (
+        runtime.store.get(runtime.ctx.account_id, "bot_forget", {"task_id": item["task_id"]})[
+            "state"
+        ]
+        == "superseded"
+    )
+
+
+def test_shared_object_scan_reports_backup_protection(runtime):
+    files, account = runtime.files, runtime.ctx.account_id
+    file_id = new_id("f")
+    storage_key = files.publish(account, file_id, b"shared source", name="source.txt")["storage_key"]
+    directory = files._path(account, storage_key).rsplit("/", 1)[0]
+    marker = f"{directory}/backup.json"
+    try:
+        files.client.write(marker, b'{"backup_refs":["snapshot-1"]}')
+        cursor, found = None, None
+        for _ in range(50):
+            page = files.list_objects(limit=100, cursor=cursor)
+            found = next((row for row in page["items"] if row["file_id"] == file_id), None)
+            cursor = page["next_cursor"]
+            if found is not None or not cursor:
+                break
+        assert found is not None, f"Published object {file_id} was not listed"
+        assert found["backup_protected"] is True
+        assert found["modified_at"]
+    finally:
+        if any(entry["name"] == "backup.json" for entry in files._entries(directory)):
+            files.client.rm(marker)
+        files.delete(account, storage_key)
+
+
+def test_running_file_cancellation_publishes_terminal_file_state(runtime, monkeypatch):
+    file_id = new_id("f")
+    saved = runtime.files.publish(
+        runtime.ctx.account_id, file_id, "青禾资料".encode(), name="source.txt"
+    )
+    item = task(
+        runtime,
+        "ingest",
+        {"file_id": file_id},
+        file={**saved, "file_id": file_id, "purpose": "source", "source_kind": "upload"},
+    )
+    read = runtime.files.read
+
+    def read_and_cancel(*args, **kwargs):
+        data = read(*args, **kwargs)
+        with runtime.store.transaction(runtime.ctx.account_id) as tx:
+            tx.update("bot_task", {"task_id": item["task_id"]}, {"cancel_requested": True})
+        return data
+
+    monkeypatch.setattr(runtime.files, "read", read_and_cancel)
+    runtime.worker.run_once()
+    assert runtime.store.get_task(runtime.ctx.account_id, item["task_id"])["state"] == "cancelled"
+    assert (
+        runtime.store.get(runtime.ctx.account_id, "bot_file", {"file_id": file_id})["state"]
+        == "failed"
+    )
+
+
+@pytest.mark.parametrize("category", ["tool", "experience"])
+def test_structured_agent_correction_updates_units_revisions_and_projection(runtime, category):
+    from extraction.agent_memory import (
+        memory_units,
+        node_memory_fields,
+        render_agent_memory,
+    )
+    from index.index_record_builder import build_index_records
+
+    ctx = runtime.ctx
+    units = [
+        {
+            "key": "batch",
+            "title": "青禾批次",
+            "content": "青禾每批处理20个请求。",
+            "grounding": [{"uri": f"ctx://{ctx.account_id}/sessions/source/history/first"}],
+        }
+    ]
+    if category == "tool":
+        units.append(
+            {
+                "key": "cursor",
+                "title": "青禾分页",
+                "content": "沿用返回的游标。",
+                "grounding": units[0]["grounding"],
+            }
+        )
+    fields = {"tool_name": "qinghe", "units": units} if category == "tool" else units[0]
+    directory = "tool_units" if category == "tool" else "experiences"
+    uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/{directory}/qinghe"
+    node = ContextNode(
+        uri,
+        "MEMORY",
+        category,
+        4,
+        ctx.agent_space_name(),
+        "青禾批次说明",
+        "青禾处理规范",
+        render_agent_memory(category, fields),
+        {
+            "routing_key": "qinghe",
+            "agent_memory_version": 1,
+            "structured_fields": fields,
+            "agent_memory": {
+                "version": 1,
+                "applied_operations": [],
+                "revisions": [],
+                "producer_agent_ids": [ctx.agent_id],
+                "units": {
+                    unit["key"]: {
+                        "revision": 1,
+                        "grounding": unit["grounding"],
+                        "withdrawn": False,
+                    }
+                    for unit in units
+                },
+            },
+        },
+    )
+    fs = runtime.memory._get_context_fs()
+    fs.write_node(node, ctx)
+    runtime.memory._get_outbox_store(fs).register_write(node, ctx)
+    runtime.memory.drain_outbox_sync(ctx.account_id)
+    corrected = execute(
+        runtime,
+        task(
+            runtime,
+            "memory_write",
+            {
+                "action": "correct",
+                "memory_uri": uri,
+                "new_text": "青禾每批处理50个请求。",
+                "source_refs": [],
+            },
+        ),
+    )
+    saved = fs.read_node(uri, ctx)
+    active = memory_units(category, node_memory_fields(saved))
+    assert [unit["content"] for unit in active] == ["青禾每批处理50个请求。"]
+    assert saved.metadata["version"] == 2
+    assert saved.metadata["agent_memory"]["units"]["batch"]["revision"] == 2
+    if category == "tool":
+        assert saved.metadata["agent_memory"]["units"]["cursor"]["withdrawn"] is True
+    records = build_index_records(saved)
+    for record in records:
+        actual = runtime.memory._get_shared_vector_index().get_record(record.id)
+        assert actual.text == record.text and actual.metadata["canonical_revision"] == 2
+    assert active[0]["grounding"][0]["role"] == "user"
+    assert active[0]["grounding"][0]["origin"] == "memorybot_explicit_correction"
+    with runtime.store.transaction(ctx.account_id, ctx.user_id) as tx:
+        assert runtime.gateway.has_task_reference(tx, corrected) is True
