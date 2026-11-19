@@ -4,9 +4,9 @@
 
 ## 本地开发
 
-本地默认使用 SQL 存储。先准备可连接的 PostgreSQL 或 openGauss 数据库；数据库不会由本地向导创建。配置示例见 [SQL 直连最小本地启动](OGMEMORY_ENV.md#sql-直连最小本地启动)。
+本地配置向导和参考配置默认使用 openGauss 主存储。请先创建 PG 兼容模式数据库。配置示例见 [SQL 直连最小本地启动](OGMEMORY_ENV.md#sql-直连最小本地启动)。
 
-首次运行本地配置向导时，若 openGauss 支持原生 BM25 且数据库角色可在当前 schema 创建对象，默认开启向量与 BM25 混合检索。通过 `retrieval.hybrid_enabled` 可以调整检索模式。
+首次运行本地配置向导时，若 openGauss 支持原生 BM25 且数据库角色可在当前 schema 创建对象，向导会配置倒排索引并开启混合检索。`retrieval.inverted_index.provider` 选择索引，`retrieval.hybrid_enabled` 控制查询是否融合向量和倒排结果。
 
 ```bash
 python -m pip install -e ".[dev]"

@@ -10,6 +10,7 @@ Missing filters cause SILENT cross-tenant leakage (no runtime error).
 """
 
 import re
+from dataclasses import replace
 from typing import Final
 
 from core.models import ContextNode, IndexRecord
@@ -84,6 +85,9 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
 
     # Extract account_id from URI for tenant isolation
     account_id = _extract_account_id(node.uri)
+    if node.metadata.get("node_type") == "directory":
+        return build_directory_index_records(node, account_id)
+
 
     # Build base filters shared by every emitted record
     base_filters: dict[str, str | int | float | bool] = {
@@ -195,6 +199,33 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
     # Validate every emitted record has the required filters
     _validate_filters(records)
 
+    return records
+
+
+def build_agfs_lexical_records(node: ContextNode) -> list[IndexRecord]:
+    """Project a leaf overview alongside its abstract for AGFS lexical recall."""
+    records = build_index_records(node)
+    if (records and node.overview and node.metadata.get("node_type") != "directory"
+            and node.metadata.get("agent_memory_version") != 1):
+        records[0] = replace(records[0], text=f"{node.abstract}\n{node.overview}")
+    return records
+
+
+def build_directory_index_records(node: ContextNode, account_id: str) -> list[IndexRecord]:
+    records = []
+    for level, text in ((0, node.abstract), (1, node.overview)):
+        if level == 1 and not text:
+            continue
+        record = build_single_record(
+            node.uri, level, text, account_id, node.owner_space, node.category, node.context_type,
+        )
+        record.metadata.update(
+            node_type="directory", parent_uri=node.parent_uri,
+            child_count=node.metadata.get("child_count", 0),
+        )
+        if level == 0:
+            record.metadata["categories"] = node.metadata.get("categories", [])
+        records.append(record)
     return records
 
 

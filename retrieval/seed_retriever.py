@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 class RetrievalConfigError(RuntimeError):
     """Retrieval is misconfigured (missing lexical backfill coordinator,
-    backfill not ready, lexical provider lacking mandatory security filters).
+    unavailable required backfill, lexical provider lacking mandatory security filters).
 
     Raised — not degraded — so a broken deployment fails fast instead of
     silently returning vector-only results forever. Subclasses
@@ -47,12 +47,15 @@ class SeedRetriever:
         config: RetrievalConfig | None = None,
         bm25_index: Any | None = None,
         lexical_backfill: Any | None = None,
+        *,
+        allow_lexical_warming: bool = False,
     ) -> None:
         self.vector_index = vector_index
         self.embedder = embedder
         self.config = config or RetrievalConfig()
         self.bm25_index = bm25_index
         self.lexical_backfill = lexical_backfill
+        self._allow_lexical_warming = allow_lexical_warming
 
     def embed_query(self, text: str) -> list[float]:
         if self.config.hybrid_enabled and self.config.semantic_weight <= 0:
@@ -106,6 +109,7 @@ class SeedRetriever:
         lexical_enabled = (
             not self.config.hybrid_enabled or self.config.lexical_weight > 0
         )
+        lexical_warming = False
         if self.bm25_index and lexical_enabled and (
             self.config.hybrid_enabled
             or getattr(self.bm25_index, "doc_count", 0) > 0
@@ -120,9 +124,13 @@ class SeedRetriever:
                             raise RetrievalConfigError(
                                 "hybrid retrieval requires a lexical backfill coordinator"
                             )
-                        if not self.lexical_backfill.ensure_ready(ctx, owner_spaces):
+                        if self.lexical_backfill.ensure_ready(ctx, owner_spaces):
+                            bm25_results = self._bm25_search(typed_query, ctx)
+                        elif self._allow_lexical_warming:
+                            lexical_warming = True
+                            bm25_results = []
+                        else:
                             raise RetrievalConfigError("required lexical backfill is not ready")
-                        bm25_results = self._bm25_search(typed_query, ctx)
                 else:
                     bm25_results = self._bm25_search(typed_query, ctx)
             except RetrievalConfigError:
@@ -169,6 +177,7 @@ class SeedRetriever:
             return SeedResult(
                 initial_candidates=[hit for hit in global_results if hit.level == 2],
                 query_vector=query_vector,
+                lexical_warming=lexical_warming,
             )
 
         starting_points, initial_candidates = self._merge_starting_points(
@@ -180,6 +189,7 @@ class SeedRetriever:
             initial_candidates=initial_candidates,
             query_vector=query_vector,
             root_uris=root_uris,
+            lexical_warming=lexical_warming,
         )
 
     @staticmethod

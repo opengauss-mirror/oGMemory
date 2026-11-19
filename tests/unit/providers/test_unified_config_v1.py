@@ -3,23 +3,35 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from providers.unified_config import OgMemConfig
 
 
-def test_agfs_sqlite_bm25_loads_with_only_llm_and_agfs_config(tmp_path):
+@pytest.mark.parametrize("mode", ["vector_free", "agfs"])
+def test_vector_free_sqlite_bm25_loads_with_only_llm_and_agfs_config(tmp_path, mode):
     config = tmp_path / "ogmem.yaml"
     config.write_text(
         "llm:\n  provider: mock\nstorage:\n  backend: agfs\n"
-        "retrieval:\n  mode: agfs\n  agfs_fts_ranker: sqlite_bm25\n",
+        f"retrieval:\n  mode: {mode}\n  agfs_fts_ranker: sqlite_bm25\n",
         encoding="utf-8",
     )
     cfg = OgMemConfig.load(str(config))
+    assert cfg.retrieval_mode == "vector_free"
     assert cfg.agfs_retrieval_enabled
     assert cfg.retrieval_agfs_fts_enabled
     assert cfg.retrieval_agfs_fts_ranker == "sqlite_bm25"
+
+
+def test_reference_config_uses_opengauss_for_primary_storage():
+    path = Path(__file__).resolve().parents[3] / "config/ogmem.reference.yaml"
+
+    cfg = OgMemConfig.load(str(path))
+
+    assert cfg.storage_backend == "sql"
+    assert cfg.sql_dialect == "opengauss"
 
 
 def test_explicit_model_overrides_take_priority_over_yaml(monkeypatch):
@@ -844,9 +856,17 @@ def test_enabled_skill_sedimentation_requires_sql_connection_string():
         OgMemConfig(skill_sedimentation_enabled=True, storage_backend="sql")
 
 
-def test_hybrid_retrieval_requires_sql_canonical_storage():
-    with pytest.raises(ValueError, match="storage.backend=sql"):
-        OgMemConfig(retrieval_hybrid_enabled=True, storage_backend="agfs")
+@pytest.mark.parametrize("hybrid_enabled", [False, True])
+@pytest.mark.parametrize("provider", ["sqlite_fts", "opengauss_native"])
+def test_agfs_vector_retrieval_maintains_configured_inverted_index(hybrid_enabled, provider):
+    cfg = OgMemConfig(
+        storage_backend="agfs",
+        retrieval_hybrid_enabled=hybrid_enabled,
+        retrieval_lexical_provider=provider,
+    )
+
+    assert cfg.retrieval_uses_lexical_projection
+    assert cfg.retrieval_lexical_provider == provider
 
 
 def test_hybrid_retrieval_requires_sql_canonical_connection():

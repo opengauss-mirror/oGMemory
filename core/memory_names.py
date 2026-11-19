@@ -6,6 +6,17 @@ import unicodedata
 from core.candidate_dedup import case_draft_signature, event_draft_signature
 
 
+AGFS_SEARCH_DIRECTORY_PATTERN = (
+    r"^ctx://[^/]+/(?:resources|sessions/[^/]+/history|[^/]+/[^/]+/"
+    r"(?:memories(?:/(?!profile/?$)[^/]+)?|skills(?:/(?:generated|imported))?))/?$"
+)
+_AGFS_SEARCH_DIRECTORY = re.compile(AGFS_SEARCH_DIRECTORY_PATTERN)
+
+
+def is_agfs_search_directory(uri: str) -> bool:
+    return _AGFS_SEARCH_DIRECTORY.fullmatch(uri) is not None
+
+
 def memory_directory(uri: str) -> str:
     """Return the type directory from a memory or skill context URI."""
     parts = uri.split("/", 7)

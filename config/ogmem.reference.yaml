@@ -5,7 +5,7 @@
 # This is the single reference template for all deployment modes.
 # Copy and edit for your use case:
 #
-#   Local dev:  cp config/ogmem.reference.yaml ogmem.yaml
+#   Local dev:  cp config/ogmem.reference.yaml config/ogmem.yaml
 #   Docker:     cp config/ogmem.reference.yaml deploy/ogmemory.yaml
 #
 # Mode annotations:
@@ -55,7 +55,7 @@ llm:
 #   # api_key: ""                  # explicit empty string for services without auth
 #   timeout_seconds: 30
 
-# ---- Embedding Configuration [all] ----
+# ---- Embedding Configuration [all, retrieval.mode=default] ----
 embedding:
   # provider: null               # [all] defaults to llm.provider
   model: "text-embedding-v4"     # [all]
@@ -66,7 +66,7 @@ embedding:
   multimodal: false              # [all] true for VolcEngine /doubao embeddings
   # st_model: "BAAI/bge-m3"     # [local] Sentence Transformer local model (overrides API embedding)
 
-# ---- Vector Database [all] ----
+# ---- Vector Database [all, retrieval.mode=default] ----
 vector_db:
   type: chroma                   # [local] memory (quickstart) / chroma / opengauss / milvus
                                   # [docker] opengauss / milvus (opengauss recommended for production)
@@ -185,9 +185,9 @@ mcp:
 
 # ---- Storage Backend [all] ----
 storage:
-  backend: sql                   # [all] agfs / sql (recommended: sql)
-  dialect: postgresql            # [all] postgresql / opengauss
-  connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"  # [local]
+  backend: sql                   # [all] canonical memory store: sql / agfs
+  dialect: opengauss             # [all] opengauss / postgresql
+  connection_string: "host=127.0.0.1 port=15432 dbname=ogmemory user=gaussdb password=CHANGE_ME"  # [local]
   pool_size: 5                   # [all]
   trace_max_turn_events: 128     # [all] first + newest events retained per finalized turn (2-1024)
 
@@ -321,11 +321,14 @@ skills:
 
 # ---- Retrieval [all] ----
 retrieval:
-  # AGFS file retrieval uses storage.backend=agfs.
-  # mode: agfs
-  # SQLite FTS5 candidate index for AGFS mode; builds per scope on first eligible query.
-  agfs_fts_enabled: true
-  agfs_fts_ranker: literal       # AGFS only: literal / sqlite_bm25
+  # mode: default               # default: embedding + vector search; or vector_free
+  # vector_free requires storage.backend: agfs. Omit embedding and vector_db,
+  # keep llm for extraction, and disable shared spaces, code retrieval, Scene
+  # and skill sedimentation.
+
+  # For vector_free + sqlite_fts, FTS5 finds candidates and AGFS verifies them.
+  # literal ranks verified text matches; sqlite_bm25 uses the FTS5 BM25 order.
+  agfs_fts_ranker: literal
   # Opt-in Jev-compatible evidence reranking; requires decision configuration.
   decision_rerank_enabled: false
   # Service-instance setting; restart every worker after changing it.
@@ -334,14 +337,9 @@ retrieval:
   # URI/read behavior apply; results discovered through L0/L1 may be lost.
   # Priority: this YAML value > OGMEM_RETRIEVAL_EXPAND_HIERARCHY > true.
   expand_hierarchy: true
-  # Hybrid retrieval [openGauss + SQL canonical storage, opt-in]: requires
-  # the openGauss BM25 access method and <&> operator. The configured database
-  # role must be able to create/alter the versioned lexical tables, indexes,
-  # and generation sequence. Rolling mixed-version workers are unsupported:
-  # upgrade and stop every old vector-only outbox worker before enabling this
-  # flag, and do not start one while hybrid is enabled. Historical rebuilds
-  # stream bounded pages in one background worker; the first read per owner
-  # scope fails closed until ready.
+  # Use true to fuse vector and inverted results in default mode. An explicitly
+  # selected index is maintained with either value. vector_free queries its
+  # selected index directly, so keep hybrid_enabled false for that mode.
   hybrid_enabled: false
   vector_top_k: 100
   lexical_top_k: 50
@@ -349,14 +347,18 @@ retrieval:
   semantic_weight: 1.0
   lexical_weight: 1.0
   backfill_page_size: 500
-  lexical:
-    provider: opengauss_native
-    options:
-      # Projection/checkpoint tables use opengauss_connection_string (or the
-      # vector openGauss DSN); canonical outbox state gates reads fail-closed.
-      table_name: lexical_index_opengauss_native
-      query_timeout_ms: 5000
-      max_query_chars: 32768
+  # Set one provider. Omitted: vector_free uses sqlite_fts; default with
+  # hybrid off uses none; default with hybrid on falls back to opengauss_native.
+  # In vector_free, none scans AGFS and sqlite_fts builds a process-local
+  # temporary FTS5 index. opengauss_native uses a persistent openGauss BM25 index.
+  # Use the same configuration across the API and all outbox workers.
+  # See docs/OGMEMORY_ENV.md for copyable examples and legacy fallbacks.
+  # inverted_index:
+  #   provider: none             # none / sqlite_fts / opengauss_native
+  #   options:
+  #     path: /data/ogmemory/lexical.db  # sqlite_fts in default mode; shared file
+  #     connection_string: "host=127.0.0.1 port=15432 dbname=ogmemory user=gaussdb password=CHANGE_ME"  # opengauss_native only
+  #     table_name: lexical_index_opengauss_native  # opengauss_native only
 
 # ---- Cache [all] ----
 agent_memory:

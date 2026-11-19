@@ -34,9 +34,9 @@ configure_third_party_loggers()
 logger = logging.getLogger("index-service")
 
 
-def _create_storage(cfg):
-    """Use the same storage backend as the API, not an unrelated AGFS outbox."""
-    if cfg.storage_backend == "sql":
+def _create_storage(cfg, *, invalidate_lexical_scopes=None):
+    """Open the canonical storage and Outbox used by the API."""
+    if cfg.storage_backend == "sql" or cfg.shared_spaces_enabled:
         from commit.sql_outbox_store import SQLOutboxStore
         from fs.sql_adapter import SQLContextFS
         from fs.sql_adapter.pool import SharedConnectionPool
@@ -47,7 +47,13 @@ def _create_storage(cfg):
             cfg.sql_connection_string, pool_size=cfg.sql_pool_size,
             dialect=cfg.sql_dialect,
         )
-        fs = SQLContextFS(pool=pool)
+        if cfg.storage_backend == "agfs":
+            from fs.agfs_adapter.client import create_agfs_client
+            from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
+
+            fs = AGFSSpaceBridge(pool, create_agfs_client(cfg), cfg.agfs_mount_prefix)
+        else:
+            fs = SQLContextFS(pool=pool)
         return fs, SQLOutboxStore(pool=pool, fs=fs), pool
 
     from fs.agfs_adapter.client import create_agfs_client
@@ -56,32 +62,35 @@ def _create_storage(cfg):
 
     client = create_agfs_client(cfg)
     fs = AGFSContextFS(client=client, mount_prefix=cfg.agfs_mount_prefix)
-    return fs, OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix), None
+    outbox = OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix,
+                         invalidate_lexical_scopes=invalidate_lexical_scopes)
+    return fs, outbox, None
 
 
 def main():
+    from providers.composite_index import create_projection_writer
     from providers.config import ProviderConfig
     from providers.unified_config import get_config
     from service.index_service import init_index_service
 
     cfg = get_config()
-    if cfg.retrieval_hybrid_enabled:
-        raise RuntimeError(
-            "hybrid retrieval is unsupported by the standalone index service; "
-            "run the SQL-backed MemoryService so every outbox event dual-writes"
-        )
     provider_cfg = ProviderConfig.from_ogmem_config(cfg)
 
     embedder = vector_index = None
     if not cfg.agfs_retrieval_enabled:
         embedder = provider_cfg.create_embedder()
         vector_index = provider_cfg.create_vector_index()
+    projection_index = create_projection_writer(cfg, vector_index)
 
-    fs, outbox_store, storage_pool = _create_storage(cfg)
+    lexical_index = getattr(projection_index, "lexical_index", None)
+    fs, outbox_store, storage_pool = _create_storage(
+        cfg, invalidate_lexical_scopes=lexical_index.mark_scopes_dirty if lexical_index is not None else None,
+    )
 
-    logger.info("Config: provider=%s, embedding=%s, db=%s, storage=%s",
-                cfg.provider, cfg.openai_embedding_model,
-                cfg.vector_db_type, cfg.storage_backend)
+    logger.info("Config: provider=%s, embedding=%s, vector_db=%s, storage=%s, inverted_index=%s",
+                cfg.provider, cfg.openai_embedding_model if embedder is not None else "none",
+                cfg.vector_db_type if vector_index is not None else "none", cfg.storage_backend,
+                cfg.retrieval_lexical_provider)
     logger.info("Params: account=%s, interval=%ds, workers=%d",
                 cfg.account_id, cfg.index_interval, cfg.index_workers)
 
@@ -105,7 +114,7 @@ def main():
     service = init_index_service(
         outbox_store=outbox_store,
         embedder=embedder,
-        vector_index=vector_index,
+        vector_index=projection_index,
         get_account_ids=lambda: [cfg.account_id],
         interval_seconds=cfg.index_interval,
         worker_count=cfg.index_workers,
@@ -117,6 +126,10 @@ def main():
     def shutdown(signum, frame):
         logger.info("Received signal %d, stopping...", signum)
         service.stop(wait=True)
+        for resource in (projection_index, fs):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
         if usage_pool is not None:
             usage_pool.close_all()
         sys.exit(0)

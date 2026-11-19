@@ -329,6 +329,7 @@ class SeedResult:
     initial_candidates: list[SeedHit] = field(default_factory=list)
     query_vector: list[float] = field(default_factory=list)
     root_uris: list[str] = field(default_factory=list)
+    lexical_warming: bool = False
 
 
 @dataclass

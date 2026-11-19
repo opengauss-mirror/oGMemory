@@ -161,12 +161,12 @@ check_prereqs() {
     fi
 
     if [ -z "$SQL_CONNECTION_STRING" ]; then
-        fail "No PostgreSQL DSN found"
+        fail "No SQL storage DSN found"
         echo "  Set storage.connection_string in $CONFIG_PATH"
         if [ -f "$EXAMPLE_CONFIG_PATH" ]; then
             echo "  Example template: $EXAMPLE_CONFIG_PATH"
         fi
-        echo "  Env override still works: export SQL_CONNECTION_STRING='host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres'"
+        echo "  Env override: export SQL_CONNECTION_STRING='host=127.0.0.1 port=15432 dbname=ogmemory user=gaussdb password=CHANGE_ME'"
         exit 1
     fi
 
@@ -185,7 +185,7 @@ conn = psycopg2.connect(dsn)
 conn.close()
 PY
     then
-        fail "Cannot connect to PostgreSQL using the configured SQL DSN"
+        fail "Cannot connect to the configured SQL storage database"
         exit 1
     fi
 

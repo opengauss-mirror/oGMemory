@@ -24,6 +24,7 @@ class LexicalBackfill:
         scanner: CanonicalNodeScanner,
         lexical_index,
         *,
+        record_builder=build_index_records,
         page_size: int = 500,
         max_pending: int = 16,
         retry_base_seconds: float = 5.0,
@@ -40,6 +41,8 @@ class LexicalBackfill:
             raise ValueError("backfill retry bounds are invalid")
         self._scanner = scanner
         self._lexical = lexical_index
+        self._record_builder = record_builder
+        self._prepare_projection = getattr(scanner, "prepare_lexical_projection", None)
         self._page_size = page_size
         self._max_pending = max_pending
         self._retry_base_seconds = retry_base_seconds
@@ -60,9 +63,10 @@ class LexicalBackfill:
         scopes = tuple(dict.fromkeys(str(value) for value in owner_spaces if value))
         if not scopes:
             return False
-        if not self._scanner.projection_is_quiescent(account_id=ctx.account_id):
+        quiescent = self._scanner.projection_is_quiescent(account_id=ctx.account_id)
+        if quiescent is False:
             return False
-        ready = self._lexical.ready_scopes(ctx.account_id, scopes)
+        ready = self._lexical.ready_scopes(ctx.account_id, scopes) if quiescent else frozenset()
         if ready == frozenset(scopes):
             return True
         with self._condition:
@@ -144,6 +148,8 @@ class LexicalBackfill:
         scopes = (owner_space,)
         rebuild_id = None
         try:
+            if self._prepare_projection is not None and not self._prepare_projection(account_id=account_id):
+                return False
             rebuild_id = self._lexical.begin_rebuild()
             nodes = self._scanner.scan_active_nodes(
                 account_id=account_id,
@@ -153,7 +159,7 @@ class LexicalBackfill:
             records = (
                 lexical_record_from_index_record(record)
                 for node in nodes
-                for record in build_index_records(node)
+                for record in self._record_builder(node)
                 if record.level in (0, 1, 2)
             )
             if not self._lexical.replace_scopes(

@@ -100,6 +100,29 @@ def test_missing_scope_schedules_background_backfill_and_then_becomes_ready():
     assert backfill.close(timeout=1.0) is True
 
 
+def test_backfill_prepares_canonical_checkpoint_before_rebuilding():
+    scanner = _Scanner()
+    scanner.quiescent = None
+    lexical = _Lexical()
+    lexical.ready = frozenset({"user_u1"})
+
+    def prepare(*, account_id):
+        assert account_id == "acct"
+        scanner.quiescent = True
+        return True
+
+    scanner.prepare_lexical_projection = prepare
+    backfill = LexicalBackfill(scanner, lexical)
+    try:
+        ctx = SimpleNamespace(account_id="acct")
+        backfill.ensure_ready(ctx, ["user_u1"])
+        assert lexical.completed.wait(1.0)
+        assert backfill.ensure_ready(ctx, ["user_u1"]) is True
+        assert lexical.rebuilds == scanner.calls == 1
+    finally:
+        backfill.close()
+
+
 def test_pending_canonical_projection_fails_closed_without_scheduling_backfill():
     scanner = _Scanner()
     scanner.quiescent = False

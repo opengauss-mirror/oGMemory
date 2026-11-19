@@ -152,13 +152,72 @@ cache:
 
 ### 记忆检索模式
 
+在服务端的 `config/ogmem.yaml`（或 `OGMEM_CONFIG` 指定的文件）配置。HTTP、MCP 和各 Agent 插件共用服务端的设置。
+
 | YAML 路径 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `retrieval.mode` | `OGMEM_RETRIEVAL_MODE` | `default` | `default` 使用现有向量配置。`agfs` 要求 `storage.backend: agfs`，可省略 `embedding` 和 `vector_db`。 |
-| `retrieval.agfs_fts_enabled` | `OGMEM_RETRIEVAL_AGFS_FTS_ENABLED` | `true` | 在 AGFS 模式构建进程内 SQLite FTS5 索引，运行时需支持 FTS5 和 `trigram`。 |
-| `retrieval.agfs_fts_ranker` | `OGMEM_RETRIEVAL_AGFS_FTS_RANKER` | `literal` | `literal` 使用字面评分。`sqlite_bm25` 使用 SQLite FTS5 BM25 排序，要求启用 FTS。 |
+| `retrieval.mode` | `OGMEM_RETRIEVAL_MODE` | `default` | `default` 保留向量写入和检索。`vector_free` 要求 `storage.backend: agfs`，写入和检索均跳过 embedding，可删除 `embedding` 与 `vector_db`，保留抽取所需的 `llm`。 |
+| `retrieval.inverted_index.provider` | `OGMEM_RETRIEVAL_INVERTED_INDEX_PROVIDER` | 见下文 | `none`、`sqlite_fts` 或 `opengauss_native`。显式选择索引后，索引维护独立于混合检索开关。 |
+| `retrieval.hybrid_enabled` | `OGMEM_RETRIEVAL_HYBRID_ENABLED` | `false` | `default` 模式下，`true` 融合向量与倒排结果，`false` 仅查向量。`vector_free` 直接查选定的倒排，示例统一设为 `false`。 |
+| `retrieval.agfs_fts_ranker` | `OGMEM_RETRIEVAL_AGFS_FTS_RANKER` | `literal` | 仅用于 `vector_free` + `sqlite_fts`。`literal` 对 AGFS 回读结果做字面评分，`sqlite_bm25` 按 FTS5 的 BM25 顺序排序。 |
+| `retrieval.inverted_index.options.path` | — | — | `default` + `sqlite_fts` 必填。使用 API 与索引 Worker 共同读写的持久化 SQLite 文件路径。容器部署应共享可写目录。`vector_free` + `sqlite_fts` 无需该项。 |
+| `retrieval.inverted_index.options.connection_string` | — | 见下文 | `opengauss_native` 的数据库连接。优先取该项，其次取 `vector_db.connection_string`，最后取 `storage.connection_string`。目标库须支持原生 BM25，建议 AGFS 部署显式填写该项。 |
+| `retrieval.inverted_index.options.table_name` | — | `lexical_index_opengauss_native` | `opengauss_native` 使用的倒排表名。首次建表和建索引时，数据库账号须在目标 schema 拥有相应权限。 |
 
-AGFS 模式的配置示例见 [Agent 对接文档](integrations/README.md#无-embedding-模式)。
+**本地参考配置**使用 `storage.backend: sql`、`storage.dialect: opengauss`、`retrieval.mode: default`、`hybrid_enabled: false` 和 `vector_db.type: chroma`，即 openGauss 保存记忆原文，Chroma 承载向量检索，倒排索引默认关闭。首次执行本地向导时，若未显式设置混合检索环境变量，向导会在探测到原生 BM25 和 schema 权限后配置 `opengauss_native` 并开启混合检索。未加载配置文件且未设置 `STORAGE_BACKEND` 时，代码的主存储回退值是 `agfs`。
+
+**未通过配置或环境变量指定 provider**时，`vector_free` 默认选择 `sqlite_fts`，旧的 `agfs_fts_enabled: false` 会选择 `none`。`default` 在混合关闭时选择 `none`，开启时缺省选择 `opengauss_native`。整个 `inverted_index` 块省略且混合开启时，会读取旧的 `retrieval.lexical`。新配置建议明确指定 provider。旧的 `retrieval.mode: agfs` 仍解析为 `vector_free`。
+
+#### AGFS 无向量 + 内置 SQLite FTS5
+
+替换现有配置中的对应块。示例连接 HTTP AGFS，`mount_prefix` 要与 AGFS 实际挂载一致。使用 native AGFS 时保留原有 `agfs` 配置。
+
+```yaml
+storage:
+  backend: agfs
+agfs:
+  transport: http
+  base_url: "http://127.0.0.1:1833"
+  mount_prefix: "/local/plugin"
+retrieval:
+  mode: vector_free
+  hybrid_enabled: false
+  inverted_index:
+    provider: sqlite_fts
+  agfs_fts_ranker: literal
+```
+
+AGFS 保存记忆原文和元数据。各服务进程按访问范围构建临时 FTS5 索引，覆盖 L0、L1、L2 与部分节点元数据，重启后按需重建。仅需 AGFS 字面扫描时，将 `provider` 改为 `none`。两种配置均可移除 `embedding` 和 `vector_db`。请关闭 `shared_spaces.enabled`、`features.code_retrieval_enabled`、`scene.enabled` 和 `skills.sedimentation.enabled`，这些功能缺省关闭。
+
+#### AGFS 无向量 + openGauss BM25
+
+沿用上例的 `storage` 和 `agfs`，将 `retrieval` 改成以下内容。AGFS 继续保存原文，openGauss 持久化倒排。回填期间可走 AGFS 字面扫描。
+
+```yaml
+retrieval:
+  mode: vector_free
+  hybrid_enabled: false
+  inverted_index:
+    provider: opengauss_native
+    options:
+      connection_string: "host=127.0.0.1 port=15432 dbname=ogmemory user=gaussdb password=CHANGE_ME"
+```
+
+#### 向量 + 倒排
+
+继续使用原有的 `storage`、`embedding` 和 `vector_db` 配置。下面用持久化 SQLite 做倒排，也可改用上一例的 `opengauss_native` 及对应 `options`。
+
+```yaml
+retrieval:
+  mode: default
+  hybrid_enabled: true
+  inverted_index:
+    provider: sqlite_fts
+    options:
+      path: /data/ogmemory/lexical.db
+```
+
+设 `hybrid_enabled: false` 可让查询只用向量，明确配置的倒排索引仍随写入更新。改动 provider 或连接后，让 API 及对应的索引 Worker 读取相同配置并重启。切回向量模式时，为无向量期间新增或更新的记忆重建向量索引。
 
 ### 向量数据库
 
@@ -174,9 +233,9 @@ AGFS 模式的配置示例见 [Agent 对接文档](integrations/README.md#无-em
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
-| `storage.backend` | `STORAGE_BACKEND` | `sql` | 否 | 固定为 `sql`（PostgreSQL 直连存储） |
-| `storage.dialect` | `SQL_DIALECT` | `postgresql` | 否 | SQL 方言：`postgresql` / `opengauss`；openGauss 数据库必须使用 `DBCOMPATIBILITY='PG'` |
-| `storage.connection_string` | `STORAGE_DB_CONNECTION_STRING`（旧名 `SQL_CONNECTION_STRING` 仍生效） | 无 | **必填** | PostgreSQL libpq DSN，例如 `host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres` |
+| `storage.backend` | `STORAGE_BACKEND` | 本地参考配置和向导为 `sql` | 否 | `sql` 或 `agfs`。 |
+| `storage.dialect` | `SQL_DIALECT` | 本地参考配置和向导为 `opengauss` | 否 | openGauss 数据库须使用 `DBCOMPATIBILITY='PG'`。使用 PostgreSQL 时显式配置 `postgresql`。 |
+| `storage.connection_string` | `STORAGE_DB_CONNECTION_STRING`（旧名 `SQL_CONNECTION_STRING` 仍生效） | 无 | `backend: sql` 时必填 | libpq DSN，例如 `host=127.0.0.1 port=15432 dbname=ogmemory user=gaussdb password=CHANGE_ME`。 |
 | `storage.pool_size` | `STORAGE_DB_POOL_SIZE`（旧名 `SQL_POOL_SIZE`） | `5` | 否 | SQL storage 连接池大小 |
 
 团队任务与 AGFS 正文存储采用 openGauss 7.0.0-RC3、PG/UTF8 基线；版本能力和实际请求见[团队记忆 SQL 存储兼容性](deployment/team-memory-sql-compatibility.md)。
@@ -280,9 +339,9 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 ```
 
 说明：
-- 这个模式只要求本机 PostgreSQL 可连通。
+- 先准备可连接的 openGauss 数据库，创建业务库时指定 `DBCOMPATIBILITY='PG'`。
 - `./scripts/start_sql.sh` 会优先读取 `config/ogmem.yaml`，不必额外导出环境变量。
-- PostgreSQL 参数写在 `storage.connection_string`。
+- 主存储连接参数写在 `storage.connection_string`。
 - `vector_db.type: memory` 避免额外依赖 Chroma 或 openGauss vector 扩展。
 - `llm.provider: mock` 避免依赖外部 LLM API。
 

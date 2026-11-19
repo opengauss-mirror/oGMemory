@@ -122,3 +122,27 @@ def test_persisted_reference_reads_are_deduplicated_and_survive_store_restart():
     assert len(loaded) == 1
     assert loaded[0][0] == node.uri
     assert loaded[0][1] == replace(event, created_at=event.created_at or "")
+
+
+def test_failed_lexical_event_invalidates_scope_before_finishing_pending_work():
+    client, fs, _ = make_runtime()
+    ctx = request_context()
+    node = memory_node(ctx)
+    fs.write_node(node, ctx)
+    invalidated = []
+
+    def invalidate(scopes):
+        assert store._lexical_queue_entries(ctx.account_id) == {event.event_id + ".json"}
+        invalidated.extend(scopes)
+
+    store = OutboxStore(client, fs, invalidate_lexical_scopes=invalidate)
+    assert store.prepare_lexical_projection(account_id=ctx.account_id)
+    event = store.register_write(fs.read_node(node.uri, ctx), ctx)
+    with store.claim_processing_event(event, node.uri, "projection-worker") as claimed:
+        assert claimed
+        store.move_to_dlq(event, node.uri)
+    store.list_pending(ctx.account_id)
+
+    assert invalidated == [(ctx.account_id, ctx.user_space_name())]
+    assert store.projection_is_quiescent(account_id=ctx.account_id) is True
+    assert store.get_event_status(node.uri, event.event_id) == "FAILED"

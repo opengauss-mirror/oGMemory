@@ -732,7 +732,7 @@ class OgMemConfig:
     retrieval_global_result_rerank_enabled: bool = False
     retrieval_owner_scope_filter_enabled: bool = False
     retrieval_hybrid_enabled: bool = False
-    retrieval_lexical_provider: str = "opengauss_native"
+    retrieval_lexical_provider: str | None = None
     retrieval_lexical_options: dict[str, Any] = field(default_factory=dict, repr=False)
     retrieval_vector_top_k: int = 100
     retrieval_lexical_top_k: int = 50
@@ -1119,26 +1119,36 @@ class OgMemConfig:
             )
         if not isinstance(self.retrieval_expand_hierarchy, bool):
             raise ValueError("retrieval_expand_hierarchy must be a boolean")
-        if self.retrieval_mode not in {"default", "agfs"}:
-            raise ValueError("retrieval.mode must be default or agfs")
+        if self.retrieval_mode == "agfs":
+            self.retrieval_mode = "vector_free"
+        if self.retrieval_mode not in {"default", "vector_free"}:
+            raise ValueError("retrieval.mode must be default or vector_free")
         if self.retrieval_agfs_fts_ranker not in {"literal", "sqlite_bm25"}:
             raise ValueError("retrieval.agfs_fts_ranker must be literal or sqlite_bm25")
+        if self.retrieval_lexical_provider is None:
+            if self.agfs_retrieval_enabled:
+                if self.retrieval_agfs_fts_ranker == "sqlite_bm25" and not self.retrieval_agfs_fts_enabled:
+                    raise ValueError("retrieval.agfs_fts_ranker=sqlite_bm25 requires agfs_fts_enabled")
+                self.retrieval_lexical_provider = "sqlite_fts" if self.retrieval_agfs_fts_enabled else "none"
+            else:
+                self.retrieval_lexical_provider = "opengauss_native" if self.retrieval_hybrid_enabled else "none"
+        self.retrieval_lexical_provider = self.retrieval_lexical_provider.strip().casefold()
+        if not self.retrieval_lexical_provider:
+            raise ValueError("retrieval.inverted_index.provider must not be empty")
         if self.agfs_retrieval_enabled:
-            if self.retrieval_agfs_fts_ranker == "sqlite_bm25" and not self.retrieval_agfs_fts_enabled:
-                raise ValueError("retrieval.agfs_fts_ranker=sqlite_bm25 requires agfs_fts_enabled")
             if self.storage_backend != "agfs":
-                raise ValueError("retrieval.mode=agfs requires storage.backend=agfs")
+                raise ValueError("retrieval.mode=vector_free requires storage.backend=agfs")
             if self.shared_spaces_enabled or self.code_retrieval_enabled or self.scene_enabled or self.skill_sedimentation_enabled:
                 raise ValueError(
-                    "retrieval.mode=agfs requires shared spaces, code retrieval, Scene and skill sedimentation to be disabled"
+                    "retrieval.mode=vector_free requires shared spaces, code retrieval, Scene and skill sedimentation to be disabled"
                 )
-        if self.retrieval_hybrid_enabled and self.storage_backend != "sql":
+        if (self.retrieval_hybrid_enabled and not self.agfs_retrieval_enabled
+                and self.retrieval_lexical_provider == "none"):
+            raise ValueError("hybrid retrieval requires an inverted index provider")
+        if (self.retrieval_uses_lexical_projection and self.storage_backend == "sql"
+                and not (self.sql_connection_string or self.opengauss_connection_string)):
             raise ValueError(
-                "hybrid retrieval requires storage.backend=sql for canonical backfill"
-            )
-        if self.retrieval_hybrid_enabled and not self.sql_connection_string:
-            raise ValueError(
-                "hybrid retrieval requires storage.connection_string for canonical backfill"
+                "inverted index requires storage.connection_string for canonical backfill"
             )
         if not 1 <= self.retrieval_vector_top_k <= 1_000:
             raise ValueError("retrieval_vector_top_k must be between 1 and 1000")
@@ -1246,6 +1256,22 @@ class OgMemConfig:
         sharing = raw.get("sharing") or {}
         memory = raw.get("memory") or {}
         retrieval = raw.get("retrieval") or {}
+        hybrid_enabled = _resolve_bool(retrieval.get("hybrid_enabled"), "OGMEM_RETRIEVAL_HYBRID_ENABLED", False)
+        inverted_index = retrieval.get("inverted_index")
+        if inverted_index is None:
+            legacy = retrieval.get("lexical")
+            legacy = legacy if isinstance(legacy, dict) else {"provider": retrieval.get("lexical_provider")}
+            inverted_index = legacy if hybrid_enabled else {}
+            lexical_provider = _resolve(
+                inverted_index.get("provider"), "OGMEM_RETRIEVAL_INVERTED_INDEX_PROVIDER",
+                os.environ.get("OGMEM_RETRIEVAL_LEXICAL_PROVIDER") if hybrid_enabled else None,
+            )
+        else:
+            if not isinstance(inverted_index, dict):
+                raise ValueError("retrieval.inverted_index must be a mapping")
+            lexical_provider = _resolve(
+                inverted_index.get("provider"), "OGMEM_RETRIEVAL_INVERTED_INDEX_PROVIDER", None,
+            )
         cache = raw.get("cache") or {}
         perf = raw.get("perf") or {}
         sedimentation = (raw.get("skills") or {}).get("sedimentation") or {}
@@ -2424,23 +2450,9 @@ class OgMemConfig:
             retrieval_agfs_fts_ranker=_resolve(
                 retrieval.get("agfs_fts_ranker"), "OGMEM_RETRIEVAL_AGFS_FTS_RANKER", "literal",
             ),
-            retrieval_hybrid_enabled=_resolve_bool(
-                retrieval.get("hybrid_enabled"),
-                "OGMEM_RETRIEVAL_HYBRID_ENABLED",
-                False,
-            ),
-            retrieval_lexical_provider=_resolve(
-                (retrieval.get("lexical") or {}).get("provider")
-                if isinstance(retrieval.get("lexical"), dict)
-                else retrieval.get("lexical_provider"),
-                "OGMEM_RETRIEVAL_LEXICAL_PROVIDER",
-                "opengauss_native",
-            ),
-            retrieval_lexical_options=(
-                dict((retrieval.get("lexical") or {}).get("options") or {})
-                if isinstance(retrieval.get("lexical"), dict)
-                else {}
-            ),
+            retrieval_hybrid_enabled=hybrid_enabled,
+            retrieval_lexical_provider=lexical_provider,
+            retrieval_lexical_options=dict(inverted_index.get("options") or {}),
             retrieval_vector_top_k=_resolve(
                 retrieval.get("vector_top_k"),
                 "OGMEM_RETRIEVAL_VECTOR_TOP_K",
@@ -2506,7 +2518,15 @@ class OgMemConfig:
 
     @property
     def agfs_retrieval_enabled(self) -> bool:
-        return self.retrieval_mode == "agfs"
+        return self.retrieval_mode == "vector_free"
+
+    @property
+    def retrieval_uses_agfs_fts(self) -> bool:
+        return self.agfs_retrieval_enabled and self.retrieval_lexical_provider == "sqlite_fts"
+
+    @property
+    def retrieval_uses_lexical_projection(self) -> bool:
+        return self.retrieval_lexical_provider != "none" and not self.retrieval_uses_agfs_fts
 
     @property
     def effective_code_retrieval_semantic_enabled(self) -> bool:

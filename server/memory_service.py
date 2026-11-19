@@ -1018,7 +1018,7 @@ class MemoryService:
             return SQLContextFS(pool=self._get_shared_sql_pool())
         if _HAS_AGFS:
             client = self._get_agfs_client()
-            if self._agfs_retrieval_enabled and getattr(self._cfg, "retrieval_agfs_fts_enabled", True):
+            if self._cfg.retrieval_uses_agfs_fts:
                 return AGFSContextFS(client=client, mount_prefix=self._mount_prefix,
                                      on_node_change=self._on_agfs_node_change)
             return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
@@ -1051,8 +1051,15 @@ class MemoryService:
             )
         if _HAS_AGFS:
             client = self._get_agfs_client()
-            return OutboxStore(client=client, fs=fs, mount_prefix=self._mount_prefix)
+            invalidate = self._invalidate_lexical_scopes if self._cfg.retrieval_uses_lexical_projection else None
+            return OutboxStore(
+                client=client, fs=fs, mount_prefix=self._mount_prefix,
+                invalidate_lexical_scopes=invalidate,
+            )
         return None
+
+    def _invalidate_lexical_scopes(self, scopes) -> None:
+        self._get_shared_projection_index().lexical_index.mark_scopes_dirty(scopes)
 
     def _get_relation_store(self):
         """Create the appropriate RelationStore implementation based on config."""
@@ -1069,7 +1076,7 @@ class MemoryService:
 
     @property
     def _agfs_retrieval_enabled(self) -> bool:
-        return getattr(self._cfg, "retrieval_mode", "default") == "agfs"
+        return getattr(self._cfg, "retrieval_mode", "default") == "vector_free"
 
     def _graph_enabled(self):
         return getattr(self._cfg,"graph_backend","none") == "sql"
@@ -2431,7 +2438,7 @@ class MemoryService:
                     hints={"include_all_memories": True},
                 )
             if agfs_retrieval and result is not None:
-                stats["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
+                stats["retrieval"] = {"mode": "vector_free", "status": "partial" if result.partial else "complete"}
             if self._graph_enabled() and result is not None and result.trace is not None:
                 stats["graph_expansion"] = dict(result.trace.graph_expansion)
             if result and result.hits:
@@ -2488,7 +2495,7 @@ class MemoryService:
             try:
                 summary_result = summary.result() if summary is not None else summary_search()
                 if agfs_retrieval and summary_result is not None and summary_result.partial:
-                    stats["retrieval"] = {"mode": "agfs", "status": "partial"}
+                    stats["retrieval"] = {"mode": "vector_free", "status": "partial"}
                 if summary_result and summary_result.hits:
                     summary_items = [
                         {
@@ -2921,10 +2928,10 @@ class MemoryService:
 
     # -- Lazy resource getters ------------------------------------------------
 
-    @_serialize_lazy_initialization("_vector_index")
-    def _get_shared_vector_index(self):
-        """Lazy-init shared vector index (same instance for read + outbox worker)."""
-        if self._vector_index is None:
+    @_serialize_lazy_initialization("_projection_index")
+    def _get_shared_projection_index(self):
+        """Return the outbox sink for the configured retrieval projections."""
+        if self._projection_index is None:
             # Use the same conservative identity as the session mutation guard.
             from fs.sql_adapter.pool import sql_connection_identity
             pool = None
@@ -2935,73 +2942,57 @@ class MemoryService:
                     and vector_dsn
                     and sql_connection_identity(vector_dsn) == sql_connection_identity(self._cfg.sql_connection_string)):
                 pool = self._get_shared_sql_pool()
-            vector_index = (self._provider_cfg.create_vector_index(pool=pool) if pool is not None
-                            else self._provider_cfg.create_vector_index())
-            projection_index = vector_index
-            lexical_index = None
-            if getattr(self._cfg, "retrieval_hybrid_enabled", False):
-                try:
-                    from core.lexical import HybridLexicalIndex
-                    from providers.composite_index import CompositeProjectionWriter
-                    from providers.lexical_index import create_lexical_index
+            vector_index = None
+            if not self._agfs_retrieval_enabled:
+                vector_index = (self._provider_cfg.create_vector_index(pool=pool) if pool is not None
+                                else self._provider_cfg.create_vector_index())
+            from providers.composite_index import create_projection_writer
 
-                    lexical_index = create_lexical_index(self._cfg)
-                    if not isinstance(lexical_index, HybridLexicalIndex):
-                        raise TypeError(
-                            "hybrid lexical provider lacks durable checkpoint capabilities"
-                        )
-                    projection_index = CompositeProjectionWriter(
-                        vector_index,
-                        lexical_index,
-                    )
-                    from core.lexical import lexical_scopes_from_index_records
-
-                    projection_index.set_failure_callbacks(
-                        records_failed=lambda records: lexical_index.mark_scopes_dirty(
-                            lexical_scopes_from_index_records(records)
-                        ),
-                        scope_unknown_failed=lexical_index.mark_all_scopes_dirty,
-                    )
-                except Exception:
-                    for resource in (lexical_index, vector_index):
-                        close = getattr(resource, "close", None)
-                        if callable(close):
-                            try:
-                                close()
-                            except Exception:
-                                logger.warning(
-                                    "Resource cleanup failed after lexical initialization error",
-                                    exc_info=True,
-                                )
-                    raise
+            projection_index = create_projection_writer(self._cfg, vector_index)
+            if self._cfg.retrieval_uses_lexical_projection:
+                self._lexical_index = projection_index.lexical_index
             # Publish the resource tree only after required lexical
             # initialization succeeds, so transient failures remain retryable.
             self._vector_index = vector_index
             self._projection_index = projection_index
-            self._lexical_index = lexical_index
-            logger.info("Shared vector_index ready: %s", type(self._vector_index).__name__)
-        return self._vector_index
-
-    def _get_shared_projection_index(self):
-        """Return the outbox sink that keeps vector and lexical projections aligned."""
-        self._get_shared_vector_index()
+            logger.info("Retrieval projections ready: vector=%s lexical=%s",
+                        type(vector_index).__name__, self._cfg.retrieval_lexical_provider)
         return self._projection_index
+
+    def _get_shared_vector_index(self):
+        """Return the shared vector index for vector queries and prefetch."""
+        if self._vector_index is None:
+            self._get_shared_projection_index()
+        return self._vector_index
 
     @_serialize_lazy_initialization("_lexical_backfill")
     def _get_lexical_backfill(self):
         """Return the lifecycle-owned lexical backfill coordinator."""
-        if not getattr(self._cfg, "retrieval_hybrid_enabled", False):
+        if not self._cfg.retrieval_uses_lexical_projection:
             return None
         if self._lexical_backfill is None:
-            self._get_shared_vector_index()
             if self._lexical_index is None:
-                raise RuntimeError("hybrid retrieval requires a lexical index")
-            from fs.sql_adapter.node_scanner import SQLCanonicalNodeScanner
+                self._get_shared_projection_index()
+            from index.index_record_builder import build_agfs_lexical_records, build_index_records
             from providers.lexical_backfill import LexicalBackfill
 
+            if self._use_sql_metadata:
+                from fs.sql_adapter.node_scanner import SQLCanonicalNodeScanner
+
+                bridge = self._get_space_content_store()
+                scanner = SQLCanonicalNodeScanner(
+                    self._get_shared_sql_pool(),
+                    hydrate_nodes=bridge.hydrate_nodes if bridge is not None else None,
+                )
+            else:
+                from fs.agfs_adapter.node_scanner import AGFSCanonicalNodeScanner
+
+                fs = self._get_context_fs()
+                scanner = AGFSCanonicalNodeScanner(fs, outbox=self._get_outbox_store(fs))
             self._lexical_backfill = LexicalBackfill(
-                SQLCanonicalNodeScanner(self._get_shared_sql_pool()),
+                scanner,
                 self._lexical_index,
+                record_builder=build_agfs_lexical_records if self._agfs_retrieval_enabled else build_index_records,
                 page_size=getattr(self._cfg, "retrieval_backfill_page_size", 500),
             )
         return self._lexical_backfill
@@ -3047,7 +3038,8 @@ class MemoryService:
         agfs_retrieval = self._agfs_retrieval_enabled
         directory_summary_enabled = bool(getattr(self._cfg, "directory_summary_enabled", False))
         return OutboxWorker(
-            vector_index=None if agfs_retrieval else self._get_shared_projection_index(),
+            vector_index=(self._get_shared_projection_index()
+                          if not agfs_retrieval or self._cfg.retrieval_uses_lexical_projection else None),
             embedder=None if agfs_retrieval else self._get_shared_embedder(),
             fs=fs,
             llm=self.get_llm() if directory_summary_enabled else None,
@@ -3274,10 +3266,10 @@ class MemoryService:
         if self._lexical_index is not None and self._projection_index is not None:
             try:
                 if not self._projection_index.close(timeout=join_timeout):
-                    logger.warning("Hybrid retrieval indexes did not close before deadline")
+                    logger.warning("Retrieval projections did not close before deadline")
                     return
             except Exception as exc:
-                logger.warning("Failed to close hybrid retrieval indexes: %s", exc)
+                logger.warning("Failed to close retrieval projections: %s", exc)
                 return
             self._projection_index = None
             self._lexical_index = None
@@ -3628,10 +3620,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 include_agent_memories=self._cfg.agent_memory_enabled,
                 max_top_k=self._cfg.retrieval_max_top_k,
                 default_top_k=self._cfg.retrieval_default_top_k,
+                lexical_top_k=self._cfg.retrieval_lexical_top_k,
             )
+            lexical_backfill = self._get_lexical_backfill()
             pipeline = AGFSRetrieval(
-                fs, cfg, fts_enabled=getattr(self._cfg, "retrieval_agfs_fts_enabled", True),
-                fts_ranker=getattr(self._cfg, "retrieval_agfs_fts_ranker", "literal"),
+                fs, cfg, fts_enabled=self._cfg.retrieval_uses_agfs_fts,
+                fts_ranker=self._cfg.retrieval_agfs_fts_ranker,
+                lexical_index=self._lexical_index, lexical_backfill=lexical_backfill,
             )
             self._agfs_fts = pipeline.fts
             self._read_api = ReadAPI(
@@ -3722,8 +3717,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     vector_index,
                     embedder,
                     cfg,
-                    self._lexical_index,
+                    self._lexical_index if cfg.hybrid_enabled else None,
                     lexical_backfill,
+                    allow_lexical_warming=self._cfg.storage_backend == "agfs",
                 ),
                 hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
                 assembly=ResultRanker(cfg, relation_store=relation_store),
@@ -4292,7 +4288,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             topic_buffer.set_pending_injection(hits)
             response = {"ok": True, "prefetched": len(hits)}
             if self._agfs_retrieval_enabled and result is not None:
-                response["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
+                response["retrieval"] = {"mode": "vector_free", "status": "partial" if result.partial else "complete"}
             return response
         except Exception as exc:
             logger.warning("prefetch failed: %s", exc, exc_info=True)
@@ -8361,8 +8357,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if isinstance(health.get("lexical_backfill"), dict)
             else {}
         )
-        hybrid_enabled = bool(self._cfg.retrieval_hybrid_enabled)
-        lexical_healthy = not hybrid_enabled or lexical.get("available") is True
+        hybrid_enabled = self._cfg.retrieval_hybrid_enabled and not self._agfs_retrieval_enabled
+        lexical_configured = getattr(self._cfg, "retrieval_uses_lexical_projection", hybrid_enabled)
+        lexical_healthy = not lexical_configured or lexical.get("available") is True
         backfill_busy = any(
             lexical_backfill.get(key)
             for key in (
@@ -8674,26 +8671,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     pool.return_connection(conn)
                 info["sql"] = "connected"
                 info["sql_dialect"] = self._cfg.sql_dialect
-                if self._cfg.retrieval_hybrid_enabled:
-                    self._get_shared_vector_index()
-                    lexical_health = self._lexical_index.health()
-                    info["lexical"] = lexical_health
-                    if not lexical_health.get("available", False):
-                        raise RuntimeError("required openGauss BM25 projection is unavailable")
-                    backfill_health = self._get_lexical_backfill().health()
-                    info["lexical_backfill"] = backfill_health
-                    if (
-                        backfill_health.get("queued")
-                        or backfill_health.get("running")
-                        or backfill_health.get("at_capacity")
-                        or backfill_health.get("cooldown_failures")
-                        or backfill_health.get("last_errors")
-                        or backfill_health.get("stopping")
-                    ):
-                        info["status"] = "degraded"
-                        info["error"] = "lexical historical projection is not ready"
+            info["lexical_provider"] = self._cfg.retrieval_lexical_provider
+            if self._cfg.retrieval_uses_lexical_projection:
+                if self._lexical_index is None:
+                    self._get_shared_projection_index()
+                lexical_health = self._lexical_index.health()
+                info["lexical"] = lexical_health
+                if not lexical_health.get("available", False):
+                    raise RuntimeError("configured inverted index is unavailable")
+                backfill_health = self._get_lexical_backfill().health()
+                info["lexical_backfill"] = backfill_health
+                if any(backfill_health.get(key) for key in (
+                    "queued", "running", "at_capacity", "cooldown_failures", "last_errors", "stopping",
+                )):
+                    info["status"] = "degraded"
+                    info["error"] = "lexical historical projection is not ready"
             if self._agfs_retrieval_enabled:
-                info["retrieval_mode"] = "agfs"
+                info["retrieval_mode"] = "vector_free"
             elif self._cfg.vector_db_type.strip().casefold() == "milvus":
                 info["vector_db"] = {"type": "milvus", "available": False}
                 # A cached client can outlive a failed server or revoked grant.
