@@ -70,6 +70,7 @@ const TASK_ERROR_MESSAGES = {
   },
 };
 const API_KEY_STORAGE_KEY = 'ogmemory-viewer-api-key';
+const VIEWER_REQUEST_TIMEOUT_MS = 10000;
 const API_KEY_CHANNEL_NAME = 'ogmemory-viewer-api-key-sync';
 const SCENE_PAGE_SIZE = 6;
 const storedApiKey = sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
@@ -80,7 +81,7 @@ const state = {
   accountId: localStorage.getItem('ogmemory-viewer-account-id') || '',
   tree: null, accountTrees: new Map(), inventories: new Map(), expanded: new Set(), directories: new Map(), directorySpecs: new Map(),
   singletonSpecs: new Map(), selectedUri: '', selectedDirectoryKey: '', detailRequestId: 0, searchQuery: '', view: 'memory',
-  adminMode: true, retrievalRequestId: 0, searchTargets: new Map(), lastSearchTarget: null,
+  adminMode: true, retrievalRequestId: 0, retrievalController: null, searchTargets: new Map(), lastSearchTarget: null,
   retrievalHits: [], metricsRequestId: 0, monitoringRequestId: 0, treeRequestId: 0, accountRequestId: 0,
   monitoringData: null, activeMonitor: 'overview',
   tasks: [], tasksPage: 1, tasksRequestId: 0, tasksSnapshot: '',
@@ -100,6 +101,7 @@ const elements = {
   refresh: $('#refresh-button'), settings: $('#settings-dialog'), detailView: $('#detail-view'),
   detailPlaceholder: $('#detail-placeholder'), shell: $('.app-shell'), pageTitle: $('#page-title'),
   memoryView: $('#memory-view'), dashboardView: $('#dashboard-view'),
+  botView: $('#bot-view'), botFrame: $('#bot-frame'),
   retrievalView: $('#retrieval-view'), retrievalScope: $('#retrieval-scope'),
   monitoringView: $('#monitoring-view'), monitoringContent: $('#monitoring-content'),
   retrievalResults: $('#retrieval-results'), retrievalDetail: $('#retrieval-detail'),
@@ -110,10 +112,24 @@ const elements = {
 
 function requestHeaders() { return state.apiKey ? { 'X-API-Key': state.apiKey } : {}; }
 function setApiKey(value) {
-  window.sharedSpaces?.reset();
+  const changed = value.trim() !== state.apiKey;
+  if (changed) window.sharedSpaces?.reset();
   state.apiKey = value.trim();
   if (state.apiKey) sessionStorage.setItem(API_KEY_STORAGE_KEY, state.apiKey);
   else sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+  if (changed) {
+    sessionStorage.removeItem('memorybot.session');
+    sessionStorage.removeItem('memorybot.authorization');
+    if (elements.botFrame.hasAttribute('src')) elements.botFrame.src = '/bot?embedded=1';
+  }
+}
+function sendBotMessage(type) {
+  if (elements.botFrame.hasAttribute('src')) {
+    elements.botFrame.contentWindow.postMessage({ type, theme: document.documentElement.dataset.theme }, location.origin);
+  }
+}
+function showBot() {
+  if (!elements.botFrame.hasAttribute('src')) elements.botFrame.src = '/bot?embedded=1';
 }
 function loadTreeAfterApiKeySync() {
   if (!initialTreeLoadPending) return;
@@ -144,16 +160,16 @@ async function fetchJson(url, options = {}) {
   return body;
 }
 
-async function loadTree() {
+async function loadTree(verifiedScope = null) {
   const requestId = ++state.treeRequestId;
   const accountRequestId = ++state.accountRequestId;
-  const requestOptions = { headers: requestHeaders(), signal: AbortSignal.timeout(10000) };
+  const requestOptions = { headers: requestHeaders(), signal: AbortSignal.timeout(VIEWER_REQUEST_TIMEOUT_MS) };
   resetRetrieval();
   resetScenes();
   setLoading(true);
   if (state.view === 'spaces') window.sharedSpaces?.notify('正在连接并读取团队空间…');
   try {
-    const scope = await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), requestOptions);
+    const scope = verifiedScope || await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), requestOptions);
     const adminMode = Boolean(scope.admin_mode);
     const body = adminMode
       ? await fetchJson(apiUrl('/api/v1/memory-viewer/admin/tree', { accountId: state.accountId }), requestOptions)
@@ -176,13 +192,16 @@ async function loadTree() {
     loadInventories(body.accounts || []);
     setConnection(true);
     if (state.view === 'spaces') await window.sharedSpaces?.initialize();
+    if (state.view === 'dashboard') loadDashboardMetrics();
+    if (state.view === 'monitoring') loadMonitoring();
+    if (state.view === 'tasks') loadTasks();
   } catch (error) {
     if (requestId !== state.treeRequestId || accountRequestId !== state.accountRequestId) return;
     const message = error.name === 'TimeoutError' ? '连接超时，请检查服务或连接设置后刷新。' : error.message;
     showTreeError(message);
     if (state.view === 'spaces') window.sharedSpaces?.notify(message, true);
     setConnection(false);
-    if (!state.apiKey || error.message === 'Invalid API Key') openSettings();
+    if (!state.apiKey || error.status === 401) openSettings(state.apiKey ? 'API Key 无效，请重新填写。' : '');
   } finally {
     if (requestId === state.treeRequestId) setLoading(false);
   }
@@ -288,12 +307,13 @@ function renderAccounts(accounts) {
 }
 
 async function loadTasks({ silent = false } = {}) {
-  const requestId = ++state.tasksRequestId;
   const refresh = $('#tasks-refresh');
+  if (silent && (refresh.disabled || $('#task-detail-dialog').open)) return;
+  const requestId = ++state.tasksRequestId;
   if (!silent) {
     refresh.classList.add('loading');
     refresh.disabled = true;
-    elements.tasksPanel.innerHTML = '<div class="tasks-empty loading"><span>↻</span><strong>正在加载任务</strong></div>';
+    elements.tasksPanel.innerHTML = '<div class="tasks-empty loading" role="status"><span aria-hidden="true">↻</span><strong>正在加载任务</strong></div>';
   }
   try {
     const body = await fetchJson(apiUrl('/api/v1/memory-viewer/tasks', { accountId: state.accountId, limit: 200 }));
@@ -309,7 +329,7 @@ async function loadTasks({ silent = false } = {}) {
   } catch (error) {
     if (requestId !== state.tasksRequestId) return;
     if (!silent) {
-      elements.tasksPanel.innerHTML = `<div class="tasks-empty error"><span>!</span><strong>任务加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
+      elements.tasksPanel.innerHTML = `<div class="tasks-empty error" role="status"><span aria-hidden="true">!</span><strong>任务加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
       $('#tasks-pagination').hidden = true;
     }
   } finally {
@@ -336,11 +356,20 @@ function renderTasks() {
   const page = tasks.slice((state.tasksPage - 1) * pageSize, state.tasksPage * pageSize);
   if (!page.length) {
     const filtered = Boolean($('#tasks-type').value || $('#tasks-status').value);
-    elements.tasksPanel.innerHTML = `<div class="tasks-empty"><span>▣</span><strong>${filtered ? '没有匹配任务' : '暂无后台任务'}</strong><p>${filtered ? '调整筛选条件后重试。' : '异步索引任务启动后，会在这里显示执行状态和更新时间。'}</p></div>`;
+    elements.tasksPanel.innerHTML = `<div class="tasks-empty" role="status"><span aria-hidden="true">▣</span><strong>${filtered ? '没有匹配任务' : '暂无后台任务'}</strong><p>${filtered ? '调整筛选条件后重试。' : '异步索引任务启动后，会在这里显示执行状态和更新时间。'}</p></div>`;
     $('#tasks-pagination').hidden = true;
     return;
   }
-  elements.tasksPanel.innerHTML = `<div class="tasks-table-wrap"><table class="tasks-table"><thead><tr><th>任务</th><th>类型</th><th>资源</th><th>状态</th><th>更新时间</th></tr></thead><tbody>${page.map((task) => `<tr tabindex="0" data-task-id="${escapeHtml(task.task_id)}"><td><code title="${escapeHtml(task.task_id)}">${escapeHtml(task.task_id)}</code></td><td>${escapeHtml(TASK_TYPE_LABELS[task.task_type] || task.task_type || '—')}</td><td><span class="task-resource" title="${escapeHtml(task.resource_id)}">${escapeHtml(task.resource_id || '—')}</span></td><td><span class="task-status" data-status="${escapeHtml(task.status)}">${escapeHtml(TASK_STATUS_LABELS[task.status] || task.status || '未知')}</span></td><td>${escapeHtml(formatTaskTime(task.updated_at || task.created_at))}</td></tr>`).join('')}</tbody></table></div>`;
+  const focusedElement = document.activeElement;
+  const focusWasInside = elements.tasksPanel.contains(focusedElement);
+  const focusedTaskId = focusedElement?.dataset.taskId;
+  elements.tasksPanel.innerHTML = `<div class="tasks-table-wrap" tabindex="0" role="region" aria-label="后台任务列表"><table class="tasks-table"><thead><tr><th>任务</th><th>类型</th><th>资源</th><th>状态</th><th>更新时间</th></tr></thead><tbody>${page.map((task) => `<tr><td><button class="task-link" type="button" data-task-id="${escapeHtml(task.task_id)}"><code>${escapeHtml(task.task_id)}</code></button></td><td>${escapeHtml(TASK_TYPE_LABELS[task.task_type] || task.task_type || '—')}</td><td><span class="task-resource" title="${escapeHtml(task.resource_id)}">${escapeHtml(task.resource_id || '—')}</span></td><td><span class="task-status" data-status="${escapeHtml(task.status)}">${escapeHtml(TASK_STATUS_LABELS[task.status] || task.status || '未知')}</span></td><td>${escapeHtml(formatTaskTime(task.updated_at || task.created_at))}</td></tr>`).join('')}</tbody></table></div>`;
+  if (focusWasInside) {
+    const tableRegion = elements.tasksPanel.firstElementChild;
+    const focusedTask = Array.from(tableRegion.querySelectorAll('.task-link'))
+      .find((task) => task.dataset.taskId === focusedTaskId);
+    (focusedTask || tableRegion).focus({ preventScroll: true });
+  }
   $('#tasks-pagination').hidden = false;
   $('#tasks-page-summary').textContent = `第 ${state.tasksPage} / ${pageCount} 页 · 共 ${tasks.length} 条`;
   $('#tasks-previous').disabled = state.tasksPage === 1;
@@ -747,7 +776,7 @@ function renderAgentNode(agent, agentsRoot, depth = 2, accountId = state.account
 function folderNode(key, label, depth, kind, children, meta = '') {
   const expanded = state.expanded.has(key);
   return `<div class="context-node context-folder ${expanded ? 'open' : ''}" data-node-key="${escapeHtml(key)}">
-    <button class="context-row" type="button" data-folder-key="${escapeHtml(key)}" style="--tree-depth:${depth}">
+    <button class="context-row" type="button" data-folder-key="${escapeHtml(key)}" aria-expanded="${expanded}" style="--tree-depth:${depth}">
       <span class="context-chevron">${expanded ? '⌄' : '›'}</span><span class="context-icon" data-kind="${kind}">${kind === 'root' ? '⌂' : kind === 'account' ? '▱' : '▰'}</span>
       <span class="context-name">${escapeHtml(label)}</span>${meta ? `<span class="context-meta">${escapeHtml(meta)}</span>` : ''}
     </button><div class="context-children">${children}</div></div>`;
@@ -944,7 +973,10 @@ function renderDashboard() {
 async function loadDashboardMetrics() {
   const requestId = ++state.metricsRequestId;
   const status = $('#metrics-status');
+  const table = $('#token-chart-data');
   status.hidden = true;
+  table.hidden = true;
+  table.querySelector('.monitoring-table-scroll').replaceChildren();
   $('#metrics-updated').textContent = '最近 14 天';
   $('#metrics-scope').textContent = state.accountId
     ? `${state.accountId} 的 LLM、Embedding 与 Decision Token 使用情况。`
@@ -1044,8 +1076,16 @@ function renderMonitoring() {
     : '';
   const tabs = [{ id: 'overview', name: '总览' }, ...components];
   if (!tabs.some((item) => item.id === state.activeMonitor)) state.activeMonitor = 'overview';
-  $('#monitoring-tabs').innerHTML = tabs.map((item) => `<button type="button" role="tab" data-monitor="${escapeHtml(item.id)}" aria-selected="${item.id === state.activeMonitor}">
-    <span>${MONITOR_ICONS[item.id] || '◇'}</span>${escapeHtml(item.name)}</button>`).join('');
+  const tabList = $('#monitoring-tabs');
+  const restoreFocus = tabList.contains(document.activeElement);
+  tabList.innerHTML = tabs.map((item, index) => {
+    const selected = item.id === state.activeMonitor;
+    return `<button id="monitoring-tab-${index}" type="button" role="tab" data-monitor="${escapeHtml(item.id)}" aria-controls="monitoring-content" aria-selected="${selected}" tabindex="${selected ? 0 : -1}">
+      <span aria-hidden="true">${MONITOR_ICONS[item.id] || '◇'}</span>${escapeHtml(item.name)}</button>`;
+  }).join('');
+  const activeTab = tabList.querySelector('[aria-selected="true"]');
+  elements.monitoringContent.setAttribute('aria-labelledby', activeTab.id);
+  if (restoreFocus) activeTab.focus({ preventScroll: true });
   renderMonitoringContent();
 }
 
@@ -1114,6 +1154,15 @@ function renderTokenTrend(series) {
     ['decision_input', 'decision-input', 'Decision 输入'],
     ['decision_output', 'decision-output', 'Decision 输出'],
   ];
+  const columns = keys.map(([, , label]) => `<th scope="col">${label}</th>`).join('');
+  const dataRows = series.map((entry) => {
+    const cells = keys.map(([key]) => `<td>${Number(entry[key] || 0).toLocaleString('zh-CN')}</td>`).join('');
+    return `<tr><th scope="row">${escapeHtml(entry.date || '')}</th>${cells}</tr>`;
+  }).join('');
+  const table = $('#token-chart-data');
+  table.querySelector('.monitoring-table-scroll').innerHTML = `<table>
+    <thead><tr><th scope="col">日期（UTC）</th>${columns}</tr></thead><tbody>${dataRows}</tbody></table>`;
+  table.hidden = false;
   const maxValue = Math.max(1, ...series.flatMap((item) => keys.map(([key]) => Number(item[key] || 0))));
   const x = (index) => padding.left + (series.length === 1 ? plotWidth / 2 : index * plotWidth / (series.length - 1));
   const y = (value) => padding.top + plotHeight - Number(value || 0) * plotHeight / maxValue;
@@ -1148,17 +1197,35 @@ function renderTokenTrend(series) {
   });
 }
 async function runRetrieval() {
-  const query = $('#retrieval-input').value.trim();
+  const input = $('#retrieval-input');
+  const threshold = $('#retrieval-threshold');
   const target = state.searchTargets.get(elements.retrievalScope.value);
-  if (!query || !target) return;
+  const query = input.value.trim();
+  if (!query) {
+    showFieldProblem(input, $('#retrieval-status'), '请输入检索内容。');
+    return;
+  }
+  if (!threshold.validity.valid) {
+    const toggle = $('#retrieval-filters-toggle');
+    if ($('#retrieval-filters').hidden) toggle.click();
+    showFieldProblem(threshold, $('#retrieval-status'), '请输入 0 到 1 之间的分数。');
+    return;
+  }
+  if (!target) {
+    $('#retrieval-status').textContent = '连接账户后才能选择检索范围。';
+    return;
+  }
+  $('#retrieval-status').textContent = '';
+  state.retrievalController?.abort();
+  const controller = new AbortController();
+  state.retrievalController = controller;
   const requestId = ++state.retrievalRequestId;
   state.lastSearchTarget = target;
   clearRetrievalDetail();
-  $('#retrieval-submit').disabled = true;
+  setRetrievalBusy(true);
   $('#retrieval-result-count').textContent = '';
   elements.retrievalResults.innerHTML = '<div class="retrieval-empty loading"><span>⌕</span><strong>正在检索</strong><p>匹配语义相关记忆…</p></div>';
   const type = $('#retrieval-type').value;
-  const threshold = $('#retrieval-threshold').value;
   const payload = {
     query,
     top_k: Number($('#retrieval-count').value),
@@ -1166,7 +1233,7 @@ async function runRetrieval() {
     userId: target.userId,
     agentId: target.agentId,
     types: type ? [type] : undefined,
-    score_threshold: threshold === '' ? undefined : Number(threshold),
+    score_threshold: threshold.value === '' ? undefined : Number(threshold.value),
     sessionId: $('#retrieval-session').value.trim() || undefined,
   };
   try {
@@ -1174,6 +1241,7 @@ async function runRetrieval() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
     if (requestId !== state.retrievalRequestId) return;
     renderRetrievalResults(body.hits || []);
@@ -1182,12 +1250,15 @@ async function runRetrieval() {
       elements.retrievalResults.innerHTML = `<div class="retrieval-empty error"><span>!</span><strong>检索失败</strong><p>${escapeHtml(error.message)}</p></div>`;
     }
   } finally {
-    if (requestId === state.retrievalRequestId) $('#retrieval-submit').disabled = false;
+    if (requestId === state.retrievalRequestId) {
+      state.retrievalController = null;
+      setRetrievalBusy(false);
+    }
   }
 }
 function renderRetrievalResults(hits) {
   state.retrievalHits = hits;
-  $('#retrieval-result-count').textContent = hits.length ? `Top ${hits.length}` : '';
+  $('#retrieval-result-count').textContent = hits.length ? `${hits.length} 条结果` : '';
   if (!hits.length) {
     elements.retrievalResults.innerHTML = '<div class="retrieval-empty"><span>⌕</span><strong>没有找到匹配内容</strong><p>试试其他关键词或范围。</p></div>';
     return;
@@ -1195,7 +1266,7 @@ function renderRetrievalResults(hits) {
   elements.retrievalResults.innerHTML = hits.map((hit, index) => {
     const score = Number.isFinite(hit.score) ? hit.score.toFixed(3) : '';
     const summary = hit.abstract || hit.overview || hit.content_excerpt || '暂无摘要';
-    return `<button class="retrieval-result" type="button" data-search-index="${index}">
+    return `<button class="retrieval-result" type="button" data-search-index="${index}" aria-pressed="false">
       <span class="type-chip" data-type="${escapeHtml(hit.type)}">${escapeHtml(typeLabel(hit.type))}</span>
       <span class="retrieval-result-body"><strong>${escapeHtml(hit.id || '未命名节点')}</strong><small>${escapeHtml(hit.uri)}</small><span>${escapeHtml(summary)}</span></span>
       ${score ? `<span class="retrieval-score">${score}</span>` : ''}
@@ -1229,19 +1300,29 @@ function clearRetrievalDetail() {
   $('#retrieval-detail-view').hidden = true;
   $('#retrieval-detail-placeholder').hidden = false;
 }
+function setRetrievalBusy(busy) {
+  $('#retrieval-submit').disabled = busy;
+  $('#retrieval-submit').textContent = busy ? '检索中' : '检索';
+  elements.retrievalResults.setAttribute('aria-busy', String(busy));
+}
 function resetRetrieval() {
   state.retrievalRequestId += 1;
+  state.retrievalController?.abort();
+  state.retrievalController = null;
   state.lastSearchTarget = null;
   clearRetrievalDetail();
-  $('#retrieval-submit').disabled = false;
+  setRetrievalBusy(false);
   $('#retrieval-result-count').textContent = '';
   elements.retrievalResults.innerHTML = '<div class="retrieval-empty"><span>⌕</span><strong>输入内容后开始检索</strong><p>结果将按语义相关度排序。</p></div>';
 }
 function switchView(view, loadContent = true) {
   state.view = view;
+  if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
   document.querySelectorAll('[data-view]').forEach((item) => {
     item.classList.toggle('active', item.dataset.view === view);
-    if (item.matches('.sidebar-link')) item.toggleAttribute('aria-current', item.dataset.view === view);
+    if (!item.matches('.sidebar-link')) return;
+    if (item.dataset.view === view) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
   });
   const dashboard = view === 'dashboard';
   const retrieval = view === 'retrieval';
@@ -1249,17 +1330,21 @@ function switchView(view, loadContent = true) {
   const tasks = view === 'tasks';
   const scenes = view === 'scenes';
   const spaces = view === 'spaces';
+  const bot = view === 'bot';
+  elements.botView.hidden = !bot;
+  elements.shell.classList.toggle('bot-active', bot);
   elements.dashboardView.hidden = !dashboard;
-  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes || spaces;
+  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes || spaces || bot;
   $('#spaces-view').hidden = !spaces;
-  elements.account.closest('.scope-switcher').hidden = spaces;
+  elements.account.closest('.scope-switcher').hidden = spaces || bot;
   elements.retrievalView.hidden = !retrieval;
   elements.monitoringView.hidden = !monitoring;
   elements.tasksView.hidden = !tasks;
   elements.scenesView.hidden = !scenes;
-  elements.pageTitle.textContent = spaces ? '团队空间' : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
+  elements.pageTitle.textContent = bot ? 'memoryBot' : spaces ? '团队空间' : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : '记忆';
   document.title = `${elements.pageTitle.textContent} · oGMemory`;
   if (spaces) { if (loadContent) window.sharedSpaces?.load(); return; }
+  if (bot) { showBot(); return; }
   const skill = view === 'skill';
   $('#tree-label').textContent = skill ? 'Agent Skill' : 'ContextFS';
   elements.tree.setAttribute('aria-label', skill ? 'Agent Skill 目录树' : 'ContextFS 目录树');
@@ -1268,8 +1353,10 @@ function switchView(view, loadContent = true) {
   $('#detail-placeholder-copy').textContent = skill
     ? '展开 Agent 目录后查看已生成或导入的 Skill。'
     : '展开目录后查看摘要、概览、正文与元数据。';
+  $('#memory-heading').textContent = skill ? 'Agent Skill' : '记忆';
+  $('#memory-description').textContent = skill ? '按 Agent 浏览已生成或导入的 Skill。' : '浏览 ContextFS 目录与已加载的记忆节点。';
   if (dashboard) { renderDashboard(); loadDashboardMetrics(); return; }
-  if (retrieval) { $('#retrieval-input').focus(); return; }
+  if (retrieval) return;
   if (monitoring) { loadMonitoring(); return; }
   if (tasks) { loadTasks(); return; }
   if (scenes) { loadScenes(state.sceneOffset); return; }
@@ -1300,7 +1387,7 @@ function showTreeError(message) {
 function setLoading(loading) { elements.refresh.classList.toggle('loading', loading); }
 function setConnection(online) {
   elements.connection.className = `connection sidebar-connection ${online ? 'online' : 'offline'}`;
-  elements.connection.innerHTML = `<span></span>${online ? '已连接' : '连接失败'}`;
+  elements.connection.innerHTML = `<span aria-hidden="true"></span>${online ? '已连接' : '连接失败'}`;
 }
 function displayValue(value, fallback) {
   if (value === null || value === undefined || value === '') return fallback;
@@ -1311,6 +1398,12 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
 
+function showDetailOnNarrowScreen(selector) {
+  if (!window.matchMedia('(max-width: 760px)').matches) return;
+  const panel = $(selector);
+  panel.focus({ preventScroll: true });
+  panel.scrollIntoView({ block: 'start' });
+}
 elements.account.addEventListener('change', async () => {
   try { await selectAccount(elements.account.value); }
   catch (error) { showTreeError(error.message); }
@@ -1343,7 +1436,9 @@ elements.tree.addEventListener('click', async (event) => {
     if (resource.dataset.account !== state.accountId) await selectAccount(resource.dataset.account);
     if (resource.dataset.account !== state.accountId) return;
     state.selectedDirectoryKey = resource.closest('[data-node-key]')?.dataset.nodeKey || '';
-    await openDetail(resource.dataset.resourceUri, resource.dataset.user, resource.dataset.agent);
+    const detail = openDetail(resource.dataset.resourceUri, resource.dataset.user, resource.dataset.agent);
+    showDetailOnNarrowScreen('#detail-panel');
+    await detail;
     return;
   }
   const singleton = event.target.closest('[data-singleton-key]');
@@ -1352,6 +1447,7 @@ elements.tree.addEventListener('click', async (event) => {
     if (accountId && accountId !== state.accountId) await selectAccount(accountId);
     if (accountId !== state.accountId) return;
     await openSingleton(singleton.dataset.singletonKey);
+    if (!elements.detailView.hidden) showDetailOnNarrowScreen('#detail-panel');
     return;
   }
   const folder = event.target.closest('[data-folder-key]');
@@ -1362,13 +1458,52 @@ elements.tree.addEventListener('click', async (event) => {
     await toggleDirectory(folder.dataset.folderKey);
   }
 });
-elements.search.addEventListener('input', () => {
+function showFieldProblem(field, status, message) {
+  status.textContent = message;
+  field.setAttribute('aria-invalid', 'true');
+  field.focus();
+}
+function clearFieldProblem(field, status) {
+  if (!field.hasAttribute('aria-invalid')) return;
+  field.removeAttribute('aria-invalid');
+  status.textContent = '';
+}
+function bindSearchField(field, clearButton, onInput) {
+  let composing = false;
+  function update() {
+    clearButton.hidden = !field.value;
+    if (!composing) onInput();
+  }
+  field.addEventListener('compositionstart', () => { composing = true; });
+  field.addEventListener('compositionend', () => { composing = false; update(); });
+  field.addEventListener('input', update);
+  clearButton.addEventListener('click', () => {
+    field.value = '';
+    update();
+    field.focus();
+  });
+  return () => composing;
+}
+bindSearchField(elements.search, $('#search-clear'), () => {
   state.searchQuery = elements.search.value.trim().toLocaleLowerCase();
   renderContextTree();
 });
+const retrievalInput = $('#retrieval-input');
+const retrievalStatus = $('#retrieval-status');
+const retrievalComposing = bindSearchField(retrievalInput, $('#retrieval-clear'), () => {
+  clearFieldProblem(retrievalInput, retrievalStatus);
+  if (!retrievalInput.value) resetRetrieval();
+});
+$('#retrieval-threshold').addEventListener('input', (event) => clearFieldProblem(event.target, retrievalStatus));
+elements.retrievalScope.addEventListener('change', () => {
+  if (!retrievalInput.hasAttribute('aria-invalid') && !$('#retrieval-threshold').hasAttribute('aria-invalid')) {
+    retrievalStatus.textContent = '';
+  }
+  resetRetrieval();
+});
 $('#retrieval-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  runRetrieval();
+  if (!retrievalComposing()) runRetrieval();
 });
 $('#retrieval-filters-toggle').addEventListener('click', () => {
   const filters = $('#retrieval-filters');
@@ -1378,8 +1513,10 @@ $('#retrieval-filters-toggle').addEventListener('click', () => {
 elements.retrievalResults.addEventListener('click', (event) => {
   const result = event.target.closest('[data-search-index]');
   if (!result) return;
-  elements.retrievalResults.querySelectorAll('.retrieval-result').forEach((item) => item.classList.remove('active'));
-  result.classList.add('active');
+  elements.retrievalResults.querySelectorAll('.retrieval-result').forEach((item) => {
+    item.classList.toggle('active', item === result);
+    item.setAttribute('aria-pressed', String(item === result));
+  });
   renderRetrievalDetail(state.retrievalHits[Number(result.dataset.searchIndex)]);
 });
 $('#monitoring-tabs').addEventListener('click', (event) => {
@@ -1388,11 +1525,28 @@ $('#monitoring-tabs').addEventListener('click', (event) => {
   state.activeMonitor = target.dataset.monitor;
   renderMonitoring();
 });
+$('#monitoring-tabs').addEventListener('keydown', (event) => {
+  const tabs = [...event.currentTarget.querySelectorAll('[role="tab"]')];
+  const index = tabs.indexOf(event.target);
+  if (index < 0) return;
+  let next;
+  switch (event.key) {
+    case 'Home': next = 0; break;
+    case 'End': next = tabs.length - 1; break;
+    case 'ArrowLeft': next = (index + tabs.length - 1) % tabs.length; break;
+    case 'ArrowRight': next = (index + 1) % tabs.length; break;
+    default: return;
+  }
+  event.preventDefault();
+  state.activeMonitor = tabs[next].dataset.monitor;
+  renderMonitoring();
+});
 elements.monitoringContent.addEventListener('click', (event) => {
   const target = event.target.closest('[data-monitor]');
   if (!target) return;
   state.activeMonitor = target.dataset.monitor;
   renderMonitoring();
+  $('#monitoring-tabs [aria-selected="true"]').focus({ preventScroll: true });
 });
 $('#monitoring-refresh').addEventListener('click', loadMonitoring);
 async function refreshSpaces() {
@@ -1403,6 +1557,7 @@ async function refreshSpaces() {
 }
 elements.refresh.addEventListener('click', () => {
   if (state.view === 'spaces') window.sharedSpaces.guardNavigation(refreshSpaces, elements.refresh);
+  else if (state.view === 'bot') sendBotMessage('memorybot:refresh');
   else if (state.view === 'dashboard') loadDashboardMetrics();
   else if (state.view === 'monitoring') loadMonitoring();
   else if (state.view === 'tasks') loadTasks();
@@ -1421,7 +1576,10 @@ $('#scenes-next').addEventListener('click', () => {
 elements.scenesList.addEventListener('click', event => {
   const card = event.target.closest('[data-scene-id]');
   const scene = state.scenes.find(item => item.scene_id === card?.dataset.sceneId);
-  if (scene) selectScene(scene);
+  if (scene) {
+    selectScene(scene);
+    showDetailOnNarrowScreen('#scene-detail');
+  }
 });
 $('#scene-detail-members').addEventListener('click', event => {
   const member = event.target.closest('[data-member-uri]');
@@ -1429,6 +1587,7 @@ $('#scene-detail-members').addEventListener('click', event => {
   state.selectedDirectoryKey = '';
   switchView('memory');
   openDetail(member.dataset.memberUri, member.dataset.user, member.dataset.agent);
+  showDetailOnNarrowScreen('#detail-panel');
 });
 $('#tasks-refresh').addEventListener('click', loadTasks);
 ['#tasks-type', '#tasks-status'].forEach((selector) => $(selector).addEventListener('change', () => {
@@ -1444,11 +1603,6 @@ function openSelectedTask(target) {
   if (task) openTaskDetail(task);
 }
 elements.tasksPanel.addEventListener('click', (event) => openSelectedTask(event.target));
-elements.tasksPanel.addEventListener('keydown', (event) => {
-  if (!['Enter', ' '].includes(event.key)) return;
-  event.preventDefault();
-  openSelectedTask(event.target);
-});
 $('#task-detail-close').addEventListener('click', () => $('#task-detail-dialog').close());
 $('#task-retry').addEventListener('click', retrySelectedTask);
 $('#task-detail-dialog').addEventListener('click', (event) => {
@@ -1459,35 +1613,113 @@ $('#theme-button').addEventListener('click', () => {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
   localStorage.setItem('ogmemory-viewer-theme', next);
+  sendBotMessage('memorybot:theme');
 });
-$('#sidebar-toggle').addEventListener('click', () => {
-  elements.shell.classList.add('sidebar-collapsed');
-  localStorage.setItem('ogmemory-viewer-sidebar', 'collapsed');
+function setSidebarCollapsed(collapsed, focusControl = false) {
+  elements.shell.classList.toggle('sidebar-collapsed', collapsed);
+  $('.workspace-icon').hidden = !collapsed;
+  if (focusControl) {
+    localStorage.setItem('ogmemory-viewer-sidebar', collapsed ? 'collapsed' : 'expanded');
+    $(collapsed ? '.workspace-icon' : '#sidebar-toggle').focus();
+  }
+}
+$('#sidebar-toggle').addEventListener('click', () => setSidebarCollapsed(true, true));
+$('.workspace-icon').addEventListener('click', () => setSidebarCollapsed(false, true));
+$('.skip-link').addEventListener('click', (event) => {
+  event.preventDefault();
+  $('#main-content').focus();
 });
-$('.workspace-icon').addEventListener('click', () => {
-  if (!elements.shell.classList.contains('sidebar-collapsed')) return;
-  elements.shell.classList.remove('sidebar-collapsed');
-  localStorage.setItem('ogmemory-viewer-sidebar', 'expanded');
+const apiKeyInput = $('#api-key-input');
+const settingsFeedback = $('#settings-feedback');
+const saveSettings = $('#save-settings');
+let settingsController;
+function setKeyVisibility(visible) {
+  apiKeyInput.type = visible ? 'text' : 'password';
+  const button = $('#api-key-visibility');
+  button.textContent = visible ? '隐藏' : '显示';
+  button.setAttribute('aria-pressed', String(visible));
+}
+function openSettings(message = '') {
+  if (elements.settings.open) return;
+  apiKeyInput.value = state.apiKey;
+  setKeyVisibility(false);
+  elements.settings.showModal();
+  if (message) showFieldProblem(apiKeyInput, settingsFeedback, message);
+}
+elements.botFrame.addEventListener('load', () => sendBotMessage('memorybot:theme'));
+window.addEventListener('message', (event) => {
+  if (event.origin !== location.origin || event.source !== elements.botFrame.contentWindow) return;
+  if (event.data?.type === 'memorybot:open-settings') openSettings();
 });
-function openSettings() { $('#api-key-input').value = state.apiKey; elements.settings.showModal(); }
-$('#settings-button').addEventListener('click', openSettings);
+function showHashView({ initial = false } = {}) {
+  const view = location.hash.slice(1);
+  if (!['bot', 'memory', 'dashboard', 'scenes', 'retrieval', 'skill', 'monitoring', 'tasks', 'spaces'].includes(view)) return;
+  if (initial) { switchView(view, view !== 'spaces'); return; }
+  if (view === state.view) return;
+  if (state.view === 'spaces') history.replaceState(null, '', '#spaces');
+  navigateToView(view, document.querySelector(`.sidebar-link[data-view="${state.view}"]`));
+}
+window.addEventListener('hashchange', () => showHashView());
+$('#settings-button').addEventListener('click', () => openSettings());
 $('#settings-close').addEventListener('click', () => elements.settings.close());
-$('#api-key-input').addEventListener('keydown', (event) => {
-  if (event.key !== 'Enter' || event.isComposing) return;
-  event.preventDefault();
-  $('#settings-form').requestSubmit();
+$('#api-key-visibility').addEventListener('click', () => setKeyVisibility(apiKeyInput.type === 'password'));
+apiKeyInput.addEventListener('input', () => {
+  apiKeyInput.removeAttribute('aria-invalid');
+  settingsFeedback.textContent = '';
 });
-$('#settings-form').addEventListener('submit', (event) => {
+elements.settings.addEventListener('close', () => {
+  settingsController?.abort();
+  settingsController = null;
+  apiKeyInput.value = '';
+  apiKeyInput.removeAttribute('aria-invalid');
+  settingsFeedback.textContent = '';
+  setKeyVisibility(false);
+  saveSettings.disabled = false;
+  saveSettings.textContent = '连接';
+});
+$('#settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const apiKey = $('#api-key-input').value;
-  const applySettings = () => {
-    setApiKey(apiKey);
-    apiKeyChannel?.postMessage({ type: 'update', apiKey: state.apiKey });
-    elements.settings.close();
-    return loadTree();
-  };
-  if (state.view === 'spaces') window.sharedSpaces.guardNavigation(applySettings, event.submitter);
-  else applySettings();
+  if (settingsController) return;
+  const candidate = apiKeyInput.value.trim();
+  const controller = new AbortController();
+  const timeout = AbortSignal.timeout(VIEWER_REQUEST_TIMEOUT_MS);
+  settingsController = controller;
+  saveSettings.disabled = true;
+  saveSettings.textContent = '连接中';
+  settingsFeedback.textContent = '';
+  try {
+    const scope = await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), {
+      signal: AbortSignal.any([controller.signal, timeout]),
+      headers: { 'X-API-Key': candidate },
+    });
+    if (!elements.settings.open || controller.signal.aborted) return;
+    const applySettings = () => {
+      if (!elements.settings.open || controller.signal.aborted) return;
+      setApiKey(candidate);
+      apiKeyChannel?.postMessage({ type: 'update', apiKey: state.apiKey });
+      elements.settings.close();
+      loadTree(scope);
+    };
+    if (state.view === 'spaces' && candidate !== state.apiKey) {
+      await window.sharedSpaces.guardNavigation(applySettings, event.submitter);
+    } else applySettings();
+  } catch (error) {
+    if (!elements.settings.open || controller.signal.aborted) return;
+    if (error.status === 401 || error.status === 403) {
+      const message = candidate ? 'API Key 无效或没有访问权限，请核对后重试。' : '请输入 API Key。';
+      showFieldProblem(apiKeyInput, settingsFeedback, message);
+    } else {
+      settingsFeedback.textContent = timeout.aborted
+        ? '连接超时，请检查服务状态后重试。'
+        : '无法连接服务，请检查服务状态后重试。';
+    }
+  } finally {
+    if (settingsController === controller) {
+      settingsController = null;
+      saveSettings.disabled = false;
+      saveSettings.textContent = '连接';
+    }
+  }
 });
 apiKeyChannel?.addEventListener('message', (event) => {
   const message = event.data;
@@ -1513,9 +1745,8 @@ elements.settings.addEventListener('click', (event) => {
 
 document.addEventListener('DOMContentLoaded', () => {
   document.documentElement.dataset.theme = localStorage.getItem('ogmemory-viewer-theme') || 'light';
-  elements.shell.classList.toggle('sidebar-collapsed', localStorage.getItem('ogmemory-viewer-sidebar') === 'collapsed');
-  if (location.hash === '#scenes') switchView('scenes');
-  if (location.hash === '#spaces') switchView('spaces', false);
+  setSidebarCollapsed(localStorage.getItem('ogmemory-viewer-sidebar') === 'collapsed');
+  showHashView({ initial: true });
   if (initialTreeLoadPending) {
     apiKeyChannel.postMessage({ type: 'request' });
     setTimeout(loadTreeAfterApiKeySync, 100);

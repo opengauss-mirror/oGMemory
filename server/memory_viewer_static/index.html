@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#f6f7fb">
+    <meta name="theme-color" content="#f5f5f5">
     <title>oGMemory · 记忆查看器</title>
     <link rel="stylesheet" href="/memory-viewer/styles.css">
     <script src="/memory-viewer/app.js" defer></script>
@@ -11,32 +11,39 @@
     <script src="/memory-viewer/spaces.js" defer></script>
   </head>
   <body>
+    <a class="skip-link" href="#main-content">跳至主要内容</a>
     <div class="app-shell">
       <aside class="app-sidebar">
-        <div class="workspace-switch"><span class="workspace-icon">▥</span><strong>default</strong><button id="sidebar-toggle" type="button" title="收起侧栏" aria-label="收起侧栏">◧</button></div>
+        <div class="workspace-switch">
+          <button class="workspace-icon" type="button" title="展开侧栏" aria-label="展开侧栏" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5m-18 4 9 5 9-5"/></svg></button>
+          <span class="workspace-brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5m-18 4 9 5 9-5"/></svg></span>
+          <strong>oGMemory</strong>
+          <button id="sidebar-toggle" type="button" title="收起侧栏" aria-label="收起侧栏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h18v14H3zM9 5v14m6-11-3 4 3 4"/></svg></button>
+        </div>
         <nav class="sidebar-nav" aria-label="主导航">
           <section class="nav-group">
             <p>工作区</p>
-            <button class="sidebar-link" type="button" data-view="dashboard"><span>⌁</span>控制台</button>
-            <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span>▤</span>记忆</button>
-            <button class="sidebar-link" type="button" data-view="scenes" aria-label="场景记忆"><span>◈</span>场景记忆</button>
-            <button class="sidebar-link" type="button" data-view="retrieval"><span>⌕</span>检索</button>
-            <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Agent Skill</button>
-            <button class="sidebar-link" type="button" data-view="spaces"><span>▦</span>团队空间</button>
+            <button class="sidebar-link" type="button" data-view="dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z"/></svg></span><span class="nav-label">控制台</span></button>
+            <button class="sidebar-link" type="button" data-view="bot" aria-label="memoryBot 工作助手" title="memoryBot 工作助手"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 0 1-8 8H4l1.7-4A8 8 0 1 1 20 12ZM9 12h6m-3-3v6"/></svg></span><span class="nav-label">memoryBot</span></button>
+            <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h14v16H5a2 2 0 0 1-2-2V6c0-1 .9-2 2-2Zm0 13h14M8 8h7m-7 4h5"/></svg></span><span class="nav-label">记忆</span></button>
+            <button class="sidebar-link" type="button" data-view="scenes" aria-label="场景记忆"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 21V3m2 4h10m-10 5h6m-6 5h13"/></svg></span><span class="nav-label">场景记忆</span></button>
+            <button class="sidebar-link" type="button" data-view="retrieval"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg></span><span class="nav-label">检索</span></button>
+            <button class="sidebar-link" type="button" data-view="skill"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 5-6 7 6 7m8-14 6 7-6 7m-2-15-4 16"/></svg></span><span class="nav-label">Agent Skill</span></button>
+            <button class="sidebar-link" type="button" data-view="spaces"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h18v15H3zM3 10h18M9 10v10"/></svg></span><span class="nav-label">团队空间</span></button>
           </section>
           <section class="nav-group">
             <p>活动</p>
-            <button class="sidebar-link" type="button" data-view="monitoring"><span>▣</span>监控</button>
-            <button class="sidebar-link" type="button" data-view="tasks"><span>☷</span>任务中心</button>
+            <button class="sidebar-link" type="button" data-view="monitoring"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-6 4 12 3-6h4M2 3h20v18H2z"/></svg></span><span class="nav-label">监控</span></button>
+            <button class="sidebar-link" type="button" data-view="tasks"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5h14v16H5zM9 5V3h6v2m-6 5h6m-6 4h6m-6 4h4"/></svg></span><span class="nav-label">任务中心</span></button>
           </section>
           <section class="nav-group">
             <p>设置</p>
-            <a class="sidebar-link" href="/memory-viewer/migration">⇄ 导入导出</a>
-            <button id="settings-button" class="sidebar-link" type="button"><span>⌁</span>连接设置</button>
-            <button id="theme-button" class="sidebar-link" type="button"><span>◐</span>外观</button>
+            <a class="sidebar-link" href="/memory-viewer/migration"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h15l-4-4m5 12H5l4 4"/></svg></span><span class="nav-label">导入导出</span></a>
+            <button id="settings-button" class="sidebar-link" type="button"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16m-16 6h16m-16 6h16M8 4v4m8 2v4m-5 2v4"/></svg></span><span class="nav-label">连接设置</span></button>
+            <button id="theme-button" class="sidebar-link" type="button"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 9 9 0 0 1-9-9Z"/></svg></span><span class="nav-label">外观</span></button>
           </section>
         </nav>
-        <span id="connection" class="connection sidebar-connection"><span></span>正在连接</span>
+        <span id="connection" class="connection sidebar-connection" role="status"><span aria-hidden="true"></span>正在连接</span>
       </aside>
 
       <div class="app-main">
@@ -48,12 +55,12 @@
             <span>账户</span>
             <select id="account-select" aria-label="账户"><option value="">加载中</option></select>
           </label>
-          <button id="refresh-button" class="icon-button" type="button" title="刷新" aria-label="刷新">↻</button>
+          <button id="refresh-button" class="icon-button" type="button" title="刷新" aria-label="刷新"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 5v5h-5M4 19v-5h5m10.5-4A8 8 0 0 0 6 6.5M4.5 14A8 8 0 0 0 18 17.5"/></svg></button>
         </div>
           </div>
         </header>
 
-        <main class="memory-browser">
+        <main id="main-content" class="memory-browser" tabindex="-1">
       <section id="spaces-view" hidden aria-label="团队空间">
         <div class="space-heading">
           <div class="space-team-identity"><span class="space-team-mark" data-space-icon="team" aria-hidden="true"></span><header id="space-header"><h2>团队空间</h2></header></div>
@@ -64,8 +71,14 @@
           <section class="space-main"><nav id="space-tabs" class="type-tabs" role="tablist" aria-label="团队空间功能"></nav><div id="space-body" role="tabpanel" tabindex="0"><p class="space-empty">暂无团队空间</p></div></section>
         </div>
       </section>
+      <section id="bot-view" class="bot-view" aria-label="memoryBot 工作助手" hidden>
+        <iframe id="bot-frame" title="memoryBot 工作助手"></iframe>
+      </section>
       <section id="dashboard-view" class="dashboard-view" hidden>
-        <header><h1>控制台</h1><p>当前账户的记忆运行概况。</p></header>
+        <header class="view-heading">
+          <div><h1>控制台</h1><p>查看账户资源与模型用量。</p></div>
+          <button class="secondary-button" type="button" data-view="memory">浏览记忆</button>
+        </header>
         <div class="dashboard-grid dashboard-inventory-grid">
           <article><span>用户</span><strong id="dashboard-users">—</strong></article>
           <article><span>Agent</span><strong id="dashboard-agents">—</strong></article>
@@ -112,13 +125,16 @@
             <div id="token-trend-chart" class="token-trend-chart" role="img" aria-label="最近 14 天 Token 使用趋势">
               <div class="metrics-empty">正在加载模型用量…</div>
             </div>
+            <details id="token-chart-data" class="token-chart-data" hidden>
+              <summary>查看每日用量数据</summary>
+              <div class="monitoring-table-scroll" tabindex="0" role="region" aria-label="每日 Token 用量"></div>
+            </details>
           </article>
         </section>
-        <button class="secondary-button" type="button" data-view="memory">查看记忆</button>
       </section>
       <section id="tasks-view" class="tasks-view" hidden>
-        <header class="tasks-heading">
-          <div><h1>任务中心</h1><p>集中查看记忆写入、目录 Reindex 和会话提交产生的后台索引任务。</p></div>
+        <header class="view-heading tasks-heading">
+          <div><h1>任务中心</h1><p>查看记忆索引、目录重建、Skill 处理和会话提交任务。</p></div>
           <button id="tasks-refresh" class="secondary-button" type="button">↻ 刷新</button>
         </header>
         <div class="tasks-filterbar">
@@ -126,8 +142,8 @@
           <label><span class="sr-only">任务类型</span><select id="tasks-type" aria-label="任务类型"><option value="">全部类型</option><option value="memory_index">记忆索引</option><option value="reindex">目录 Reindex</option><option value="skill_processing">Skill 处理</option><option value="session_commit">会话提交</option></select></label>
           <label><span class="sr-only">任务状态</span><select id="tasks-status" aria-label="任务状态"><option value="">全部状态</option><option value="pending">等待中</option><option value="running">执行中</option><option value="failed">失败</option></select></label>
         </div>
-        <section id="tasks-panel" class="tasks-panel" aria-live="polite">
-          <div class="tasks-empty loading"><span>↻</span><strong>正在加载任务</strong></div>
+        <section id="tasks-panel" class="tasks-panel">
+          <div class="tasks-empty loading" role="status"><span aria-hidden="true">↻</span><strong>正在加载任务</strong></div>
         </section>
         <footer id="tasks-pagination" class="tasks-pagination" hidden>
           <span id="tasks-page-summary"></span>
@@ -135,12 +151,14 @@
         </footer>
       </section>
       <section id="memory-view">
-      <section class="browser-heading">
-        <label class="search-box">
-          <span>⌕</span>
-          <input id="search-input" type="search" placeholder="搜索已加载节点、路径或摘要" autocomplete="off">
-        </label>
-      </section>
+      <header class="view-heading browser-heading">
+        <div><h1 id="memory-heading">记忆</h1><p id="memory-description">浏览 ContextFS 目录与已加载的记忆节点。</p></div>
+        <div class="search-box">
+          <span class="search-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg></span>
+          <input id="search-input" type="search" placeholder="筛选已加载节点" autocomplete="off" aria-label="筛选已加载节点">
+          <button id="search-clear" class="field-clear" type="button" aria-label="清除节点筛选" hidden>×</button>
+        </div>
+      </header>
 
       <section class="workspace">
         <aside class="hierarchy-panel">
@@ -153,22 +171,22 @@
           </div>
           <nav id="hierarchy-tree" aria-label="ContextFS 目录树"></nav>
         </aside>
-        <article id="detail-panel" class="detail-panel">
+        <article id="detail-panel" class="detail-panel" tabindex="-1" aria-label="节点详情">
           <div id="detail-placeholder" class="detail-placeholder"><span>◇</span><strong id="detail-placeholder-title">选择一个 ContextFS 节点</strong><p id="detail-placeholder-copy">展开目录后查看摘要、概览、正文与元数据。</p></div>
           <div id="detail-view" hidden>
             <header class="detail-head">
               <div><span id="detail-type" class="type-chip"></span><h2 id="detail-title"></h2><p id="detail-uri" class="detail-uri"></p></div>
             </header>
-            <section><h3>L0 · 摘要</h3><p id="detail-abstract" class="detail-text"></p></section>
-            <section><h3>L1 · 概览</h3><pre id="detail-overview" class="detail-text detail-box"></pre></section>
-            <section><h3>L2 · 正文</h3><pre id="detail-content" class="detail-content"></pre></section>
+            <section><h3><span class="detail-level">L0</span>摘要</h3><p id="detail-abstract" class="detail-text"></p></section>
+            <section><h3><span class="detail-level">L1</span>概览</h3><pre id="detail-overview" class="detail-text detail-box"></pre></section>
+            <section><h3><span class="detail-level">L2</span>正文</h3><pre id="detail-content" class="detail-content"></pre></section>
             <details class="metadata-section"><summary>元数据</summary><div id="detail-metadata" class="metadata-grid"></div></details>
           </div>
         </article>
       </section>
       </section>
       <section id="scenes-view" class="scenes-view" hidden>
-        <header class="scenes-heading">
+        <header class="view-heading scenes-heading">
           <div><h1>场景记忆</h1><p>查看场景的时间脉络与关联记忆。</p></div>
           <button id="scenes-refresh" class="secondary-button" type="button">↻ 刷新</button>
         </header>
@@ -177,14 +195,15 @@
           <span id="scenes-count" role="status"></span>
         </div>
         <div class="scenes-workspace">
-          <section aria-label="场景列表">
+          <section class="scene-index" aria-label="场景列表">
+            <header class="index-header"><h2>场景列表</h2></header>
             <div id="scenes-list" class="scenes-list" aria-live="polite"></div>
             <footer id="scenes-pagination" class="tasks-pagination" hidden>
               <span id="scenes-page-summary"></span>
               <div><button id="scenes-previous" type="button">上一页</button><button id="scenes-next" type="button">下一页</button></div>
             </footer>
           </section>
-          <article id="scene-detail" class="scene-detail" hidden>
+          <article id="scene-detail" class="scene-detail" tabindex="-1" aria-label="场景详情" hidden>
             <header><span id="scene-detail-origin" class="section-label"></span><h2 id="scene-detail-title"></h2></header>
             <div id="scene-detail-meta" class="scene-meta"></div>
             <p id="scene-detail-description" class="scene-description"></p>
@@ -196,25 +215,31 @@
         </div>
       </section>
       <section id="retrieval-view" class="retrieval-view" hidden>
-        <form id="retrieval-form" class="retrieval-form" novalidate>
-          <span aria-hidden="true">⌕</span>
-          <input id="retrieval-input" type="search" placeholder="输入语义问题或关键词" autocomplete="off" aria-label="检索内容">
-          <button id="retrieval-submit" class="retrieval-submit" type="submit">检索</button>
+        <header class="view-heading">
+          <div><h1>检索</h1><p>按语义查找记忆，查看命中内容与相关度。</p></div>
+        </header>
+        <form novalidate id="retrieval-form" class="retrieval-form">
+          <div class="retrieval-query">
+            <span class="search-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg></span>
+            <input id="retrieval-input" type="search" placeholder="输入问题或关键词" autocomplete="off" aria-label="检索内容" aria-describedby="retrieval-status">
+            <button id="retrieval-clear" class="field-clear" type="button" aria-label="清除检索内容" hidden>×</button>
+            <button id="retrieval-submit" class="retrieval-submit" type="submit">检索</button>
+          </div>
+          <div class="retrieval-toolbar" aria-label="检索工具栏">
+            <label><span>返回数量</span><select id="retrieval-count"><option>5</option><option selected>10</option><option>20</option></select></label>
+            <label class="retrieval-scope-control"><span>范围</span><select id="retrieval-scope" aria-label="检索范围"><option value="">加载中</option></select></label>
+            <button id="retrieval-filters-toggle" class="toolbar-button" type="button" aria-expanded="false" aria-controls="retrieval-filters">更多筛选</button>
+          </div>
+          <div id="retrieval-filters" class="retrieval-filters" hidden>
+            <label><span>记忆类型</span><select id="retrieval-type"><option value="">全部类型</option><option value="profile">用户画像</option><option value="preference">偏好</option><option value="entity">实体</option><option value="event">事件</option><option value="case">案例</option><option value="pattern">模式</option><option value="tool_memory">工具记忆</option><option value="tool_evidence">Tools</option><option value="experience">Experiences</option><option value="skill">Skills</option><option value="session_summary">会话摘要</option><option value="session_archive">会话归档</option></select></label>
+            <label><span>最低分数</span><input id="retrieval-threshold" type="number" min="0" max="1" step="any" placeholder="不限" aria-describedby="retrieval-status"></label>
+            <label><span>Session ID</span><input id="retrieval-session" type="text" placeholder="可选"></label>
+          </div>
+          <p id="retrieval-status" class="form-feedback" aria-live="polite"></p>
         </form>
-        <div class="retrieval-toolbar" aria-label="检索工具栏">
-          <span class="retrieval-mode">search</span>
-          <label><span>返回数量</span><select id="retrieval-count"><option>5</option><option selected>10</option><option>20</option></select></label>
-          <label class="retrieval-scope-control"><span>范围</span><select id="retrieval-scope" aria-label="检索范围"><option value="">加载中</option></select></label>
-          <button id="retrieval-filters-toggle" class="toolbar-button" type="button" aria-expanded="false">更多筛选⌄</button>
-        </div>
-        <div id="retrieval-filters" class="retrieval-filters" hidden>
-          <label><span>记忆类型</span><select id="retrieval-type"><option value="">全部类型</option><option value="profile">用户画像</option><option value="preference">偏好</option><option value="entity">实体</option><option value="event">事件</option><option value="case">案例</option><option value="pattern">模式</option><option value="tool_memory">工具记忆</option><option value="tool_evidence">Tools</option><option value="experience">Experiences</option><option value="skill">Skills</option><option value="session_summary">会话摘要</option><option value="session_archive">会话归档</option></select></label>
-          <label><span>最低分数</span><input id="retrieval-threshold" type="number" min="0" max="1" step="0.05" placeholder="不限"></label>
-          <label><span>Session ID</span><input id="retrieval-session" type="text" placeholder="可选"></label>
-        </div>
         <div class="retrieval-workspace">
           <section class="retrieval-results-section">
-            <div class="retrieval-results-head"><h2>检索结果</h2><span id="retrieval-result-count"></span></div>
+            <div class="retrieval-results-head"><h2>检索结果</h2><span id="retrieval-result-count" role="status"></span></div>
             <div id="retrieval-results" class="retrieval-results">
               <div class="retrieval-empty"><span>⌕</span><strong>输入内容后开始检索</strong><p>结果将按语义相关度排序。</p></div>
             </div>
@@ -223,16 +248,16 @@
             <div id="retrieval-detail-placeholder" class="detail-placeholder"><span>◇</span><strong>选择一条检索结果</strong><p>在当前页面查看命中的记忆内容。</p></div>
             <div id="retrieval-detail-view" hidden>
               <header class="detail-head"><div><span id="retrieval-detail-type" class="type-chip"></span><h2 id="retrieval-detail-title"></h2><p id="retrieval-detail-uri" class="detail-uri"></p></div></header>
-              <section><h3>L0 · 摘要</h3><p id="retrieval-detail-abstract" class="detail-text"></p></section>
-              <section><h3>L1 · 概览</h3><pre id="retrieval-detail-overview" class="detail-text detail-box"></pre></section>
-              <section><h3>L2 · 命中正文</h3><pre id="retrieval-detail-content" class="detail-content"></pre></section>
+              <section><h3><span class="detail-level">L0</span>摘要</h3><p id="retrieval-detail-abstract" class="detail-text"></p></section>
+              <section><h3><span class="detail-level">L1</span>概览</h3><pre id="retrieval-detail-overview" class="detail-text detail-box"></pre></section>
+              <section><h3><span class="detail-level">L2</span>命中正文</h3><pre id="retrieval-detail-content" class="detail-content"></pre></section>
               <details class="metadata-section"><summary>检索信息</summary><div id="retrieval-detail-metadata" class="metadata-grid"></div></details>
             </div>
           </article>
         </div>
       </section>
       <section id="monitoring-view" class="monitoring-view" hidden>
-        <header class="monitoring-header">
+        <header class="view-heading monitoring-header">
           <div><h1>监控</h1><p>查看 oGMemory 各组件的实时健康状态。</p></div>
           <div class="monitoring-actions"><span id="monitoring-updated"></span><button id="monitoring-refresh" class="secondary-button" type="button">↻ 刷新</button></div>
         </header>
@@ -242,26 +267,33 @@
           <div><strong>正在加载监控数据</strong><p>检查服务、存储、模型、索引、任务与检索。</p></div>
         </section>
         <div id="monitoring-tabs" class="monitoring-tabs" role="tablist" aria-label="监控类型"></div>
-        <div id="monitoring-content"></div>
+        <div id="monitoring-content" role="tabpanel"></div>
       </section>
         </main>
       </div>
     </div>
 
     <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-description">
-      <form id="settings-form" novalidate>
+      <form novalidate id="settings-form">
         <div class="dialog-head">
           <div><h2 id="settings-title">连接 oGMemory</h2></div>
           <button id="settings-close" class="close-button" type="button" aria-label="关闭">×</button>
         </div>
         <p id="settings-description" class="settings-description">请输入管理员为你分配的 oGMemory API Key。连接后将显示你有权限查看的内容。</p>
-        <label>API Key<input id="api-key-input" type="password" placeholder="请输入你的 API Key" autocomplete="off" aria-describedby="settings-help"></label>
+        <div class="settings-field">
+          <label for="api-key-input">API Key</label>
+          <div class="secret-control">
+            <input id="api-key-input" type="password" placeholder="请输入你的 API Key" autocomplete="current-password" spellcheck="false" aria-describedby="settings-feedback settings-help" autofocus>
+            <button id="api-key-visibility" class="secondary-button" type="button" aria-controls="api-key-input" aria-pressed="false">显示</button>
+          </div>
+          <p id="settings-feedback" class="form-feedback" aria-live="polite"></p>
+          <p id="settings-help" class="settings-help">没有 API Key？请联系管理员获取。</p>
+        </div>
         <button id="save-settings" class="primary-button" type="submit">连接</button>
-        <p id="settings-help" class="settings-help">没有 API Key？请联系管理员获取。</p>
       </form>
     </dialog>
 
-    <dialog id="task-detail-dialog" class="detail-dialog task-detail-dialog">
+    <dialog id="task-detail-dialog" class="detail-dialog task-detail-dialog" aria-labelledby="task-detail-title">
       <article>
         <div class="dialog-head">
           <div><span class="section-label">后台任务</span><h2 id="task-detail-title">任务详情</h2></div>
