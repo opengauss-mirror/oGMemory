@@ -130,7 +130,8 @@ class BotService:
             }
         return public("task", task)
 
-    def mutation(self, ctx, operation, request_id, data, action):
+    @staticmethod
+    def validate_request_id(request_id):
         if (
             not request_id
             or len(request_id) > 64
@@ -141,6 +142,9 @@ class BotService:
                 "Idempotency-Key 需要 1–64 个可打印 ASCII 字符",
                 details={"field": "Idempotency-Key"},
             )
+
+    def mutation(self, ctx, operation, request_id, data, action):
+        self.validate_request_id(request_id)
 
         def execute(tx):
             status, result = action(tx)
