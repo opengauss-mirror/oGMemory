@@ -521,7 +521,8 @@
       body.replaceChildren(el("span"), el("span"), el("span")); body.classList.add("thinking"); body.setAttribute("aria-label", "正在回复"); delete body.dataset.text;
     }
     const progress = state.progress.get(task.task_id);
-    const statusKey = JSON.stringify([task.state, task.cancel_requested, task.error, progress, task.memory_status, task.steps]);
+    const pendingMemory = task.pending_memory_confirmations || [];
+    const statusKey = JSON.stringify([task.state, task.cancel_requested, task.error, task.confirmation, progress, task.memory_status, task.steps, pendingMemory]);
     const status = $(".answer-status", card);
     if (status.dataset.signature !== statusKey) {
       const wasOpen = $("details", status)?.open; status.replaceChildren(); status.dataset.signature = statusKey;
@@ -534,7 +535,8 @@
       summary.append(el("span", "执行过程", "execution-title"), el("span", `${steps.length ? steps.length + " 步 · " : ""}${phase}`, "execution-phase"));
       const path = steps.length > 5 ? [steps[0].label, steps[1].label, "…", steps.at(-2).label, latest.label] : steps.map(step => step.label);
       if (path.length) summary.append(el("span", path.join(" → "), "execution-path"));
-      if (task.memory_status && task.memory_status !== "not_requested") summary.append(el("span", task.memory_status === "pending" ? "记忆整理中" : labels[task.memory_status] || task.memory_status, "execution-memory"));
+      const memoryLabel = pendingMemory.length ? "记忆待核对" : task.memory_status === "pending" ? "记忆整理中" : labels[task.memory_status] || task.memory_status;
+      if (task.memory_status && task.memory_status !== "not_requested") summary.append(el("span", memoryLabel, "execution-memory"));
       const list = el("ol", null, "execution-steps");
       for (const step of steps) {
         const item = el("li", null, "execution-step"); item.dataset.stepId = step.step_id; item.dataset.state = step.state;
@@ -568,6 +570,13 @@
         stop.disabled = Boolean(task.cancel_requested); info.append(stop);
       }
       if (task.task_id !== "pending") info.append(button("刷新进度", "refresh-task", task.task_id, "subtle"));
+      for (const child of pendingMemory) {
+        info.append(el("p", child.confirmation.reason, "step-result"));
+        const recheck = button("核对记忆", "confirm-task", task.task_id);
+        const cancel = button("停止记忆整理", "cancel-confirmation", task.task_id);
+        recheck.dataset.confirmationTask = cancel.dataset.confirmationTask = child.task_id;
+        info.append(recheck, cancel);
+      }
       detail.append(summary, list, info); status.append(detail); updateExecutionTimes();
     }
     const resources = $(".answer-resources", card), resourceKey = JSON.stringify([task.result?.citations, task.result?.file_ids]);
@@ -749,6 +758,7 @@
     if (type === "answer.reset") state.drafts.set(taskId, {attempt: payload.attempt, text: ""});
     if (type === "answer.delta") {
       let draft = state.drafts.get(taskId);
+      if (draft?.awaitingReset) return event;
       if (!draft || draft.attempt < payload.attempt) draft = {attempt: payload.attempt, text: ""};
       if (draft.attempt === payload.attempt) draft.text += payload.text || "";
       state.drafts.set(taskId, draft);
@@ -756,7 +766,8 @@
     if (type === "progress") state.progress.set(taskId, payload.message + (payload.total ? ` (${payload.completed || 0}/${payload.total})` : ""));
     if (type === "memory.updated") {
       const task = state.tasks.get(taskId);
-      if (task) updateTask({
+      if (task?.pending_memory_confirmations?.length) await getTask(taskId);
+      else if (task) updateTask({
         ...task, last_event_seq: event.event_seq, memory_status: payload.memory_status,
         memory_operation_id: payload.memory_operation_id,
       });
@@ -778,9 +789,10 @@
           if (after) auth.set("Last-Event-ID", `${task.task_id}:${after}`);
           const response = await fetch(`${API}/tasks/${id(task.task_id)}/events?after=${after}`, {headers: auth, signal: controller.signal, credentials: "same-origin"});
           if (response.status === 410) {
+            state.drafts.set(task.task_id, {awaitingReset: true, text: ""});
             const snapshot = await getTask(task.task_id);
-            after = snapshot.last_event_seq;
-            if (settled(snapshot)) return;
+            if (settled(snapshot) || snapshot.state === "waiting_confirmation") return;
+            after = terminal.has(snapshot.state) ? snapshot.last_event_seq : snapshot.event_floor_seq - 1;
             continue;
           }
           if (!response.ok) throw await decodeError(response);
@@ -1268,8 +1280,19 @@
     if (name === "open-task") return openTask(value);
     if (name === "refresh-task") return getTask(value);
     if (name === "cancel-task") { const task = await api(`/tasks/${id(value)}/cancel`, {method: "POST", body: {}}); updateTask(task); watchTask(task); return; }
-    if (name === "confirm-task") { const task = state.tasks.get(value); updateTask(await api(`/tasks/${id(value)}/confirm`, {method: "POST", body: {operation_id: task.confirmation.operation_id, decision: "recheck"}})); watchTask(state.tasks.get(value)); return; }
-    if (name === "cancel-confirmation") { const task = state.tasks.get(value); updateTask(await api(`/tasks/${id(value)}/confirm`, {method: "POST", body: {operation_id: task.confirmation.operation_id, decision: "cancel"}})); watchTask(state.tasks.get(value)); return; }
+    if (name === "confirm-task" || name === "cancel-confirmation") {
+      const task = state.tasks.get(value);
+      const child = task?.pending_memory_confirmations?.find(item => item.task_id === target.dataset.confirmationTask);
+      const confirmation = (target.dataset.confirmationTask ? child : task)?.confirmation;
+      if (!confirmation) return;
+      target.disabled = true;
+      try {
+        const decision = name === "confirm-task" ? "recheck" : "cancel";
+        const updated = await api(`/tasks/${id(child?.task_id || value)}/confirm`, {method: "POST", body: {operation_id: confirmation.operation_id, decision}});
+        watchTask(child ? await getTask(value) : updateTask(updated));
+      } finally { target.disabled = false; }
+      return;
+    }
     if (name === "new-plan") return planDialog();
     if (name === "edit-plan") return planDialog(value);
     if (["pause-plan", "resume-plan", "cancel-plan"].includes(name)) return changePlan(value, name.split("-")[0]);

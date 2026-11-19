@@ -17,7 +17,9 @@ from cli.main import main
 @pytest.fixture
 def bot_http(monkeypatch, request):
     monkeypatch.setenv("no_proxy", "127.0.0.1")
-    truncate_stream = getattr(request, "param", False)
+    stream_mode = getattr(request, "param", False)
+    truncate_stream = stream_mode is True
+    pending_child = stream_mode == "pending_child"
     calls = []
     stream_connections = []
     artifact = "客户,合计\n甲,25\n乙,20\n".encode()
@@ -74,7 +76,9 @@ def bot_http(monkeypatch, request):
                 self.wfile.write(artifact)
             elif path.endswith("/events"):
                 stream_connections.append(self.headers)
-                if len(stream_connections) == 1:
+                if pending_child:
+                    events = [(1, "task.completed", {"state": "succeeded"})]
+                elif len(stream_connections) == 1:
                     events = [(1, "progress", {"message": "已读取资料", "phase": "context"})]
                 else:
                     events = [
@@ -103,6 +107,18 @@ def bot_http(monkeypatch, request):
                 self.end_headers()
                 self.wfile.write(text)
             elif path == "/tasks/t_answer":
+                if pending_child:
+                    self.respond({
+                        "task_id": "t_answer",
+                        "state": "succeeded",
+                        "last_event_seq": 2,
+                        "memory_status": "pending",
+                        "pending_memory_confirmations": [{
+                            "task_id": "t_memory",
+                            "confirmation": {"operation_id": "op_capture", "actions": ["recheck"]},
+                        }],
+                    })
+                    return
                 self.respond(
                     {
                         "task_id": "t_answer",
@@ -326,6 +342,24 @@ def test_task_cancel_and_receipt_recheck(bot_http, capsys):
     capsys.readouterr()
     assert invoke(bot_http, "task", "confirm", "t_weekly", "--operation-id", "op_delivery") == 0
     assert bot_http[1][-1]["body"] == {"operation_id": "op_delivery", "decision": "recheck"}
+
+
+@pytest.mark.parametrize("bot_http", ["pending_child"], indirect=True)
+def test_stream_close_reports_pending_memory_confirmation(bot_http, capsys):
+    assert invoke(bot_http, "task", "events", "t_answer") == 0
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith('{"event":')
+    ]
+    assert [event["event"] for event in events] == ["task.completed", "snapshot"]
+    [pending] = events[-1]["data"]["pending_memory_confirmations"]
+    assert invoke(
+        bot_http, "task", "confirm", pending["task_id"],
+        "--operation-id", pending["confirmation"]["operation_id"],
+    ) == 0
+    assert bot_http[1][-1]["path"] == "/api/v1/bot/tasks/t_memory/confirm"
+    assert bot_http[1][-1]["body"] == {"operation_id": "op_capture", "decision": "recheck"}
 
 
 def test_delivery_receipts_and_exact_memory_source(bot_http, capsys):

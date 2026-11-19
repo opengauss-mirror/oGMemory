@@ -112,23 +112,40 @@ class BotService:
             events[0]["event_seq"] if events else task.get("next_event_seq", 1)
         )
         if task["state"] == "waiting_confirmation":
-            steps = tx.list(
-                "bot_step",
-                {"task_id": task["task_id"], "state": "waiting_confirmation"},
-                order_by="step_no ASC",
-                limit=1,
+            task["confirmation"] = self._confirmation(tx, task)
+        if task["kind"] == "chat" and task["memory_status"] in {"pending", "stored"}:
+            pending = tx.list(
+                "bot_task",
+                {
+                    "parent_task_id": task["task_id"],
+                    "kind": "memory_write",
+                    "state": "waiting_confirmation",
+                },
+                order_by="task_id ASC",
             )
-            operation_id = (
-                steps[0]["operation_id"]
-                if steps
-                else (task.get("error") or {}).get("details", {}).get("operation_id")
-            )
-            task["confirmation"] = {
-                "operation_id": operation_id,
-                "reason": (task.get("error") or {}).get("message", "等待核对外部结果"),
-                "actions": ["recheck", "cancel"],
-            }
+            task["pending_memory_confirmations"] = [
+                {"task_id": child["task_id"], "confirmation": self._confirmation(tx, child)}
+                for child in pending
+            ]
         return public("task", task)
+
+    @staticmethod
+    def _confirmation(tx, task):
+        steps = tx.list(
+            "bot_step",
+            {"task_id": task["task_id"], "state": "waiting_confirmation"},
+            order_by="step_no ASC",
+            limit=1,
+        )
+        error = task.get("error") or {}
+        operation_id = (
+            steps[0]["operation_id"] if steps else (error.get("details") or {}).get("operation_id")
+        )
+        return {
+            "operation_id": operation_id,
+            "reason": error.get("message", "等待核对外部结果"),
+            "actions": ["recheck", "cancel"],
+        }
 
     @staticmethod
     def validate_request_id(request_id):
@@ -400,6 +417,8 @@ class BotService:
         self.store.append_event(
             tx, task_id, "task.updated", {"state": task["state"], "confirmation": None}
         )
+        if operation_id is not None:
+            self.store.notify_memory_confirmation(tx, task)
         return 202, self.task_public(self.require(tx, "bot_task", {"task_id": task_id}), tx)
 
     def _request_cancel(self, tx, task):

@@ -523,7 +523,7 @@ erDiagram
 | `event.payload.progress` | `{phase,completed,total,message}`；`phase=context/model/tool/ingest/generate/memory/delivery`，`message`≤512 字符；计数可空或非负整数，有值时 `completed<=total` |
 | `event.payload`（步骤事件） | 公开步骤快照，字段见 4.5；与 `bot_step.public_progress` 同事务保存 |
 | `event.payload.answer` | `answer.delta={attempt,text}`，`attempt>=1`、单片文本≤8192 UTF-8 字节；`answer.reset={attempt,replaced_attempt}`，两者均为≥1 的执行代次 |
-| `event.payload.task` | `task.completed={state,result_url,error}`，状态为三种终态；`result_url=/api/v1/bot/tasks/{task_id}`；`task.updated={state,confirmation}`，沿用公开 Task 状态及确认结构 |
+| `event.payload.task` | `task.completed={state,result_url,error}`，状态为三种终态；`result_url=/api/v1/bot/tasks/{task_id}`。 `task.updated` 沿用第 5.4 节的结构 |
 | `event.payload.memory`／`delivery` | `memory.updated={memory_status,memory_operation_id}`；`delivery.updated={delivery_id,state,channel,target_id}`；字段沿用对应表类型和枚举 |
 | `file.metadata` | `{summary,source_time,parsed_mime_type?,parsed_ranges:[],memory_sources:[]}`；解析类型≤128字符，模板按此类型校验输入，网页正文为`text/plain`；摘要≤4096 字符，来源时间可空；范围项 `{unit,start,end}`；行／页从 1 计数且使用闭区间，字节从 0 计数且使用 `[start,end)`；端点为整数，`end>=start` |
 | `file.metadata.memory_sources[]` | `{uri,node_version,indexed_version}`；`node_version` 为≥1 的整数，`indexed_version` 可空或为≥1 的整数；本次目标的 `indexed_version>=node_version` 表示该来源索引达到目标版本 |
@@ -642,3 +642,917 @@ AGFS 挂载路径：
 | 临时文件和未登记最终对象 | 执行租约失效并结束后至少 24 小时 | 核对活跃任务、步骤和文件引用后回收 |
 
 清理在租户内锁定候选文件记录，扫描任务输入和结果、计划输入、记忆来源及遗忘来源中的引用；新引用写入同样锁定该文件记录。清理事务确认零引用后移除文件记录并保存审计摘要，提交后由共享存储扫描回收孤立对象。数据库备份关联该恢复点的不可变文件清单，清单内对象保护至备份保留期结束；恢复后按 `file_id/storage_key/sha256` 逐项校验内容。
+
+## 5. 接口与用户回显
+
+### 5.1 接口总表与公共协议
+
+以下为**首版新增设计**。路径统一使用`/api/v1/bot`，其中`/api/v1`沿用仓库现有HTTP前缀。提供方为Bot接入服务；Web、CLI及业务客户端使用相同契约。JSON采用UTF-8，时刻采用含时区的ISO 8601字符串，返回值统一为UTC。
+
+| 用途 | HTTP方法与路径，省略公共前缀 | 调用方式 | 成功data结构 |
+|---|---|---|---|
+| 已授权Agent | GET `/agents` | 同步，200 | `{items:[{agent_id:string}],default_agent_id:string或null}` |
+| 创建会话 | POST `/sessions` | 同步，201 | Session |
+| 会话列表 | GET `/sessions` | 同步，200 | `Page<Session>` |
+| 修改标题／归档／恢复 | PATCH `/sessions/{session_id}` | 同步，200；请求`{expected_revision:integer,title?:string,archived?:boolean}`，标题与归档状态至少一项 | Session |
+| 会话及历史 | GET `/sessions/{session_id}` | 同步，200 | `{session:Session,messages:Task[],next_cursor:string或null}` |
+| 提交任务 | POST `/sessions/{session_id}/tasks` | 持久受理，202 | Task |
+| 查询任务 | GET `/tasks/{task_id}` | 同步，200 | Task |
+| 订阅进度 | GET `/tasks/{task_id}/events` | SSE，200 | 第5.4节事件 |
+| 取消／核对待确认任务 | POST `/tasks/{task_id}/cancel`；POST `/tasks/{task_id}/confirm` | 持久受理，202；已有终态200 | Task |
+| 上传或收录资料 | POST `/files` | 持久受理，202 | `{file:File,task:Task}` |
+| 资料与成果查询 | GET `/files`；GET `/files/{file_id}` | 同步，200 | `Page<File>`；File |
+| 下载文件 | GET `/files/{file_id}/content` | 文件流，200或206 | 文件字节及下载头 |
+| 可执行模板 | GET `/templates` | 同步，200 | `Page<Template>` |
+| 创建计划 | POST `/schedules` | 同步，201 | Schedule |
+| 计划查询 | GET `/schedules`；GET `/schedules/{schedule_id}` | 同步，200 | `Page<Schedule>`；Schedule |
+| 调整计划 | PATCH `/schedules/{schedule_id}` | 同步，200 | Schedule |
+| 计划执行记录 | GET `/schedules/{schedule_id}/runs` | 同步，200 | `Page<Task>` |
+| 查看／操作记忆 | GET `/memories`；POST `/memory-actions` | 查询200；持久受理202 | `Page<MemoryItem>`；`{task:Task,forget_id:string或null}` |
+
+| 公共输入／输出 | 类型、必填与默认 | 约束及处理 |
+|---|---|---|
+| Authorization或X-API-Key | string，用户调用必填 | `Authorization: Bearer <token>`或`X-API-Key: <token>`；同时提供时须指向同一凭据 |
+| Content-Type | string，有请求体时必填 | JSON为`application/json`；文件上传使用带boundary的`multipart/form-data` |
+| Idempotency-Key | string，POST/PATCH/DELETE必填 | 1—64个可打印ASCII字符；作为稳定`request_id`保存；同主体、HTTP方法和规范路径内唯一 |
+| 路径中的对象ID | string，必填 | 1—64字符；服务端生成不可预测值；示例`s_qinghe`、`t_weekly`用于说明关联 |
+| cursor、limit | query string／integer，可选 | cursor默认空；limit默认20、范围1—100；所有Page列表适用 |
+| request_id | response string，必填 | 变更响应沿用稳定请求标识；查询响应由服务端生成；同时写入`X-Request-ID`头 |
+| data | response object，成功必填 | 结构由接口总表指定；所有JSON成功响应使用相同包裹 |
+| error | response Error，失败必填 | 与data二选一；统一错误见第5.9节 |
+
+首次部署启用用户API Key身份鉴权。服务端从凭据确定account_id、user_id；会话归属、Agent可用性、资料范围和结果所属会话在受理与执行时校验。前端提供的是业务选择，最终访问范围取当前授权交集。memory_uri及citations.uri沿用oGMemory实际返回的ctx://标识，示例中的租户和用户仅作说明，服务端验证真实归属与访问权。
+
+相同幂等键和相同规范化请求返回首次保存的HTTP状态及响应体；当前进度通过任务查询获取。同键异请求返回409。JSON先补齐默认值、按键排序规范化再计算SHA-256；multipart使用规范化scope、文件名、媒体类型及文件内容SHA-256计算请求摘要。文件流读取过程中计算摘要，数据库受理与幂等回执同事务提交。去重记录至少保留90天，且覆盖关联任务存续期和请求重试期限。
+
+Page固定为`{items:对象数组,next_cursor:string或null}`。一般列表按`created_at、对象ID`降序；会话历史按seq升序。游标绑定认证主体、筛选条件与分页位置，客户端原样传回。请求字段按所属结构校验；响应可增加可选字段，枚举变更同时更新客户端契约。
+
+### 5.2 共享JSON结构
+
+表内“必填”同时适用于响应；请求省略可选字段时采用所列默认值。string长度按Unicode字符计，另标bytes的字段按UTF-8字节计；所有数组元素须满足对应对象定义。
+
+| 对象／字段 | 类型、必填／默认 | 含义和约束 |
+|---|---|---|
+| Scope.memory_scope | string，可选／user | `user`读取本人空间，含有效会话原文及摘要归档；`authorized`扩展到当前已授权Agent空间 |
+| Scope.resource_ids | string[]，可选／[] | 最多100项，每项为≤2048字符的oGMemory资源URI；读取时同时应用memory_scope及实际授权 |
+| Delivery.channel | string，可选／web | 当前为web；结果直接进入会话，CLI从任务读取同一结果 |
+| Delivery.target_id | string或null，可选／null | 由服务端展开为所属session_id |
+| ChatInput.text | string，可选／空串 | 最多32,768 bytes；text非空、file_ids非空、template_id非空至少满足一项 |
+| ChatInput.file_ids | string[]，可选／[] | 最多20项，引用当前可读且ready的资料或成果 |
+| ChatInput.template_id | string或null，可选／null | 已发布模板ID，最大64字符；指定后须满足模板输入与权限要求 |
+| ChatInput.output_format | string，可选／markdown | `markdown/csv`；须属于所选模板支持格式；自由对话采用markdown |
+| ChatInput.delivery | Delivery，可选／站内交付 | 受理时展开默认接收位置；完整ChatInput序列化≤256KiB |
+| Citation.uri/title | string，必填 | 来源URI≤2048字符、标题≤128字符；以实际读取来源生成 |
+| Citation.id | string，可选 | 正文引用编号，如S1；引用卡与正文[S1]对应 |
+| Citation.quote | string，可选／空串 | 支撑结论的摘录，≤1024字符 |
+| Citation.source_time | datetime或null，可选／null | 来源时间；未知为null |
+| Result.text | string，必填 | 最终正文或已完成部分，≤524,288 bytes |
+| Result.citations/file_ids | Citation[]／string[]，必填 | 分别≤100条、≤20项；完整Result序列化≤1MiB |
+| SourceRef.file_id/task_id/uri | string或null，可选／null | 三者恰有一个非空；分别指向资料、任务或授权来源URI |
+| SourceRef.quote | string，可选／空串 | ≤1024字符，辅助定位原文；source_refs数组最多100条 |
+| Confirmation.operation_id | string，必填 | 当前待核对步骤的稳定操作标识，最大64字符 |
+| Confirmation.reason | string，必填 | ≤512字符，说明结果待核对原因 |
+| Confirmation.actions | string[]，必填 | 固定为`["recheck","cancel"]` |
+| Error.code/message/details | string／string／object，必填 | 机器错误码、≤1024字符用户说明、按第5.9节定义的明细；无明细为{} |
+
+| Session字段 | 类型及约束 |
+|---|---|
+| session_id、title、scope | string、1—128字符string、Scope，必填 |
+| agent_id、session_generation | string、integer，必填；Agent标识≤128字符，generation首版为1，由服务端绑定 |
+| next_seq、revision | integer，必填；均从1开始，前者为下一个对话任务序号，后者为会话修改次数 |
+| archived | boolean，必填，默认false；归档后可恢复 |
+| created_at、updated_at | datetime，必填 |
+
+| Task字段 | 类型及约束 |
+|---|---|
+| task_id、request_id、kind | string，必填；kind为`chat/ingest/memory_write/delivery` |
+| session_id、parent_task_id | string或null，必填；后续记忆／交付任务通过parent_task_id关联成果任务 |
+| seq | integer或null，必填；chat从1递增，其余为null；计划生成的chat同样进入会话顺序 |
+| input | ChatInput或null，必填；chat回显受理输入，后台任务返回null |
+| state | string，必填；`queued/running/retry_wait/waiting_confirmation/succeeded/cancelled/failed` |
+| result | Result或null，必填；完成后可读，失败／取消时可保存已完成部分 |
+| memory_status | string，必填；`not_requested/pending/stored/searchable/unchanged/failed`，默认not_requested；unchanged表示已检查且无有效记忆变更 |
+| memory_operation_id | null，必填；核对操作使用待确认任务的 `confirmation.operation_id` |
+| schedule_id、scheduled_at | string或null、datetime或null，必填；计划触发时记录计划和原定到期时间 |
+| cancel_requested | boolean，必填，默认false；表示已保存停止意图 |
+| confirmation、error | Confirmation或null、Error或null，必填；waiting_confirmation须有confirmation |
+| pending_memory_confirmations | `[{task_id:string,confirmation:Confirmation}]`，必填；对话的待确认记忆子任务，默认空数组 |
+| steps | Step[]，必填，默认[]；按step_no排列的真实执行记录，字段见5.7 |
+| last_event_seq、event_floor_seq | integer，必填；已分配最大事件序号、最早可重放序号，初值0和1 |
+| created_at、updated_at、finished_at | datetime、datetime、datetime或null，必填；终态finished_at非空 |
+
+### 5.3 会话、任务、取消与确认
+
+| 接口 | 输入定义 | 输出及客户端动作 |
+|---|---|---|
+| POST `/sessions` | body.title必填；scope可选，默认空Scope；agent_id可选，默认memorybot | 201 Session；界面打开新会话 |
+| GET `/sessions` | 通用分页；q为标题关键字≤128字符；archived为true/false，默认false | 200 `Page<Session>`；按updated_at、session_id倒序 |
+| GET `/sessions/{session_id}` | 路径ID；通用分页用于messages；history_order=asc/desc，默认asc | 200 session及chat任务数组；desc先取最新页，每页按seq升序回显；next_cursor读取更早页 |
+| POST `/sessions/{session_id}/tasks` | body为ChatInput | 202 Task，初态queued；立即显示“已受理”；文件输入尚未ready返回409 |
+| GET `/tasks/{task_id}` | 路径ID | 200 Task；权威结果、记忆状态及事件游标 |
+| POST `/tasks/{task_id}/cancel` | 空JSON对象 | 202保存停止意图；已终态200原状态；通过查询或事件确认cancelled |
+| POST `/tasks/{task_id}/confirm` | body.operation_id:string必填；decision:string必填，recheck或cancel | recheck核对真实回执后继续，仍未知保持waiting_confirmation；cancel保存停止意图；202 Task，已终态200 |
+
+读取待确认任务的 `confirmation.operation_id`，向同一任务提交确认。对话自动整理记忆时，从对话快照或会话历史的 `pending_memory_confirmations` 读取子任务 ID 和确认信息，使用子任务 ID 调用 `POST /tasks/{task_id}/confirm`。
+
+服务端对终态任务返回当前快照（200），对仍可执行且操作标识不匹配的任务返回409。受理 `recheck` 后，执行服务核对原回执并沿原步骤继续；取消在步骤边界收敛，已提交结果与文件仍可查询。
+
+```http
+POST /api/v1/bot/sessions HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: req_session
+
+{
+  "title": "青禾发布",
+  "scope": {
+    "memory_scope": "user",
+    "resource_ids": []
+  },
+  "agent_id": "memorybot"
+}
+
+HTTP/1.1 201 Created
+Content-Type: application/json
+X-Request-ID: req_session
+
+{
+  "request_id": "req_session",
+  "data": {
+    "session_id": "s_qinghe",
+    "title": "青禾发布",
+    "scope": {
+      "memory_scope": "user",
+      "resource_ids": []
+    },
+    "agent_id": "memorybot",
+    "session_generation": 1,
+    "next_seq": 1,
+    "revision": 1,
+    "archived": false,
+    "created_at": "2026-11-03T02:00:00Z",
+    "updated_at": "2026-11-03T02:00:00Z"
+  }
+}
+```
+
+```http
+POST /api/v1/bot/sessions/s_qinghe/tasks HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: req_weekly
+
+{
+  "text": "根据青禾资料生成本周周报",
+  "file_ids": [
+    "f_notes"
+  ],
+  "template_id": "weekly_report",
+  "output_format": "markdown",
+  "delivery": {
+    "channel": "web",
+    "target_id": null
+  }
+}
+
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+X-Request-ID: req_weekly
+Location: /api/v1/bot/tasks/t_weekly
+
+{
+  "request_id": "req_weekly",
+  "data": {
+    "task_id": "t_weekly",
+    "request_id": "req_weekly",
+    "kind": "chat",
+    "session_id": "s_qinghe",
+    "parent_task_id": null,
+    "seq": 1,
+    "input": {
+      "text": "根据青禾资料生成本周周报",
+      "file_ids": [
+        "f_notes"
+      ],
+      "template_id": "weekly_report",
+      "output_format": "markdown",
+      "delivery": {
+        "channel": "web",
+        "target_id": "s_qinghe"
+      }
+    },
+    "state": "queued",
+    "result": null,
+    "memory_status": "not_requested",
+    "memory_operation_id": null,
+    "pending_memory_confirmations": [],
+    "schedule_id": null,
+    "scheduled_at": null,
+    "cancel_requested": false,
+    "confirmation": null,
+    "error": null,
+    "steps": [],
+    "last_event_seq": 0,
+    "event_floor_seq": 1,
+    "created_at": "2026-11-03T02:01:00Z",
+    "updated_at": "2026-11-03T02:01:00Z",
+    "finished_at": null
+  }
+}
+```
+
+```http
+GET /api/v1/bot/tasks/t_weekly HTTP/1.1
+Host: memorybot.example
+X-API-Key: <token>
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Request-ID: req_query
+
+{
+  "request_id": "req_query",
+  "data": {
+    "task_id": "t_weekly",
+    "request_id": "req_weekly",
+    "kind": "chat",
+    "session_id": "s_qinghe",
+    "parent_task_id": null,
+    "seq": 1,
+    "input": {
+      "text": "根据青禾资料生成本周周报",
+      "file_ids": [
+        "f_notes"
+      ],
+      "template_id": "weekly_report",
+      "output_format": "markdown",
+      "delivery": {
+        "channel": "web",
+        "target_id": "s_qinghe"
+      }
+    },
+    "state": "succeeded",
+    "result": {
+      "text": "青禾周报已生成，客户验收安排在11月9日。[S1]",
+      "citations": [
+        {
+          "id": "S1",
+          "uri": "ctx://acct_demo/users/user_demo/memories/events/qinghe_acceptance",
+          "title": "青禾会议记录",
+          "quote": "林悦计划11月9日确认客户验收。",
+          "source_time": "2026-11-03T01:00:00Z"
+        }
+      ],
+      "file_ids": [
+        "f_weekly"
+      ]
+    },
+    "memory_status": "pending",
+    "memory_operation_id": null,
+    "pending_memory_confirmations": [],
+    "schedule_id": null,
+    "scheduled_at": null,
+    "cancel_requested": false,
+    "confirmation": null,
+    "error": null,
+    "steps": [{"step_id":"t_weekly:1","step_no":1,"kind":"retrieve","label":"检索记忆","state":"succeeded","attempt":1,"event_seq":2,"started_at":"2026-11-03T02:01:00Z","finished_at":"2026-11-03T02:01:01Z","elapsed_ms":1000,"summary":{"source_count":1}}],
+    "last_event_seq": 4,
+    "event_floor_seq": 1,
+    "created_at": "2026-11-03T02:01:00Z",
+    "updated_at": "2026-11-03T02:01:08Z",
+    "finished_at": "2026-11-03T02:01:08Z"
+  }
+}
+```
+
+页面在succeeded显示完整正文、来源及成果下载；memory_status另行显示“整理中／已保存／可用于后续问答／本次记忆无变化”，not_requested显示“未触发记忆整理”。CLI使用同一任务查询，先打印任务ID，再输出正文和成果ID。文件生成或记忆步骤失败时显示已完成部分和具体错误。
+
+### 5.4 事件订阅与断线恢复
+
+GET `/tasks/{task_id}/events`使用当前用户认证。query.after为integer、默认0；`Last-Event-ID`可选，格式为`<task_id>:<event_seq>`。两者同时存在时须指向同一序号；服务器返回该序号之后的事件。每条事件先持久化后发送，序号在任务内严格递增。
+
+| 事件type | payload完整结构 | 用户可见行为 |
+|---|---|---|
+| progress | `{phase:string,message:string,completed:integer或null,total:integer或null}` | 阶段为context/model/tool/ingest/generate/memory/delivery；message≤512字符，计数非负，两项非空时completed≤total |
+| step.started／step.completed／step.updated／step.failed／step.cancelled | 第5.7节Step完整快照 | 按step_id更新实际步骤、状态、耗时及摘要 |
+| answer.delta | `{attempt:integer,text:string}` | attempt≥1；向当前草稿追加文本，单片≤8192 bytes |
+| answer.reset | `{attempt:integer,replaced_attempt:integer}` | 清除被替换执行尝试的草稿，再接收新内容 |
+| task.completed | `{state:string,result_url:string,error:Error或null}` | state为succeeded/cancelled/failed；按同源相对result_url查询Task，以完整结果替换草稿 |
+| task.updated | `{state:string,confirmation:Confirmation或null,memory_confirmation_task_id?:string}` | 待确认时展示“核对结果／停止任务”。带记忆子任务 ID 时刷新父任务快照 |
+| memory.updated | `{memory_status:string,memory_operation_id:string或null}` | 更新记忆保存状态，枚举与Task一致 |
+| delivery.updated | `{delivery_id:string,state:string,channel:string,target_id:string}` | state为pending/sending/sent/retry_wait/waiting_confirmation/cancelled/failed；显示交付进度 |
+
+所有SSE data固定为`{task_id:string,event_seq:integer,payload:上述对象}`，event字段等于type，id等于`task_id:event_seq`，单条事件≤64KiB。result_url固定为`/api/v1/bot/tasks/{task_id}`。每15秒发送`: heartbeat`注释。Web使用支持认证头的fetch流；客户端按id去重。业务失败通过task.completed或task.updated呈现，连接建立前的协议错误使用普通JSON错误。
+
+```http
+GET /api/v1/bot/tasks/t_weekly/events?after=2 HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+Accept: text/event-stream
+Last-Event-ID: t_weekly:2
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream; charset=utf-8
+Cache-Control: no-cache
+X-Request-ID: req_stream
+
+id: t_weekly:3
+event: answer.delta
+data: {"task_id":"t_weekly","event_seq":3,"payload":{"attempt":1,"text":"青禾周报已生成。"}}
+
+id: t_weekly:4
+event: task.completed
+data: {"task_id":"t_weekly","event_seq":4,"payload":{"state":"succeeded","result_url":"/api/v1/bot/tasks/t_weekly","error":null}}
+
+id: t_weekly:5
+event: memory.updated
+data: {"task_id":"t_weekly","event_seq":5,"payload":{"memory_status":"searchable","memory_operation_id":null}}
+
+```
+
+断线后先查任务快照，再用最后收到的事件序号续订。若 `after` 小于 `event_floor_seq - 1`，返回 410，附带 `snapshot_url`、`last_event_seq` 和 `event_floor_seq`。事件保留 7 天，任务结果按任务保留期查询。游标无法解析、越界或不一致时，返回空 `details` 的 400 `INVALID_ARGUMENT`，客户端可读快照后修正游标。
+
+收到 410 后重新读取快照。终态任务用快照替换草稿，从 `last_event_seq` 续订后续状态。任务仍在执行时，Web 清空旧草稿，CLI 先输出 `snapshot` 记录，随后从 `event_floor_seq - 1` 重放保留的事件。收到 `answer.reset` 后才处理同次尝试的 `answer.delta`。重放期间只收到进度或缺少重置的增量时，等待完整结果。
+
+任务进入终态且本身的记忆状态离开 `pending`、`stored` 后，服务端发完事件并关闭连接。每次连接最长60秒，客户端用最后收到的序号续订；断线后后台任务继续执行。
+
+Web 在对话的执行过程提供 **核对记忆** 和 **停止记忆整理**。CLI 收到待确认快照后可用 `ogmem bot task confirm <子任务ID> --operation-id <操作ID>` 提交核对。提交后可继续订阅父任务，查看记忆状态和最新的待确认子任务。
+
+### 5.5 资料、成果与模板
+
+| File字段 | 类型、默认与约束 |
+|---|---|
+| file_id、purpose、source_kind、state | string必填；purpose为source/artifact；source_kind为upload/url/generated；state为processing/ready/failed |
+| task_id、previous_file_id | string、string或null，必填；task_id关联处理任务，previous_file_id关联被修订成果 |
+| name | string，必填且非空，≤255字符；URL来源受理时采用来源主机名，处理后可替换为页面标题 |
+| mime_type、size_bytes、sha256 | string≤128、非负integer、64位小写十六进制string；processing可空，ready全部非空 |
+| source_url | string或null，必填；URL来源保留最终公开来源，≤2048字符 |
+| scope、created_at、updated_at | Scope、datetime、datetime，必填 |
+| metadata.summary、metadata.source_time | string或null、datetime或null；摘要≤4096字符，未知时间为null |
+| metadata.parsed_ranges | array默认[]；每项`{unit:line或page或byte,start:integer,end:integer}`；line/page从1且闭区间，byte从0且左闭右开 |
+| metadata.parsed_mime_type | 解析正文的MIME，解析完成后回显；网页为text/plain，CSV为text/csv；模板按解析类型取材 |
+| metadata.memory_sources | array默认[]；每项`{uri:string,node_version:integer,indexed_version:integer或null}`；URI≤2048字符，版本≥1 |
+
+source仅在内容解析和检索可见后进入ready；artifact在完整文件发布、可下载后进入ready。成果发布后内容固定；用户修订产生新file_id并设置previous_file_id。上传接口返回202时，原件已存入AGFS，文件记录包含大小、摘要及存储键；URL收录则由后台抓取后填写。下载时依据file_id查询并鉴权，接入实例通过AGFS按路径读取字节，代理返回200或206；Range转换为AGFS读取的offset和size。
+
+| 接口 | 输入定义 | 输出及条件 |
+|---|---|---|
+| POST `/files`，multipart | file必填，单文件≤50MiB；类型为TXT、Markdown或CSV，对应text/plain、text/markdown、text/csv；scope可选JSON文本，默认空Scope | 202 `{file,task}`；purpose=source、source_kind=upload，创建kind=ingest任务 |
+| POST `/files`，JSON | source_kind必填且为url；source_url必填，HTTP(S) URL≤2048字符；scope可选 | 202 `{file,task}`；按允许的抓取策略提取网页正文，正文≤50MiB |
+| GET `/files` | 通用分页；purpose、state、task_id均可选，枚举同File | 200 `Page<File>`；过滤当前授权资料及成果 |
+| GET `/files/{file_id}` | 路径ID | 200 File；处理错误通过关联Task查询 |
+| GET `/files/{file_id}/content` | 路径ID；Range可选，仅支持单段bytes范围 | ready时200完整字节或206部分字节；ETag为带引号sha256；未ready返回409 |
+| GET `/templates` | 通用分页；query.q可选，≤128字符；output_format可选，枚举同ChatInput | 200 `Page<Template>`；返回当前身份可执行的已发布模板 |
+
+Template固定为`{id,name,input,output,permission_requirements}`。id≤64字符；name≤128字符；input为`{text_required:boolean,file_min:integer,file_max:integer,accepted_mime_types:string[]}`，文件范围0—20；output为`{formats:string[],mime_types:string[]}`，formats采用ChatInput格式枚举且至少一项；permission_requirements为`[{action:string,scope:string}]`，action限定memory.read/resource.read/file.write/tool.execute，scope为对应授权空间、资源范围或注册工具名。模板筛选与任务执行分别校验这些权限。
+
+```http
+POST /api/v1/bot/files HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+Idempotency-Key: req_notes
+Content-Type: multipart/form-data; boundary=bot-boundary
+
+--bot-boundary
+Content-Disposition: form-data; name="scope"
+Content-Type: application/json
+
+{
+  "memory_scope": "user",
+  "resource_ids": []
+}
+--bot-boundary
+Content-Disposition: form-data; name="file"; filename="notes.md"
+Content-Type: text/markdown
+
+林悦计划11月9日确认客户验收。
+--bot-boundary--
+
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+X-Request-ID: req_notes
+Location: /api/v1/bot/files/f_notes
+
+{
+  "request_id": "req_notes",
+  "data": {
+    "file": {
+      "file_id": "f_notes",
+      "purpose": "source",
+      "source_kind": "upload",
+      "task_id": "t_ingest_notes",
+      "previous_file_id": null,
+      "name": "notes.md",
+      "mime_type": "text/markdown",
+      "size_bytes": 42,
+      "sha256": "7814110e3238c74989b74e4d64a085237612a2c9fd03ecba58e428a592f0cb6b",
+      "source_url": null,
+      "scope": {
+        "memory_scope": "user",
+        "resource_ids": []
+      },
+      "state": "processing",
+      "metadata": {
+        "summary": null,
+        "source_time": null,
+        "parsed_ranges": [],
+        "memory_sources": []
+      },
+      "created_at": "2026-11-03T01:59:00Z",
+      "updated_at": "2026-11-03T01:59:00Z"
+    },
+    "task": {
+      "task_id": "t_ingest_notes",
+      "request_id": "req_notes",
+      "kind": "ingest",
+      "session_id": null,
+      "parent_task_id": null,
+      "seq": null,
+      "input": null,
+      "state": "queued",
+      "result": null,
+      "memory_status": "not_requested",
+      "memory_operation_id": null,
+      "pending_memory_confirmations": [],
+      "schedule_id": null,
+      "scheduled_at": null,
+      "cancel_requested": false,
+      "confirmation": null,
+      "error": null,
+      "steps": [],
+    "last_event_seq": 0,
+      "event_floor_seq": 1,
+      "created_at": "2026-11-03T01:59:00Z",
+      "updated_at": "2026-11-03T01:59:00Z",
+      "finished_at": null
+    }
+  }
+}
+```
+
+```http
+GET /api/v1/bot/files/f_weekly/content HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+
+HTTP/1.1 200 OK
+Content-Type: text/markdown; charset=utf-8
+Content-Disposition: attachment; filename="qinghe-weekly.md"
+Accept-Ranges: bytes
+ETag: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+X-Request-ID: req_download
+
+# 青禾周报
+林悦计划11月9日确认客户验收。
+```
+
+下载时中文文件名使用Content-Disposition的filename*参数；206响应附Content-Range及实际Content-Length。示例ETag仅展示哈希字段格式，实际值由文件字节计算。文件处理完成后，界面显示摘要、来源和“可用于问答”；成果显示文件名、大小、修订关系和下载操作。
+
+### 5.6 执行计划
+
+| Schedule字段 | 类型、必填／默认与约束 |
+|---|---|
+| schedule_id、session_id、name | string必填；name为1—128字符；session_id须为当前用户会话 |
+| task_input | ChatInput必填；执行时读取会话范围及最新授权资料 |
+| rule、timezone | Rule、IANA时区string必填，例如Asia/Shanghai |
+| delivery | Delivery，响应必填；派生自task_input.delivery，默认位置已展开 |
+| state、next_run_at、revision | string、datetime或null、integer必填；state为active/paused/cancelled/completed；revision从1开始 |
+| created_at、updated_at | datetime必填 |
+
+Rule为以下互斥结构：`{"type":"once","at":datetime}`；`{"type":"interval","interval_seconds":integer}`；`{"type":"weekly","weekdays":integer[],"local_time":"HH:mm:ss"}`。once.at须在未来且带时区；interval_seconds范围60—31,536,000，首次执行时间为创建时间加间隔；weekdays取ISO周一1至周日7，1—7个去重值。weekly按timezone展开，下次时间取严格晚于当前时刻的最近一次。夏令时跳过的本地时刻顺延到首个有效时刻，重复时刻采用第一次出现；回显next_run_at供用户确认。
+
+| 接口 | 输入定义 | 输出及行为 |
+|---|---|---|
+| POST `/schedules` | body.session_id/name/task_input/rule/timezone必填 | 201 Schedule，state=active、revision=1；任务投递位置取task_input.delivery |
+| GET `/schedules` | 通用分页；query.state、session_id可选 | 200 `Page<Schedule>` |
+| GET `/schedules/{schedule_id}` | 路径ID | 200 Schedule，含下次执行时刻及归属会话 |
+| PATCH `/schedules/{schedule_id}` | expected_revision:integer≥1必填；action:update/pause/resume/cancel必填；update时可带name/task_input/rule/timezone，至少一项 | 200最新Schedule；revision加1，冲突409附当前revision；task_input/rule按完整对象替换 |
+| GET `/schedules/{schedule_id}/runs` | 路径ID、通用分页；query.state可选，Task枚举 | 200 `Page<Task>`，每项包含schedule_id及scheduled_at |
+
+pause和cancel停止后续触发并取消该计划尚未开始的排队任务；已运行任务由任务取消接口处理。resume仅适用于paused；update适用于active/paused；cancelled/completed保持其历史执行记录。一次计划创建到期任务后为completed，执行成功与交付结果从runs查询。每次执行的答复、文件与状态直接保存在归属会话。
+
+```http
+POST /api/v1/bot/schedules HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: req_friday
+
+{
+  "session_id": "s_qinghe",
+  "name": "青禾周五周报",
+  "task_input": {
+    "text": "生成本周青禾周报",
+    "file_ids": [],
+    "template_id": "weekly_report",
+    "output_format": "markdown",
+    "delivery": {
+      "channel": "web",
+      "target_id": "s_qinghe"
+    }
+  },
+  "rule": {
+    "type": "weekly",
+    "weekdays": [
+      5
+    ],
+    "local_time": "09:00:00"
+  },
+  "timezone": "Asia/Shanghai"
+}
+
+HTTP/1.1 201 Created
+Content-Type: application/json
+X-Request-ID: req_friday
+
+{
+  "request_id": "req_friday",
+  "data": {
+    "schedule_id": "p_friday",
+    "session_id": "s_qinghe",
+    "name": "青禾周五周报",
+    "task_input": {
+      "text": "生成本周青禾周报",
+      "file_ids": [],
+      "template_id": "weekly_report",
+      "output_format": "markdown",
+      "delivery": {
+        "channel": "web",
+        "target_id": "s_qinghe"
+      }
+    },
+    "rule": {
+      "type": "weekly",
+      "weekdays": [
+        5
+      ],
+      "local_time": "09:00:00"
+    },
+    "timezone": "Asia/Shanghai",
+    "delivery": {
+      "channel": "web",
+      "target_id": "s_qinghe"
+    },
+    "state": "active",
+    "next_run_at": "2026-11-06T01:00:00Z",
+    "revision": 1,
+    "created_at": "2026-11-03T02:05:00Z",
+    "updated_at": "2026-11-03T02:05:00Z"
+  }
+}
+```
+
+```http
+PATCH /api/v1/bot/schedules/p_friday HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: req_friday_pause
+
+{
+  "expected_revision": 1,
+  "action": "pause"
+}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Request-ID: req_friday_pause
+
+{
+  "request_id": "req_friday_pause",
+  "data": {
+    "schedule_id": "p_friday",
+    "session_id": "s_qinghe",
+    "name": "青禾周五周报",
+    "task_input": {
+      "text": "生成本周青禾周报",
+      "file_ids": [],
+      "template_id": "weekly_report",
+      "output_format": "markdown",
+      "delivery": {
+        "channel": "web",
+        "target_id": "s_qinghe"
+      }
+    },
+    "rule": {
+      "type": "weekly",
+      "weekdays": [
+        5
+      ],
+      "local_time": "09:00:00"
+    },
+    "timezone": "Asia/Shanghai",
+    "delivery": {
+      "channel": "web",
+      "target_id": "s_qinghe"
+    },
+    "state": "paused",
+    "next_run_at": null,
+    "revision": 2,
+    "created_at": "2026-11-03T02:05:00Z",
+    "updated_at": "2026-11-03T02:06:00Z"
+  }
+}
+```
+
+该请求返回200 Schedule，state=paused、next_run_at=null、revision=2，其余字段沿用原计划；界面显示“已暂停”。重新启用时以当前时间计算新的next_run_at；计划卡同时显示时区、当地时间和UTC展开值。
+
+### 5.7 任务执行记录
+
+任务查询和会话历史在每个 Task 中返回 `steps`，SSE 在真实步骤开始、完成或状态变化时更新同一条记录。步骤顺序取 `step_no`，标识为 `task_id:step_no`；数据库保存快照，刷新页面后恢复同一执行记录。
+
+| Step 字段 | 类型／约束 | 用户回显 |
+|---|---|---|
+| step_id、step_no | string、integer≥1 | 同一任务内稳定定位和排序 |
+| kind、label | string | 实际动作及中文名称，如“检索记忆”“生成回复”“生成成果文件” |
+| state | pending/running/retry_wait/waiting_confirmation/succeeded/cancelled/failed | 等待、运行、重试、待核对、完成、停止或失败 |
+| attempt | integer≥0 | 当前执行代次；接续时更新同一步骤 |
+| event_seq | integer≥0 | 最近一次步骤事件序号；历史回填可为0 |
+| started_at、finished_at | datetime、datetime或null | 开始时间及本次状态记录时间；运行中 finished_at=null |
+| elapsed_ms | integer≥0或null | 已记录耗时，单位毫秒 |
+| summary | object，默认{} | 来源数量与标题、文件名、工具名、字符数、计划标识或记忆状态 |
+
+`summary` 按动作提供 `tool_name/source_count/sources/file_id/file_name/file_count/character_count/tool_call_count/schedule_count/schedule_id/memory_status/confirmed/error_code`。数量字段为非负整数，0表示查询成功且结果为空。`sources` 最多10条，每条含标题及URI；文件名只显示名称部分。前台将步骤列表放在回复之前，可展开查看具体结果；正文持续显示模型返回的文本增量。
+
+```json
+{
+  "step_id": "t_weekly:1",
+  "step_no": 1,
+  "kind": "retrieve",
+  "label": "检索记忆",
+  "state": "succeeded",
+  "attempt": 1,
+  "event_seq": 3,
+  "started_at": "2026-11-03T02:01:00Z",
+  "finished_at": "2026-11-03T02:01:01Z",
+  "elapsed_ms": 1000,
+  "summary": {"source_count": 1, "sources": [{"title": "发布会议记录", "uri": "ctx://acct_demo/users/user_demo/memories/events/qinghe_acceptance"}]}
+}
+```
+
+前台先应用 Task.steps，再按 `step_id` 合并 SSE 更新；同一步骤采用较大的 `event_seq`，相同事件只应用一次。完整正文、来源和成果以 Task.result 为准。
+
+### 5.8 记忆查询、更正、遗忘与重新记住
+
+| 对象／接口 | 输入与输出 |
+|---|---|
+| MemoryItem | `{uri:string,title:string,text:string,source_refs:SourceRef[],updated_at:string,category:string,owner_space:string,can_forget:boolean}`；uri≤2048字符、title≤128字符；text为完整节点正文；updated_at为已有更新时间，原节点未提供时为空字符串 |
+| GET `/memories` | 通用分页；query.q可选≤2048字符；memory_scope可选user/authorized默认user；uri可选，URL编码后定位单个授权来源；200 `Page<MemoryItem>`。省略q时按目录列举，传q时按原生类型路由检索最多30个候选后应用范围与遗忘规则 |
+| POST `/memory-actions` | body.action必填，correct/forget/remember；memory_uri:string可选；new_text:string可选≤32768 bytes；source_refs可选默认[]；fact_scope可选默认`{"mode":"entry"}` |
+| correct约束 | memory_uri、非空new_text必填；记录原条目与更正输入关系，202返回memory_write任务 |
+| forget约束 | memory_uri必填；fact_scope首版固定mode=entry；202返回memory_write任务与forget_id |
+| remember约束 | 非空new_text必填；memory_uri可指向曾遗忘条目；以本次明确输入重新建立记忆，并关联被替代的遗忘选择 |
+
+| MemoryItem补充字段 | 含义与回显 |
+|---|---|
+| category | 原生类别，例如profile、event、session_archive、case；界面显示中文类别 |
+| owner_space | 原生归属，例如user:user_demo、agent:memorybot；界面区分用户与Agent |
+| can_forget | category为profile时false；其他条目属于本人用户空间，或当前角色为ADMIN／ROOT且目标为已授权Agent空间时true；前台据此提供遗忘入口 |
+
+记忆页的范围独立于当前聊天设置。关键词查询返回“相关结果”，数量表示本次匹配条目；计划、任务和文件数量从对应业务接口读取。
+
+```http
+GET /api/v1/bot/memories?memory_scope=user&q=%E9%9D%92%E7%A6%BE%E8%B4%9F%E8%B4%A3%E4%BA%BA&limit=20 HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "request_id": "req_memory_search",
+  "data": {
+    "items": [{
+      "uri": "ctx://acct_demo/users/user_demo/memories/session_archives/chunk_qinghe",
+      "title": "青禾发布安排",
+      "text": "user: 青禾负责人是林悦，11月12日发布。",
+      "source_refs": [],
+      "updated_at": "2026-11-03T09:00:00Z",
+      "category": "session_archive",
+      "owner_space": "user:user_demo",
+      "can_forget": true
+    }],
+    "next_cursor": null
+  }
+}
+```
+
+source_refs中的条目均须可访问；省略时由服务端从目标记忆提取既有来源，并加入本次操作输入。遗忘保留原始资料，处理范围是目标记忆及其召回、上下文和自动整理使用；完成回执明确该范围。新明确输入通过remember重新建立记忆，记录本次request_id作为重新启用依据。
+
+记忆操作创建kind=memory_write任务；受理时memory_status=pending，正文确认后stored，检索确认后searchable；forget的searchable表示该条目已从有效检索和后续上下文中排除。correct通过首版定点更正适配器写回指定URI，冻结目标版本及内容摘要，接入方式见本章现有服务接入小节。检查后无有效变更时为unchanged并在result.text解释原因。任务result.text回显实际处理范围，citations列出仍可打开的原始来源，file_ids为空；forget_id用于追踪遗忘规则，其他动作返回null。
+
+```http
+POST /api/v1/bot/memory-actions HTTP/1.1
+Host: memorybot.example
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: req_correct_release
+
+{
+  "action": "correct",
+  "memory_uri": "ctx://acct_demo/users/user_demo/memories/events/qinghe_release",
+  "new_text": "青禾客户验收改为11月13日，由林悦确认。",
+  "source_refs": [
+    {
+      "file_id": "f_notes",
+      "task_id": null,
+      "uri": null,
+      "quote": "林悦计划11月9日确认客户验收。"
+    }
+  ],
+  "fact_scope": {
+    "mode": "entry"
+  }
+}
+
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+X-Request-ID: req_correct_release
+Location: /api/v1/bot/tasks/t_correct_release
+
+{
+  "request_id": "req_correct_release",
+  "data": {
+    "task": {
+      "task_id": "t_correct_release",
+      "request_id": "req_correct_release",
+      "kind": "memory_write",
+      "session_id": null,
+      "parent_task_id": null,
+      "seq": null,
+      "input": null,
+      "state": "queued",
+      "result": null,
+      "memory_status": "pending",
+      "memory_operation_id": null,
+      "pending_memory_confirmations": [],
+      "schedule_id": null,
+      "scheduled_at": null,
+      "cancel_requested": false,
+      "confirmation": null,
+      "error": null,
+      "steps": [],
+    "last_event_seq": 0,
+      "event_floor_seq": 1,
+      "created_at": "2026-11-03T02:15:00Z",
+      "updated_at": "2026-11-03T02:15:00Z",
+      "finished_at": null
+    },
+    "forget_id": null
+  }
+}
+```
+
+同一路径提交`{"action":"forget","memory_uri":"ctx://acct_demo/users/user_demo/memories/preferences/hobby","fact_scope":{"mode":"entry"}}`时，响应增加实际forget_id，例如`fg_hobby`；Task仍采用完整共享结构。界面等待任务终态后显示“已遗忘这条记忆，原始资料保留”。重新记住的请求使用新Idempotency-Key、action=remember、该memory_uri及新的new_text。
+
+### 5.9 错误与重试
+
+| HTTP／任务错误 | code | details字段 | 调用方处理 |
+|---|---|---|---|
+| 400 | INVALID_ARGUMENT | `{field?:string}` | 有 `field` 时按字段约束修正。事件游标错误见第 5.4 节 |
+| 401／403 | UNAUTHENTICATED／PERMISSION_DENIED | {} | 更新凭据或选择已授权资源 |
+| 404 | NOT_FOUND | `{object_type:string}` | 刷新当前用户列表 |
+| 409 | IDEMPOTENCY_CONFLICT | `{}` | 从外层 `request_id` 或响应头 `X-Request-ID` 读取请求标识。用同一幂等键和原报文重放可读取原结果；新操作使用新键 |
+| 409 | REVISION_CONFLICT（会话） | `{}` | 读取 `GET /sessions/{session_id}` 的 `data.session.revision`，核对状态后用新幂等键提交修改 |
+| 409 | REVISION_CONFLICT（计划） | `{revision:integer}` | 读取 `GET /schedules/{schedule_id}` 的当前计划和 `data.revision`，核对状态后用新幂等键提交修改 |
+| 409 | FILE_NOT_READY／TASK_STATE_CONFLICT | `{file_id:string}`／`{state:string}` | 查询相关对象后继续 |
+| 异步任务failed | MEMORY_CHANGED | `{memory_uri:string,current_version:integer,current_sha256:string}` | 指定条目已变化；读取最新内容后提交新的更正请求 |
+| 410 | EVENT_CURSOR_EXPIRED | `{snapshot_url:string,last_event_seq:integer,event_floor_seq:integer}` | 按第 5.4 节读取快照并续订 |
+| 413／416 | FILE_TOO_LARGE／RANGE_NOT_SATISFIABLE | `{max_size_bytes:integer}`／`{size_bytes:integer}` | 缩小上传或调整下载范围 |
+| 429／503 | CAPACITY_LIMIT／DEPENDENCY_UNAVAILABLE | `{retry_after_seconds:integer}` | 按Retry-After等待，使用原幂等键重试 |
+| 查询200、任务failed | MODEL_ERROR／TOOL_ERROR／BUDGET_EXHAUSTED／INGEST_ERROR／MEMORY_ERROR／DELIVERY_ERROR | `{stage:string,operation_id:string或null}` | 展示已有结果与错误；需要继续时提交明确的新任务 |
+
+服务端已返回202的操作通过任务查询确定结果；HTTP超时后客户端使用同一幂等键重试受理。外部操作结果未知时任务进入 `waiting_confirmation`，确认入口见第5.3、5.4节。响应错误正文统一如下，HTTP错误和Task.error使用相同Error结构。
+
+```http
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+X-Request-ID: req_friday_change
+
+{
+  "request_id": "req_friday_change",
+  "error": {
+    "code": "REVISION_CONFLICT",
+    "message": "计划已更新，请读取最新计划后再修改。",
+    "details": {
+      "revision": 2
+    }
+  }
+}
+```
+
+### 5.10 接入现有 oGMemory 服务
+
+模型返回工具请求时保留 `id/name/arguments`，先追加包含 `tool_calls` 的assistant消息；执行后追加 `role=tool`、`tool_call_id=原id` 的结果消息，再请求下一轮模型生成。步骤与工具回执共同持久保存，实例接续沿用已完成结果。
+
+#### 模型与工具的消息契约
+
+| 边界 | 结构与约束 |
+|---|---|
+| 运行时→模型适配层 | `messages`为完整本轮消息序列；`tools`为本轮 `{name,description,input_schema}` 列表；传入输出额度与文本增量回调 |
+| 模型适配层→运行时 | `{text:string,calls:[{id:string,tool:string,input:object}]}`；工具参数从JSON字符串解析为对象 |
+| 运行时→工具处理器 | `bot_step.input={id,tool,input}`；管理动作另接收稳定 `operation_id`、当前事务及本轮允许动作集合 |
+| 工具处理器→运行时 | 读取返回 `sources`，计划查询返回 `schedules/has_more`，管理动作返回 `operation/status/data` |
+| 运行时→下一模型回合 | 追加原 `assistant.tool_calls` 与逐项 `role=tool` 消息；`tool_call_id`对应原调用，`content`为工具输出的JSON字符串 |
+
+以“查看青禾提醒计划”为例，模型请求与工具回执依次加入下一轮消息：
+
+```json
+[
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "call_plan_1",
+        "type": "function",
+        "function": {"name": "list_schedules", "arguments": "{}"}
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_plan_1",
+    "content": "{\"schedules\":[{\"schedule_id\":\"sc_qinghe\",\"session_id\":\"s_qinghe\",\"name\":\"青禾发布检查\",\"state\":\"active\",\"next_run_at\":\"2026-11-09T01:00:00Z\",\"timezone\":\"Asia/Shanghai\",\"revision\":1}],\"has_more\":false}"
+  }
+]
+```
+
+下一回合依据该回执生成“青禾发布检查处于启用状态，下次执行时间为北京时间11月9日09:00”，归一化结果中的 `calls=[]`。同一回合返回多项调用时，保留每项调用与回执的顺序和标识；缺少调用标识时按任务标识、当前步骤号、调用序号补齐稳定值。
+
+| 只读工具 | 输入 | 结果 |
+|---|---|---|
+| `search_memory` | `{query:string}` | 沿原生查询类型检索，再应用会话范围及遗忘规则；普通记忆查询可返回结构化记忆、会话原文与摘要 |
+| `read_memory` | `{uri:string}` | 指定已授权条目的内容和来源 |
+| `list_schedules` | `{}` | 当前account_id/user_id下最近100条计划；`{schedules:[{schedule_id,session_id,name,state,next_run_at,timezone,revision}],has_more:boolean}`；前台步骤显示实际schedule_count |
+
+Bot 执行实例复用进程内 MemoryService、SQLContextFS、持久提取检查点和索引事件处理器。Bot 表承担排队、租约、步骤与结果查询；原生 Session 管理上下文和提取状态，记忆服务负责节点写入与检索投影。
+
+| 调用方式 | 用途 | 关键输入 | 持久回执与恢复 |
+|---|---|---|---|
+| `MemoryService.compose` | 进入原生会话上下文处理流程 | 当前鉴权上下文、固定sessionId/agentId、messages、query、tokenBudget | Bot重建持久历史并取原始消息；已提取的消息与上下文状态由原生Session管理 |
+| `search_memory`与授权节点读取 | 查找背景、读取引用和指定资料 | query、当前身份；Bot另行应用scope及遗忘选择 | 读取真实节点后形成来源；本轮来源冻结在步骤 |
+| `MemoryService.after_turn` | 对话记忆与明确重新记录 | 固定会话、`clientRequestId`、messages、`forceExtract=true`、`wait=true` | 原请求标识复用；提取检查点恢复；完整响应保存为步骤输出 |
+| SQLContextFS 与索引事件 | 资料入库、定点更正及归档 | URI、原版本、摘要、正文及来源 | 与 Bot 执行权、步骤回执同一事务提交；按目标版本确认索引完成 |
+| 发布技能读取 | 管理员发布可执行模板 | `SKILL.md` YAML头部的 `memorybot_template` 声明与正文；已有节点也可保存 `metadata.memorybot_template` | 冻结技能 URI、版本、声明、允许工具及执行器；完整发布示例见使用文档 |
+
+后台执行按 `accepted_authz.credential_ref` 从已有用户注册表解析当前 API Key，重新鉴权并取受理范围与当前权限交集。当前记忆调用的稳定标识使用 `bot_step.operation_id`，作为 `after_turn.clientRequestId`；公开 `memory_operation_id` 为 `null`。
+
+#### 记忆写入请求
+
+```http
+POST /api/v1/after_turn HTTP/1.1
+Authorization: Bearer <用户API Key>
+Content-Type: application/json
+
+{
+  "sessionId": "s_qinghe",
+  "agentId": "memorybot",
+  "clientRequestId": "step_qinghe_memory",
+  "forceExtract": true,
+  "wait": true,
+  "timeoutSeconds": 900,
+  "prePromptMessageCount": 0,
+  "messages": [
+    {
+      "id": "t_qinghe_user",
+      "role": "user",
+      "content": "记住：青禾负责人是林悦，11月12日发布。",
+      "created_at": "2026-11-03T09:00:00Z"
+    }
+  ]
+}
+```
+
+| 输入 | 类型及规则 |
+|---|---|
+| sessionId、agentId | string，聊天链路分别取bot_session.session_id与agent_id；独立文件／记忆任务使用受理时保存的memory_session_id；执行时复核当前身份 |
+| clientRequestId | string，取持久步骤的稳定操作标识，接续时沿用 |
+| messages | 原始确认消息及来源；按遗忘记录过滤自动整理输入 |
+| forceExtract、wait | boolean，均取 true；由后台执行实例等待并保存结果 |
+| timeoutSeconds | number，取 Bot 文件及记忆处理预算，默认900秒 |
+
+#### 状态映射与接续
+
+| 已有服务结果 | Bot 状态 | 用户回显 |
+|---|---|---|
+| processing／处理中检查点 | 任务 retry_wait，memory_status=pending | 记忆整理中 |
+| completed，含有效写入及原始回执 | memory_status=stored | 已保存，正在建立检索 |
+| 目标正文及索引版本均确认 | memory_status=searchable | 可用于后续问答 |
+| completed，实际写入计划为空或全部跳过 | memory_status=unchanged | 记忆已检查，无需更新 |
+| duplicate／needs_confirmation，完整结果待核对 | 任务 waiting_confirmation | 展示核对结果与停止入口 |
+
+结果接续先复用 Bot 已保存的完整步骤；正在执行的原写入通过共享提取检查点确认。已处理请求的去重回执若缺少完整写入结果，保留待确认状态，按真实回执推进。更正与归档使用同一 SQL 事务写入正文、索引事件及步骤结果；重放直接读取已提交步骤。
+
+同一记忆身份的写入由数据库锁串行保护，Bot 领取时再限制同租户用户的记忆修改并发。执行实例可横向扩容，写入资格随任务租约接续。
+
+#### 上下文与来源
+
+| 内容 | 数据去向 |
+|---|---|
+| 原始用户消息、已完成答复 | Bot持久会话；符合记忆规则的新增内容进入写入请求 |
+| 原生`compose`的合成上下文与检索提示 | 由核心服务整理；Bot本轮取材以再次授权读取的节点正文为准 |
+| 相关记忆、`resource_ids`及上传资料 | 应用会话范围和遗忘规则后作为模型资料输入；保留真实URI和文件来源 |
+| Bot对外`citations` | 读取授权原始记忆／资料后，登记真实`uri/title/quote/source_time`；引用段落与原文核对 |

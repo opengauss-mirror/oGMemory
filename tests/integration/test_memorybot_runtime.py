@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -10,11 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from flask import Flask
 
 from core.models import ContextNode, RequestContext, Role
 from memorybot.config import BotConfig
 from memorybot.files import AGFSFileStore, parse_text
 from memorybot.gateway import MemoryGateway
+from memorybot.http import create_blueprint
 from memorybot.models import ChatInput, new_id
 from memorybot.runtime import BotWorker
 from memorybot.service import BotService
@@ -572,6 +575,46 @@ def test_completed_model_step_replays_after_lease_transfer(runtime, monkeypatch)
         {"task_id": item["task_id"], "type": "answer.reset"},
     )
     assert events[0]["payload"] == {"attempt": 2, "replaced_attempt": 1}
+
+
+def test_csv_template_stream_preserves_multibyte_reply(runtime):
+    runtime.memory._cfg.role_control_enabled = True
+    service = BotService(
+        runtime.store, runtime.memory, runtime.files, runtime.worker.config, gateway=runtime.gateway
+    )
+    app = Flask(__name__)
+    app.register_blueprint(create_blueprint(lambda: service))
+    client = app.test_client()
+    auth = {"X-API-Key": runtime.api_key}
+    long_group = "青禾🌾" * 1000
+    uploaded = client.post(
+        "/api/v1/bot/files",
+        headers={**auth, "Idempotency-Key": "utf8-csv-upload"},
+        data={"file": (io.BytesIO(f"组名,金额\n{long_group},3\n".encode()), "groups.csv")},
+    )
+    assert uploaded.status_code == 202
+    attachment = uploaded.json["data"]
+    execute(runtime, attachment["task"])
+
+    session_url = f"/api/v1/bot/sessions/{runtime.ctx.session_id}"
+    created = client.post(
+        session_url + "/tasks",
+        headers={**auth, "Idempotency-Key": "utf8-csv-chat"},
+        json={"file_ids": [attachment["file"]["file_id"]], "template_id": "csv_summary"},
+    )
+    assert created.status_code == 202
+    result = execute(runtime, created.json["data"])
+    path = f"/api/v1/bot/tasks/{result['task_id']}/events"
+    stream = client.get(path, headers=auth)
+    assert stream.status_code == 200
+    chunks = [
+        json.loads(record.split("data: ", 1)[1])["payload"]["text"]
+        for record in stream.text.split("\n\n")
+        if "event: answer.delta\n" in record
+    ]
+    assert max(len(chunk.encode("utf-8")) for chunk in chunks) <= 8192
+    assert "".join(chunks) == result["result"]["text"]
+    assert long_group in result["result"]["text"]
 
 
 def test_model_stream_is_visible_while_model_step_runs(runtime):
