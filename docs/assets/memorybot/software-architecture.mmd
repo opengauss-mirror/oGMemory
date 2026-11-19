@@ -1,0 +1,27 @@
+flowchart TB
+    U[前台 / CLI / HTTP] -->|对话请求| A[BotService<br/>认证、输入校验、请求去重]
+    A -->|保存 chat 任务并返回 202| D[(openGauss<br/>会话、任务、步骤、事件)]
+    D -->|领取任务、建立租约| W[BotWorker<br/>领取、续期、接管]
+    subgraph R[Agent 运行时：一次任务执行]
+        E[Execution<br/>权限、预算、检查点、事件]
+        C[ConversationContext<br/>历史、记忆、资料<br/>来源编号]
+        P[ChatRun<br/>路径选择、动作识别<br/>模型与工具回合]
+        T[工具分派<br/>MemoryGateway / BotService]
+        O[ConversationResult<br/>正文、引用、成果<br/>后续任务]
+        E -->|调用 chat 处理器| P
+        P -->|加载本轮材料| C
+        C -->|上下文与来源| P
+        P -->|结构化工具请求| T
+        T -->|工具回执追加上下文| P
+        P -->|生成完成| O
+    end
+    W -->|创建共享执行状态| E
+    P <-->|消息、工具声明、生成结果| L[模型服务]
+    C -->|授权取材| M[oGMemory<br/>上下文、记忆、资源、技能]
+    T -->|检索 / 读取| M
+    E <-->|步骤恢复、事件持久化| D
+    O -->|原子提交结果与后续任务| D
+    O -->|发布成果文件| F[(AGFS)]
+    C -->|读取资料| F
+    D -->|任务查询 / 事件读取| A
+    A -->|结果 / SSE| U
