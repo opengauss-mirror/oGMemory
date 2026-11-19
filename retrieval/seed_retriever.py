@@ -54,6 +54,18 @@ class SeedRetriever:
         self.bm25_index = bm25_index
         self.lexical_backfill = lexical_backfill
 
+    def embed_query(self, text: str) -> list[float]:
+        if self.config.hybrid_enabled and self.config.semantic_weight <= 0:
+            return []
+        try:
+            return self.embedder.embed_texts([text])[0]
+        except Exception as exc:
+            logger.warning(
+                "SeedRetriever: embed failed for query (%s: %s); continuing with keyword retrieval",
+                type(exc).__name__, exc,
+            )
+            return []
+
     def search(
         self,
         typed_query: TypedQuery,
@@ -76,19 +88,7 @@ class SeedRetriever:
                 if self.config.expand_hierarchy else []
             )
             if query_vector is None:
-                try:
-                    query_vector = self.embedder.embed_texts([typed_query.text])[0]
-                except Exception as exc:
-                    # Degrade instead of emptying the working set: when the
-                    # embedder is saturated/down, continue with BM25-only
-                    # retrieval so downstream score-threshold filtering still
-                    # behaves conservatively.
-                    logger.warning(
-                        "SeedRetriever: embed failed for query (%s: %s) — "
-                        "degrading to keyword/BM25-only retrieval",
-                        type(exc).__name__, exc,
-                    )
-                    query_vector = []
+                query_vector = self.embed_query(typed_query.text)
             if query_vector:
                 global_results = self._global_vector_search(
                     query_vector, typed_query, ctx

@@ -13,12 +13,14 @@ import os
 import re as _re
 import threading
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import UTC
 from datetime import datetime as _dt
-from functools import wraps
+from functools import partial, wraps
 from typing import Any
 from uuid import uuid4
 
@@ -146,6 +148,7 @@ except ImportError:
     _HAS_SQL = False
 
 logger = logging.getLogger("ogmem.service")
+_COMPOSE_SEARCH_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="compose-search")
 
 
 def _ambiguous_pending_replay(pending, messages, client_request_id):
@@ -2380,34 +2383,47 @@ class MemoryService:
 
 
     def _search_working_set(self, query: str, ctx: RequestContext) -> tuple[list[dict], list[dict], dict]:
-        """Two-round search for memory nodes using the configured retrieval pipeline.
+        """Search memory and historical summaries using the configured retrieval pipeline.
 
-        Round 1: All categories → structured items for retrievedEvidence.
-        Round 2: session_summary only, top_k=1 → historical retrieval evidence.
+        All categories → structured items for retrievedEvidence.
+        session_summary only, top_k=1 → historical retrieval evidence.
 
         Returns (structured_items, summary_items, stats).
         """
         items = []
         summary_items = []
         stats: dict = {}
+        summary = None
         try:
-            read_api = self.get_read_api()
-            graph_kwargs = dict(include_debug=True,collect_graph_supplement=True) if self._graph_enabled() else {}
+            from fs.sql_adapter.session_mutation import active_session_guard
 
-            # Round 1: structured nodes (all categories)
+            read_api = self.get_read_api()
+            agfs_retrieval = self._agfs_retrieval_enabled
+            query_vector = None if agfs_retrieval else read_api.prepare_query_vector(query)
+            graph_kwargs = dict(include_debug=True,collect_graph_supplement=True) if self._graph_enabled() else {}
+            summary_search = partial(
+                read_api.search_memory, query=query, ctx=ctx, top_k=1,
+                categories=["session_summary"], fill_content_for_top_k=0,
+                mode="QUICK", query_vector=query_vector,
+            )
+            if not agfs_retrieval and active_session_guard() is None:
+                summary = _COMPOSE_SEARCH_POOL.submit(copy_context().run, summary_search)
+
+            # Structured nodes and summaries keep independent result quotas.
             if self._cfg.skill_sedimentation_enabled:
                 result = self._search_without_generated_skills(
-                    read_api, query=query, ctx=ctx, top_k=15,
+                    read_api, query=query, ctx=ctx, top_k=15, query_vector=query_vector,
                     fill_content_for_top_k=0,
                 )
             else:
                 result = read_api.search_memory(
                     query=query, ctx=ctx, top_k=15,
+                    query_vector=query_vector,
                     fill_content_for_top_k=5 if self._graph_enabled() else 0, mode="QUICK",
                     **graph_kwargs,
                     hints={"include_all_memories": True},
                 )
-            if self._agfs_retrieval_enabled and result is not None:
+            if agfs_retrieval and result is not None:
                 stats["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
             if self._graph_enabled() and result is not None and result.trace is not None:
                 stats["graph_expansion"] = dict(result.trace.graph_expansion)
@@ -2434,7 +2450,7 @@ class MemoryService:
                     vector_items = [i for i in items if i["metadata"].get("retrieval_origin") != "graph_neighbor"]
                     graph_items = [i for i in items if i["metadata"].get("retrieval_origin") == "graph_neighbor"]
                     items = self._truncate_by_score_gap(vector_items) + graph_items
-                elif not self._agfs_retrieval_enabled:
+                elif not agfs_retrieval:
                     items = self._truncate_by_score_gap(items)
 
             if getattr(self._cfg, "code_retrieval_enabled", False):
@@ -2461,14 +2477,10 @@ class MemoryService:
                             type(exc).__name__,
                         )
 
-            # Round 2: historical session summary with source provenance.
+            # Historical session summary with source provenance.
             try:
-                summary_result = read_api.search_memory(
-                    query=query, ctx=ctx, top_k=1,
-                    categories=["session_summary"],
-                    fill_content_for_top_k=0, mode="QUICK",
-                )
-                if self._agfs_retrieval_enabled and summary_result is not None and summary_result.partial:
+                summary_result = summary.result() if summary is not None else summary_search()
+                if agfs_retrieval and summary_result is not None and summary_result.partial:
                     stats["retrieval"] = {"mode": "agfs", "status": "partial"}
                 if summary_result and summary_result.hits:
                     summary_items = [
@@ -2493,6 +2505,9 @@ class MemoryService:
         except Exception as exc:
             logger.warning("Working set search failed: %s", exc)
             return [], [], {}
+        finally:
+            if summary is not None:
+                wait((summary,))
         return items, summary_items, stats
 
     def _search_without_generated_skills(
@@ -2503,6 +2518,7 @@ class MemoryService:
         ctx: RequestContext,
         top_k: int,
         fill_content_for_top_k: int,
+        query_vector: list[float] | None = None,
     ):
         """Search ordinary memories and legacy skills before applying top-k.
 
@@ -2526,6 +2542,7 @@ class MemoryService:
             mode="QUICK",
             **(dict(include_debug=True,collect_graph_supplement=True) if self._graph_enabled() else {}),
             hints={"include_all_memories": True},
+            **({"query_vector": query_vector} if query_vector is not None else {}),
         )
         if result is None:
             return None
@@ -4920,7 +4937,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             ordinary_items = [item for item in working_set
                               if (item.get("metadata") or {}).get("retrieval_origin") != "graph_neighbor"]
             read_many = None
-            if self._cfg.storage_backend == "sql" and not self._graph_enabled():
+            if not self._graph_enabled():
                 def read_many(requests, read_ctx):
                     return self.get_read_api().read_memories(requests, read_ctx)
             working_set, delivery_stats = hydrate_evidence(

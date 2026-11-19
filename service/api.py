@@ -897,6 +897,15 @@ class ReadAPI:
         self._read_service = read_service
         self._cfg = config or RetrievalConfig()
 
+    def prepare_query_vector(self, query: str) -> list[float]:
+        """Prepare one semantic vector for related searches in a request."""
+        from retrieval.query_planner import sanitize_query
+
+        text = sanitize_query(query or "")
+        if not text:
+            raise CoreValidationError("query", "query must not be empty")
+        return self._pipeline.seed_retriever.embed_query(text)
+
     def append_graph_supplement(self, items, query, stats, ctx, budget, formatter):
         supplement = getattr(self._pipeline,"_graph_supplement",None)
         if not (self._cfg.enable_graph_expansion and self._cfg.graph_supplement_enabled and supplement):
@@ -929,6 +938,7 @@ class ReadAPI:
         use_scene: bool | None = None,
         final_top_k: int | None = None,
         hints: dict | None = None,
+        query_vector: list[float] | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -956,6 +966,7 @@ class ReadAPI:
             **({"use_scene": use_scene} if use_scene is not None else {}),
             final_top_k=final_top_k,
             hints=hints,
+            **({"query_vector": query_vector} if query_vector is not None else {}),
         )
 
         if not include_debug:

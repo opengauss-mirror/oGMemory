@@ -44,6 +44,7 @@ test("accepted write follows its server receipt through HTTP GET", async (t) => 
   assert.deepEqual(calls.map(({ method }) => method), ["POST", "GET"]);
   assert.equal(calls[1].path, "/api/v1/sessions/session%20one/write-requests?clientRequestId=server-receipt");
   assert.match(calls[0].body.clientRequestId, /^oc-[a-f0-9]{64}$/);
+  assert.equal(calls[0].body.timeoutSeconds, 4.5);
   assert.equal(calls[1].headers["x-agent-id"], "worker");
   assert.equal(calls[1].headers["x-api-key"], "fixture-key");
   assert.deepEqual(result.http_observations.map(({ method, http_status, request_id }) => (
@@ -55,12 +56,13 @@ test("receipt polling preserves slash and percent characters", async (t) => {
   const requestId = "/turn/%2F";
   const { url, calls } = await receiptServer(t, false, requestId);
   const result = await callHttp(url, "after_turn", {
-    sessionId: "session", clientRequestId: requestId,
+    sessionId: "session", clientRequestId: requestId, timeoutSeconds: 3,
     messages: [{ role: "user", content: "Remember blue." }],
   }, { requestTimeoutMs: 5000 });
 
   assert.equal(result.request_status, "SUCCEEDED");
   assert.equal(calls[0].body.clientRequestId, requestId);
+  assert.equal(calls[0].body.timeoutSeconds, 3);
   const query = new URL(calls[1].path, url);
   assert.equal(query.pathname, "/api/v1/sessions/session/write-requests");
   assert.equal(query.searchParams.get("clientRequestId"), requestId);
@@ -78,6 +80,7 @@ test("buffered write keeps its accepted receipt for normal session flush", async
   assert.equal(result.retry_action, "none");
   assert.deepEqual(calls.map(({ method }) => method), ["POST"]);
   assert.equal(result.http_observations[0].request_id, "server-receipt");
+  assert.equal(calls[0].body.timeoutSeconds, 290);
 });
 
 test("compaction completes after a source-only receipt finishes projection", async (t) => {

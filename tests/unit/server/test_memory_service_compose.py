@@ -31,6 +31,16 @@ def compose_storage(monkeypatch):
     monkeypatch.setattr(MemoryService, "_get_context_fs", lambda self: None)
 
 
+def _read_api_stub():
+    api = Mock()
+    def read_memories(requests, ctx):
+        return {(uri, key): api.read_memory(uri, ctx, **({"unit_key": key} if key else {}))
+                for uri, key in requests}
+    api.read_memories.side_effect = read_memories
+    api.prepare_query_vector.return_value = [1.0]
+    return api
+
+
 def _ctx(session_id: str = "sess-archive") -> RequestContext:
     return RequestContext(
         account_id="acct-test",
@@ -195,6 +205,9 @@ def test_memory_service_adds_code_results_without_changing_compose_schema(monkey
     service = MemoryService(config=OgMemConfig(code_retrieval_enabled=True))
 
     class OrdinaryReadAPI:
+        def prepare_query_vector(self, query):
+            return [1.0]
+
         def search_memory(self, **kwargs):
             if kwargs.get("categories") == ["session_summary"]:
                 return SearchMemoryResult()
@@ -266,6 +279,9 @@ def test_memory_service_code_failure_preserves_ordinary_working_set(monkeypatch)
     service = MemoryService(config=OgMemConfig(code_retrieval_enabled=True))
 
     class OrdinaryReadAPI:
+        def prepare_query_vector(self, query):
+            return [1.0]
+
         def search_memory(self, **kwargs):
             if kwargs.get("categories") == ["session_summary"]:
                 return SearchMemoryResult()
@@ -327,9 +343,8 @@ def test_memory_service_working_set_budget_preserves_code_locator():
 
 def test_search_working_set_preserves_legacy_skill_behavior_when_feature_disabled():
     service = MemoryService(config=OgMemConfig())
-    read_api = Mock()
-    read_api.search_memory.side_effect = [
-        _WorkingSetResult([
+    read_api = _read_api_stub()
+    ordinary_result = _WorkingSetResult([
             _PrefetchHit(
                 "ctx://acct-test/agents/agent-test/skills/generated/review-code",
                 0.95,
@@ -342,9 +357,10 @@ def test_search_working_set_preserves_legacy_skill_behavior_when_feature_disable
                 "preference",
                 "Use concise answers",
             )
-        ]),
-        _WorkingSetResult([]),
-    ]
+        ])
+    read_api.search_memory.side_effect = lambda **kwargs: (
+        _WorkingSetResult([]) if kwargs.get("categories") == ["session_summary"] else ordinary_result
+    )
     service.get_read_api = Mock(return_value=read_api)
 
     items, summary_items, stats = service._search_working_set("query", _ctx())
@@ -361,7 +377,7 @@ def test_search_working_set_preserves_legacy_skill_behavior_when_feature_disable
 
 def test_generated_skill_filter_preserves_none_search_result():
     service = MemoryService(config=OgMemConfig())
-    read_api = Mock()
+    read_api = _read_api_stub()
     read_api.search_memory.return_value = None
 
     result = service._search_without_generated_skills(
@@ -383,7 +399,7 @@ def test_generated_skill_filter_overfetches_before_top_k():
             retrieval_min_candidate_pool_size=4,
         )
     )
-    read_api = Mock()
+    read_api = _read_api_stub()
     read_api.search_memory.return_value = _WorkingSetResult([
         _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/one", .99, "skill", "one",
                      metadata={"ogmemory_generated": True}),
@@ -431,7 +447,7 @@ def test_get_session_state_runs_rolling_compressor_when_gate_enabled():
 def test_prefetch_populates_topic_buffer_pending_injection():
     service = MemoryService(config=OgMemConfig(prefetch_enabled=True, prefetch_top_k=2))
     ctx = _ctx("sess-prefetch")
-    read_api = Mock()
+    read_api = _read_api_stub()
     read_api.search_memory.return_value = _PrefetchResult([
         _PrefetchHit(
             "ctx://acct-test/agents/agent-test/skills/generated/review-code",
@@ -476,17 +492,17 @@ def test_enabled_sedimentation_defensively_excludes_generated_skills_but_keeps_m
         storage_backend="sql", sql_connection_string="postgresql://unused",
     ))
     service._cfg.skill_sedimentation_enabled = True
-    read_api = Mock()
-    read_api.search_memory.side_effect = [
-        _WorkingSetResult([
+    read_api = _read_api_stub()
+    ordinary_result = _WorkingSetResult([
             _PrefetchHit("ctx://acct-test/users/user-test/memories/profile", .8, "profile", "profile"),
             _PrefetchHit("ctx://acct-test/users/user-test/memories/custom/one", .85, "custom", "custom"),
             _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/generated", .99, "skill", "generated",
                          metadata={"ogmemory_generated": True}),
             _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/manual", .9, "skill", "manual"),
-        ]),
-        _WorkingSetResult([]),
-    ]
+        ])
+    read_api.search_memory.side_effect = lambda **kwargs: (
+        _WorkingSetResult([]) if kwargs.get("categories") == ["session_summary"] else ordinary_result
+    )
     service.get_read_api = Mock(return_value=read_api)
 
     items, _, _ = service._search_working_set("query", _ctx())
@@ -496,7 +512,8 @@ def test_enabled_sedimentation_defensively_excludes_generated_skills_but_keeps_m
         "ctx://acct-test/users/user-test/memories/custom/one",
         "ctx://acct-test/users/user-test/memories/profile",
     ]
-    search_args = read_api.search_memory.call_args_list[0].kwargs
+    search_args = next(call.kwargs for call in read_api.search_memory.call_args_list
+                       if call.kwargs.get("categories") != ["session_summary"])
     assert search_args["fill_content_for_top_k"] == 0
     assert "exclude_generated_skills" not in search_args
 
@@ -1112,7 +1129,7 @@ def test_compose_merges_pending_injection_into_working_set():
     service._read_profile = Mock(return_value="")
     service._collect_archives = Mock(return_value=([], []))
     service._search_working_set = Mock(return_value=([], [], {}))
-    read_api = Mock()
+    read_api = _read_api_stub()
     read_api.read_memory.return_value = RetrievedBlock(
         uri="ctx://acct-test/users/user-test/memories/preferences/coding_style",
         abstract="prefetched memory",
@@ -1187,7 +1204,8 @@ def test_compose_delivers_mixed_memories_and_confirms_each_tool_unit():
         return SearchMemoryResult(hits=[user_hit, tool_hits[0]])
 
     service.get_read_api = Mock(return_value=SimpleNamespace(
-        read_memory=reader.read, search_memory=search_memory,
+        read_memory=reader.read, read_memories=reader.read_many, search_memory=search_memory,
+        prepare_query_vector=lambda query: [1.0],
     ))
     service._read_profile = Mock(return_value="")
     service._collect_archives = Mock(return_value=([], []))
@@ -1405,7 +1423,7 @@ def test_compose_skips_pending_injection_uri_already_in_working_set():
             "score": 0.95,
         }
     ], [], {}))
-    read_api = Mock()
+    read_api = _read_api_stub()
     read_api.read_memory.return_value = RetrievedBlock(
         uri=duplicate_uri, category="preference", abstract="existing memory",
         content_excerpt="Use four spaces for indentation.",
@@ -1448,7 +1466,7 @@ def test_compose_allows_prefetch_reinjection_after_topic_change():
     service._search_working_set = Mock(return_value=([], [], {}))
     service._get_session_state = Mock(return_value=SessionWindowState())
     service._get_shared_embedder = Mock(return_value=None)
-    read_api = Mock()
+    read_api = _read_api_stub()
     read_api.read_memory.return_value = RetrievedBlock(
         uri=reused_uri, category="preference", abstract="prefetched memory for the new topic",
         content_excerpt="Use four spaces for indentation.",

@@ -7,8 +7,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.models import ContextNode, RequestContext, RetrievalConfig, SeedHit, SeedResult
+from core.models import ContextNode, LeafHit, RequestContext, RetrievalConfig, SeedHit, SeedResult, TypedQuery
 from extraction.agent_memory import render_agent_memory
+from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+from fs.agfs_adapter.client import NativeAGFSClient
 from index.index_record_builder import build_index_records
 from providers.vector_index.in_memory_index import InMemoryVectorIndex
 from retrieval.context_reader import ContextReader
@@ -64,6 +66,45 @@ def unit_memory():
     nodes = {node.uri: node, user.uri: user, experience.uri: experience}
     fs = SimpleNamespace(read_node=lambda uri, ctx: nodes[uri], nodes=nodes)
     return ctx, node, user, fs
+
+
+@pytest.mark.parametrize("storage_backend", ["agfs", "sql"])
+def test_batch_read_projects_units_from_one_canonical_node(unit_memory, storage_backend):
+    ctx, node, user, fs = unit_memory
+    fs.read_nodes = Mock(side_effect=lambda uris, ctx: {uri: fs.nodes[uri] for uri in uris})
+    reader = ContextReader(fs, storage_backend=storage_backend)
+    requests = [(node.uri, "batch"), (node.uri, "cursor"), (user.uri, None)]
+    expected = {key: reader.read(key[0], ctx, unit_key=key[1]) for key in requests}
+
+    actual = reader.read_many(requests + requests, ctx)
+
+    assert actual == expected
+    fs.read_nodes.assert_called_once_with([node.uri, user.uri], ctx)
+
+
+def test_native_batch_read_supplies_ranked_units_and_keeps_summary_tail(unit_memory):
+    ctx, node, user, _ = unit_memory
+    fs = AGFSContextFS(Mock(spec=NativeAGFSClient))
+    fs.read_node = Mock(return_value=node)
+    fs.exists = Mock(return_value=True)
+    hits = [
+        LeafHit(node.uri + "/content.md", score, metadata={"unit_key": unit})
+        for score, unit in ((0.9, "batch"), (0.8, "cursor"))
+    ] + [LeafHit(user.uri + "/content.md", 0.7, abstract=user.abstract)]
+    config = RetrievalConfig(expand_hierarchy=False)
+
+    result = ResultRanker(config).assemble(
+        TypedQuery("search", "MEMORY", [], top_k=3), hits, None, ctx,
+        fill_content_for_top_k=2, context_reader=ContextReader(fs),
+    )
+
+    assert [block.metadata["unit_key"] for block in result[:2]] == ["batch", "cursor"]
+    assert [block.metadata["unit_revision"] for block in result[:2]] == [1, 2]
+    assert "Use batches of 20 requests." in result[0].content_excerpt
+    assert "Reuse the returned cursor for the next page." in result[1].content_excerpt
+    assert result[2].abstract == user.abstract
+    fs.read_node.assert_called_once_with(node.uri, ctx)
+    fs.exists.assert_called_once_with(user.uri, ctx)
 
 
 @pytest.mark.parametrize("expand_hierarchy", [False, True])

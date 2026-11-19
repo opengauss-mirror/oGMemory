@@ -17,9 +17,11 @@ import logging
 import re
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from threading import Event, Thread
@@ -61,6 +63,7 @@ _WORKSPACE_BINDING_MUTEX_TTL_SECONDS = 60.0
 _WORKSPACE_BINDING_MUTEX_TIMEOUT_SECONDS = 10.0
 _WORKSPACE_BINDING_MUTEX_POLL_SECONDS = 0.05
 _SESSION_RECOVERY = ContextVar("agfs_session_recovery", default=None)
+_NODE_READS = ThreadPoolExecutor(max_workers=8, thread_name_prefix="agfs-node-read")
 
 
 class _ResourceMutationLease:
@@ -2656,6 +2659,30 @@ class AGFSContextFS:
 
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
         return self._read_node_snapshot(uri, ctx, lambda: self._read_node_once(uri, ctx))
+
+    def read_nodes(
+        self, uris: list[str], ctx: RequestContext,
+    ) -> dict[str, ContextNode | Exception]:
+        """Read unique nodes with a process-wide concurrency limit."""
+        from fs.sql_adapter.session_mutation import active_session_guard
+
+        def read(uri):
+            try:
+                return self.read_node(uri, ctx)
+            except Exception as exc:
+                return exc
+
+        uris = list(dict.fromkeys(uris))
+        if len(uris) <= 1 or active_session_guard() is not None:
+            return {uri: read(uri) for uri in uris}
+        pending = deque((uri, _NODE_READS.submit(copy_context().run, read, uri)) for uri in uris[:4])
+        results = {}
+        for uri in uris[4:]:
+            completed_uri, future = pending.popleft()
+            results[completed_uri] = future.result()
+            pending.append((uri, _NODE_READS.submit(copy_context().run, read, uri)))
+        results.update((uri, future.result()) for uri, future in pending)
+        return results
 
     def _read_node_once(self, uri: str, ctx: RequestContext) -> tuple[ContextNode, str]:
         """Read a node from AGFS.

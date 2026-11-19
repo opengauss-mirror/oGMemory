@@ -56,6 +56,14 @@ class ContextReader:
         self._fs = fs
         self._storage_backend = storage_backend
 
+    @property
+    def uses_native_agfs(self) -> bool:
+        from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+        from fs.agfs_adapter.client import NativeAGFSClient
+
+        return (self._storage_backend == "agfs" and isinstance(self._fs, AGFSContextFS)
+                and isinstance(self._fs._client, NativeAGFSClient))
+
     def is_visible(self, uri: str, ctx: RequestContext) -> bool:
         """Validate an index hit against the current node status and access scope."""
         uri = canonical_uri(uri)
@@ -98,7 +106,7 @@ class ContextReader:
     ) -> dict[tuple[str, str | None], RetrievedBlock | Exception]:
         results = {}
         read_nodes = getattr(self._fs, "read_nodes", None)
-        if self._storage_backend == "sql" and callable(read_nodes):
+        if callable(read_nodes):
             read_uris = {}
             for uri, unit_key in requests:
                 key = (uri, unit_key)

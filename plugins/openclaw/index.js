@@ -581,6 +581,10 @@ export async function callHttp(baseUrl, method, params, cfg = {}) {
       params.prePromptMessageCount || 0, params.messages]);
     params = { ...params, clientRequestId: "oc-" + createHash("sha256").update(source).digest("hex") };
   }
+  if (method === "after_turn" && params.timeoutSeconds === undefined) {
+    const confirmationMs = Math.min(10_000, timeoutMs / 10);
+    params = { ...params, timeoutSeconds: (timeoutMs - confirmationMs) / 1000 };
+  }
   try {
     const headers = buildAuthHeaders(cfg, params, "application/json");
     const resp = await fetch(`${baseUrl}/api/v1/${method}`, {
