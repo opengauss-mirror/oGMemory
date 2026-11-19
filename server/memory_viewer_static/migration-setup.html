@@ -1,5 +1,50 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>开启迁移模式</title><link rel="stylesheet" href="/memory-viewer/styles.css"></head>
-<body style="padding:32px;max-width:900px;margin:auto"><h1>记忆导入导出</h1><p>请先停止当前实例的业务服务、MCP 及独立后台任务，并完成必要落盘，再启动迁移专用页面。</p>
-<pre style="white-space:pre-wrap">ogmem migration --config /path/ogmem.yaml --workspace /path/migration-work --maintenance-confirmed</pre>
-<p>配置 root_api_key 或通过环境变量 OGMEM_MIGRATION_API_KEY 设置迁移管理员密钥。默认页面地址为 http://127.0.0.1:8091；远端部署可通过 SSH 端口转发访问。</p>
-<p>支持全量导出和空目标导入。导入成功后停止迁移模式，再按现有方式启动业务服务。此普通业务页面不会执行迁移。</p><a href="/memory-viewer/">返回记忆查看器</a></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>开启迁移模式 · oGMemory</title>
+  <link rel="stylesheet" href="/memory-viewer/styles.css">
+  <link rel="stylesheet" href="/memory-viewer/migration.css">
+</head>
+<body class="migration">
+  <header class="migration-bar">
+    <div class="migration-wrap migration-brand">
+      <span class="migration-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5m-18 4 9 5 9-5"/></svg>
+      </span>
+      <strong>oGMemory</strong>
+      <a class="migration-link migration-back" href="/memory-viewer/">返回记忆查看器</a>
+    </div>
+  </header>
+  <main class="migration-wrap migration-main">
+    <header class="migration-heading">
+      <h1>记忆导入导出</h1>
+      <p>迁移在独立服务中执行。请在源端和目标端分别准备。</p>
+    </header>
+    <section class="migration-panel migration-setup" aria-labelledby="setup-title">
+      <h2 id="setup-title">启动迁移模式</h2>
+      <ol class="migration-steps">
+        <li>
+          <h3>停止业务写入</h3>
+          <p>停止 HTTP、MCP 与独立后台任务，完成必要落盘。导入需要空目标。</p>
+        </li>
+        <li>
+          <h3>配置密钥并启动服务</h3>
+          <p>配置 <code>auth.root_api_key</code> 或设置 <code>OGMEM_MIGRATION_API_KEY</code>。</p>
+          <pre><code>ogmem migration --config /path/ogmem.yaml --workspace /path/migration-work --maintenance-confirmed</code></pre>
+        </li>
+        <li>
+          <h3>打开迁移页面</h3>
+          <p>默认地址为 <code>http://127.0.0.1:8091</code>。远端部署可通过 SSH 端口转发访问。</p>
+        </li>
+      </ol>
+    </section>
+    <aside class="migration-next" aria-labelledby="next-title">
+      <h2 id="next-title">完成校验后</h2>
+      <p>停止迁移服务，再启动业务服务。</p>
+    </aside>
+  </main>
+</body>
+</html>

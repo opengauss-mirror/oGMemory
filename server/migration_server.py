@@ -204,7 +204,9 @@ def create_app(
             "/",
             "/memory-viewer/migration",
             "/memory-viewer/migration.js",
+            "/memory-viewer/migration.css",
             "/memory-viewer/styles.css",
+            "/memory-viewer/theme.css",
         }:
             return None
         supplied = request.headers.get("X-API-Key", "")
@@ -236,8 +238,10 @@ def create_app(
         return send_file(static / "migration.js")
 
     @app.get("/memory-viewer/styles.css")
+    @app.get("/memory-viewer/theme.css")
+    @app.get("/memory-viewer/migration.css")
     def stylesheet():
-        return send_file(static / "styles.css")
+        return send_file(static / request.path.rsplit("/", 1)[-1])
 
     @app.post("/api/migration/login")
     def login():

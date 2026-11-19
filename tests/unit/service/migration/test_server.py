@@ -33,6 +33,19 @@ def done(client, job_id):
     pytest.fail("job did not finish")
 
 
+def test_migration_gui_loads_shared_theme_before_sign_in(tmp_path):
+    app = create_app(cfg(), tmp_path, maintenance_confirmed=True, service=Service())
+    client = app.test_client()
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert b"/memory-viewer/migration.css" in page.data
+    for filename in ("theme.css", "migration.css"):
+        response = client.get(f"/memory-viewer/{filename}")
+        assert response.status_code == 200
+        assert response.mimetype == "text/css"
+
+
 def test_migration_mode_requires_operator_confirmation_and_auth(tmp_path, monkeypatch):
     monkeypatch.delenv("OGMEM_MIGRATION_API_KEY", raising=False)
     with pytest.raises(ValueError, match="maintenance"):

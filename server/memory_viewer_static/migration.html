@@ -1,17 +1,128 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>记忆导入导出 · oGMemory</title><link rel="stylesheet" href="/memory-viewer/styles.css">
-<style>body{padding:24px}main{max-width:900px;margin:auto}section{border:1px solid var(--line);border-radius:10px;padding:20px;margin:18px 0}button,input{margin:6px;padding:9px}button{border:1px solid var(--line);border-radius:6px;cursor:pointer}button:disabled{cursor:default}details{margin-top:12px}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}progress{width:100%}.error{color:#c33}a{color:inherit}</style>
-<script src="/memory-viewer/migration.js" defer></script></head>
-<body><main><h1>记忆导入导出</h1>
-<p>维护模式：请先停止所有业务写入及后台任务。导入仅支持空目标；完成校验后停止迁移服务，再启动业务服务。</p>
-<section><h2>管理员连接</h2><label>迁移管理员密钥 <input id="key" type="password" autocomplete="off"></label><button id="connect">连接</button><p id="connection">尚未连接</p></section>
-<p id="error" class="error" role="alert"></p>
-<div id="operations" hidden>
-<p><label><input type="checkbox" id="maintenance">已停止其他业务进程并完成必要落盘</label></p>
-<section><h2>导出记忆</h2><p>全量导出支持的持久化节点、关系与历史归档。包含模型及存储的来源描述，不包含模型文件、密钥或运行任务。</p><button id="export">开始导出</button><a id="download" hidden>下载迁移包</a></section>
-<section><h2>导入记忆</h2><p>自动按目标存储配置恢复，使用目标 embedding 重建持久化索引。此过程会调用 embedding 模型。</p><input id="file" type="file" accept=".gz"><button id="inspect">上传并预检</button><button id="import" disabled>开始导入</button><p id="upload"></p><p id="plan-summary"></p><div id="compatibility"></div><details><summary>预检详情</summary><pre id="plan"></pre></details></section>
-<section><h2>进度与结果</h2><p id="phase">等待操作</p><p id="result-summary"></p><details><summary>完整报告</summary><pre id="result"></pre></details></section>
-<section><h2>最近任务</h2><div id="history"></div></section>
-</div></main></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>记忆导入导出 · oGMemory</title>
+  <link rel="stylesheet" href="/memory-viewer/styles.css">
+  <link rel="stylesheet" href="/memory-viewer/migration.css">
+  <script src="/memory-viewer/migration.js" defer></script>
+</head>
+<body class="migration">
+  <header class="migration-bar">
+    <div class="migration-wrap migration-brand">
+      <span class="migration-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5m-18 4 9 5 9-5"/></svg>
+      </span>
+      <strong>oGMemory</strong>
+      <span class="migration-mode">迁移专用模式</span>
+    </div>
+  </header>
+  <main class="migration-wrap migration-main">
+    <header class="migration-heading">
+      <h1>记忆导入导出</h1>
+      <p>在源端导出迁移包，在空目标端预检并导入。</p>
+    </header>
+    <section class="migration-panel migration-auth" aria-labelledby="auth-title">
+      <div>
+        <h2 id="auth-title">管理员连接</h2>
+        <p id="connection" class="migration-status" role="status" data-tone="neutral">尚未连接</p>
+      </div>
+      <form id="connect-form" class="migration-form" novalidate>
+        <label for="key">迁移管理员密钥</label>
+        <div class="migration-connect">
+          <div class="migration-key">
+            <input id="key" type="password" autocomplete="current-password" required aria-describedby="key-error">
+            <button id="toggle-key" class="migration-reveal" type="button" aria-label="显示管理员密钥">显示</button>
+          </div>
+          <button id="connect" class="primary-button" type="submit">连接</button>
+        </div>
+        <p id="key-error" class="migration-error migration-field-error" role="alert" hidden></p>
+      </form>
+      <dl id="migration-target" class="migration-target" hidden>
+        <div><dt>内容存储</dt><dd id="migration-storage"></dd></div>
+        <div><dt>向量存储</dt><dd id="migration-vector"></dd></div>
+      </dl>
+    </section>
+    <p id="error" class="migration-error migration-alert" role="alert" hidden></p>
+    <div id="operations" hidden>
+      <label class="migration-maintenance">
+        <input type="checkbox" id="maintenance" aria-describedby="maintenance-hint">
+        <span><strong>已停止业务进程并完成落盘</strong>
+          <small id="maintenance-hint">停止 HTTP、MCP 与后台任务。迁移期间保持停写。</small></span>
+      </label>
+      <div class="migration-actions">
+        <section class="migration-panel migration-operation" aria-labelledby="export-title">
+          <header>
+            <span class="migration-direction">源端</span>
+            <h2 id="export-title">导出记忆</h2>
+            <p>将已持久化的记忆、关系、历史归档及受支持的附件打包。</p>
+            <p class="migration-note">迁移包不包含凭据、模型文件或运行任务。</p>
+          </header>
+          <div class="migration-controls">
+            <button id="export" class="primary-button" type="button">开始导出</button>
+            <a id="download" class="migration-link" hidden>下载迁移包</a>
+          </div>
+        </section>
+        <section class="migration-panel migration-operation" aria-labelledby="import-title">
+          <header>
+            <span class="migration-direction migration-direction-target">空目标端</span>
+            <h2 id="import-title">导入记忆</h2>
+            <p>用目标配置恢复数据并重建索引。上传迁移包后先预检。</p>
+          </header>
+          <div class="migration-file">
+            <label for="file">迁移包（.ogmem.tar.gz）</label>
+            <input id="file" type="file" accept=".gz" aria-describedby="upload">
+            <p id="upload" class="migration-note" role="status"></p>
+          </div>
+          <div class="migration-controls">
+            <button id="inspect" class="secondary-button" type="button">上传并预检</button>
+            <button id="import" class="primary-button" type="button" disabled>开始导入</button>
+          </div>
+        </section>
+      </div>
+      <section id="preflight-report" class="migration-panel migration-preflight" aria-labelledby="preflight-title" hidden>
+        <h2 id="preflight-title">预检结果</h2>
+        <p id="plan-summary"></p>
+        <div id="compatibility"></div>
+        <details>
+          <summary>预检完整报告</summary>
+          <pre id="plan"></pre>
+        </details>
+      </section>
+      <div class="migration-ledger">
+        <section class="migration-panel migration-progress" aria-labelledby="progress-title">
+          <h2 id="progress-title">任务进度</h2>
+          <p id="phase" class="migration-status" data-tone="neutral" role="status" tabindex="-1">等待操作</p>
+          <p id="task-reference" class="migration-note" hidden>任务 ID <code id="task-id"></code></p>
+          <progress id="task-progress" aria-label="任务正在处理" hidden></progress>
+          <p id="result-summary"></p>
+          <details id="result-details" hidden>
+            <summary>任务完整报告</summary>
+            <pre id="result"></pre>
+          </details>
+        </section>
+        <section class="migration-panel migration-history" aria-labelledby="history-title">
+          <header class="migration-history-heading">
+            <h2 id="history-title">最近任务</h2>
+            <button id="refresh-jobs" class="secondary-button" type="button">刷新任务</button>
+          </header>
+          <ul id="history" class="migration-job-list"></ul>
+          <p id="history-empty" class="migration-note">暂无任务</p>
+        </section>
+      </div>
+    </div>
+    <dialog id="import-dialog" aria-labelledby="import-dialog-title" aria-describedby="import-impact">
+      <form method="dialog" novalidate>
+        <h2 id="import-dialog-title">确认导入记忆</h2>
+        <p id="import-impact">数据将写入当前空目标并重建索引。请保持业务停写，等待导入与校验完成。</p>
+        <div class="migration-controls">
+          <button class="secondary-button" value="cancel" autofocus>取消</button>
+          <button class="primary-button" value="import">确认导入</button>
+        </div>
+      </form>
+    </dialog>
+  </main>
+</body>
+</html>
