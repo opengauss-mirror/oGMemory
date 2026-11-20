@@ -110,3 +110,11 @@ def correlate_extraction_calls(invoke):
 def record_assembly_event(*, selection=None, decision=None, attempt=None):
     """Capture bounded assembly metadata, separate from physical model usage."""
     _emit('assembly', **_copy_content(selection=selection, decision=decision, attempt=attempt))
+
+
+def record_decision_result(*, option_count, elapsed_seconds, choices=None,
+                           probabilities=None, threshold=None, selected=None):
+    """Capture routing metadata without source text or raw responses."""
+    details = ({"selected_choice": dict(choices)} if choices is not None else
+               {"probabilities": dict(probabilities), "threshold": threshold, "selected": list(selected)})
+    _emit("decision_result", option_count=option_count, elapsed_seconds=elapsed_seconds, **details)

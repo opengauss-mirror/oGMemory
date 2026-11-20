@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -66,3 +67,55 @@ def test_empty_sql_decision_model_uses_configuration():
     }
     svc._get_model_usage_store = Mock(return_value=store)
     assert svc.get_model_usage_metrics(account_id="a")["models"]["decision"] == "configured-jev"
+
+
+def test_first_lazy_write_and_retrieval_share_decision_client_without_deadlock(monkeypatch):
+    svc = MemoryService(OgMemConfig(
+        provider="mock", extraction_mode="lazy", retrieval_mode="agfs",
+        decision=DecisionConfig(base_url="http://localhost:1", model="jev"),
+        retrieval_decision_rerank_enabled=True,
+    ))
+    write_started, retrieval_waiting = threading.Event(), threading.Event()
+    init_lock = svc._init_lock
+
+    class ObservedInitLock:
+        def __enter__(self):
+            if threading.current_thread().name == "first-decision":
+                retrieval_waiting.set()
+            return init_lock.__enter__()
+
+        def __exit__(self, *args):
+            return init_lock.__exit__(*args)
+
+    def context_fs():
+        write_started.set()
+        assert retrieval_waiting.wait(3)
+        return Mock()
+
+    monkeypatch.setattr(svc, "_init_lock", ObservedInitLock())
+    monkeypatch.setattr(svc, "_get_context_fs", context_fs)
+    monkeypatch.setattr(svc, "_get_outbox_store", lambda fs: Mock())
+    monkeypatch.setattr(svc, "_start_outbox_worker", lambda: None)
+    results, errors = {}, []
+
+    def invoke(key, callback):
+        try:
+            results[key] = callback()
+        except Exception as exc:
+            errors.append(exc)
+
+    writer = threading.Thread(target=invoke, args=("write", svc.get_write_api), daemon=True)
+    reader = threading.Thread(target=invoke, args=("decision", svc.get_decision_client),
+                              name="first-decision", daemon=True)
+    writer.start()
+    assert write_started.wait(3)
+    reader.start()
+    writer.join(3)
+    reader.join(3)
+    assert not writer.is_alive() and not reader.is_alive(), "first initialization deadlocked"
+    assert not errors
+    assert results["write"]._decision_client is results["decision"]
+    assert svc._get_model_usage_store() is None
+    with usage_scope("a", "user:alice"):
+        results["decision"].token_tracker.record_response({"usage": {"input_tokens": 1, "output_tokens": 2}})
+    assert results["decision"].token_tracker.snapshot().input_tokens == 1

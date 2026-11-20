@@ -308,10 +308,11 @@ class ExtractionReActLoop(ReactLoop):
         loop_result = super().run(ctx, task_ctx)
         check_deadline()
         if not loop_result.completed:
-            raise ExtractionIncompleteError(
-                f"Extraction did not complete: {loop_result.finish_reason}"
-            )
+            raise self._incomplete_error(loop_result)
         return self._to_extraction_react_result(loop_result, ctx)
+
+    def _incomplete_error(self, result: ReactLoopResult) -> Exception:
+        return ExtractionIncompleteError(f"Extraction did not complete: {result.finish_reason}")
 
     def _get_tools(self) -> list[dict]:
         return self._all_tools
@@ -963,3 +964,20 @@ class ExtractionReActLoop(ReactLoop):
             completed=loop_result.completed,
             llm_error=loop_result.llm_error,
         )
+
+
+def create_extraction_loop(
+    *, decision_client=None, generate_operations=None, read_probability_threshold=None, correlation=None, **native_kwargs,
+) -> ExtractionReActLoop:
+    if decision_client is None:
+        return ExtractionReActLoop(**native_kwargs)
+
+    from extraction.jev_react_loop import JevExtractionReActLoop
+
+    return JevExtractionReActLoop(
+        decision_client=decision_client,
+        generate_operations=generate_operations,
+        read_probability_threshold=read_probability_threshold,
+        correlation=correlation,
+        **native_kwargs,
+    )

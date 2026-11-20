@@ -76,6 +76,11 @@ class _OccurrenceBudget:
                     entry.result.read_versions[entry.uri] = entry.version
 
 
+IDENTITY_HINT_FIELDS = (
+    "scope_ref", "object_name", "who", "routing_key", "routing_key_aliases", "object_name_aliases",
+)
+
+
 @dataclass
 class PrefetchResult:
     """Result of prefetching existing memories for a memory type."""
@@ -87,6 +92,8 @@ class PrefetchResult:
     is_lazy: bool = False
     read_versions: dict[str, int] = field(default_factory=dict)
     read_nodes: dict[str, ContextNode] = field(default_factory=dict)
+    # Bounded directory identities; these do not authorize reads or updates.
+    identity_hints: list[dict] = field(default_factory=list)
 
 
 class MemoryPrefetcher:
@@ -101,8 +108,8 @@ class MemoryPrefetcher:
     def __init__(
         self,
         fs: ContextFS,
-        vector_index: VectorIndex,
-        embedder: Embedder,
+        vector_index: VectorIndex | None,
+        embedder: Embedder | None,
         registry: SchemaRegistry,
         uri_resolver: URIResolver,
     ):
@@ -111,6 +118,10 @@ class MemoryPrefetcher:
         self._embedder = embedder
         self._registry = registry
         self._uri_resolver = uri_resolver
+
+    @property
+    def _has_vector_search(self) -> bool:
+        return self._vector_index is not None and self._embedder is not None
 
     def prefetch_node_snapshots(self, categories, ctx, conversation_text, *, read_nodes=None):
         """Read bounded semantic candidates with one shared embedding batch."""
@@ -227,6 +238,7 @@ class MemoryPrefetcher:
                 combined.read_nodes.update(result.read_nodes)
                 combined.listed_uris.update(result.listed_uris)
                 combined.uri_hints.extend(result.uri_hints)
+                combined.identity_hints.extend(result.identity_hints)
         return combined
 
     def _prefetch_vectors(self, text: str) -> list[list[float]]:
@@ -238,6 +250,8 @@ class MemoryPrefetcher:
 
     def _embed_queries(self, text: str) -> list[list[float]]:
         """Bound query count/length while retaining windows across the whole source."""
+        if not self._has_vector_search:
+            return []
         provider_limit = getattr(self._embedder, "max_input_chars", _QUERY_CHARS)
         limit = min(_QUERY_CHARS, provider_limit) if type(provider_limit) is int and provider_limit > 0 else _QUERY_CHARS
         count = min(_MAX_QUERIES, (len(text) + limit - 1) // limit)
@@ -272,7 +286,7 @@ class MemoryPrefetcher:
                             or node.category != memory_type or node.owner_space != owner):
                         continue
                     fields = {"name": node.uri.rsplit("/", 1)[-1], "L0": node.abstract}
-                    for key in ("scope_ref", "object_name", "who", "routing_key", "routing_key_aliases", "object_name_aliases"):
+                    for key in IDENTITY_HINT_FIELDS:
                         if node.metadata.get(key):
                             fields[key] = node.metadata[key]
                     line = json.dumps(fields, ensure_ascii=False) + "\n"
@@ -281,6 +295,10 @@ class MemoryPrefetcher:
                     lines.append(line)
                     size += len(line)
                     result.listed_uris.add(node.uri)
+                    result.identity_hints.append(deepcopy({
+                        "uri": node.uri, "abstract": node.abstract,
+                        **{key: fields[key] for key in IDENTITY_HINT_FIELDS if key in fields},
+                    }))
                 else:
                     if len(page) < _CATALOG_PAGE_SIZE:
                         status = "complete"
@@ -417,6 +435,9 @@ class MemoryPrefetcher:
         authorizes an update. Keep full source scope and occurrence facts visible.
         """
         result = PrefetchResult(is_lazy=lazy)
+        if lazy and not self._has_vector_search:
+            self._add_identity_catalog(memory_type, ctx, result)
+            return result
         local_budget = budget is None
         if budget is None:
             budget = _OccurrenceBudget(_available_prefetch_chars(len(conversation_text or "")))
@@ -510,14 +531,15 @@ class MemoryPrefetcher:
     def _get_abstract_for_uri(self, uri: str, memory_type: str, ctx: RequestContext) -> str:
         """Get abstract for a URI (for lazy single-file prefetch)."""
         # Try vector index first
-        try:
-            filters = self._build_filters(memory_type, ctx)
-            vectors = self._embedder.embed_texts([memory_type])
-            hits = self._vector_index.search_by_vector(query_vector=vectors[0], filters=filters, top_k=1)
-            if hits and hits[0].uri.rstrip("/content.md") == uri:
-                return hits[0].abstract
-        except Exception:
-            pass
+        if self._has_vector_search:
+            try:
+                filters = self._build_filters(memory_type, ctx)
+                vectors = self._embedder.embed_texts([memory_type])
+                hits = self._vector_index.search_by_vector(query_vector=vectors[0], filters=filters, top_k=1)
+                if hits and hits[0].uri.rstrip("/content.md") == uri:
+                    return hits[0].abstract
+            except Exception:
+                pass
         # Fallback: minimal read
         node = self._fs.read_node(uri, ctx)
         return node.abstract

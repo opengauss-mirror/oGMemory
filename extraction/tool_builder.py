@@ -457,12 +457,23 @@ def parse_tool_call(
     target_uri = tool_input.get("target_uri", "")
     expected_version = tool_input.get("expected_version")
     if target_uri or expected_version is not None:
-        if (not _supports_read_target(schema)
-                or not isinstance(target_uri, str) or not target_uri.strip()
-                or type(expected_version) is not int or expected_version < 1
-                or not all(isinstance(tool_input.get(name), str) and tool_input[name].strip()
-                           for name in ("abstract", "overview", "content"))):
-            logger.warning("Invalid read target for tool %s", tool_name)
+        invalid_fields = []
+        if not _supports_read_target(schema):
+            invalid_fields.append("unsupported_category")
+        if not isinstance(target_uri, str) or not target_uri.strip():
+            invalid_fields.append("target_uri")
+        if type(expected_version) is not int or expected_version < 1:
+            invalid_fields.append("expected_version")
+        invalid_fields.extend(
+            name for name in ("abstract", "overview", "content")
+            if not isinstance(tool_input.get(name), str) or not tool_input[name].strip()
+        )
+        if invalid_fields:
+            logger.warning(
+                "Invalid read target for tool %s: invalid_fields=%s uri_present=%s version_type=%s",
+                tool_name, ",".join(invalid_fields), "target_uri" in tool_input,
+                type(expected_version).__name__,
+            )
             return None
 
     # Extract common fields for CandidateMemory

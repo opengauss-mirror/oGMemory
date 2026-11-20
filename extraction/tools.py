@@ -45,6 +45,7 @@ from core.errors import (
     LLMCallError,
     ExtractionOutputError,
     LLMOutputTruncatedError,
+    LLMTransientError,
     OperationDeadlineExceededError,
     ToolCallProtocolError,
     ValidationError,
@@ -60,6 +61,7 @@ from core.validation import (
     validate_attribution,
     validate_candidate,
 )
+from extraction.assembly_contract import UnsupportedAssemblyTemplateError
 from extraction.event_reconciliation import reconcile_event_drafts
 from extraction.incremental_edit import (
     INCREMENTAL_TOOLS,
@@ -89,8 +91,21 @@ from extraction.tool_builder import (
     validate_read_target,
 )
 from providers.llm_observation import observe_call
+from providers.token_tracker import UsagePersistenceError
 
 _EXTRACTION_RUNTIME = ContextVar("extraction_runtime", default=None)
+
+
+def generate_memory_operations(llm, *, prompt, tools, correlation, temperature=None):
+    """Share the Eager request, returning native operations before candidate adoption."""
+    check_deadline()
+    calls = run_model_call(
+        observe_call, "extraction", llm.complete_with_tools,
+        prompt=prompt, tools=tools, tool_choice="required",
+        temperature=temperature, correlation=correlation,
+    )
+    check_deadline()
+    return calls
 
 
 class ExtractionRuntime:
@@ -531,6 +546,8 @@ class Extractor:
         dual_pass_enabled: bool = True,
         node_processing_enabled: bool = False,
         activation_enabled: bool = False,
+        decision_client=None,
+        read_probability_threshold: float = 0.70,
     ):
         """Initialize the Extractor.
 
@@ -569,6 +586,8 @@ class Extractor:
         self._span_retries = (
             _DEFAULT_SPAN_RETRIES if span_retries is None else max(0, span_retries)
         )
+        self._decision_client = decision_client
+        self._read_probability_threshold = read_probability_threshold
         if prompt_manager is None:
             from extraction.prompts import PromptManager
 
@@ -598,7 +617,9 @@ class Extractor:
 
         validate_prompt_manager(self._prompt_manager, self._extraction_template)
         self._prefetcher: MemoryPrefetcher | None = None
-        if fs and vector_index and embedder and uri_resolver and self._schema_registry:
+        if (fs and uri_resolver and self._schema_registry
+                and ((vector_index is not None and embedder is not None)
+                     or (mode == "lazy" and decision_client is not None))):
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
@@ -957,7 +978,7 @@ class Extractor:
                             exc,
                         )
                         continue
-                    except OperationDeadlineExceededError:
+                    except (OperationDeadlineExceededError, UsagePersistenceError, UnsupportedAssemblyTemplateError):
                         # Never degrade a deadline expiry — the request is
                         # out of budget and must unwind, not retry later.
                         raise
@@ -1009,7 +1030,7 @@ class Extractor:
                 # propagates them, and the finalize path must not become a
                 # hole that masks an internal fault as graceful degradation.
                 raise
-            except OperationDeadlineExceededError:
+            except (OperationDeadlineExceededError, UsagePersistenceError, UnsupportedAssemblyTemplateError):
                 raise
             except Exception as exc:
                 # Partial-chunk resilience: one span's total failure (all
@@ -1235,6 +1256,8 @@ class Extractor:
                 ToolCallProtocolError,
                 LLMOutputTruncatedError,
                 OperationDeadlineExceededError,
+                UsagePersistenceError,
+                UnsupportedAssemblyTemplateError,
                 _SpanProgrammingError,
             ):
                 raise
@@ -1326,7 +1349,7 @@ class Extractor:
                         exc,
                     )
                     break
-                except OperationDeadlineExceededError:
+                except (OperationDeadlineExceededError, UsagePersistenceError, UnsupportedAssemblyTemplateError):
                     # Never burn the retry budget on an expired deadline.
                     raise
                 except _SpanProgrammingError:
@@ -1985,15 +2008,11 @@ class Extractor:
         """Eager mode: prefetch + single-shot extraction."""
         check_deadline()
         tools = self._extraction_tools if extraction_tools is None else extraction_tools
-        tool_calls = run_model_call(observe_call, "extraction", self._llm.complete_with_tools,
+        tool_calls = generate_memory_operations(
+            self._llm, prompt=prompt, tools=tools, temperature=temperature,
             correlation={"session_id": ctx.session_id, "trace_id": ctx.trace_id,
                          "span_start": span.start, "span_end": span.end},
-            prompt=prompt,
-            tools=tools,
-            tool_choice="required",
-            temperature=temperature,
         )
-        check_deadline()
 
         if not tool_calls:
             logger.warning(
@@ -2185,9 +2204,24 @@ class Extractor:
             if categories is None
             else tools_for_categories(self._extraction_tools, self._schema_registry, categories)
         )
-        try:
-            from extraction.extraction_react_loop import ExtractionReActLoop
+        from extraction.extraction_react_loop import create_extraction_loop
 
+        loop = create_extraction_loop(
+            decision_client=self._decision_client,
+            generate_operations=generate_memory_operations,
+            read_probability_threshold=self._read_probability_threshold,
+            correlation={"archive_id": archive_id, "span_id": f"{span.start}:{span.end}"},
+            llm=self._llm,
+            fs=self._fs,
+            registry=self._schema_registry,
+            uri_resolver=self._uri_resolver,
+            prompt_manager=self._prompt_manager,
+            prefetcher=self._prefetcher,
+            timeout_seconds=self._react_timeout_seconds,
+            activation_enabled=self._activation_enabled,
+            internal_tool_usage_tracker=self._internal_tool_usage_tracker,
+        )
+        try:
             # Use lazy prefetch: URIs only, no content reading
             prefetch_result = None
             if self._prefetcher is not None:
@@ -2195,17 +2229,6 @@ class Extractor:
                     span.categories, ctx, focused_messages=focused_messages, lazy=True,
                 )
 
-            loop = ExtractionReActLoop(
-                llm=self._llm,
-                fs=self._fs,
-                registry=self._schema_registry,
-                uri_resolver=self._uri_resolver,
-                prompt_manager=self._prompt_manager,
-                prefetcher=self._prefetcher,
-                timeout_seconds=self._react_timeout_seconds,
-                activation_enabled=self._activation_enabled,
-                internal_tool_usage_tracker=self._internal_tool_usage_tracker,
-            )
             conversation = (
                 prompt_parts.data_prompt
                 if prompt_parts is not None and prompt_parts.data_prompt is not None
@@ -2243,9 +2266,11 @@ class Extractor:
                 read_versions=dict(result.read_versions), read_nodes=dict(result.read_nodes),
             )
             return candidates
-        except (LLMCallError, OperationDeadlineExceededError):
+        except (LLMCallError, OperationDeadlineExceededError, UsagePersistenceError):
             raise
         except Exception as e:
+            if self._decision_client is not None and isinstance(e, LLMTransientError):
+                raise
             check_deadline()
             logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
             # Dual native attempts share a span. Keep this fallback's prompt and
@@ -2341,7 +2366,7 @@ class Extractor:
             result = self._prefetcher.prefetch_for_span(categories, ctx, conversation_text=conv_text, lazy=lazy, **kwargs)
             check_deadline()
             return result
-        except OperationDeadlineExceededError:
+        except (OperationDeadlineExceededError, UsagePersistenceError, UnsupportedAssemblyTemplateError):
             raise
         except Exception as e:
             check_deadline()

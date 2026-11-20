@@ -762,6 +762,7 @@ class OgMemConfig:
     card_format_enabled: bool = False
     dual_pass_enabled: bool = False
     node_processing_enabled: bool = False
+    read_probability_threshold: float = 0.70
 
     # Explicit opt-in, independent of the generative LLM and eager/lazy mode.
     decision: DecisionConfig | None = None
@@ -793,6 +794,9 @@ class OgMemConfig:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         if type(self.card_format_enabled) is not bool:
             raise ValueError("card_format_enabled must be a boolean")
+        threshold = self.read_probability_threshold
+        if type(threshold) not in (int, float) or not 0 < threshold <= 1:
+            raise ValueError("memory.extraction.read_probability_threshold must be finite and in (0, 1]")
         if type(self.dual_pass_enabled) is not bool:
             raise ValueError("dual_pass_enabled must be a boolean")
         if type(self.node_processing_enabled) is not bool:
@@ -2207,6 +2211,7 @@ class OgMemConfig:
                 "OGMEM_EXTRACTION_MODE",
                 "eager",
             ),
+            read_probability_threshold=memory.get("extraction", {}).get("read_probability_threshold", 0.70),
             dual_pass_enabled=_resolve_bool(
                 memory.get("extraction", {}).get("dual_pass_enabled"),
                 "OGMEM_DUAL_PASS_ENABLED", False,
