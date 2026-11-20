@@ -6,12 +6,11 @@ transactionally during restore; constraints and unrelated tables stay intact.
 """
 import csv
 import os
-import sys
 import tempfile
 from itertools import groupby
 from pathlib import Path
 
-from psycopg2 import sql
+from psycopg2 import extensions, sql
 
 from service.migration.durability import sync_directory
 from service.migration.package import PackageError
@@ -148,8 +147,9 @@ class SQLBackup:
         # COPY must use the stored account, including during rollback. Preserve
         # CSV values exactly; a quoted empty string differs from SQL NULL.
         account_index = names.index('account_id')
-        csv.field_size_limit(sys.maxsize)
-        with path.open('r', newline='') as source:
+        csv.field_size_limit(2**31 - 1)
+        encoding = extensions.encodings[self.conn.encoding]
+        with path.open('r', encoding=encoding, newline='') as source:
             def rows():
                 lines = []
                 def capture_lines():
@@ -161,7 +161,7 @@ class SQLBackup:
                     lines.clear()
             for account, group in groupby(rows(), key=lambda row: row[0]):
                 cur.execute("SELECT set_config('app.account_id',%s,true)", (account,))
-                with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode='w+', newline='') as stream:
+                with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode='w+', encoding=encoding, newline='') as stream:
                     for _, raw in group:
                         stream.write(raw)
                     stream.seek(0)

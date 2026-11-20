@@ -1,9 +1,12 @@
 """Fix a source inventory while registered business writers are paused."""
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 
 from service.migration.maintenance import MaintenanceError
+
+sql_snapshot_deadline = ContextVar('sql_snapshot_deadline', default=None)
 
 
 class SourceSnapshot:
@@ -31,8 +34,12 @@ class SourceSnapshot:
                 check()
                 from core.operation_deadline import operation_deadline
                 with operation_deadline(deadline - time.monotonic()):
-                    yield check
-                    check()
+                    token = sql_snapshot_deadline.set(deadline)
+                    try:
+                        yield check
+                        check()
+                    finally:
+                        sql_snapshot_deadline.reset(token)
             finally:
                 # Export performs no business writes. Even an unsuccessful drain
                 # can release this write barrier without clearing source data.

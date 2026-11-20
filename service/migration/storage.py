@@ -65,14 +65,30 @@ class SQLStorage:
         if not cfg.sql_connection_string:
             raise PackageError("storage.connection_string is required")
         self.cfg = cfg
-        self.conn = psycopg2.connect(cfg.sql_connection_string)
+        from service.migration.snapshot import sql_snapshot_deadline
+        from service.migration.sql_snapshot import SnapshotConnection
+
+        deadline = sql_snapshot_deadline.get()
+        snapshot = deadline is not None
+        self.conn = (SnapshotConnection(cfg.sql_connection_string, deadline) if snapshot
+                     else psycopg2.connect(cfg.sql_connection_string))
         from fs.sql_adapter.pool import resolve_connection_dialect
         from fs.sql_adapter.schema import ensure_schema
 
         try:
-            self.dialect = resolve_connection_dialect(
-                cfg.sql_dialect or "auto", cfg.sql_connection_string, 10
-            )
+            if snapshot and (cfg.sql_dialect or "auto") == "auto":
+                with self.conn.cursor() as cur:
+                    cur.execute('SELECT version()')
+                    version = cur.fetchone()[0].lower()
+                if 'opengauss' in version:
+                    dialect = 'opengauss'
+                elif 'postgresql' in version:
+                    dialect = 'postgresql'
+                else:
+                    raise ValueError('Unrecognized SQL server; configure its dialect explicitly')
+            else:
+                dialect = cfg.sql_dialect or "auto"
+            self.dialect = resolve_connection_dialect(dialect, cfg.sql_connection_string, 10)
             # Both roles bypass forced tenant RLS on their respective engines.
             privilege = (
                 "rolsuper OR rolsystemadmin" if self.dialect.name == "opengauss" else "rolsuper"
@@ -83,7 +99,8 @@ class SQLStorage:
                     raise PackageError(
                         "all-account SQL migration requires a database administrator with RLS bypass"
                     )
-            ensure_schema(self.conn, self.dialect)
+            if not snapshot:
+                ensure_schema(self.conn, self.dialect)
         except Exception:
             self.conn.close()
             raise

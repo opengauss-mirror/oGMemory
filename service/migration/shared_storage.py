@@ -32,7 +32,7 @@ class SharedStorage(SQLStorage):
                 self.files = AGFSStorage(cfg)
                 self.client, self.prefix = self.files.client, self.files.prefix
                 self.pool = SharedConnectionPool(cfg.sql_connection_string, pool_size=1,
-                                                 dialect=cfg.sql_dialect or 'auto')
+                                                 dialect=self.dialect)
                 self.bridge = AGFSSpaceBridge(self.pool, self.client, self.prefix)
         except BaseException:
             self.close()

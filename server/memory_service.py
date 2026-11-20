@@ -2311,7 +2311,12 @@ class MemoryService:
                     pool=self._get_shared_sql_pool(),
                 )
             elif _HAS_AGFS:
-                client = self._get_agfs_client()
+                # Control reads remain available while business clients are drained.
+                client = (AGFSClient(api_base_url=self._agfs_base_url) if self._cfg.agfs_transport == "http"
+                          else create_agfs_client(self._cfg))
+                if getattr(self, '_admission', None) is not None:
+                    from service.migration.admission import control_client
+                    client = control_client(client, self._admission, self._mount_prefix)
                 self._control_store = ControlPlaneStore(
                     mount_prefix=self._mount_prefix,
                     client=client,

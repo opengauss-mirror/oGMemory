@@ -232,7 +232,13 @@ def _json_object_body() -> dict:
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
     from scene.config import ConfigRevisionError
+    from service.migration.maintenance import MaintenanceError
     from service.operator_service import OperatorServiceBusyError
+
+    if isinstance(exc, MaintenanceError):
+        response = jsonify({"error": "migration_maintenance", "message": str(exc), "retryable": True})
+        response.headers["Retry-After"] = "5"
+        return response, 503
 
     if isinstance(exc, OperatorServiceBusyError):
         return jsonify({"error": str(exc), "retryable": True}), 429
@@ -294,7 +300,10 @@ def _lifecycle_result_ok(result: dict) -> bool:
 
 
 def _lifecycle_result_response(result: dict):
-    return jsonify(result), _lifecycle_result_status(result)
+    response = jsonify(result)
+    if (result.get("error_detail") or {}).get("code") == "MIGRATION_MAINTENANCE":
+        response.headers["Retry-After"] = "5"
+    return response, _lifecycle_result_status(result)
 
 
 def _lifecycle_error_response(exc: Exception, params: dict):
@@ -305,7 +314,10 @@ def _lifecycle_error_response(exc: Exception, params: dict):
     result = normalize_write_result({**response.get_json(), **fields, "ok": False,
                                      "accepted": False, "http_status": status},
                                     fields["error_detail"]["request_id"])
-    return jsonify(result), status
+    output = jsonify(result)
+    if "Retry-After" in response.headers:
+        output.headers["Retry-After"] = response.headers["Retry-After"]
+    return output, status
 
 
 @app.errorhandler(RequestEntityTooLarge)

@@ -117,6 +117,8 @@ class Admission:
                              and getattr(exc, 'sql_write_not_started', False) is True) or
                             (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
                              and getattr(exc, 'sql_rollback_confirmed', False) is True) or
+                            (isinstance(exc, ConcurrentModificationError)
+                             and getattr(exc, 'agfs_rejection_settled', False) is True) or
                             (http_rejections and isinstance(exc, AGFSClientError) and isinstance(cause, HTTPError)
                              and cause.response is not None
                              and cause.response.status_code in {403, 404, 409}))
@@ -231,6 +233,28 @@ class Admission:
         return storage
 
 
+def control_client(client, admission, prefix):
+    """Allow only control-namespace reads; every mutation retains admission."""
+    import posixpath
+
+    readers = {name: getattr(client, name) for name in ('read', 'cat', 'ls') if callable(getattr(client, name, None))}
+    admission.guard(client)
+    root = posixpath.normpath('/' + prefix.strip('/'))
+    for name, original in readers.items():
+        @wraps(original)
+        def read(path, *args, _original=original, _name=name, **kwargs):
+            normalized = posixpath.normpath(path)
+            relative = normalized[len(root.rstrip('/')) + 1:] if normalized.startswith(root.rstrip('/') + '/') else ''
+            parts = relative.split('/')
+            account_listing = _name == 'ls' and parts == ['accounts'] and not args and not kwargs
+            if not (account_listing or parts[0] == '_system' or
+                    (len(parts) >= 3 and parts[0] == 'accounts' and parts[2] == '_system')):
+                raise MaintenanceError('control client cannot read business storage')
+            return _original(path, *args, **kwargs)
+        setattr(client, name, read)
+    return client
+
+
 def install(service, admission):
     """Bind one service and its concrete storage clients to admission control."""
     service._admission = admission
@@ -265,7 +289,7 @@ def install(service, admission):
         setattr(service, name, wraps(original)(factory))
     control = {
         "shutdown", "health", "build_context", "get_auth_service", "get_key_manager",
-        "get_tenant_admin_service", "get_control_plane_store", "get_llm",
+        "get_tenant_admin_service", "get_control_plane_store", "get_audit_service", "get_llm",
         "start_extraction_recovery", "stop_skill_sedimentation",
     }
     for name, method in inspect.getmembers(type(service), inspect.isfunction):

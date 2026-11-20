@@ -2292,6 +2292,7 @@ class AGFSContextFS:
             "expected_version": expected_version,
             "temporary_meta_path": temporary_meta_path,
         }
+        rejection = None
         lock_acquired = False
         lease_stop = Event()
         lease_lost = Event()
@@ -2330,9 +2331,8 @@ class AGFSContextFS:
 
             actual_version = self._read_node_version(final_node_path)
             if actual_version != expected_version:
-                raise ConcurrentModificationError(
-                    node.uri, expected_version, actual_version
-                )
+                rejection = ConcurrentModificationError(node.uri, expected_version, actual_version)
+                raise rejection
 
             self._write_node_files(
                 final_node_path,
@@ -2351,13 +2351,16 @@ class AGFSContextFS:
             lease_stop.set()
             if lease_thread is not None:
                 lease_thread.join()
-            self._remove_file_if_present(temporary_meta_path)
-            self._remove_tree_if_present(candidate_lock_path)
+            cleaned = self._remove_file_if_present(temporary_meta_path)
+            cleaned = self._remove_tree_if_present(candidate_lock_path) and cleaned
             if lock_acquired and self._owns_update_lock(lock_path, token):
                 try:
                     self._client.rm(lock_path, recursive=True)
                 except AGFSClientError:
+                    cleaned = False
                     logger.warning("Failed to release AGFS update lock: %s", lock_path)
+            if rejection is not None and cleaned:
+                rejection.agfs_rejection_settled = True
 
     def _write_update_marker(
         self,
@@ -2488,17 +2491,19 @@ class AGFSContextFS:
         self._remove_tree_if_present(lock_path)
         return True
 
-    def _remove_tree_if_present(self, path: str) -> None:
+    def _remove_tree_if_present(self, path: str) -> bool:
         try:
             self._client.rm(path.rstrip("/"), recursive=True)
-        except AGFSClientError:
-            pass
+        except AGFSClientError as exc:
+            return _is_not_found_error(exc)
+        return True
 
-    def _remove_file_if_present(self, path: str) -> None:
+    def _remove_file_if_present(self, path: str) -> bool:
         try:
             self._client.rm(path)
-        except AGFSClientError:
-            pass
+        except AGFSClientError as exc:
+            return _is_not_found_error(exc)
+        return True
 
     def _write_node_files(
         self,

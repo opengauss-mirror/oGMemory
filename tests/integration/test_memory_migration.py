@@ -1920,3 +1920,105 @@ def test_standalone_index_process_migration_and_rollback(tmp_path, monkeypatch, 
                 process.terminate()
                 process.join(5)
             assert process.exitcode == 0
+
+
+@pytest.mark.parametrize('operation', ['query', 'fetch', 'lock'])
+def test_sql_snapshot_deadline_closes_connection_and_reopens_gate(tmp_path, monkeypatch, operation):
+    import time
+
+    import psycopg2
+
+    from service.migration.maintenance import MaintenanceStore
+    from service.migration.snapshot import SourceSnapshot
+    from service.migration.storage import SQLStorage
+
+    cfg = new_config('sql', 'deadline')
+    with storage(cfg) as initialized:
+        initialized.conn.commit()
+    cfg.sql_dialect = 'auto'
+    gate = MaintenanceStore(tmp_path / 'deadline.db', 'instance')
+    connections = []
+    original_connect = psycopg2.connect
+    def connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        connections.append(conn)
+        return conn
+    monkeypatch.setattr(psycopg2, 'connect', connect)
+    blocker = psycopg2.connect(cfg.sql_connection_string)
+    try:
+        if operation == 'lock':
+            with blocker.cursor() as cur:
+                cur.execute('LOCK TABLE context_nodes IN ACCESS EXCLUSIVE MODE')
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            with SourceSnapshot(gate, 'snapshot', timeout=1).scope():
+                adapter = SQLStorage(cfg)
+                try:
+                    if operation == 'query':
+                        with adapter.conn.cursor() as cur:
+                            cur.execute('SELECT pg_sleep(5)')
+                    elif operation == 'fetch':
+                        with adapter.conn.cursor(name='slow') as cur:
+                            cur.itersize = 1
+                            cur.execute('SELECT pg_sleep(CASE WHEN i=1 THEN 0 ELSE 5 END) FROM generate_series(1,2) i')
+                            rows = iter(cur)
+                            next(rows)
+                            next(rows)
+                    else:
+                        list(adapter._rows('context_nodes', ['uri']))
+                finally:
+                    adapter.close()
+        assert time.monotonic() - started < 3
+        assert gate.status() is None
+        assert all(conn.closed for conn in connections if conn is not blocker)
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_agfs_conflict_and_control_reads_with_full_admission(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    import server.app as app_module
+    from core.errors import ConcurrentModificationError
+    from core.models import ContextNode, RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.service_factory import close_service, create_service
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    cfg = new_config('agfs', 'review-maintenance')
+    cfg.migration_workspace = str(tmp_path / 'control')
+    cfg.role_control_enabled = True
+    cfg.root_api_key = 'migration-test-root'
+    service = create_service(cfg)
+    gate = service._admission.store
+    ctx = RequestContext(account_id='acme', user_id='alice', agent_id='agent',
+                         session_id='s', trace_id='t', role=Role.ROOT)
+    node = ContextNode(uri='ctx://acme/users/alice/memories/preferences/editor',
+                       context_type='MEMORY', category='preferences', level=2, owner_space='user:alice',
+                       abstract='original', overview='original', content='original', metadata={'version': 2})
+    try:
+        fs = service._get_context_fs()
+        fs.write_node(node, ctx)
+        with pytest.raises(ConcurrentModificationError):
+            fs.write_node(replace(node, metadata={'_expected_version': 1}), ctx)
+        fs.write_node(replace(node, metadata={'_expected_version': 2}), ctx)
+        service.get_key_manager().create_account('acme', 'alice')
+        monkeypatch.setattr(app_module, '_service', service)
+        gate.enter('control-test', mode='import', resources={})
+        gate.wait_drained('control-test', 2)
+        from service.migration.participants import wait_participants
+        wait_participants(gate, 'control-test', 'drain', timeout=5)
+        client = app_module.app.test_client()
+        headers = {'X-API-Key': cfg.root_api_key, 'X-Account-ID': 'acme', 'X-User-ID': 'alice'}
+        response = client.get('/api/v1/admin/accounts', headers=headers)
+        assert response.status_code == 200, response.json
+        assert client.get('/api/v1/admin/accounts/acme/roles', headers=headers).status_code == 200
+        assert client.get('/api/v1/admin/accounts', headers={'X-API-Key': 'invalid'}).status_code == 401
+    finally:
+        if gate.status() is not None:
+            from service.migration.participants import wait_participants
+            gate.request_refresh('control-test')
+            wait_participants(gate, 'control-test', 'refresh', timeout=5)
+            gate.reopen('control-test')
+        close_service(service)

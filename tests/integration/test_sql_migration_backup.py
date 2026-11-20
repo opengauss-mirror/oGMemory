@@ -67,7 +67,9 @@ def test_sql_recovery_preserves_types_sequences_and_neighbor(tmp_path):
         conn.close()
 
 
-def test_sql_recovery_sets_each_account_and_preserves_csv_nulls(tmp_path):
+@pytest.mark.parametrize('client_encoding', ['UTF8', 'LATIN1'])
+@pytest.mark.parametrize('csv_c_long_limit', [2**31 - 1, 2**63 - 1])
+def test_sql_recovery_sets_each_account_and_preserves_csv_nulls(tmp_path, monkeypatch, client_encoding, csv_c_long_limit):
     dsn = os.environ.get('MIGRATION_TEST_ADMIN_DSN')
     if not dsn:
         pytest.skip('MIGRATION_TEST_ADMIN_DSN is required')
@@ -76,6 +78,14 @@ def test_sql_recovery_sets_each_account_and_preserves_csv_nulls(tmp_path):
 
     schema = 'recovery_' + uuid.uuid4().hex
     conn = psycopg2.connect(dsn)
+    conn.set_client_encoding(client_encoding)
+    import csv
+    original_limit = csv.field_size_limit
+    def portable_limit(value):
+        if value > csv_c_long_limit:
+            raise OverflowError('Python int too large to convert to C long')
+        return original_limit(value)
+    monkeypatch.setattr(csv, 'field_size_limit', portable_limit)
     try:
         with conn.cursor() as cur:
             cur.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
@@ -85,7 +95,7 @@ def test_sql_recovery_sets_each_account_and_preserves_csv_nulls(tmp_path):
             for number, account in enumerate(('alpha', 'beta', 'alpha')):
                 cur.execute("SELECT set_config('app.account_id',%s,true)", (account,))
                 cur.execute('INSERT INTO tenant_records VALUES(%s,%s,%s,%s)',
-                            (number, account, '中文,"quoted"\nsecond line', '' if number else None))
+                            (number, account, ('café,"quoted"\nsecond line' if client_encoding == 'LATIN1' else '中文,"quoted"\nsecond line'), '' if number else None))
         conn.commit()
         backup = SQLBackup(conn, schema, ['tenant_records'], lambda: {'schema': schema})
         destination = tmp_path / 'backup'
@@ -96,7 +106,7 @@ def test_sql_recovery_sets_each_account_and_preserves_csv_nulls(tmp_path):
         backup.restore(destination, manifest)
         with conn.cursor() as cur:
             cur.execute('SELECT account_id,content,optional FROM tenant_records ORDER BY id')
-            assert cur.fetchall() == [(account, '中文,"quoted"\nsecond line', '' if number else None)
+            assert cur.fetchall() == [(account, ('café,"quoted"\nsecond line' if client_encoding == 'LATIN1' else '中文,"quoted"\nsecond line'), '' if number else None)
                                       for number, account in enumerate(('alpha', 'beta', 'alpha'))]
     finally:
         conn.rollback()
