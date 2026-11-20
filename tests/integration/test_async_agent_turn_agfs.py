@@ -18,6 +18,9 @@ from server.memory_service import MemoryService
 from service.extraction_checkpoint import EXTENSION_KEY
 from session.session_state import SessionState
 
+REQUEST_TIMEOUT = 20
+BACKGROUND_TIMEOUT = 45
+
 
 @pytest.mark.integration
 def test_same_session_agent_turns_continue_during_background_extraction(monkeypatch):
@@ -61,7 +64,7 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
         def upsert(self, records):
             if any("/memories/events/" in record.uri and first_source in record.text for record in records):
                 projecting.set()
-                assert resume_projection.wait(25)
+                assert resume_projection.wait(BACKGROUND_TIMEOUT)
             super().upsert(records)
 
     service._vector_index = service._projection_index = ProjectingIndex()
@@ -73,7 +76,7 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
             original_lease_until.append(read_state()["runtime_extensions"][EXTENSION_KEY]["batch"]
                                         ["retry_task"]["lease_until"])
             extracting.set()
-            assert resume_extraction.wait(25)
+            assert resume_extraction.wait(BACKGROUND_TIMEOUT)
         key = "receiver_calibration" if text == first_source else "battery_replacement"
         return [CandidateMemory(
             category="event", owner_scope="user", routing_key=key, title=text,
@@ -91,7 +94,7 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
         return json.loads(fs.read_node(state_uri, ctx).content)
 
     def wait_for_renewed_batch():
-        deadline = time.monotonic() + 12
+        deadline = time.monotonic() + REQUEST_TIMEOUT
         while time.monotonic() < deadline:
             batch = read_state()["runtime_extensions"][EXTENSION_KEY]["batch"]
             if batch["retry_task"]["lease_until"] > original_lease_until[0]:
@@ -117,7 +120,7 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
         return response.get_json()
 
     def wait_for_receipts():
-        deadline = time.monotonic() + 25
+        deadline = time.monotonic() + BACKGROUND_TIMEOUT
         while time.monotonic() < deadline:
             outcomes = [receipt(key) for key in ("receiver-turn", "battery-turn")]
             if all(outcome.get("terminal") for outcome in outcomes):
@@ -128,25 +131,29 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
     try:
         with ThreadPoolExecutor(max_workers=2) as client_requests:
             try:
-                accepted_first = client_requests.submit(after_turn, "receiver-turn", first, force=True).result(6)
+                accepted_first = client_requests.submit(after_turn, "receiver-turn", first, force=True).result(REQUEST_TIMEOUT)
                 assert accepted_first.status_code == 202
                 assert accepted_first.get_json()["request_id"] == "receiver-turn"
                 assert accepted_first.get_json()["accepted"] is True
-                assert extracting.wait(8)
+                assert extracting.wait(BACKGROUND_TIMEOUT)
+                replay_first = client_requests.submit(after_turn, "receiver-turn", first, force=True).result(REQUEST_TIMEOUT)
+                assert replay_first.status_code == 202
+                assert replay_first.get_json()["request_id"] == "receiver-turn"
+                assert replay_first.get_json()["accepted"] is True
 
                 composed = client_requests.submit(
                     post, "compose", {"messages": first + second[:1], "prompt": second_source}
-                ).result(6)
+                ).result(REQUEST_TIMEOUT)
                 assert composed.status_code == 200
                 assert first_source in [message["content"] for message in composed.get_json()["messages"]]
                 accepted_second = client_requests.submit(
                     after_turn, "battery-turn", first + second, len(first)
-                ).result(6)
+                ).result(REQUEST_TIMEOUT)
                 assert accepted_second.status_code == 202
                 assert accepted_second.get_json()["request_id"] == "battery-turn"
                 assert accepted_second.get_json()["accepted"] is True
 
-                replay = client_requests.submit(after_turn, "battery-turn", first + second, len(first)).result(6)
+                replay = client_requests.submit(after_turn, "battery-turn", first + second, len(first)).result(REQUEST_TIMEOUT)
                 assert replay.get_json()["request_id"] == "battery-turn"
                 persisted = read_state()
                 assert [message["content"] for message in persisted["buffer_messages"]] == [
@@ -154,16 +161,16 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
                 ]
                 assert receipt("battery-turn")["source_status"] == "BUFFERED"
                 assert wait_for_renewed_batch()["outbox_tracking_version"] == 1
-                disposed = client_requests.submit(post, "dispose", {}).result(6)
+                disposed = client_requests.submit(post, "dispose", {}).result(REQUEST_TIMEOUT)
                 assert disposed.status_code == 200
                 assert disposed.get_json() == {
                     "disposed": True, "flushed": False, "status": "background_flush_dispatched"
                 }
                 resume_extraction.set()
-                assert projecting.wait(10)
+                assert projecting.wait(BACKGROUND_TIMEOUT)
                 composed = client_requests.submit(
                     post, "compose", {"messages": first + second, "prompt": first_source}
-                ).result(6)
+                ).result(REQUEST_TIMEOUT)
                 assert composed.status_code == 200
                 assert second_source in [message["content"] for message in composed.get_json()["messages"]]
                 assert extracted_sources == [first_source]

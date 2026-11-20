@@ -113,6 +113,7 @@ from service.extraction_checkpoint import (
     recovery_owner,
     request_message_id,
 )
+from service.extraction_receipts import read as read_extraction_receipt
 from service.extraction_retry import (
     MAX_ATTEMPTS,
     ExtractionRetryWorker,
@@ -5886,8 +5887,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             ctx=ctx,
         )
         claim_status = buf.claim_request(client_request_id)
-        if claim_status == "completed":
-            return self._after_turn(params)
         if claim_status == "processing":
             batch = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
             if batch.get("client_request_id") == client_request_id:
@@ -5906,7 +5905,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
         try:
-            result = self._after_turn(params)
+            force_extract = self._param_bool(params, "forceExtract", "force_extract", default=False)
+            for _ in range(2 if force_extract else 1):
+                result = self._after_turn(params)
+                if not (result.get("ok", True) and result.get("status") == "accumulating"):
+                    break
         except Exception:
             buf.release_request(client_request_id)
             raise
@@ -6010,6 +6013,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         completed_outcome = {}
 
         def _complete_request(result: dict) -> dict:
+            live_plans = {(plan.get("action"), plan.get("target_uri")): plan
+                          for plan in result.get("plans", [])}
             if client_request_id and result.get("ok", True):
                 previous_completed = list(buf.completed_request_ids)
                 previous_outcomes = deepcopy(buf.runtime_extensions.get(OUTCOMES_KEY))
@@ -6043,6 +6048,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             elif completed_outcome:
                 result.update(status="accumulating", request_status="ACCEPTED",
                               source_status="BUFFERED", semantic_status="PENDING")
+            if live_plans and "plans" in result:
+                result["plans"] = [live_plans.get((plan.get("action"), plan.get("target_uri")), plan)
+                                   for plan in result["plans"]]
             return result
         governance_fallback_token = params.get(
             "toolResultGovernanceFallbackToken"
@@ -6061,7 +6069,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
         pending_request_retry = bool(client_request_id and pending.get("client_request_id") == client_request_id)
-        if client_request_id and buf.request_completed(client_request_id) and (async_capture or not pending_request_retry):
+        accepted_receipt = (read_extraction_receipt(buf, ctx, client_request_id, include_accepted=True)
+                            if not async_capture and client_request_id and self._param_bool(
+                                params, "forceExtract", "force_extract", default=False) else None)
+        accepted_retry = accepted_receipt is not None and accepted_receipt.get("status") == "accepted"
+        if accepted_retry:
+            request_source_ids.update(accepted_receipt["message_ids"])
+        if (client_request_id and buf.request_completed(client_request_id)
+                and (async_capture or not (pending_request_retry or accepted_retry))):
             if not _save_idempotency_state():
                 return {
                     "ok": False,
@@ -6079,8 +6094,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
         after_turn_governance = None
-        if pending_request_retry and is_frozen_source_retry(ctx, pending):
+        if pending_request_retry and (is_frozen_source_retry(ctx, pending) or accepted_retry):
             new_messages = deepcopy(pending["request_messages"])
+        elif accepted_retry:
+            new_messages = [asdict(message) for message in buf.messages if message.id in request_source_ids]
         elif self._tool_result_governance is not None:
             after_turn_governance = self._tool_result_governance.prepare_after_turn(
                 params,
@@ -6131,7 +6148,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_id=session_id,
             )
             request_source_ids.update(governance_result.source_message_ids)
-        elif not pending_request_retry:
+        elif not pending_request_retry and not accepted_retry:
             # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest().
             buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
             for index, msg in enumerate(new_messages):
@@ -6231,7 +6248,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         checkpoint_enabled = isinstance(write_api, _CheckpointWriteAPI)
         if checkpoint_enabled:
             mgr.enable_extraction_recovery(session_id, ctx, write_api._fs)
-            if client_request_id and buf.request_completed(client_request_id):
+            if client_request_id and buf.request_completed(client_request_id) and not accepted_retry:
                 return _complete_request({"ok": True, "status": "duplicate"})
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
@@ -6401,7 +6418,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return _complete_request(
                 {
                     "ok": True,
-                    "status": "no_extractable_messages",
+                    "status": ("accumulating" if _completion_status() == "accumulating"
+                               else "no_extractable_messages"),
                     "drain": drain_stats,
                     "commit": commit_result,
                     "extraction_run_id": extraction_run_id,
