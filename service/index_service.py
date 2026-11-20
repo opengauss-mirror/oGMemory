@@ -59,6 +59,7 @@ class IndexService:
         fs=None,
         llm=None,
         directory_summary_enabled: bool = False,
+        admission=None,
     ):
         """Initialize the index service.
 
@@ -82,6 +83,7 @@ class IndexService:
         self._fs = fs
         self._llm = llm
         self._directory_summary_enabled = directory_summary_enabled
+        self._admission = admission
         
         self._worker: Optional[OutboxWorker] = None
         self._schedulers: list[OutboxScheduler] = []
@@ -120,6 +122,11 @@ class IndexService:
                 directory_summary_enabled=self._directory_summary_enabled,
             )
             
+            if self._admission is not None:
+                self._worker.run_once = self._admission.wrap(self._worker.run_once, write=True)
+
+            # A partial startup must remain stoppable if a later thread fails.
+            self._running = True
             for i in range(worker_count):
                 worker_id = f"worker-{uuid.uuid4().hex[:8]}"
                 
@@ -158,6 +165,10 @@ class IndexService:
             if not self._running:
                 return
             
+            # Join startup threads before enumerating schedulers: otherwise a
+            # scheduler may publish itself after maintenance has stopped them.
+            for thread in self._threads:
+                thread.join()
             for scheduler in self._schedulers:
                 scheduler.stop(wait=wait)
             

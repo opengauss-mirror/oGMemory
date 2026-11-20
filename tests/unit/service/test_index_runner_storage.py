@@ -50,11 +50,13 @@ def test_agfs_runner_keeps_configured_mount_and_outbox(transport):
 
 @pytest.mark.parametrize("transport", ["http", "native"])
 def test_migration_uses_configured_transport(transport):
+    from pyagfs import AGFSClient
+
     from service.migration.storage import AGFSStorage
     cfg = SimpleNamespace(agfs_transport=transport, agfs_mount_prefix="/memory")
     with patch("fs.agfs_adapter.client.create_agfs_client") as client:
         storage = AGFSStorage(cfg)
-    client.assert_called_once_with(cfg)
+    client.assert_called_once_with(cfg, http_client_class=AGFSClient)
     assert storage.client is client.return_value
 
 

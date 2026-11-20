@@ -20,6 +20,9 @@ class ImmediateThread:
         self.started = True
         self._target(*self._args)
 
+    def join(self):
+        pass
+
 
 class FakeScheduler:
     instances = []
@@ -166,3 +169,24 @@ def test_singleton_helpers_and_signal_handlers(monkeypatch):
 
     service.stop.assert_called_once_with(wait=True)
     assert exits == [0]
+
+
+def test_partial_thread_startup_can_be_stopped(monkeypatch):
+    class FailingThread(ImmediateThread):
+        calls = 0
+        def start(self):
+            type(self).calls += 1
+            if self.calls == 2:
+                raise RuntimeError('second thread failed')
+            super().start()
+    monkeypatch.setattr(index_service_module.threading, 'Thread', FailingThread)
+    monkeypatch.setattr(index_service_module, 'OutboxScheduler', FakeScheduler)
+    monkeypatch.setattr(index_service_module, 'OutboxWorker', Mock())
+    service = index_service_module.IndexService(Mock(), Mock(), Mock(), lambda: ['a'], worker_count=2)
+    import pytest
+    with pytest.raises(RuntimeError, match='second thread'):
+        service.start()
+    first = service.schedulers[0]
+    service.stop(wait=True)
+    assert first.stop_calls == [True]
+    assert not service.is_running and service.schedulers == []
