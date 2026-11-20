@@ -376,6 +376,12 @@ test(`first-view nonce rotates with capture=${autoCapture}, recall=${autoRecall}
         if (method === "compose") {
           return { messages: body.messages, estimatedTokens: 0 };
         }
+        if (method === "after_turn") {
+          return {
+            ok: true, accepted: true, request_id: body.clientRequestId,
+            request_status: "ACCEPTED", source_status: "BUFFERED",
+          };
+        }
         if (method === "govern_first_view_tool_result") {
           return {
             ok: true,

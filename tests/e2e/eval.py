@@ -600,13 +600,18 @@ def wait_write_request(args, sid, request_id, *, observations=None, deadline=Non
         record_write_observation(observations, "GET", url, sid, request_id, started,
                                  response=response, outcome=outcome)
         state = outcome.get("request_status", "UNKNOWN")
-        if state in {"FAILED", "NEEDS_CONFIRMATION"}:
+        if outcome.get("request_id") == request_id and state in {"FAILED", "NEEDS_CONFIRMATION"}:
             raise WriteRequestTerminal(outcome, observations)
         response.raise_for_status()
+        if outcome.get("request_id") != request_id:
+            raise RuntimeError(f"write receipt identity mismatch: {sid}/{request_id}")
         if state == "SUCCEEDED":
+            if (outcome.get("source_status") not in {"ARCHIVED", "RAW_ARCHIVED"}
+                    or outcome.get("projection_status") not in {"DONE", "NOT_REQUIRED"}):
+                raise RuntimeError(f"write receipt lacks archive or projection proof: {sid}/{request_id}")
             return outcome
         if state == "DEGRADED":
-            if outcome.get("request_id") != request_id or not degraded_source_archived(outcome):
+            if not degraded_source_archived(outcome):
                 raise WriteRequestTerminal(outcome, observations)
             if degraded_write_settled(outcome):
                 return outcome
@@ -624,6 +629,8 @@ def wait_idle(args, sid: str, *, observations=None, deadline=None) -> dict:
             args, "wait_until_idle", sid, timeoutSeconds=5, drainOutbox=False, waitOutbox=True,
             observations=observations, deadline=deadline,
         )
+        if result.get("status") == "needs_confirmation":
+            raise WriteRequestTerminal({**result, "request_status": "NEEDS_CONFIRMATION"}, observations)
         if result.get("idle") is True:
             outbox = result.get("outbox", {})
             if (outbox.get("error") or outbox.get("supported") is False
@@ -634,16 +641,21 @@ def wait_idle(args, sid: str, *, observations=None, deadline=None) -> dict:
     raise WriteObservationTimeout(f"source settlement observation expired: {sid}", observations=observations)
 
 
-def flush_source(args, sid: str) -> dict:
+def flush_source(args, sid: str, *, deadline=None) -> dict:
     started = time.monotonic()
-    deadline = started + args.write_wait_timeout
+    deadline = deadline if deadline is not None else started + args.write_wait_timeout
     observations = []
     lifecycle_writes = {}
-    wait_idle(args, sid, observations=observations, deadline=deadline)
-    state = source_state(args, sid, observations=observations, deadline=deadline)
-    if not (state.get("message_count", 0) or state.get("commit_count", 0)
-            or source_state(args, sid, context=True, observations=observations, deadline=deadline).get("archive_count", 0)):
-        raise RuntimeError(f"source write evidence unavailable: {sid}")
+    while time.monotonic() < deadline:
+        wait_idle(args, sid, observations=observations, deadline=deadline)
+        state = source_state(args, sid, observations=observations, deadline=deadline)
+        if (state.get("message_count", 0) or state.get("commit_count", 0)
+                or source_state(args, sid, context=True, observations=observations,
+                                deadline=deadline).get("archive_count", 0)):
+            break
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    else:
+        raise WriteObservationTimeout(f"source write evidence unobserved: {sid}", observations=observations)
     if state.get("message_count", 0):
         compacted = memory_call(args, "compact", sid, observations=observations, deadline=deadline)
         if compacted.get("compacted") is not True:

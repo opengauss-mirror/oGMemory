@@ -1,6 +1,7 @@
 """Profile conflicts refresh original source against the current stored profile."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from threading import Barrier, Lock
@@ -8,7 +9,7 @@ from threading import Barrier, Lock
 import pytest
 
 from commit.write_receipts import WriteDeadlineExceededError
-from service.extraction_checkpoint import EXTENSION_KEY
+from service.extraction_checkpoint import EXTENSION_KEY, ExtractionBatchJournal
 from tests.unit.commit.test_memory_identity import MemoryFS
 from tests.unit.commit.test_profile_merge import profile, profile_context
 from tests.unit.server.test_extraction_batch_recovery import params, setup_service
@@ -26,6 +27,58 @@ def snapshot(fs, uri, ctx, fact, archive_id):
     return replace(profile("identity", current.content + " " + fact), target_uri=uri,
                    expected_version=current.metadata["version"],
                    provenance_ids=[f"prov:1:archive:{archive_id}:source"])
+
+
+def test_background_profile_merge_publishes_after_releasing_session_scope():
+    fs, ctx, _, writer, manager, uri = setup()
+    source = "Location: Utrecht."
+    manager.add_message(ctx.session_id, "user", source, ctx)
+    buffer = manager.get_or_create(ctx.session_id, ctx=ctx)
+    messages = [{"role": "user", "content": source}]
+    journal = ExtractionBatchJournal(
+        manager, buffer, ctx, buffer.messages, archive_id="agent-capture",
+        messages=messages, session_time=None, session_summary="", tool_stats_text="",
+        agent_async=True,
+    )
+    lock_depth, events = 0, []
+
+    @contextmanager
+    def publication_scope():
+        nonlocal lock_depth
+        lock_depth += 1
+        try:
+            yield
+        finally:
+            lock_depth -= 1
+
+    merged = "Name: Nora. Location: Utrecht."
+
+    class Model:
+        def complete_json(self, **kwargs):
+            events.append(("model", lock_depth))
+            return dict.fromkeys(("abstract", "overview", "content"), merged)
+
+    def extract(*args, **kwargs):
+        events.append(("extract", lock_depth))
+        return [profile("identity", source)]
+
+    write_node = fs.write_node
+
+    def write(node, request):
+        if node.uri == uri:
+            events.append(("publish", lock_depth))
+        return write_node(node, request)
+
+    fs.write_node = write
+    writer._pipeline.extract = extract
+    writer._writer._archive_builder._llm = Model()
+    journal.publication_scope = publication_scope
+    result = writer.commit_session(messages, ctx, candidate_checkpoint=journal.checkpoint("chunk:0"),
+                                   publication_scope=publication_scope)
+
+    assert result["writes_completed"] == 1
+    assert fs.read_node(uri, ctx).content == merged
+    assert events == [("extract", 0), ("model", 0), ("publish", 1)]
 
 
 def test_parallel_sessions_refresh_profile_and_complete_both_sources():

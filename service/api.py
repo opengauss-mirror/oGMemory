@@ -10,20 +10,22 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 import threading
 import uuid
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import replace
 from providers.llm_observation import correlate_extraction_calls
 
 from typing import Optional
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
+from commit.context_writer import ArchivePreparationRequired
 from commit.write_receipts import WriteDeadlineExceededError, WriteNotStartedError, receipt_plan
-from core.errors import ConcurrentModificationError, ExtractionIncompleteError, MemoryCardFormatError
+from core.errors import ConcurrentModificationError, ExtractionIncompleteError, MemoryCardFormatError, OperationDeadlineExceededError
 from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
 from core.operation_deadline import check_deadline, remaining_seconds
 from extraction import Extractor
-from extraction.node_processing import NodeProcessor, NodeProcessingPartialError, serialized_topics
+from extraction.node_processing import NodeProcessor, NodeProcessingPartialError, serialized_topics, topic_directory_scope
 
 logger = get_logger(__name__)
 
@@ -188,6 +190,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         archive_id: str | None = None,
         candidate_checkpoint=None,
         before_write=None,
+        *,
+        publication_scope=None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -262,6 +266,11 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     candidate_checkpoint.invalidate_unaccepted_preparation()
                     raise MemoryCardFormatError(str(exc)) from exc
 
+        publish = publication_scope or nullcontext
+
+        def topic_scope():
+            return topic_directory_scope(self, ctx) if publication_scope is not None else nullcontext()
+
         check_deadline()
         partial_candidates, partial_plans = [], []
         partial_extracted = partial_filtered = 0
@@ -272,7 +281,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             stored, extracted, filtered_count = partial.load()
             if before_write is not None:
                 before_write()
-            completed = self._write_checkpointed_candidates(stored, ctx, partial, refresh_profile=refresh_profile)
+            completed = self._write_checkpointed_candidates(stored, ctx, partial, refresh_profile=refresh_profile,
+                                                             publication_scope=publication_scope)
             if len(completed) != len(stored):
                 raise ExtractionIncompleteError("accepted partial writes require recovery")
             partial_plans.extend(completed)
@@ -333,14 +343,19 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                         filtered, partial_error = exc.candidates, exc
                     else:
                         prepared = sorted(exc.candidates, key=lambda candidate: not bool(candidate.target_uri))
-                        preflight(prepared)
+                        if publication_scope is None:
+                            preflight(prepared)
                         if before_write is not None:
                             before_write()
-                        partial = candidate_checkpoint.accept_partial(
-                            prepared, extracted_count, filtered_count, exc.failures,
-                            others_complete=exc.others_complete or others_complete)
+                        with publish(), topic_scope():
+                            if publication_scope is not None:
+                                preflight(prepared)
+                            partial = candidate_checkpoint.accept_partial(
+                                prepared, extracted_count, filtered_count, exc.failures,
+                                others_complete=exc.others_complete or others_complete)
                         self._write_checkpointed_candidates(partial.load()[0], ctx, partial,
-                                                            refresh_profile=refresh_profile)
+                                                            refresh_profile=refresh_profile,
+                                                            publication_scope=publication_scope)
                         raise
             else:
                 from commit.topic_aliases import reconcile_topic_aliases
@@ -358,20 +373,22 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 targets = [c.target_uri for c in filtered if c.target_uri]
                 if len(targets) != len(set(targets)):
                     raise ExtractionIncompleteError("memory decisions require one update per target")
-                for candidate in filtered:
-                    if candidate.target_uri:
-                        current = self._fs.read_node(candidate.target_uri, ctx)
-                        version = current.metadata.get("version", 0)
-                        if version != candidate.expected_version:
-                            raise ConcurrentModificationError(candidate.target_uri, candidate.expected_version, version)
+                if publication_scope is None:
+                    for candidate in filtered:
+                        if candidate.target_uri:
+                            current = self._fs.read_node(candidate.target_uri, ctx)
+                            version = current.metadata.get("version", 0)
+                            if version != candidate.expected_version:
+                                raise ConcurrentModificationError(candidate.target_uri, candidate.expected_version, version)
             if before_write is not None:
                 before_write()
             if candidate_checkpoint is not None:
-                preflight(filtered)
-                check_deadline()
-                if partial_checkpoints:
-                    extracted_count = filtered_count = 0
-                filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
+                with publish(), topic_scope():
+                    preflight(filtered)
+                    check_deadline()
+                    if partial_checkpoints:
+                        extracted_count = filtered_count = 0
+                    filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
         else:
             filtered, extracted_count, filtered_count = accepted
             if self._graph_enabled:
@@ -387,15 +404,19 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         extraction_proposals = take(deduplicated)
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
         graph_batch = nullcontext()
-        if self._graph_enabled:
+        if self._graph_enabled and publication_scope is None:
             from fs.sql_adapter.session_mutation import active_session_guard
             from providers.relation_store.projection_batch import graph_projection_batch
 
             graph_batch = graph_projection_batch(active_session_guard())
         with graph_batch:
-            plans = (self._write_checkpointed_candidates(
-                         deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
-                     if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
+            if candidate_checkpoint is not None:
+                plans = self._write_checkpointed_candidates(
+                    deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile,
+                    publication_scope=publication_scope)
+            else:
+                with publish(), topic_scope():
+                    plans = self._writer.write_candidates(deduplicated, ctx)
 
         deduplicated = [*partial_candidates, *deduplicated]
         plans = [*partial_plans, *plans]
@@ -427,10 +448,12 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                                      native_relation_rejections=native_rejections)
             if lookup_error:
                 graph_diagnostics["historical_recommendation_failure"] = lookup_error
-            graph_diagnostics.update(self._store_relations(edges, ctx, candidate_checkpoint))
+            with publish():
+                graph_diagnostics.update(self._store_relations(edges, ctx, candidate_checkpoint))
         elif self._graph_enabled:
-            graph_diagnostics = self.finish_partial_relations(
-                deduplicated, plans, ctx, proposals=extraction_proposals)
+            with publish():
+                graph_diagnostics = self.finish_partial_relations(
+                    deduplicated, plans, ctx, proposals=extraction_proposals)
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")
@@ -501,9 +524,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         return NodeProcessor(resolver, self._llm, prefetcher)
 
     def _write_checkpointed_candidates(self, candidates, ctx, checkpoint, *, refresh_profile=None,
-                                       source_only=False):
+                                       source_only=False, publication_scope=None):
         """Reuse durable drafts and receipts; never guess whether a write committed."""
         from service.extraction_checkpoint import RecoveryNeedsConfirmationError
+        publish = publication_scope or nullcontext
         plans = []
         for index, candidate in enumerate(candidates):
             check_deadline()
@@ -515,45 +539,48 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             # including old checkpoints that marked them 'writing' before skip.
             skipped = self._writer.prewrite_skip(candidate, ctx)
             if skipped is not None:
-                checkpoint.complete(index, skipped)
+                with publish():
+                    checkpoint.complete(index, skipped)
                 plans.append(skipped)
                 continue
             if checkpoint.outcome_uncertain(index):
-                resolver = self._writer._identity_resolver
-                normalized = resolver._normalize_subject(candidate, ctx)
-                committed = receipt_plan(self._fs, resolver.uris, normalized, ctx,
-                                         outbox_store=self._outbox_store)
-                if committed is None:
-                    raise RecoveryNeedsConfirmationError(
-                        f"write outcome needs confirmation for operation {candidate.write_operation_id}")
-                checkpoint.complete(index, committed)
+                with publish():
+                    resolver = self._writer._identity_resolver
+                    normalized = resolver._normalize_subject(candidate, ctx)
+                    committed = receipt_plan(self._fs, resolver.uris, normalized, ctx,
+                                             outbox_store=self._outbox_store)
+                    if committed is None:
+                        raise RecoveryNeedsConfirmationError(
+                            f"write outcome needs confirmation for operation {candidate.write_operation_id}")
+                    checkpoint.complete(index, committed)
                 plans.append(committed)
                 continue
             if source_only:
                 plan = WritePlan(action="skip", target_uri=candidate.target_uri,
                                  merged_fields={"status": "source_preserved"})
-                checkpoint.complete(index, plan)
+                with publish():
+                    checkpoint.complete(index, plan)
                 plans.append(plan)
                 continue
             for attempt in range(3):
                 check_deadline()
-                checkpoint.begin(index)
                 try:
-                    plan = self._writer.write_candidate(candidate, ctx)
-                except WriteDeadlineExceededError as exc:
-                    checkpoint.reject(index, str(exc))
-                    raise
+                    plan = self._persist_checkpointed_candidate(candidate, ctx, checkpoint, index, publication_scope)
                 except WriteNotStartedError as exc:
-                    checkpoint.reject(index, str(exc))
                     from core.errors import LLMTransientError, MemoryCardFormatError
                     from fs.sql_adapter.session_mutation import SessionMutationBusyError
+                    if (publication_scope is not None and not candidate.target_uri and attempt < 2
+                            and isinstance(exc.__cause__, ConcurrentModificationError)):
+                        continue
                     if (refresh_profile is not None
                             and candidate.category == "profile" and candidate.target_uri
                             and isinstance(exc.__cause__, ConcurrentModificationError)):
                         if attempt == 2:
                             raise ExtractionIncompleteError("profile update remains concurrently modified") from exc
                         check_deadline()
-                        candidate = checkpoint.revise_unwritten(index, refresh_profile(candidate))
+                        refreshed = refresh_profile(candidate)
+                        with publish():
+                            candidate = checkpoint.revise_unwritten(index, refreshed)
                         logger.info("Refreshed concurrently updated profile: %s", candidate.target_uri)
                         continue
                     if (self._node_processing_enabled and candidate.category in {"entity", "preference"}
@@ -565,17 +592,15 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                                 and revised[0].target_uri != candidate.target_uri):
                             raise MemoryCardFormatError(
                                 "node revision must preserve one accepted target: " + candidate.target_uri)
-                        candidate = checkpoint.revise_unwritten(index, revised[0])
-                        checkpoint.begin(index)
+                        with publish():
+                            candidate = checkpoint.revise_unwritten(index, revised[0])
                         try:
-                            plan = self._writer.write_candidate(candidate, ctx)
+                            plan = self._persist_checkpointed_candidate(candidate, ctx, checkpoint, index, publication_scope)
                         except WriteNotStartedError as retry_error:
-                            checkpoint.reject(index, str(retry_error))
                             if isinstance(retry_error.__cause__,
                                           (MemoryCardFormatError, LLMTransientError, SessionMutationBusyError)):
                                 raise retry_error.__cause__
                             raise
-                        checkpoint.complete(index, plan)
                         plans.append(plan)
                         break
                     if isinstance(exc.__cause__,
@@ -583,10 +608,61 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                         raise exc.__cause__
                     logger.error("Accepted candidate rejected before writing: %s", exc)
                     break
-                checkpoint.complete(index, plan)
                 plans.append(plan)
                 break
         return plans
+
+    def _persist_checkpointed_candidate(self, candidate, ctx, checkpoint, index, publication_scope):
+        if publication_scope is None:
+            checkpoint.begin(index)
+            try:
+                plan = self._writer.write_candidate(candidate, ctx)
+            except (WriteDeadlineExceededError, WriteNotStartedError) as exc:
+                checkpoint.reject(index, str(exc))
+                raise
+            checkpoint.complete(index, plan)
+            return plan
+
+        builder = self._writer._archive_builder
+        prepared = None
+
+        def input_key(incoming, plan):
+            fields = {k: v for k, v in plan.merged_fields.items() if k != "updated_at"}
+            return incoming, plan.action, plan.target_uri, fields, plan.relation_edges
+
+        def build_archive(incoming, plan, write_ctx):
+            if not builder.needs_model(incoming, plan):
+                return builder.build(incoming, plan, write_ctx)
+            if prepared is None or prepared[0] != input_key(incoming, plan):
+                raise ArchivePreparationRequired(incoming, plan)
+            return prepared[1]
+
+        for attempt in range(3):
+            with publication_scope():
+                try:
+                    plan = self._writer.write_candidate(
+                        candidate, ctx, build_archive=build_archive,
+                        before_persistence=lambda: checkpoint.begin(index))
+                except ArchivePreparationRequired as required:
+                    pending = required
+                except (WriteDeadlineExceededError, WriteNotStartedError) as exc:
+                    checkpoint.reject(index, str(exc))
+                    raise
+                else:
+                    checkpoint.complete(index, plan)
+                    return plan
+            if attempt == 2:
+                with publication_scope():
+                    checkpoint.reject(index, "memory changed during merge preparation")
+                raise ExtractionIncompleteError("memory changed during merge preparation")
+            try:
+                key = deepcopy(input_key(pending.candidate, pending.plan))
+                prepared = (key, builder.build(pending.candidate, pending.plan, ctx))
+            except Exception as exc:
+                with publication_scope():
+                    checkpoint.reject(index, str(exc))
+                error_type = WriteDeadlineExceededError if isinstance(exc, OperationDeadlineExceededError) else WriteNotStartedError
+                raise error_type(str(exc)) from exc
 
     def write_raw_chunk(
         self,
