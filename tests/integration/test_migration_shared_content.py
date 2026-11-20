@@ -1,5 +1,6 @@
 """Real shared-catalog producer/adapter/reader contract on isolated databases."""
 import os
+import time
 from contextlib import closing
 from dataclasses import replace
 from uuid import uuid4
@@ -159,7 +160,7 @@ def test_shared_catalog_preserves_produced_content_and_evidence(tmp_path, backen
                     'trigger_policy': {'debounce_seconds': 0, 'min_interval_seconds': 0, 'reconcile_seconds': 1},
                 }}, expected_rev=0)
 
-                def recompute():
+                def recompute(*, background=False):
                     target_repo.dispatch_source_events('acme')
                     with target_repo.transaction('acme') as cur:
                         cur.execute('UPDATE space_rule_runtime SET next_run_at=NOW() WHERE account_id=%s', ('acme',))
@@ -169,7 +170,8 @@ def test_shared_catalog_preserves_produced_content_and_evidence(tmp_path, backen
                     SpaceMemoryWorker(target_repo, EvidenceLLM(), worker_count=1)._execute(job)
                     assert next(row for row in target_repo.list_jobs(ctx, 'existing')['items']
                                 if row['job_id'] == job['job_id'])['state'] == 'SUCCEEDED'
-                    project_items(target_repo, ctx)
+                    if not background:
+                        project_items(target_repo, ctx)
 
                 recompute()
                 with closing(SharedStorage(configs[1])) as existing:
@@ -192,8 +194,17 @@ def test_shared_catalog_preserves_produced_content_and_evidence(tmp_path, backen
                 assert after['metadata']['shared_source_epoch'] == before['metadata']['shared_source_epoch']
                 assert after['version'] > before['version']
                 assert search.search(replace(ctx, user_id='bob'), 'detailed', ['existing'])['total'] == 0
-                recompute()
-                assert search.search(replace(ctx, user_id='bob'), 'compact', ['existing'])['total'] == 1
+                recompute(background=True)
+                search = service.get_shared_memory_retrieval(mode='semantic')
+                # Verify the resumed real worker and the configured vector
+                # backend, waiting for normal asynchronous publication.
+                deadline = time.monotonic() + 10
+                while True:
+                    result = search.search(replace(ctx, user_id='bob'), 'compact', ['existing'], mode='semantic')
+                    if result['total'] == 1 or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.05)
+                assert result['total'] == 1, result
                 return
             if dependent_uri and authority != 'same':
                 with pytest.raises(PackageError, match='depend on skipped'):
