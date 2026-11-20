@@ -31,6 +31,9 @@ def model_dimension(cfg, provider):
 
 def describe(cfg, adapter):
     provider = getattr(cfg, "embedding_provider", None) or getattr(cfg, "provider", None)
+    vector_free = getattr(cfg, "agfs_retrieval_enabled", False)
+    if vector_free:
+        provider = "none"
     model = None
     if provider == "mock":
         model = "MockEmbedder"
@@ -46,12 +49,12 @@ def describe(cfg, adapter):
         "embedding": {
             "provider": provider,
             "model": model,
-            "dimension": model_dimension(cfg, provider),
+            "dimension": None if vector_free else model_dimension(cfg, provider),
             # Current providers do not expose a reliable resolved model revision.
             "model_version": None,
         },
         "content_storage": adapter.description(),
-        "vector_storage": {"backend": cfg.vector_db_type},
+        "vector_storage": {"backend": "none" if vector_free else cfg.vector_db_type},
     }
     validate_description(result, adapter.backend)
     return result
@@ -84,19 +87,21 @@ def compatibility(source, target):
                 before, after = source[section][field], target[section][field]
                 if before != after:
                     changes.append(f"{section}.{field}")
-    notices = ["始终使用目标模型重建向量，不复用源向量；来源描述不会覆盖目标配置。"]
+    vector_free = target["embedding"]["provider"] == "none"
+    notices = (["目标使用无 Embedding 的 AGFS 检索，不创建模型或向量索引；导入后按目标配置重新建立全文缓存。"]
+               if vector_free else ["始终使用目标模型重建向量，不复用源向量；来源描述不会覆盖目标配置。"])
     if source is None:
         notices.append("迁移包缺少来源环境描述，无法比较模型、维度及数据库版本。")
     elif any(name.startswith("embedding.") for name in changes):
         notices.append("Embedding 配置发生变化，重建后的检索结果可能变化。")
-    if target["embedding"]["dimension"] is None or (
+    if not vector_free and (target["embedding"]["dimension"] is None or (
         source is not None and source["embedding"]["dimension"] is None
-    ):
+    )):
         notices.append("部分模型维度无法获取，显示为未知；不能据此判断模型维度相同。")
-    if target["embedding"]["dimension"] is None:
+    if not vector_free and target["embedding"]["dimension"] is None:
         notices.append("目标模型维度尚未验证，导入前仍须通过模型探测与索引维度校验。")
     if any(name.startswith("content_storage.") for name in changes):
         notices.append("内容存储或数据库发生变化，将按目标存储适配器恢复。")
-    if "vector_storage.backend" in changes:
+    if not vector_free and "vector_storage.backend" in changes:
         notices.append("向量后端发生变化，将在已通过支持检查的目标后端重建索引。")
     return {"source": source, "target": target, "changes": changes, "notices": notices}

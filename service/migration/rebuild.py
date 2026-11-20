@@ -83,7 +83,14 @@ def records_for_node(r):
             if record.level == 0:
                 record.metadata["categories"] = node.metadata.get("categories", [])
         return records
-    return build_index_records(node)
+    records = build_index_records(node)
+    if node.owner_space.startswith('space:'):
+        for record in records:
+            record.filters.update(space_key=node.owner_space.removeprefix('space:'),
+                                  authorization_resource_id=node.uri,
+                                  content_rev=r['version'], state=r['status'])
+            record.metadata['content_rev'] = r['version']
+    return records
 
 
 def batches(iterator, size=64):
@@ -92,11 +99,37 @@ def batches(iterator, size=64):
         yield batch
 
 
+def validate_vector_target(vector, *, include_embedding=True):
+    check = getattr(vector, 'check_migration_target', None)
+    if not callable(check):
+        raise PackageError('vector backend does not support persistent migration')
+    try:
+        if include_embedding:
+            check(empty=False)
+        else:
+            check(empty=False, include_embedding=False)
+    except ValueError as exc:
+        raise PackageError(str(exc)) from exc
+
+
+def validate_vector_records(vector, embedder, dimension, inv):
+    validate = getattr(vector, 'validate_records', None)
+    if not callable(validate):
+        return
+    records = (record for node in inv.records('nodes') for record in records_for_node(node))
+    for batch in batches(records):
+        values = augment_with_embeddings(batch, ([0.0] * dimension for _ in batch), embedder)
+        try:
+            validate(values)
+        except ValueError as exc:
+            raise PackageError(str(exc)) from exc
+
+
 class Rebuilder:
     def __init__(self, cfg):
         self.cfg = cfg
         self.provider = cfg.to_provider_config()
-        self.vector = self.provider.create_vector_index()
+        self.vector = None if getattr(cfg, "agfs_retrieval_enabled", False) else self.provider.create_vector_index()
         self.embedder = None
         self.lexical = None
         self.pool = None
@@ -110,23 +143,15 @@ class Rebuilder:
             raise
 
     def close(self):
-        for obj in (self.lexical, self.vector, self.embedder):
-            close = getattr(obj, "close", None)
+        for name in ('lexical', 'vector', 'embedder'):
+            obj = getattr(self, name)
+            close = getattr(obj, 'release_for_migration', None) or getattr(obj, "close", None)
             if callable(close):
                 close()
+            setattr(self, name, None)
         if self.pool is not None:
             self.pool.close_all()
-
-    def check_empty(self):
-        check = getattr(self.vector, "check_migration_target", None)
-        if not callable(check):
-            raise PackageError("vector backend does not support persistent migration")
-        try:
-            check()
-        except ValueError as exc:
-            raise PackageError(str(exc)) from exc
-        if self.lexical and self.lexical.health().get("records") != 0:
-            raise PackageError("target lexical index is not empty")
+            self.pool = None
 
     def _embed(self, texts):
         vectors = self.embedder.embed_texts(texts)
@@ -138,20 +163,11 @@ class Rebuilder:
         return vectors
 
     def validate_records(self, inv):
-        validate = getattr(self.vector, "validate_records", None)
-        if not callable(validate):
+        if self.vector is None:
             return
         if self.embedder is None:
             self.embedder = self.provider.create_embedder()
-        dimension = self.provider.embedding_dimension
-        for batch in batches(self._records(inv)):
-            records = augment_with_embeddings(
-                batch, ([0.0] * dimension for _ in batch), self.embedder
-            )
-            try:
-                validate(records)
-            except ValueError as exc:
-                raise PackageError(str(exc)) from exc
+        validate_vector_records(self.vector, self.embedder, self.provider.embedding_dimension, inv)
 
     def probe(self):
         if self.embedder is None:
@@ -162,9 +178,28 @@ class Rebuilder:
         for r in inv.records("nodes", scope=scope):
             yield from records_for_node(r)
 
-    def rebuild(self, inv, progress):
+    def validate_existing(self):
+        """A merge preserves existing vectors, so their model identity must match."""
+        if self.vector is None:
+            return
+        self.probe()
+        model = getattr(self.embedder, "model", None)
+        for record in self.vector.iter_records():
+            meta = record.metadata
+            if (not isinstance(model, str) or not model
+                    or meta.get("embedding_dimension") != self.provider.embedding_dimension
+                    or meta.get("embedding_model") != model
+                    or len(meta.get("_embedding", [])) != self.provider.embedding_dimension):
+                raise PackageError("existing vectors do not match the target embedding model")
+
+    def rebuild(self, inv, progress, *, changed=None):
+        if self.vector is None:
+            progress(phase="reindexing", index_records=0)
+            return 0  # AGFS FTS is a process-local cache, rebuilt by normal reads.
         count = 0
-        for batch in batches(self._records(inv)):
+        records = self._records(inv) if changed is None else (
+            record for node in changed() for record in records_for_node(node))
+        for batch in batches(records):
             vectors = self._embed([r.text for r in batch])
             self.vector.upsert(augment_with_embeddings(batch, vectors, self.embedder))
             count += len(batch)
@@ -258,17 +293,27 @@ class Rebuilder:
             self.pool.return_connection(conn)
 
     def verify(self, inv):
-        expected = 0
-        for r in self._records(inv):
-            actual = self.vector.get_record(r.id)
-            if (
-                actual is None
-                or actual.text != r.text
-                or any(actual.filters.get(k) != v for k, v in r.filters.items())
-            ):
-                raise PackageError(
-                    "rebuilt index record is not queryable or differs from canonical data"
-                )
-            expected += 1
-        if self.vector.count() != expected:
-            raise PackageError("rebuilt index record count differs")
+        if self.vector is not None:
+            verify_vector_inventory(self.vector, inv)
+
+
+def verify_vector_inventory(vector, inv, *, include_embedding=True):
+    """Read-only canonical projection check shared by preflight and acceptance."""
+    expected = 0
+    for node in inv.records('nodes'):
+        expected += verify_node_projection(vector, node, include_embedding=include_embedding)
+    if vector.count() != expected:
+        raise PackageError('index record count differs from canonical data; '
+                           'wait for indexing or repair the target index before importing')
+
+
+def verify_node_projection(vector, node, *, include_embedding=True):
+    records = records_for_node(node)
+    for record in records:
+        actual = (vector.get_record(record.id) if include_embedding else
+                  vector.get_record(record.id, include_embedding=False))
+        if (actual is None or actual.text != record.text
+                or any(actual.filters.get(key) != value for key, value in record.filters.items())):
+            raise PackageError('index record is not queryable or differs from canonical data; '
+                               'wait for indexing or repair the target index before importing')
+    return len(records)
