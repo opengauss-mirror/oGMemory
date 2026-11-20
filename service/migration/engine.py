@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 import tempfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -58,6 +58,9 @@ class Inventory:
 
     def add(self, kind, r):
         validate_record(kind, r)
+        shared = kind == 'space_nodes'
+        if shared:
+            kind = 'nodes'
         r = {
             "nodes": normalize_node,
             "archives": normalize_archive,
@@ -74,7 +77,7 @@ class Inventory:
             if kind == "relations" and old == body:
                 return
             raise PackageError(f"duplicate {kind} identity") from exc
-        if kind in {"nodes", "archives"}:
+        if kind in {"nodes", "archives"} and not shared:
             from fs.agfs_adapter.agfs_context_fs import uri_to_path
 
             uri = r["uri"] if kind == "nodes" else archive_uri(r)
@@ -176,65 +179,101 @@ class Inventory:
 
 
 @contextmanager
-def inventory(path, reader):
+def inventory(path, reader, *, shared_records=(), validate_references=True):
     inv = Inventory(path)
     try:
         for kind in DATASETS:
             for r in reader(kind):
                 inv.add(kind, r)
-        inv.finish()
+        for record in shared_records:
+            inv.add('space_nodes', record)
+        if validate_references:
+            inv.finish()
         yield inv
     finally:
         inv.close()
 
 
 class MigrationService:
-    def __init__(self, cfg, *, adapter_factory=storage, index_factory=None, asset_root=None):
+    def __init__(self, cfg, *, adapter_factory=storage, index_factory=None, asset_root=None, snapshot_scope=None):
         self.cfg = cfg
         self.adapter_factory = adapter_factory
         self.index_factory = index_factory
         self.asset_root = asset_root
+        self.snapshot_scope = snapshot_scope or nullcontext
 
     def export(self, destination, progress=lambda **kw: None):
         destination = Path(destination)
         progress(phase="validating")
-        with (
-            tempfile.TemporaryDirectory(dir=destination.parent) as tmp,
-            self.adapter_factory(self.cfg) as adapter,
-        ):
-            adapter.check()
+        with tempfile.TemporaryDirectory(dir=destination.parent) as tmp, ExitStack() as lifetime:
             assets = Assets(self.asset_root, tmp)
+            shared_description = None
+            spaces = None
+            with self.snapshot_scope() as check_snapshot, self.adapter_factory(self.cfg) as adapter:
+                adapter.check()
+                progress(phase="snapshotting")
+                source_backend = adapter.backend
+                environment = describe(self.cfg, adapter)
 
-            def read(kind):
-                for record in adapter.records(kind):
-                    yield assets.capture(record) if kind == "nodes" else record
+                def read(kind):
+                    for record in adapter.records(kind):
+                        if callable(check_snapshot):
+                            check_snapshot()
+                        yield assets.capture(record) if kind == "nodes" else record
 
-            with inventory(Path(tmp) / "source.sqlite", read) as inv:
-                progress(phase="exporting", counts=inv.summary())
-                staged = Path(tmp) / "package.tar.gz"
-                write_package(
-                    staged,
-                    {kind: inv.records(kind) for kind in DATASETS},
-                    source_backend=adapter.backend,
-                    source_version="ogmem/" + __version__,
-                    source_environment=describe(self.cfg, adapter),
-                    blobs=assets.files.values(),
-                )
-                with open_package(staged):
-                    pass
-                os.link(staged, destination)
-                with destination.open("rb") as stream:
-                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                return {
-                    "data": inv.summary(),
-                    "source_backend": adapter.backend,
-                    "archive_bytes": destination.stat().st_size,
-                    "archive_sha256": digest,
-                }
+                inv = lifetime.enter_context(inventory(Path(tmp) / "source.sqlite", read,
+                    validate_references=not getattr(self.cfg, 'shared_spaces_enabled', False)))
+                if getattr(self.cfg, 'shared_spaces_enabled', False):
+                    from service.migration.space_catalog import SpaceCatalog
+                    from service.migration.space_inventory import SpaceInventory
+
+                    catalog = SpaceCatalog(adapter)
+                    shared_description = catalog.description()
+                    def shared_read():
+                        for record in adapter.records('space_nodes'):
+                            if callable(check_snapshot):
+                                check_snapshot()
+                            yield assets.capture(record)
+                    spaces = SpaceInventory(Path(tmp) / 'spaces.sqlite', catalog.records(), shared_read())
+                    lifetime.callback(spaces.close)
+                    spaces.validate_dependencies(inv)
+                    for record in spaces.records('space_nodes'):
+                        inv.add('space_nodes', record)
+                    inv.finish()
+            # All records and attachment bytes are fixed. Release the source write
+            # barrier before compression; later source changes are not included.
+            progress(phase="exporting", counts=inv.summary())
+            staged = Path(tmp) / "package.tar.gz"
+            datasets = {kind: inv.records(kind) for kind in DATASETS}
+            if spaces is not None:
+                datasets['nodes'] = (node for node in inv.records('nodes')
+                                     if not node['owner_space'].startswith('space:'))
+                datasets.update({kind: spaces.records(kind) for kind in ('spaces', 'space_nodes')})
+            write_package(
+                staged,
+                datasets,
+                source_backend=source_backend,
+                source_version="ogmem/" + __version__,
+                source_environment=environment,
+                blobs=assets.files.values(),
+                shared_spaces=shared_description,
+            )
+            with open_package(staged):
+                pass
+            os.link(staged, destination)
+            with destination.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            return {
+                "data": inv.summary(),
+                "source_backend": source_backend,
+                "archive_bytes": destination.stat().st_size,
+                "archive_sha256": digest,
+                **({'shared_spaces': {'spaces': spaces.count(), 'action': 'exported'}} if spaces is not None else {}),
+            }
 
     def _validate_source(self, package, inv):
         assets = Assets(self.asset_root, package.root)
-        assets.validate(package, inv)
+        assets.validate(package, inv, check_target=False)
         # Reject malformed typed Agent records before any target writes.
         from service.migration.rebuild import records_for_node, validate_relation_endpoints
 
@@ -243,33 +282,55 @@ class MigrationService:
         validate_relation_endpoints(self.cfg, inv)
         return assets
 
-    def _check_target(self, adapter, inv):
-        from service.migration.rebuild import validate_target_model
+    def preview(self, source, *, indexes=None):
+        from service.migration.merge import fingerprint, lookup
+        from service.migration.rebuild import (
+            validate_target_model,
+            validate_vector_records,
+            validate_vector_target,
+            verify_vector_inventory,
+        )
+        from service.migration.space_scope import discard_shared, incoming_scope, shared_records
+        from service.migration.space_selection import select_spaces
 
-        adapter.validate_restore(inv)
-        adapter.check(empty=True)
-        target = describe(self.cfg, adapter)
-        validate_target_model(self.cfg, target["embedding"]["dimension"])
-        return target
-
-    def preflight(self, source):
-        with (
-            open_package(source) as package,
-            inventory(package.root / "inventory.sqlite", package.records) as inv,
-        ):
-            self._validate_source(package, inv)
-            with self.adapter_factory(self.cfg) as adapter:
-                target = self._check_target(adapter, inv)
-            with self._indexes() as indexes:
-                indexes.check_empty()
-                indexes.validate_records(inv)
-            return {
-                "data": inv.summary(),
-                "source_backend": package.manifest["source_backend"],
-                "target_backend": self.cfg.storage_backend,
-                "vector_backend": self.cfg.vector_db_type,
-                "compatibility": compatibility(package.manifest.get("source_environment"), target),
-            }
+        with open_package(source) as package, incoming_scope(package) as (incoming, spaces):
+            assets = self._validate_source(package, incoming)
+            # Reuse this process's registered native client. Opening a second
+            # Chroma client before the drain would retain the old native cache.
+            with self.adapter_factory(self.cfg) as adapter, ExitStack() as lifetime:
+                adapter.check()
+                target = describe(self.cfg, adapter)
+                validate_target_model(self.cfg, target['embedding']['dimension'])
+                projection = lifetime.enter_context((indexes or self._indexes)())
+                vector_free = getattr(self.cfg, "agfs_retrieval_enabled", False)
+                if not vector_free and projection.embedder is None:
+                    projection.embedder = self.cfg.to_provider_config().create_embedder()
+                vector, embedder = projection.vector, projection.embedder
+                if not vector_free:
+                    validate_vector_target(vector, include_embedding=False)
+                def read(kind):
+                    for record in adapter.records(kind):
+                        yield assets.capture(record, copy_bytes=False) if kind == 'nodes' else record
+                counts = {'new': 0, 'unchanged': 0, 'conflicts': 0}
+                with inventory(package.root / 'target.sqlite', read,
+                        shared_records=shared_records(self.cfg, adapter, assets)) as existing:
+                    selection = select_spaces(package.manifest, spaces, self.cfg, adapter, existing, vector)
+                    if selection['action'] != 'import':
+                        discard_shared(incoming)
+                    assets.validate(package, incoming, check_declared=False)
+                    adapter.validate_restore(incoming)
+                    if not vector_free:
+                        validate_vector_records(vector, embedder, self.cfg.to_provider_config().embedding_dimension, incoming)
+                        verify_vector_inventory(vector, existing, include_embedding=False)
+                    for kind in ('nodes', 'archives', 'relations'):
+                        for record in incoming.records(kind):
+                            previous = lookup(existing, kind, record_key(kind, record))
+                            name = ('new' if previous is None else
+                                    'unchanged' if fingerprint(previous) == fingerprint(record) else 'conflicts')
+                            counts[name] += 1
+            return {'data': incoming.summary(), 'counts': counts,
+                    'shared_spaces': selection,
+                    'compatibility': compatibility(package.manifest.get('source_environment'), target)}
 
     @contextmanager
     def _indexes(self):
@@ -286,48 +347,129 @@ class MigrationService:
         finally:
             obj.close()
 
-    def restore(self, source, progress=lambda **kw: None):
-        progress(phase="validating")
-        # A GUI preview is advisory. Revalidate the current package and target,
-        # then retain this same validated staging area through restore/verify.
-        with (
-            open_package(source) as package,
-            inventory(package.root / "inventory.sqlite", package.records) as inv,
-        ):
-            assets = self._validate_source(package, inv)
-            expected = inv.summary()
-            with self.adapter_factory(self.cfg) as adapter:
-                self._check_target(adapter, inv)
-                with self._indexes() as indexes:
-                    indexes.check_empty()
-                    indexes.validate_records(inv)
-                    # Probe the model before writing any canonical data.
-                    indexes.probe()
-                    progress(phase="restoring", counts={k: dict(v) for k, v in expected.items()})
-                    for kind in ("nodes", "archives", "relations"):
-                        records = inv.records(kind)
-                        if kind == "nodes":
-                            records = (assets.restore(package, r) for r in records)
-                        adapter.restore(kind, records)
-                    progress(phase="reindexing")
-                    indexed = indexes.rebuild(inv, progress)
-                    progress(phase="verifying")
+    def merge(self, source, *, task, recovery_factory, llm, progress=lambda **kw: None, shared_selection=None):
+        """Merge into a backed-up, exclusively admitted target instance.
 
-                    def read_restored(kind):
-                        for record in adapter.records(kind):
-                            yield (
-                                assets.capture(record, copy_bytes=False)
-                                if kind == "nodes"
-                                else record
-                            )
+        The instance controller supplies bound backup adapters and lifecycle
+        callbacks.
+        """
+        from service.migration.merge import MergePlan, PolicyConflictResolver, lookup
+        from service.migration.rebuild import (
+            records_for_node,
+            validate_relation_endpoints,
+            validate_target_model,
+            validate_vector_target,
+        )
+        from service.migration.space_scope import discard_shared, incoming_scope, shared_records
+        from service.migration.space_selection import confirm_selection, select_spaces
 
-                    with inventory(package.root / "restored.sqlite", read_restored) as restored:
-                        if expected != restored.summary():
-                            raise PackageError("restored data differs from migration package")
-                    indexes.verify(inv)
-                    return {
-                        "data": expected,
-                        "index_records": indexed,
-                        "target_backend": adapter.backend,
-                        "next_step": "Stop migration mode, configure identities and start the normal service.",
-                    }
+        with open_package(source) as package, ExitStack() as lifetime:
+            request_identity = {'manifest_sha256': hashlib.sha256(json.dumps(
+                package.manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+            incoming, spaces = lifetime.enter_context(incoming_scope(package))
+            assets = self._validate_source(package, incoming)
+            recovery = lifetime.enter_context(recovery_factory(request_identity, incoming))
+            if recovery.request_identity != request_identity:
+                raise PackageError('recovery task must be bound to the validated package')
+            plan = adapter = indexes = None
+            target = None
+            selection = None
+            refresh = recovery.refresh
+
+            def release_and_refresh():
+                if indexes is not None:
+                    indexes.close()
+                refresh()
+
+            recovery.refresh = release_and_refresh
+
+            def prepare():
+                nonlocal adapter, indexes, target, plan, selection
+                progress(phase='planning')
+                adapter = lifetime.enter_context(self.adapter_factory(self.cfg))
+                adapter.check()
+                target_description = describe(self.cfg, adapter)
+                validate_target_model(self.cfg, target_description['embedding']['dimension'])
+                indexes = lifetime.enter_context(self._indexes())
+                if indexes.vector is not None:
+                    validate_vector_target(indexes.vector)
+
+                def read(kind):
+                    for record in adapter.records(kind):
+                        yield assets.capture(record, copy_bytes=False) if kind == 'nodes' else record
+
+                target = lifetime.enter_context(inventory(package.root / 'target.sqlite', read,
+                    shared_records=shared_records(self.cfg, adapter, assets)))
+                selection = select_spaces(package.manifest, spaces, self.cfg, adapter, target, indexes.vector)
+                confirm_selection(selection, shared_selection)
+                if selection['action'] != 'import':
+                    discard_shared(incoming)
+                assets.validate(package, incoming, check_declared=False)
+                adapter.validate_restore(incoming)
+                indexes.validate_existing()
+                from service.migration.rebuild import verify_vector_inventory
+                if indexes.vector is not None:
+                    verify_vector_inventory(indexes.vector, target)
+                indexes.validate_records(incoming)
+
+            def apply():
+                nonlocal plan
+                # Conflict policies may invoke a model. Execute them only once
+                # the complete recovery point is durable, then validate outputs
+                # before their first business write.
+                resolver = PolicyConflictResolver(target, llm,
+                    card_format_enabled=bool(getattr(self.cfg, 'memory_card_format_enabled', False)))
+                plan = MergePlan(package.root / 'merged.sqlite', target, incoming, resolver,
+                                 applied=recovery.gate.applied)
+                lifetime.callback(plan.close)
+                adapter.validate_restore(plan.inventory)
+                validate_relation_endpoints(self.cfg, plan.inventory)
+                indexes.validate_records(plan.inventory)
+                assets.validate_merged(package, plan.inventory.records('nodes'))
+                # Resolve attachments before entering the backend mutation scope;
+                # preparation failures must not become unknown remote writes.
+                plan.db.execute('CREATE TABLE restored_nodes(body TEXT NOT NULL)')
+                for record in plan.changes('nodes'):
+                    restored = assets.restore(package, record)
+                    plan.db.execute('INSERT INTO restored_nodes VALUES(?)', (json.dumps(restored),))
+                progress(phase='merging', counts=plan.counts)
+                adapter.merge_nodes(json.loads(body) for (body,) in plan.db.execute('SELECT body FROM restored_nodes'))
+                if selection['action'] == 'import':
+                    adapter.restore_space_catalog(spaces.rows)
+                adapter.restore('archives', plan.changes('archives'))
+                plan.db.execute('CREATE TABLE affected_sources(source TEXT PRIMARY KEY)')
+                plan.db.executemany('INSERT OR IGNORE INTO affected_sources VALUES(?)',
+                                    ((record['from_uri'],) for record in plan.changes('relations')))
+                edges = (json.loads(body) for (body,) in plan.db.execute(
+                    "SELECT body FROM records WHERE kind='relations' AND "
+                    "json_extract(body,'$.from_uri') IN (SELECT source FROM affected_sources) ORDER BY key"))
+                adapter.replace_relations(edges)
+                # Delete only obsolete levels of changed nodes. Unchanged vectors
+                # retain their actual values; newly imported vectors use target models.
+                for record in plan.changes('nodes'):
+                    old = lookup(target, 'nodes', record_key('nodes', record))
+                    if old and indexes.vector is not None:
+                        new_ids = {item.id for item in records_for_node(record)}
+                        obsolete = [item.id for item in records_for_node(old) if item.id not in new_ids]
+                        if obsolete:
+                            indexes.vector.delete(obsolete)
+                count = indexes.rebuild(plan.inventory, progress, changed=lambda: plan.changes('nodes'))
+                if selection['action'] == 'import':
+                    adapter.publish_space_projections(spaces.records('space_nodes'), indexes.vector)
+                return {'data': plan.inventory.summary(), 'changes': plan.counts, 'index_records': count,
+                        'shared_spaces': selection}
+
+            def verify():
+                def read(kind):
+                    for record in adapter.records(kind):
+                        yield assets.capture(record, copy_bytes=False) if kind == 'nodes' else record
+                with inventory(package.root / 'verified.sqlite', read,
+                        shared_records=shared_records(self.cfg, adapter, assets)) as actual:
+                    if actual.summary() != plan.inventory.summary():
+                        raise PackageError('merged data differs from the validated plan')
+                indexes.verify(plan.inventory)
+                if selection['action'] == 'import':
+                    adapter.verify_space_catalog(spaces)
+
+            return recovery.run(task, apply, verify, prepare=prepare,
+                                receipts=lambda: plan.receipts(), progress=progress)

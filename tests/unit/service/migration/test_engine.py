@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from service.migration.engine import MigrationService
 from service.migration.package import PackageError, open_package, write_package
 from service.migration.storage import AGFSStorage
+from tests.migration_support import MigrationHarness as MigrationService
 
 
 class Files:
@@ -46,6 +46,7 @@ def config():
         vector_db_type="chroma",
         chroma_persist_directory="/isolated",
         scene_enabled=False,
+        to_provider_config=lambda: SimpleNamespace(embedding_dimension=3),
     )
 
 
@@ -86,6 +87,8 @@ def archive():
 class Indexes:
     def __init__(self, cfg):
         self.count = 0
+        self.vector = SimpleNamespace(iter_records=lambda: iter(()), get_record=lambda _: None, count=lambda: 0, check_migration_target=lambda **kw: None)
+        self.embedder = SimpleNamespace(model='mock')
 
     def check_empty(self):
         pass
@@ -96,7 +99,10 @@ class Indexes:
     def probe(self):
         pass
 
-    def rebuild(self, inv, progress):
+    def validate_existing(self):
+        self.probe()
+
+    def rebuild(self, inv, progress, *, changed=None):
         from service.migration.rebuild import records_for_node
 
         self.count = sum(len(records_for_node(r)) for r in inv.records("nodes"))
@@ -131,7 +137,7 @@ def test_agfs_export_restore_keeps_archive_node_metadata_and_relations(tmp_path)
     path = tmp_path / "source.tar.gz"
     expected = service(source).export(path)["data"]
     target = Files()
-    result = service(target).restore(path)
+    result = service(target).import_package(path)
     assert result["data"] == expected
     assert result["index_records"] == 0
     restored = AGFSStorage(config(), target)
@@ -152,17 +158,17 @@ def test_missing_reference_rejected_before_target_writes(tmp_path):
     )
     target = Files()
     with pytest.raises(PackageError, match="reference"):
-        service(target).restore(path)
+        service(target).import_package(path)
     assert not target.files
 
 
-def test_nonempty_target_and_memory_index_rejected(tmp_path):
+def test_incomplete_target_index_and_memory_backend_rejected(tmp_path):
     source = Files()
     AGFSStorage(config(), source).restore("nodes", [node()])
     path = tmp_path / "source.tar.gz"
     service(source).export(path)
-    with pytest.raises(PackageError, match="not empty"):
-        service(source).restore(path)
+    with pytest.raises(PackageError, match="repair the target index"):
+        service(source).import_package(path)
     target = service(Files())
     target.cfg.vector_db_type = "memory"
     from providers.unified_config import OgMemConfig
@@ -174,7 +180,7 @@ def test_nonempty_target_and_memory_index_rejected(tmp_path):
     target.index_factory = Rebuilder
     target.cfg.retrieval_hybrid_enabled = False
     with pytest.raises(PackageError, match="persistent"):
-        target.preflight(path)
+        target.preview(path)
 
 
 def test_unsupported_files_fail_export_without_publishing(tmp_path):
@@ -242,7 +248,7 @@ def test_cross_account_evidence_rejected_before_writes(tmp_path):
     )
     target = Files()
     with pytest.raises(PackageError, match="cross-account"):
-        service(target).restore(path)
+        service(target).import_package(path)
     assert not target.files
 
 
@@ -264,7 +270,7 @@ def test_uri_aliases_cannot_overwrite_the_same_agfs_path(tmp_path):
     )
     target = Files()
     with pytest.raises(PackageError, match="same storage path"):
-        service(target).restore(path)
+        service(target).import_package(path)
     assert not target.files
 
 
@@ -278,7 +284,7 @@ def test_unrepresentable_sql_identity_is_rejected_during_preflight(tmp_path):
         source_version="test",
     )
     with pytest.raises(PackageError, match="storage limit"):
-        service(Files()).preflight(path)
+        service(Files()).preview(path)
 
 
 def test_node_attachment_roundtrip_and_reexport(tmp_path):
@@ -299,7 +305,7 @@ def test_node_attachment_roundtrip_and_reexport(tmp_path):
     target = Files()
     importer = service(target)
     importer.asset_root = tmp_path / "target-assets"
-    result = importer.restore(package)
+    result = importer.import_package(package)
     assert result["data"] == original["data"]
     restored = list(AGFSStorage(config(), target).records("nodes"))[0]
     target_file = Path(restored["metadata"]["source_path"])
@@ -410,10 +416,10 @@ def test_preflight_checks_target_model_dimension_before_opening_index(
     importer.index_factory = indexes
     if rejected:
         with pytest.raises(PackageError, match="dimension 384.*dimension 1024"):
-            importer.preflight(package)
+            importer.preview(package)
         assert not opened
     else:
-        report = importer.preflight(package)
+        report = importer.preview(package)
         assert opened
         if actual is None:
             assert any("目标模型维度尚未验证" in n for n in report["compatibility"]["notices"])
@@ -434,9 +440,9 @@ def test_unknown_dimension_still_requires_probe_before_restore(tmp_path):
             raise PackageError("embedding output count/dimension is invalid")
 
     importer.index_factory = FailingProbe
-    importer.preflight(package)
+    importer.preview(package)
     with pytest.raises(PackageError, match="embedding output count/dimension"):
-        importer.restore(package)
+        importer.import_package(package)
     assert not target.files
 
 
@@ -476,7 +482,7 @@ def test_package_with_write_receipt_node_rejected_before_restore(tmp_path):
     )
     target = Files()
     with pytest.raises(PackageError, match="runtime-only"):
-        service(target).restore(package)
+        service(target).import_package(package)
     assert not target.files
 
 
@@ -493,7 +499,7 @@ def test_receipt_metadata_is_removed_without_losing_business_metadata(tmp_path):
         source_version="legacy",
     )
     target = Files()
-    service(target).restore(package)
+    service(target).import_package(package)
     restored = list(AGFSStorage(config(), target).records("nodes"))[0]
     assert restored["content"] == r["content"]
     assert restored["metadata"] == {"custom": True}
@@ -525,7 +531,7 @@ def test_actual_trace_namespace_rejected_before_import_writes(tmp_path, field):
     )
     target = Files()
     with pytest.raises(PackageError, match="trace/tool evidence"):
-        service(target).restore(path)
+        service(target).import_package(path)
     assert not target.files
 
 
@@ -569,7 +575,7 @@ def test_restore_reuses_one_validated_package_and_one_target_index(tmp_path):
 
     importer.index_factory = create_indexes
     with patch("service.migration.engine.open_package", wraps=open_package) as unpack:
-        result = importer.restore(package)
+        result = importer.import_package(package)
     assert unpack.call_count == 1
     assert len(opened) == 1
     assert result["data"] == expected
@@ -584,14 +590,14 @@ def test_restore_rechecks_changes_after_preview(tmp_path, changed):
     service(source).export(package)
     target = Files()
     importer = service(target)
-    importer.preflight(package)
+    importer.preview(package)
     if changed == "package":
         package.write_bytes(package.read_bytes()[:-8])
     else:
         AGFSStorage(config(), target).restore("nodes", [node()])
     before = dict(target.files)
     with pytest.raises(PackageError):
-        importer.restore(package)
+        importer.import_package(package)
     assert target.files == before
 
 
@@ -609,7 +615,7 @@ def test_restore_rechecks_model_configuration_after_preview(tmp_path):
         create_embedder=lambda: SimpleNamespace(dimension=384),
         embedding_dimension=importer.cfg.opengauss_dimension,
     )
-    importer.preflight(package)
+    importer.preview(package)
     importer.cfg.opengauss_dimension = 1024
 
     def unexpected_index(cfg):
@@ -617,12 +623,12 @@ def test_restore_rechecks_model_configuration_after_preview(tmp_path):
 
     importer.index_factory = unexpected_index
     with pytest.raises(PackageError, match="dimension 384.*dimension 1024"):
-        importer.restore(package)
+        importer.import_package(package)
     assert not target.files
 
 
 @pytest.mark.parametrize("endpoint", ["from_uri", "to_uri"])
-@pytest.mark.parametrize("operation", ["preflight", "restore"])
+@pytest.mark.parametrize("operation", ["preview", "import_package"])
 def test_sql_graph_archive_endpoint_rejected_before_target_access(tmp_path, endpoint, operation):
     from service.migration.records import archive_uri
 
@@ -681,7 +687,7 @@ def test_sql_relation_alias_rejected_before_target_access(tmp_path, graph, endpo
         pytest.fail("alias reached target adapter")
 
     importer.adapter_factory = forbidden
-    for operation in (importer.preflight, importer.restore):
+    for operation in (importer.preview, importer.import_package):
         with pytest.raises(PackageError, match="exactly match stored URI"):
             operation(package)
 
@@ -780,8 +786,8 @@ def test_agfs_relation_source_is_checked_by_physical_path(tmp_path, source):
     if source == "alias":
         service(files).export(package)
         target = Files()
-        service(target).restore(package)
-        assert list(AGFSStorage(config(), target).records("relations")) == [edge]
+        service(target).import_package(package)
+        assert list(AGFSStorage(config(), target).records("relations")) == [{**edge, "from_uri": directory["uri"]}]
     else:
         with pytest.raises(PackageError, match="relation source differs from owning node"):
             service(files).export(package)
@@ -805,6 +811,8 @@ def test_milvus_payload_rejected_before_content_restore(tmp_path, oversize):
     service(source).export(package)
     vector = object.__new__(MilvusVectorIndex)
     vector._dimension = 8
+    vector.count = lambda: 0
+    vector.check_migration_target = lambda **kw: None
 
     class CheckedIndexes(Indexes):
         validate_records = Rebuilder.validate_records
@@ -815,13 +823,13 @@ def test_milvus_payload_rejected_before_content_restore(tmp_path, oversize):
             self.embedder = SimpleNamespace(model='m' * (65536 if oversize == 'metadata' else 8))
             self.provider = SimpleNamespace(embedding_dimension=8)
 
-        def rebuild(self, inv, progress):
+        def rebuild(self, inv, progress, *, changed=None):
             pytest.fail('payload must be rejected before rebuilding')
 
     migration = service(target)
     migration.cfg.vector_db_type = 'milvus'
     migration.index_factory = CheckedIndexes
-    for operation in (migration.preflight, migration.restore):
+    for operation in (migration.preview, migration.import_package):
         with pytest.raises(PackageError, match=f'Milvus {oversize} exceeds'):
             operation(package)
         assert not target.files
@@ -868,14 +876,14 @@ def test_agfs_target_path_byte_capacity_before_restore(tmp_path, kind, component
     target = Files()
     migration = service(target)
     if component_bytes == 256:
-        for operation in (migration.preflight, migration.restore):
+        for operation in (migration.preview, migration.import_package):
             with pytest.raises(PackageError, match='AGFS target path component'):
                 operation(package)
             assert not target.files
             assert not target.directories
     else:
-        migration.preflight(package)
-        migration.restore(package)
+        migration.preview(package)
+        migration.import_package(package)
         assert len(list(AGFSStorage(config(), target).records('nodes'))) == len(records)
         assert len(list(AGFSStorage(config(), target).records('archives'))) == len(archives)
 
@@ -891,3 +899,72 @@ def test_sql_target_does_not_apply_agfs_path_byte_limit(tmp_path):
     with inventory(tmp_path / 'inventory.sqlite',
                    lambda kind: [row] if kind == 'nodes' else []) as inv:
         SQLStorage.__new__(SQLStorage).validate_restore(inv)
+
+
+def test_export_releases_snapshot_before_packaging_and_ignores_later_source_changes(tmp_path):
+    files = Files()
+    adapter = AGFSStorage(config(), client=files)
+    original = node()
+    adapter.restore("nodes", [original])
+    exporter = service(files)
+    frozen = False
+
+    @contextmanager
+    def snapshot():
+        nonlocal frozen
+        frozen = True
+        try:
+            yield
+        finally:
+            frozen = False
+            # Normal source activity resumes while the fixed package is prepared.
+            changed = {**original, "content": "changed after snapshot"}
+            adapter.restore("nodes", [changed])
+            added = {**original, "uri": original["uri"] + "-new"}
+            adapter.restore("nodes", [added])
+
+    exporter.snapshot_scope = snapshot
+    phases = []
+
+    def progress(**fields):
+        phases.append(fields["phase"])
+        if fields["phase"] == "exporting":
+            assert not frozen
+
+    destination = tmp_path / "snapshot.tar.gz"
+    exporter.export(destination, progress)
+    with open_package(destination) as package:
+        records = list(package.records("nodes"))
+        assert len(records) == 1
+        assert records[0]["content"] == original["content"]
+    assert phases == ["validating", "snapshotting", "exporting"]
+    assert len(list(adapter.records("nodes"))) == 2
+
+
+def test_merge_fixture_rolls_back_and_preserves_original_failure(tmp_path):
+    from copy import deepcopy
+    source, target = Files(), Files()
+    AGFSStorage(config(), source).restore('nodes', [node()])
+    path = tmp_path / 'source.tar.gz'
+    service(source).export(path)
+    before = deepcopy((target.files, target.directories))
+    def fail(**event):
+        if event['phase'] == 'verifying':
+            raise RuntimeError('verification injection')
+    with pytest.raises(RuntimeError, match='verification injection'):
+        service(target).import_package(path, progress=fail)
+    assert (target.files, target.directories) == before
+
+
+def test_export_connection_failure_remains_validating(tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    @contextmanager
+    def unavailable(cfg):
+        raise ConnectionError('connection rejected')
+        yield
+    phases = []
+    service = MigrationService(SimpleNamespace(), adapter_factory=unavailable)
+    with pytest.raises(ConnectionError):
+        service.export(tmp_path / 'failed.tar.gz', lambda **kw: phases.append(kw['phase']))
+    assert phases == ['validating']

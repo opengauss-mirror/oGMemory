@@ -22,6 +22,7 @@ from pathlib import Path
 USTAR_MAX_MEMBER_BYTES = 8 * 1024**3 - 1
 FORMAT_VERSION = 1
 DATASETS = ("nodes", "relations", "archives")
+SPACE_DATASETS = ("spaces", "space_nodes")
 _CHUNK = 1024 * 1024
 _BLOB_NAME = re.compile(r"blobs/sha256/[0-9a-f]{64}\Z")
 
@@ -86,7 +87,7 @@ def _records(path: Path, limit: int) -> Iterator[dict]:
 
 
 def _data_name(name: str) -> bool:
-    return name in {f"entities/{kind}.jsonl" for kind in DATASETS}
+    return name in {f"entities/{kind}.jsonl" for kind in DATASETS + SPACE_DATASETS}
 
 
 def _allowed_name(name: str) -> bool:
@@ -121,6 +122,7 @@ def write_package(
     source_backend: str,
     source_version: str,
     source_environment: dict | None = None,
+    shared_spaces: dict | None = None,
     blobs: Iterable[Path] = (),
     limits: PackageLimits = PackageLimits(),
 ) -> dict:
@@ -130,8 +132,11 @@ def write_package(
     hashes, not source paths. The caller owns business DTO normalization.
     """
     destination = Path(destination)
-    if set(datasets) != set(DATASETS):
-        raise PackageError(f"datasets must be exactly {DATASETS}")
+    kinds = DATASETS + SPACE_DATASETS if shared_spaces is not None else DATASETS
+    if set(datasets) != set(kinds):
+        raise PackageError(f"datasets must be exactly {kinds}")
+    if shared_spaces is not None:
+        _validate_space_description(shared_spaces)
     if source_backend not in {"agfs", "sql"} or not isinstance(source_version, str):
         raise PackageError("invalid source description")
     if destination.exists() or destination.is_symlink():
@@ -141,7 +146,7 @@ def write_package(
         files = {}
         total = 0
         (root / "entities").mkdir()
-        for kind in DATASETS:
+        for kind in kinds:
             name = f"entities/{kind}.jsonl"
             count = 0
             member_size = 0
@@ -184,11 +189,13 @@ def write_package(
             if len(files) + 1 > limits.max_files:
                 raise PackageError("package exceeds file limit")
         manifest = {
-            "format_version": FORMAT_VERSION,
+            "format_version": 2 if shared_spaces is not None else FORMAT_VERSION,
             "source_backend": source_backend,
             "source_version": source_version,
             "files": files,
         }
+        if shared_spaces is not None:
+            manifest["shared_spaces"] = shared_spaces
         if source_environment is not None:
             from service.migration.description import validate_description
 
@@ -219,8 +226,10 @@ class ValidatedPackage:
     limits: PackageLimits
 
     def records(self, kind: str) -> Iterator[dict]:
-        if kind not in DATASETS:
+        if kind not in DATASETS + SPACE_DATASETS:
             raise PackageError(f"unknown dataset: {kind}")
+        if kind in SPACE_DATASETS and "shared_spaces" not in self.manifest:
+            return iter(())
         return _records(self.root / f"entities/{kind}.jsonl", self.limits.max_record_bytes)
 
     def blob(self, digest: str) -> Path:
@@ -230,15 +239,29 @@ class ValidatedPackage:
         return self.root / name
 
 
+def _validate_space_description(value):
+    if (not isinstance(value, dict) or set(value) != {"database_type", "schema_sha256"}
+            or not isinstance(value["database_type"], str)
+            or value["database_type"] not in {"postgresql", "opengauss"}
+            or not isinstance(value["schema_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["schema_sha256"])):
+        raise PackageError("invalid shared space storage description")
+
+
 def _validate(root: Path, observed: dict, limits: PackageLimits) -> dict:
     if "manifest.json" not in observed:
         raise PackageError("missing manifest")
     manifest = _decode((root / "manifest.json").read_bytes())
     if (
         type(manifest.get("format_version")) is not int
-        or manifest["format_version"] != FORMAT_VERSION
+        or manifest["format_version"] not in (FORMAT_VERSION, 2)
     ):
         raise PackageError("unsupported format version")
+    spaces = manifest["format_version"] == 2
+    if spaces:
+        _validate_space_description(manifest.get("shared_spaces"))
+    elif "shared_spaces" in manifest:
+        raise PackageError("shared spaces require format version 2")
     if manifest.get("source_backend") not in {"agfs", "sql"}:
         raise PackageError("unsupported source backend")
     if not isinstance(manifest.get("source_version"), str):
@@ -250,8 +273,11 @@ def _validate(root: Path, observed: dict, limits: PackageLimits) -> dict:
     files = manifest.get("files")
     if not isinstance(files, dict) or set(files) != set(observed) - {"manifest.json"}:
         raise PackageError("manifest file set differs from archive")
-    if not {f"entities/{kind}.jsonl" for kind in DATASETS} <= set(files):
+    kinds = DATASETS + SPACE_DATASETS if spaces else DATASETS
+    if not {f"entities/{kind}.jsonl" for kind in kinds} <= set(files):
         raise PackageError("missing required dataset")
+    if not spaces and any(f"entities/{kind}.jsonl" in files for kind in SPACE_DATASETS):
+        raise PackageError("shared spaces require format version 2")
     for name, expected in files.items():
         if not isinstance(expected, dict):
             raise PackageError("invalid file descriptor")
