@@ -120,6 +120,20 @@ def test_shared_catalog_preserves_produced_content_and_evidence(tmp_path, backen
         assert len(completed['result']['items']) == 1
         project_items(repo, ctx)
         assert SharedMemoryRetrievalService(repo).search(replace(ctx, user_id='bob'), 'compact', ['team'])['total'] == 1
+        if workflow == 'online' and authority == 'same':
+            from service.migration.snapshot import SourceSnapshot
+
+            def last_used():
+                with repo.transaction('acme', write=False) as cur:
+                    cur.execute("SELECT last_used_at FROM space_items WHERE account_id='acme' AND space_id='team'")
+                    return [row['last_used_at'] for row in cur.fetchall()]
+            with repo.transaction('acme') as cur:
+                cur.execute("UPDATE space_items SET last_used_at=NULL WHERE account_id='acme' AND space_id='team'")
+            with SourceSnapshot(services[0]._admission.store, 'read-touch-' + uuid4().hex).scope():
+                assert SharedMemoryRetrievalService(repo).search(replace(ctx, user_id='bob'), 'compact', ['team'])['total'] == 1
+                assert last_used() and all(value is None for value in last_used())
+            assert SharedMemoryRetrievalService(repo).search(replace(ctx, user_id='bob'), 'compact', ['team'])['total'] == 1
+            assert all(value is not None for value in last_used())
         dependent_uri = None
         if workflow == 'dependency':
             from core.provenance_resolver import ProvenanceResolver

@@ -157,3 +157,28 @@ def test_memory_write_structured_maintenance_response(tmp_path, monkeypatch):
     assert result.json['error_detail']['code'] == 'MIGRATION_MAINTENANCE'
     assert result.headers['Retry-After'] == '5'
     admission.store.wait_drained('export', 0)
+
+
+def test_shared_search_does_not_update_last_used_during_export(tmp_path):
+    from unittest.mock import MagicMock
+
+    from core.models import RequestContext, Role
+    from server.space_repository import SpaceRepository
+    from service.migration.admission import Admission
+    from service.shared_memory import SharedMemoryRetrievalService
+    repo = object.__new__(SpaceRepository)
+    repo.pool = MagicMock()
+    gate = MaintenanceStore(tmp_path / 'shared-gate.db', 'review-shared')
+    repo._migration_admission = Admission(gate)
+    item = dict(item_id='i', space_id='s', uri='ctx://acme/spaces/s/memories/experience/i', kind='experience',
+                content='example', abstract='example', rule_id='r', rule_rev=1, version=1, updated_at='2026-11-20')
+    repo.visible_items = lambda *a, **kw: [item]
+    ctx = RequestContext('acme', 'bob', '', '', 'review', Role.MEMBER)
+    gate.enter('snapshot', mode='export', resources={})
+    search = SharedMemoryRetrievalService(repo)
+    assert search.search(ctx, 'example', ['s'])['total'] == 1
+    repo.pool.get_connection.assert_not_called()
+    gate.reopen('snapshot')
+    assert search.search(ctx, 'example', ['s'])['total'] == 1
+    cur = repo.pool.get_connection.return_value.cursor.return_value.__enter__.return_value
+    assert any('UPDATE space_items' in str(call) for call in cur.execute.call_args_list)

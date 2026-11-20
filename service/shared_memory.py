@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from server.space_rules import SpaceError
+from service.migration.maintenance import MaintenanceError
 
 
 class SharedMemoryRetrievalService:
@@ -109,11 +110,16 @@ class SharedMemoryRetrievalService:
                             "source_count": item.get("source_count", 0), "index_state": "READY",
                             "updated_at": item["updated_at"]})
         if results:
-            with self.repository.transaction(ctx.account_id, write=False) as cur:
-                cur.execute("""UPDATE space_items SET last_used_at=NOW()
-                    WHERE account_id=%s AND uri=ANY(%s) AND
-                    (last_used_at IS NULL OR last_used_at<CURRENT_DATE)""",
-                    (ctx.account_id, [item["uri"] for item in results]))
+            try:
+                with self.repository.transaction(ctx.account_id, write=True) as cur:
+                    cur.execute("""UPDATE space_items SET last_used_at=NOW()
+                        WHERE account_id=%s AND uri=ANY(%s) AND
+                        (last_used_at IS NULL OR last_used_at<CURRENT_DATE)""",
+                        (ctx.account_id, [item["uri"] for item in results]))
+            except MaintenanceError:
+                # Usage statistics are optional; a source snapshot keeps reads
+                # available while atomically rejecting this write admission.
+                pass
         next_cursor = None
         if limit is not None and offset + consumed < total:
             next_cursor = self.repository.cursor_after(offset + consumed, binding)
