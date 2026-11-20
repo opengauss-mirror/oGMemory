@@ -746,7 +746,6 @@ class MemoryService:
 
         self._llm = None
         self._decision_client = None
-        self._decision_client_lock = threading.Lock()
         self._write_api = None
         self._read_api = None
         self._agfs_fts = None
@@ -3301,16 +3300,16 @@ class MemoryService:
             self._outbox_stop.clear()
 
 
+    @_serialize_lazy_initialization("_decision_client")
     def get_decision_client(self):
         """One optional protocol client shared by retrieval and lazy extraction."""
         config = getattr(self._cfg, "decision", None)
         if config is None:
             return None
-        with self._decision_client_lock:
-            if self._decision_client is None:
-                from providers.decision import JevDecisionClient
-                self._decision_client = self._bind_model_usage(JevDecisionClient(config))
-            return self._decision_client
+        if self._decision_client is None:
+            from providers.decision import JevDecisionClient
+            self._decision_client = self._bind_model_usage(JevDecisionClient(config))
+        return self._decision_client
 
     def _rerank_decision_evidence(self, query, working_set):
         if not self._cfg.retrieval_decision_rerank_enabled:
@@ -3513,6 +3512,9 @@ class MemoryService:
                 uri_resolver=uri_resolver,
 internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_mode=self._cfg.extraction_mode,
+                decision_client=(self.get_decision_client()
+                                 if self._cfg.extraction_mode == "lazy" else None),
+                read_probability_threshold=self._cfg.read_probability_threshold,
                 source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
                 card_format_enabled=self._cfg.card_format_enabled,
                 dual_pass_enabled=self._cfg.dual_pass_enabled,

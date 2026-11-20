@@ -59,6 +59,8 @@ internal_tool_usage_tracker=None,
         graph_enabled: bool = False,
         relation_store=None,
         relation_candidate_service=None,
+        decision_client=None,
+        read_probability_threshold: float = 0.70,
     ):
         """Initialize the API with required dependencies.
 
@@ -82,6 +84,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._uri_resolver = uri_resolver
         self._internal_tool_usage_tracker = internal_tool_usage_tracker
         self._extraction_mode = extraction_mode
+        self._decision_client = decision_client
+        self._read_probability_threshold = read_probability_threshold
         if type(source_occurrence_reconciliation_enabled) is not bool:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         self._source_occurrence_reconciliation_enabled = source_occurrence_reconciliation_enabled
@@ -138,6 +142,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 self._llm,
                 prompt_manager=pm,
                 mode=self._extraction_mode,
+                decision_client=self._decision_client,
+                read_probability_threshold=self._read_probability_threshold,
                 source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
                 dual_pass_enabled=self._dual_pass_enabled,
                 node_processing_enabled=self._node_processing_enabled,
@@ -158,6 +164,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             return [Extractor(
                 self._llm,
                 mode=self._extraction_mode,
+                decision_client=self._decision_client,
+                read_probability_threshold=self._read_probability_threshold,
                 source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
                 dual_pass_enabled=self._dual_pass_enabled,
                 node_processing_enabled=self._node_processing_enabled,

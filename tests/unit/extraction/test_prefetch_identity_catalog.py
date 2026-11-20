@@ -1,4 +1,6 @@
 """Identity hints complement semantic hits without authorizing unread updates."""
+import pytest
+
 from tests.unit.extraction.test_prefetch import (
     FakeEmbedder,
     FakeFS,
@@ -31,6 +33,29 @@ class SummaryFS(FakeFS):
         self.pages.append(after_uri)
         return sorted([n for n in self.nodes.values() if n.uri.rsplit('/', 1)[0] == directory
                        and (after_uri is None or n.uri > after_uri)], key=lambda n: n.uri)[:limit]
+
+
+@pytest.mark.parametrize("category", ["profile", "entity", "event"])
+def test_directory_only_lazy_discovery_supplies_summaries_without_read_authority(category, caplog):
+    from core.uri_resolver import URIResolver
+    from extraction.prefetch import MemoryPrefetcher
+    from extraction.schemas.registry import SchemaRegistry
+
+    fs, registry = SummaryFS(), SchemaRegistry()
+    resolver = URIResolver(registry)
+    directory = resolver.get_directory_uri(category, _ctx()).rstrip("/")
+    uri = directory if registry.get(category).is_single_file else directory + "/existing"
+    node = _node(uri, category)
+    fs.nodes[uri] = node
+    result = MemoryPrefetcher(fs, None, None, registry, resolver).prefetch_for_span(
+        [category], _ctx(), conversation_text="existing fact", lazy=True,
+    )
+    hints = result.uri_hints + result.identity_hints
+    assert {hint["uri"] for hint in hints} == {uri}
+    assert hints[0]["abstract"] == f"{category} abstract"
+    assert not result.read_uris and not result.read_nodes and not result.read_versions
+    assert "Prefetch embedding failed" not in caplog.text
+    assert "Occurrence recall failed" not in caplog.text
 
 
 def test_catalog_uses_backend_order_for_encoded_names():
