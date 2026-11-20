@@ -5,13 +5,14 @@ import os
 import subprocess
 import sys
 import uuid
+from contextlib import ExitStack, closing
 from dataclasses import fields
 
 import pytest
 
 from providers.unified_config import OgMemConfig
-from service.migration.engine import MigrationService
 from service.migration.storage import storage
+from tests.migration_support import MigrationHarness as MigrationService
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("MIGRATION_TEST_ADMIN_DSN"), reason="isolated migration services required"
@@ -72,6 +73,9 @@ def new_config(backend, suffix):
         vector_db_dialect=dialect,
         opengauss_table_name="migration_vectors",
     )
+    if backend == "agfs":
+        with storage(cfg) as adapter:
+            adapter._mkdir(cfg.agfs_mount_prefix)
     return cfg
 
 
@@ -99,7 +103,8 @@ def fixtures():
         metadata={"provenance_ids": ["prov:1:archive:archive1:"]},
     )
     archived = dict(base, uri="ctx://acme/users/alice/memories/preferences/old", status="ARCHIVED")
-    directory = dict(base, uri="ctx://acme/users/alice/memories/preferences/", content="")
+    directory = dict(base, uri="ctx://acme/users/alice/memories/preferences/", content="",
+                     metadata={"custom_directory": "preserved"})
     other = dict(
         base, uri="ctx://other/users/alice/memories/preferences/editor", account_id="other"
     )
@@ -204,6 +209,7 @@ def test_four_way_migration_and_new_process_retrieval(
         request.addfinalizer(clean_collection)
     source_assets, target_assets = tmp_path / "source-assets", tmp_path / "target-assets"
     source_assets.mkdir()
+    target_assets.mkdir()
     (source_assets / "evidence.bin").write_bytes(b"attachment-evidence")
     data = fixtures()
     data["nodes"][0]["metadata"]["source_path"] = str(source_assets / "evidence.bin")
@@ -213,7 +219,7 @@ def test_four_way_migration_and_new_process_retrieval(
             adapter.restore(kind, rows)
     package = tmp_path / "migration.tar.gz"
     exported = MigrationService(source, asset_root=source_assets).export(package)
-    preview = MigrationService(target, asset_root=target_assets).preflight(package)
+    preview = MigrationService(target, asset_root=target_assets).preview(package)
     assert preview["data"] == exported["data"]
     comparison = preview["compatibility"]
     assert comparison["source"]["embedding"]["dimension"] == 8
@@ -225,8 +231,8 @@ def test_four_way_migration_and_new_process_retrieval(
         if cfg.storage_backend == "sql":
             assert description["database_type"] == cfg.sql_dialect
             assert description["database_version"]
-    restored = MigrationService(target, asset_root=target_assets).restore(package)
-    assert restored["data"] == exported["data"]
+    restored = MigrationService(target, asset_root=target_assets).import_package(package)
+    assert_merged_package(package, target, restored, exported["data"], target_assets)
     assert restored["index_records"] == 13
     # A fresh interpreter uses the application's normal storage/provider readers.
     cfg_file = tmp_path / "cfg.json"
@@ -263,8 +269,40 @@ print('NEW_PROCESS_RETRIEVAL_OK',cfg.storage_backend)
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "NEW_PROCESS_RETRIEVAL_OK" in result.stdout
-    with pytest.raises(ValueError, match="not empty"):
-        MigrationService(target, asset_root=target_assets).preflight(package)
+    repeated = MigrationService(target, asset_root=target_assets).preview(package)
+    assert repeated["counts"]["new"] == 0
+
+
+def assert_merged_package(path, target, result, expected, asset_root=None):
+    from service.migration.assets import Assets
+    from service.migration.package import open_package
+    assert result['data']['archives'] == expected['archives']
+    assert result['data']['relations'] == expected['relations']
+    assert result['data']['nodes']['count'] == expected['nodes']['count']
+    with open_package(path) as package, storage(target) as adapter:
+        assets = Assets(asset_root, package.root)
+        actual = {r['uri']: assets.capture(r, copy_bytes=False) for r in adapter.records('nodes')}
+        for original in package.records('nodes'):
+            row = actual[original['uri']]
+            if original['uri'].endswith('/'):
+                # The merge rebuilds summaries from children instead of retaining
+                # the source's stale directory summaries and timestamp/version.
+                children = [child for child in actual.values()
+                            if child['uri'].rstrip('/').rsplit('/', 1)[0] + '/' == row['uri']
+                            and child['status'] == 'ACTIVE' and not child['metadata'].get('indexing_disabled')]
+                assert row['metadata']['child_count'] == len(children)
+                assert row['metadata']['categories'] == sorted({child['category'] for child in children})
+                assert row['metadata']['node_type'] == 'directory'
+                for key, value in original['metadata'].items():
+                    if key not in {'node_type', 'child_count', 'categories'}:
+                        assert row['metadata'][key] == value
+                assert row['version'] == original['version'] + 1
+                assert row['updated_at'] >= original['updated_at']
+                assert row['abstract']
+                for key in ('uri', 'account_id', 'owner_space', 'category', 'context_type', 'status', 'level', 'created_at', 'content'):
+                    assert row[key] == original[key]
+            else:
+                assert row == original
 
 
 def test_relation_projection_rebuild(tmp_path):
@@ -280,9 +318,9 @@ def test_relation_projection_rebuild(tmp_path):
             adapter.restore(kind, rows)
     package = tmp_path / "graph.tar.gz"
     MigrationService(source).export(package)
-    result = MigrationService(target).restore(package)
+    result = MigrationService(target).import_package(package)
     assert result["index_records"] == 13
-    with psycopg2.connect(target.sql_connection_string) as conn, conn.cursor() as cur:
+    with closing(psycopg2.connect(target.sql_connection_string)) as conn, conn, conn.cursor() as cur:
         cur.execute("SELECT edge_projection FROM relation_edges")
         projection = cur.fetchone()[0]
         assert projection is not None
@@ -290,10 +328,14 @@ def test_relation_projection_rebuild(tmp_path):
         assert cur.fetchone()[0] == 0
 
 
-def test_real_admin_api_migration_flow(tmp_path):
+def test_real_admin_api_migration_flow(tmp_path, monkeypatch, request):
     import time
 
-    from server.migration_server import create_app
+    from flask import Flask
+
+    from server.memory_service import MemoryService
+    from server.migration_api import create_migration_blueprint
+    from server.service_factory import close_service, create_service
 
     source, target = new_config("agfs", "source"), new_config("sql", "target")
     source.root_api_key = target.root_api_key = "isolated-test-key"
@@ -301,22 +343,27 @@ def test_real_admin_api_migration_flow(tmp_path):
         for kind, rows in fixtures().items():
             adapter.restore(kind, rows)
 
+    lifecycle = ExitStack()
+    request.addfinalizer(lifecycle.close)
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    headers = {'X-API-Key': 'isolated-test-key'}
     def client(cfg, directory):
-        app = create_app(cfg, tmp_path / directory, maintenance_confirmed=True)
+        cfg.role_control_enabled = True
+        cfg.migration_workspace = str(tmp_path / directory)
+        service = create_service(cfg)
+        lifecycle.callback(close_service, service)
+        app = Flask(__name__)
+        app.register_blueprint(create_migration_blueprint(lambda: service))
         cli = app.test_client()
-        assert cli.get("/api/migration/status").status_code == 401
-        assert (
-            cli.post("/api/migration/login", headers={"X-API-Key": "isolated-test-key"}).status_code
-            == 200
-        )
+        assert cli.get('/api/v1/migration/status').status_code == 401
         return cli
 
     def job(cli, body):
-        response = cli.post("/api/migration/jobs", json={**body, "maintenance_confirmed": True})
+        response = cli.post("/api/v1/migration/jobs", headers=headers, json={**body, "request_id": str(uuid.uuid4()), "maintenance_confirmed": True})
         assert response.status_code == 202, response.get_json()
         job_id = response.get_json()["job_id"]
         for _ in range(200):
-            state = cli.get("/api/migration/jobs/" + job_id).get_json()
+            state = cli.get("/api/v1/migration/jobs/" + job_id, headers=headers).get_json()
             if state["status"] != "running":
                 assert state["status"] == "succeeded", state
                 return state
@@ -325,10 +372,10 @@ def test_real_admin_api_migration_flow(tmp_path):
 
     src = client(source, "source-jobs")
     exported = job(src, {"kind": "export"})
-    package = src.get(f"/api/migration/jobs/{exported['id']}/download").data
+    package = src.get(f"/api/v1/migration/jobs/{exported['id']}/download", headers=headers).data
     dst = client(target, "target-jobs")
     uploaded = dst.post(
-        "/api/migration/uploads", data=package, content_type="application/octet-stream"
+        "/api/v1/migration/uploads", data=package, content_type="application/octet-stream", headers=headers
     )
     assert uploaded.status_code == 201
     artifact = uploaded.get_json()["artifact_id"]
@@ -338,7 +385,14 @@ def test_real_admin_api_migration_flow(tmp_path):
     assert comparison["target"]["content_storage"]["backend"] == "sql"
     assert "content_storage.backend" in comparison["changes"]
     result = job(dst, {"kind": "import", "artifact_id": artifact, "preflight_id": preview["id"]})
-    assert result["result"]["index_records"] == 13
+    # Normal source service may refresh directory summaries before snapshot.
+    # Validate the exported business records and actual target projection.
+    assert result['result']['data']['nodes']['count'] == preview['result']['data']['nodes']['count']
+    index = target.to_provider_config().create_vector_index()
+    try:
+        assert index.count() == result['result']['index_records'] > 0
+    finally:
+        index.close()
 
 
 @pytest.mark.skipif(
@@ -355,7 +409,7 @@ def test_native_lexical_rebuild(tmp_path):
             adapter.restore(kind, rows)
     package = tmp_path / "hybrid.tar.gz"
     MigrationService(source).export(package)
-    MigrationService(target).restore(package)
+    MigrationService(target).import_package(package)
     lexical = create_lexical_index(target)
     try:
         assert lexical.ready_scopes("acme", ["user:alice", "agent:main"]) == frozenset(
@@ -409,7 +463,7 @@ def test_sql_relation_authority_and_embedded_fallback(tmp_path):
         conn.commit()
     package = tmp_path / "relations.tar.gz"
     MigrationService(source).export(package)
-    MigrationService(target).restore(package)
+    MigrationService(target).import_package(package)
     with storage(target) as adapter:
         actual = list(adapter.records("relations"))
     assert sorted(actual, key=lambda r: r["from_uri"]) == sorted(
@@ -448,7 +502,7 @@ def test_agfs_skill_candidates_block_export_and_target_preflight(tmp_path):
         MigrationService(source).export(tmp_path / "unsupported.tar.gz")
     assert not (tmp_path / "unsupported.tar.gz").exists()
     with pytest.raises(PackageError, match="unsupported AGFS"):
-        MigrationService(target).preflight(package)
+        MigrationService(target).preview(package)
 
 
 @pytest.mark.parametrize("weight", [0, 1])
@@ -468,9 +522,9 @@ def test_integer_relation_weight_restores_to_sql(tmp_path, weight, legacy_packag
             for kind, rows in data.items():
                 adapter.restore(kind, rows)
         MigrationService(source).export(package)
-    preview = MigrationService(target).preflight(package)
-    result = MigrationService(target).restore(package)
-    assert result["data"] == preview["data"]
+    preview = MigrationService(target).preview(package)
+    result = MigrationService(target).import_package(package)
+    assert_merged_package(package, target, result, preview["data"])
     assert result["index_records"] == 13
     with storage(target) as adapter:
         edges = list(adapter.records("relations"))
@@ -535,7 +589,7 @@ def test_completed_write_receipts_are_excluded(tmp_path, source_backend, target_
         assert "memory_write_receipts" in fs.read_node(result["target_uri"], ctx).metadata
         package = tmp_path / "receipts.tar.gz"
         exported = MigrationService(source).export(package)
-        imported = MigrationService(target).restore(package)
+        imported = MigrationService(target).import_package(package)
         assert exported["data"]["nodes"]["count"] == 1
         assert imported["data"] == exported["data"]
         with storage(target) as adapter:
@@ -587,7 +641,7 @@ def test_rebuilt_vectors_are_accepted_by_graph_and_activation(tmp_path):
             adapter.restore(kind, rows)
     package = tmp_path / "model.tar.gz"
     MigrationService(source).export(package)
-    MigrationService(target).restore(package)
+    MigrationService(target).import_package(package)
     provider = target.to_provider_config()
     index, embedder = provider.create_vector_index(), provider.create_embedder()
     try:
@@ -668,7 +722,7 @@ def test_invalid_gzip_rejected_before_target_restore(tmp_path, mutation):
         partial(open_package, limits=PackageLimits(max_bytes=1024, max_files=4)),
     ):
         with pytest.raises(PackageError):
-            service.restore(package)
+            service.import_package(package)
     with storage(target) as adapter:
         adapter.check(empty=True)
         assert all(not list(adapter.records(kind)) for kind in DATASETS)
@@ -728,7 +782,7 @@ def test_business_writes_migrate_to_graph_candidate_selection(tmp_path):
         pool.close_all()
     package = tmp_path / "graph-business.tar.gz"
     MigrationService(source).export(package)
-    MigrationService(target).restore(package)
+    MigrationService(target).import_package(package)
     pool = SharedConnectionPool(
         target.sql_connection_string, dialect=target.sql_dialect, pool_size=2
     )
@@ -895,7 +949,7 @@ def test_archive_producer_to_provenance_consumer(tmp_path, source_backend, targe
         )["target_uri"]
         package = tmp_path / "archive.tar.gz"
         MigrationService(source).export(package)
-        MigrationService(target).restore(package)
+        MigrationService(target).import_package(package)
         target_fs, archives = open_readers(target)
         restored = target_fs.read_node(uri, ctx)
         parsed = ProvenanceResolver.parse_id(restored.metadata["provenance_ids"][0])
@@ -952,7 +1006,7 @@ def test_archive_relation_requires_node_endpoints_only_for_sql_graph(tmp_path, a
     package = tmp_path / "archive-edge.tar.gz"
     MigrationService(source).export(package)
     importer = MigrationService(target)
-    for operation in (importer.preflight, importer.restore):
+    for operation in (importer.preview, importer.import_package):
         with pytest.raises(PackageError, match="SQL graph projection requires node endpoints"):
             operation(package)
         with storage(target) as adapter:
@@ -966,8 +1020,8 @@ def test_archive_relation_requires_node_endpoints_only_for_sql_graph(tmp_path, a
         finally:
             index.close()
     target.graph_backend = "none"
-    importer.preflight(package)
-    importer.restore(package)
+    importer.preview(package)
+    importer.import_package(package)
     with storage(target) as adapter:
         assert len(list(adapter.records("nodes"))) == 1
         assert len(list(adapter.records("archives"))) == 1
@@ -1026,7 +1080,7 @@ def test_sessions_identifier_survives_sql_migration(tmp_path, source_backend, id
         package = tmp_path / "sessions-id.tar.gz"
         exported = MigrationService(source).export(package)
         assert exported["data"]["nodes"]["count"] == 1
-        imported = MigrationService(target).restore(package)
+        imported = MigrationService(target).import_package(package)
         assert imported["data"] == exported["data"]
         pool = SharedConnectionPool(
             target.sql_connection_string, dialect=target.sql_dialect, pool_size=2
@@ -1085,7 +1139,7 @@ def test_directory_relation_uri_matches_sql_identity(tmp_path, graph, alias):
     MigrationService(source).export(package)
     importer = MigrationService(target)
     if alias:
-        for operation in (importer.preflight, importer.restore):
+        for operation in (importer.preview, importer.import_package):
             with pytest.raises(PackageError, match="exactly match stored URI"):
                 operation(package)
         with storage(target) as adapter:
@@ -1096,8 +1150,8 @@ def test_directory_relation_uri_matches_sql_identity(tmp_path, graph, alias):
         finally:
             index.close()
     else:
-        importer.preflight(package)
-        importer.restore(package)
+        importer.preview(package)
+        importer.import_package(package)
         with storage(target) as adapter:
             rows = list(adapter.records("relations"))
             nodes = {r["uri"] for r in adapter.records("nodes")}
@@ -1149,29 +1203,28 @@ def test_agfs_relation_group_uses_one_remote_read_and_write():
 
 @pytest.mark.parametrize("failure", ["refused", "authentication"])
 def test_migration_job_logs_real_database_failure(tmp_path, caplog, failure):
-    import logging
     import socket
     import time
+    from types import SimpleNamespace
 
     from psycopg2.extensions import make_dsn, parse_dsn
 
-    from server.migration_server import create_app
+    from service.migration.jobs import InstanceJobs
+    from service.migration.maintenance import MaintenanceStore
 
     cfg = new_config("sql", "diagnostic-source")
     cfg.root_api_key = "diagnostic-admin-key"
     original_dsn = cfg.sql_connection_string
-    app = create_app(cfg, tmp_path, maintenance_confirmed=True)
-    client = app.test_client()
-    client.post("/api/migration/login", headers={"X-API-Key": cfg.root_api_key})
+    engine = MigrationService(cfg)
+    migration = SimpleNamespace(cfg=cfg, workspace=tmp_path,
+        gate=MaintenanceStore(tmp_path / 'gate.db', 'diagnostic'),
+        export=lambda destination, task, progress: engine.export(destination, progress))
+    queue = InstanceJobs(migration)
 
     def export_job():
-        response = client.post(
-            "/api/migration/jobs", json={"kind": "export", "maintenance_confirmed": True}
-        )
-        assert response.status_code == 202
-        job_id = response.get_json()["job_id"]
+        job_id = queue.submit('export', identity=str(uuid.uuid4()))['id']
         for _ in range(200):
-            job = client.get("/api/migration/jobs/" + job_id).get_json()
+            job = queue.get(job_id)
             if job["status"] != "running":
                 return job
             time.sleep(0.05)
@@ -1179,7 +1232,6 @@ def test_migration_job_logs_real_database_failure(tmp_path, caplog, failure):
 
     assert export_job()["status"] == "succeeded"
     caplog.clear()
-    caplog.set_level(logging.ERROR, logger="server.migration_server")
     reserved = socket.socket()
     try:
         if failure == "refused":
@@ -1195,14 +1247,7 @@ def test_migration_job_logs_real_database_failure(tmp_path, caplog, failure):
             )
         job = export_job()
         assert job["status"] == "failed"
-        assert (
-            job["error"]
-            == "OperationalError: operation failed; inspect isolated target before retrying"
-        )
-        records = [r for r in caplog.records if r.name == "server.migration_server"]
-        assert len(records) == 1 and records[0].exc_info is None
-        text = records[0].getMessage()
-        assert f"job_id={job['id']} kind=export phase=validating" in text
+        text = job["error"]
         assert "service.migration.storage" in text and "OperationalError" in text
         if failure == "refused":
             assert "connection refused" in text.lower()
@@ -1272,14 +1317,15 @@ def test_agfs_directory_source_alias_preserves_backend_semantics(tmp_path, targe
     MigrationService(source).export(package)
     importer = MigrationService(target)
     if target_backend == "agfs":
-        importer.preflight(package)
-        importer.restore(package)
+        importer.preview(package)
+        importer.import_package(package)
         target_client = AGFSClient(api_base_url=target.agfs_base_url)
         assert AGFSRelationStore(target_client, target.agfs_mount_prefix).get_edges(
             directory, ctx
-        ) == [edge]
+        ) == [RelationEdge(from_uri=directory, to_uri=edge.to_uri, relation_type=edge.relation_type,
+                           weight=edge.weight, reason=edge.reason)]
     else:
-        for operation in (importer.preflight, importer.restore):
+        for operation in (importer.preview, importer.import_package):
             with pytest.raises(PackageError, match="exactly match stored URI"):
                 operation(package)
         with storage(target) as adapter:
@@ -1320,7 +1366,7 @@ def test_tar_tail_rejected_before_business_restore(tmp_path, tail):
         raw += raw
     package.write_bytes(gzip.compress(raw))
     importer = MigrationService(target)
-    for operation in (importer.preflight, importer.restore):
+    for operation in (importer.preview, importer.import_package):
         with pytest.raises(PackageError, match="non-zero data after tar end marker"):
             operation(package)
     with storage(target) as adapter:
@@ -1331,3 +1377,546 @@ def test_tar_tail_rejected_before_business_restore(tmp_path, tail):
         assert index.count() == 0
     finally:
         index.close()
+
+
+@pytest.mark.parametrize("target_backend", ["sql", "agfs"])
+@pytest.mark.parametrize("content", ["a\x00b", r"a\u0000b"])
+def test_archive_nul_sql_preflight_before_writes(tmp_path, target_backend, content):
+    from pyagfs import AGFSClient
+
+    from core.models import RequestContext
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from service.migration.package import PackageError
+    from session.archive_store import SessionArchiveStore
+    from tests.unit.service.migration.test_engine import node
+
+    source, target = new_config("agfs", "nul-source"), new_config(target_backend, "nul-target")
+    with storage(source) as adapter:
+        adapter.restore("nodes", [node()])
+    fs = AGFSContextFS(AGFSClient(api_base_url=source.agfs_base_url), source.agfs_mount_prefix)
+    ctx = RequestContext("acme", "alice", "main", "nul-session", "nul-test")
+    messages = [{"role": "user", "content": content}]
+    written = SessionArchiveStore(fs).write_archive(ctx.session_id, "overview", "summary", messages, ctx)
+    assert written.success, written.error
+    path = tmp_path / "nul.tar.gz"
+    expected = MigrationService(source).export(path)["data"]
+    importer = MigrationService(target)
+    if target_backend == "sql" and "\x00" in content:
+        for operation in (importer.preview, importer.import_package):
+            with pytest.raises(PackageError, match="SQL target cannot store NUL"):
+                operation(path)
+            with storage(target) as adapter:
+                adapter.check(empty=True)
+    else:
+        importer.preview(path)
+        assert importer.import_package(path)["data"] == expected
+        with storage(target) as adapter:
+            assert list(adapter.records("archives"))[0]["messages"] == messages
+
+
+def test_sql_relation_group_mirrors_and_consumer(tmp_path):
+    from dataclasses import asdict
+
+    from core.models import RequestContext
+    from fs.sql_adapter.pool import SharedConnectionPool
+    from providers.relation_store.sql_relation_store import SQLRelationStore
+    from tests.unit.service.migration.test_engine import node
+
+    source, target = new_config("agfs", "edge-source"), new_config("sql", "edge-target")
+    nodes, edges = [], []
+    for account, slug, count in [("a", "first", 256), ("a", "second", 257), ("b", "third", 1000)]:
+        row = node()
+        row["account_id"] = account
+        row["uri"] = f"ctx://{account}/users/alice/memories/preferences/{slug}"
+        nodes.append(row)
+        edges.extend(dict(from_uri=row["uri"], to_uri=row["uri"], relation_type=f"rel{i:04}",
+                          weight=1.0, reason="reason") for i in range(count))
+    with storage(source) as adapter:
+        adapter.restore("nodes", nodes)
+        adapter.restore("relations", edges)
+    path = tmp_path / "edges.tar.gz"
+    expected = MigrationService(source).export(path)["data"]
+    assert MigrationService(target).import_package(path)["data"] == expected
+    with storage(target) as adapter:
+        with adapter.conn.cursor() as cur:
+            cur.execute("SELECT uri,relations FROM context_nodes ORDER BY uri")
+            mirrors = dict(cur.fetchall())
+    pool = SharedConnectionPool(target.sql_connection_string, dialect=target.sql_dialect, pool_size=2)
+    try:
+        consumer = SQLRelationStore(pool=pool)
+        for row in nodes:
+            expected_edges = [e for e in edges if e["from_uri"] == row["uri"]]
+            assert sorted(mirrors[row["uri"]], key=lambda e: e["relation_type"]) == expected_edges
+            ctx = RequestContext(row["account_id"], "alice", "main", "", "test")
+            actual = [asdict(e) for e in consumer.get_edges(row["uri"], ctx)]
+            assert sorted(actual, key=lambda e: e["relation_type"]) == expected_edges
+    finally:
+        pool.close_all()
+
+
+@pytest.mark.parametrize("payload", ["text", "metadata", "filters", "archived", "disabled", "unprojected"])
+def test_agfs_sql_projection_nul_before_writes(tmp_path, payload):
+    from service.migration.package import PackageError
+    from tests.unit.service.migration.test_engine import node
+
+    source, target = new_config("agfs", "projection-source"), new_config("agfs", "projection-target")
+    row = node()
+    if payload in {"text", "archived", "disabled"}:
+        row["content"] = "a\x00b"
+    elif payload == "filters":
+        row["category"] = "a\x00b"
+    else:
+        row["metadata"]["who" if payload == "metadata" else "custom"] = "a\x00b"
+    if payload == "archived":
+        row["status"] = "ARCHIVED"
+    if payload == "disabled":
+        row["metadata"]["indexing_disabled"] = True
+    with storage(source) as adapter:
+        adapter.restore("nodes", [row])
+    path = tmp_path / "projection.tar.gz"
+    expected = MigrationService(source).export(path)["data"]
+    importer = MigrationService(target)
+    if payload in {"text", "metadata", "filters"}:
+        for operation in (importer.preview, importer.import_package):
+            with pytest.raises(PackageError, match="SQL target cannot store NUL"):
+                operation(path)
+            with storage(target) as adapter:
+                adapter.check(empty=True)
+            index = target.to_provider_config().create_vector_index()
+            try:
+                assert index.count() == 0
+            finally:
+                index.close()
+    else:
+        importer.preview(path)
+        assert importer.import_package(path)["data"] == expected
+
+
+@pytest.mark.parametrize('backend', ['sql', 'agfs'])
+def test_cli_real_http_producer_migration_and_consumer(tmp_path, backend, monkeypatch):
+    import threading
+    from dataclasses import replace
+
+    from flask import Flask
+    from werkzeug.serving import make_server
+
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.migration_api import create_migration_blueprint
+    from server.service_factory import close_service, create_service
+    from tests.unit.commit.test_memory_identity import memory
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    key = uuid.uuid4().hex
+    env = {**os.environ, 'OGMEM_ROOT_API_KEY': key}
+    with ExitStack() as lifecycle:
+        services, urls = [], []
+        for side in ('source', 'target'):
+            cfg = new_config(backend, side)
+            cfg.root_api_key, cfg.role_control_enabled = key, True
+            cfg.migration_workspace = str(tmp_path / side)
+            service = create_service(cfg)
+            lifecycle.callback(close_service, service)
+            service.get_key_manager().create_account('acme', 'alice')
+            services.append(service)
+            app = Flask(side)
+            app.register_blueprint(create_migration_blueprint(lambda service=service: service))
+            server = make_server('127.0.0.1', 0, app, threaded=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            lifecycle.callback(server.server_close)
+            lifecycle.callback(thread.join, 5)
+            lifecycle.callback(server.shutdown)
+            urls.append(f'http://127.0.0.1:{server.server_port}')
+        ctx = RequestContext('acme', 'alice', '', 'cli-test', 'cli-test', Role.MEMBER)
+        content = 'Prefer compact CLI reports.'
+        written = services[0].get_write_api().write_memory(
+            replace(memory('cli-style', category='preference', content=content), provenance_ids=[]), ctx)
+        def cli(url, *args):
+            result = subprocess.run([sys.executable, '-m', 'cli.main', 'migration', '--base-url', url,
+                                     '--wait-timeout', '60', *args], env=env, capture_output=True, text=True, timeout=90)
+            assert result.returncode == 0, result.stdout + result.stderr
+            return json.loads(result.stdout)
+        package = tmp_path / 'cli-export.tar.gz'
+        exported = cli(urls[0], 'export', '--output', str(package))
+        assert exported['status'] == 'succeeded'
+        preview = cli(urls[1], 'preflight', str(package))
+        imported = cli(urls[1], 'import', '--preflight-id', preview['id'], '--yes')
+        assert imported['status'] == 'succeeded'
+        assert cli(urls[1], 'status', imported['id'])['id'] == imported['id']
+        assert services[1].get_read_api().read_memory(written['target_uri'], ctx).content_excerpt == content
+        repeated = cli(urls[1], 'preflight', str(package))
+        assert repeated['result']['counts']['new'] == 0
+        copy = tmp_path / 'cli-download.tar.gz'
+        cli(urls[0], 'status', exported['id'], '--output', str(copy))
+        assert copy.read_bytes() == package.read_bytes()
+
+
+@pytest.mark.parametrize('method', ['write_node', 'write_node_with_outbox'])
+def test_review_sql_conflict_and_snapshot_read(tmp_path, monkeypatch, method):
+    from dataclasses import replace
+
+    from core.errors import ConcurrentModificationError
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.service_factory import close_service, create_service
+    from service.migration.instance import InstanceMigration
+    from service.migration.snapshot import SourceSnapshot
+    from tests.unit.commit.test_memory_identity import memory
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    cfg = new_config('sql', 'review-conflict')
+    cfg.migration_workspace = str(tmp_path / 'control')
+    service = create_service(cfg)
+    try:
+        ctx = RequestContext('acme', 'alice', '', 'review', 'review', Role.ROOT)
+        written = service.get_write_api().write_memory(
+            replace(memory('editor', category='preference', content='Use editor.'), provenance_ids=[]), ctx)
+        fs = service._get_context_fs()
+        current = fs.read_node(written['target_uri'], ctx)
+        stale = replace(current, content='must not persist', metadata={**current.metadata, '_expected_version': current.metadata['version'] + 1})
+        with service._admission.scope(write=True):
+            token = service._admission._operation.get().token
+            with pytest.raises(ConcurrentModificationError):
+                getattr(fs, method)(stale, ctx)
+        assert fs.read_node(current.uri, ctx).content == 'Use editor.'
+        gate = service._admission.store
+        with gate._transaction() as db:
+            assert db.execute('SELECT 1 FROM operations WHERE token=?', (token,)).fetchone() is None
+        with SourceSnapshot(gate, 'snapshot-read', timeout=2).scope():
+            assert service._get_context_fs().read_node(current.uri, ctx).content == 'Use editor.'
+            assert service.get_read_api().read_memory(current.uri, ctx).content_excerpt == 'Use editor.'
+        result = InstanceMigration(service).export(tmp_path / 'export.tar.gz', task='export-after-conflict')
+        assert result['data']['nodes']['count'] >= 1
+    finally:
+        close_service(service)
+
+
+def test_review_archive_timestamp_preview_and_merge(tmp_path, monkeypatch):
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.service_factory import close_service, create_service
+    from service.migration.instance import InstanceMigration
+    from service.migration.package import open_package, write_package
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    cfg = new_config('sql', 'review-archive')
+    cfg.migration_workspace = str(tmp_path / 'control')
+    service = create_service(cfg)
+    try:
+        ctx = RequestContext('acme', 'alice', '', 'session1', 'review', Role.ROOT)
+        store = service._get_archive_store()
+        written = store.write_archive('session1', 'overview', 'abstract', [{'content': 'hello'}], ctx, archive_id='archive1')
+        assert written.success
+        migration = InstanceMigration(service)
+        exported = tmp_path / 'archive.tar.gz'
+        migration.export(exported, task='export-archive')
+        with open_package(exported) as package:
+            records = {kind: list(package.records(kind)) for kind in ('nodes', 'archives', 'relations')}
+        records['archives'][0]['created_at'] = '2026-01-01T00:00:00+00:00'
+        incoming = tmp_path / 'archive-different-time.tar.gz'
+        write_package(incoming, records, source_backend='sql', source_version='test')
+        assert migration.preview(incoming)['counts'] == {'new': 0, 'unchanged': 1, 'conflicts': 0}
+        assert migration.merge(incoming, task='merge-archive')['phase'] == 'succeeded'
+        assert service._get_archive_store().read_archive('session1', 'archive1', ctx).messages == [{'content': 'hello'}]
+    finally:
+        close_service(service)
+
+
+@pytest.mark.parametrize('backend', ['sql', 'agfs'])
+@pytest.mark.parametrize('fail_attachment', [False, True])
+def test_review_target_attachment_merge(tmp_path, monkeypatch, backend, fail_attachment):
+    from dataclasses import replace
+
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.service_factory import close_service, create_service
+    from service.migration.assets import Assets
+    from service.migration.instance import InstanceMigration
+    from service.migration.package import open_package, write_package
+    from tests.unit.commit.test_memory_identity import memory
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    cfg = new_config(backend, 'target-attachment')
+    cfg.migration_workspace = str(tmp_path / 'control')
+    cfg.role_control_enabled, cfg.root_api_key = True, uuid.uuid4().hex
+    assets = tmp_path / 'assets'
+    assets.mkdir()
+    manual = assets / 'manual.txt'
+    manual.write_text('Original manual')
+    cfg.migration_asset_root = str(assets)
+    service = create_service(cfg)
+    try:
+        service.get_key_manager().create_account('acme', 'alice')
+        ctx = RequestContext('acme', 'alice', '', 'session1', 'review', Role.ROOT)
+        written = service.get_write_api().write_memory(replace(
+            memory('editor', category='preference', content='Old preference',
+                   metadata={'source_path': str(manual)}), provenance_ids=[]), ctx)
+        # Candidate extraction does not copy arbitrary attachment metadata.
+        # Persist the supported attachment reference through the real ContextFS.
+        fs = service._get_context_fs()
+        saved = fs.read_node(written['target_uri'], ctx)
+        fs.write_node(replace(saved, metadata={**saved.metadata, '_expected_version': saved.metadata['version'], 'source_path': str(manual)}), ctx)
+        assert fs.read_node(written['target_uri'], ctx).metadata['source_path'] == str(manual)
+        migration = InstanceMigration(service, asset_root=assets)
+        exported = tmp_path / 'old.tar.gz'
+        migration.export(exported, task='attachment-export')
+        with open_package(exported) as package:
+            records = {kind: list(package.records(kind)) for kind in ('nodes', 'archives', 'relations')}
+        for row in records['nodes']:
+            if row['uri'] == written['target_uri']:
+                row['metadata'].pop('source_path', None)
+                row['content'] = 'New preference'
+        incoming = tmp_path / 'incoming.tar.gz'
+        write_package(incoming, records, source_backend=backend, source_version='test')
+        # Public writes project asynchronously; import requires the target index
+        # to have caught up before maintenance begins.
+        import time
+
+        from service.migration.package import PackageError
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                migration.preview(incoming)
+                break
+            except PackageError as exc:
+                if (not any(text in str(exc) for text in ('index record', 'unfinished AGFS mutation', 'unrecognized AGFS state directory'))
+                        or time.monotonic() >= deadline):
+                    raise
+                time.sleep(.1)
+        if fail_attachment:
+            def fail(*args):
+                raise OSError('attachment preparation failed')
+            monkeypatch.setattr(Assets, 'restore', fail)
+            with pytest.raises(OSError, match='attachment preparation'):
+                migration.merge(incoming, task='attachment-merge')
+        else:
+            assert migration.merge(incoming, task='attachment-merge')['phase'] == 'succeeded'
+        assert migration.gate.status() is None
+        with migration.gate._transaction() as db:
+            assert db.execute('SELECT count(*) FROM operations').fetchone()[0] == 0
+        restored = service._get_context_fs().read_node(written['target_uri'], ctx)
+        assert restored.metadata['source_path'] == str(manual)
+        assert manual.read_text() == 'Original manual'
+        assert service.get_read_api().read_memory(written['target_uri'], ctx).content_excerpt
+    finally:
+        close_service(service)
+
+
+def test_review_real_http_agfs_symlink_is_rejected(tmp_path):
+    import tempfile
+    from pathlib import Path
+
+    from pyagfs import AGFSClient
+
+    from service.migration.package import PackageError
+    from service.migration.tree_backup import AGFSTreeBackup
+    local = os.environ.get('MIGRATION_TEST_AGFS_LOCAL_ROOT')
+    if not local:
+        pytest.skip('AGFS local mount is required for a real symlink fixture')
+    with tempfile.TemporaryDirectory(prefix='migration-link-', dir=local) as folder:
+        root = Path(folder)
+        (root / 'outside.txt').write_text('not part of backup')
+        (root / 'tree').mkdir()
+        (root / 'tree/content.md').symlink_to(root / 'outside.txt')
+        client = AGFSClient(api_base_url=os.environ['MIGRATION_TEST_AGFS_URL'])
+        remote = '/local/' + root.name + '/tree'
+        entry = client.ls(remote)[0]
+        assert 'isLink' not in entry and entry['mode'] & (1 << 27)
+        backup = AGFSTreeBackup(client, [remote], lambda: {})
+        with pytest.raises(PackageError, match='file type'):
+            list(backup._walk(remote))
+        assert (root / 'tree/content.md').is_symlink()
+        assert (root / 'outside.txt').read_text() == 'not part of backup'
+
+
+@pytest.mark.parametrize('method', ['delete_node', 'archive_node', 'move_node'])
+def test_missing_sql_node_does_not_block_snapshot(tmp_path, monkeypatch, method):
+    from core.errors import AccessDeniedError, NodeNotFoundError
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.service_factory import close_service, create_service
+    from service.migration.instance import InstanceMigration
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    cfg = new_config('sql', 'missing-node')
+    cfg.migration_workspace = str(tmp_path / 'control')
+    service = create_service(cfg)
+    try:
+        ctx = RequestContext('acme', 'alice', '', 's', 'review', Role.ROOT)
+        fs = service._get_context_fs()
+        uri = 'ctx://acme/sessions/s/stage_results/' + 'a' * 64
+        args = (uri, uri[:-64] + 'b' * 64, ctx) if method == 'move_node' else (uri, ctx)
+        with service._admission.scope(write=True):
+            token = service._admission._operation.get().token
+            with pytest.raises(NodeNotFoundError):
+                getattr(fs, method)(*args)
+        with service._admission.store._transaction() as db:
+            assert db.execute('SELECT 1 FROM operations WHERE token=?', (token,)).fetchone() is None
+        invalid_args = (uri, 'invalid', ctx) if method == 'move_node' else ('invalid', ctx)
+        with pytest.raises(AccessDeniedError):
+            getattr(fs, method)(*invalid_args)
+        InstanceMigration(service, timeout=2).export(tmp_path / 'snapshot.tar.gz', task='after-missing')
+    finally:
+        close_service(service)
+
+
+@pytest.mark.parametrize('backend', ['sql', 'agfs'])
+def test_archive_notes_survive_public_store_migration(tmp_path, monkeypatch, backend):
+    from contextlib import ExitStack
+
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.service_factory import close_service, create_service
+    from service.migration.instance import InstanceMigration
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    with ExitStack() as stack:
+        services = []
+        for side in ('source', 'target'):
+            cfg = new_config(backend, 'notes-' + side)
+            cfg.migration_workspace = str(tmp_path / side)
+            service = create_service(cfg)
+            stack.callback(close_service, service)
+            services.append(service)
+        ctx = RequestContext('acme', 'alice', '', 'session1', 'review', Role.ROOT)
+        metadata = {'operator_note': {'values': ['prov:manual', 'ctx://acme/custom']}}
+        result = services[0]._get_archive_store().write_archive('session1', 'overview', 'abstract',
+            [{'content': 'original message'}], ctx, archive_id='notes', metadata=metadata)
+        assert result.success
+        path = tmp_path / 'notes.tar.gz'
+        InstanceMigration(services[0]).export(path, task='export-notes')
+        migration = InstanceMigration(services[1])
+        assert migration.preview(path)['counts']['new'] == 1
+        assert migration.merge(path, task='merge-notes')['phase'] == 'succeeded'
+        restored = services[1]._get_archive_store().read_archive('session1', 'notes', ctx)
+        assert restored.messages == [{'content': 'original message'}]
+        assert restored.metadata['operator_note'] == metadata['operator_note']
+
+
+def _standalone_index_process(cfg, pipe):
+    from scripts.run_index_service import CoordinatedIndexRunner, _build_service
+    from service.migration.maintenance import MaintenanceError
+
+    generation = 0
+    def build(config, admission):
+        nonlocal generation
+        result = _build_service(config, admission)
+        generation += 1
+        return result
+    runner = CoordinatedIndexRunner(cfg, build_service=build)
+    last = runner.service
+    try:
+        pipe.send('ready')
+        while True:
+            command = pipe.recv()
+            if command == 'close':
+                break
+            try:
+                current = runner.service
+                if current is not None:
+                    last = current
+                if command == 'project':
+                    result = last._worker.run_once(last._outbox_store, [cfg.account_id], worker_id='review')
+                    pipe.send(('projected', result))
+                else:
+                    pipe.send(('state', generation, current is not None,
+                               current._vector_index.count() if current and current._vector_index else 0))
+            except MaintenanceError:
+                pipe.send(('blocked',))
+    finally:
+        runner.close()
+        pipe.close()
+
+
+@pytest.mark.parametrize('backend,mode', [('sql', 'default'), ('agfs', 'default'), ('agfs', 'agfs')])
+def test_standalone_index_process_migration_and_rollback(tmp_path, monkeypatch, backend, mode):
+    import multiprocessing
+    import time
+    from contextlib import ExitStack
+    from dataclasses import replace
+
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.service_factory import close_service, create_service
+    from service.migration.instance import InstanceMigration
+    from service.migration.rebuild import Rebuilder
+    from service.migration.snapshot import SourceSnapshot
+    from tests.unit.commit.test_memory_identity import memory
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    monkeypatch.setattr(MemoryService, '_start_outbox_worker', lambda self: None)
+    ctx = RequestContext('acme', 'alice', '', 'review', 'test', Role.ROOT)
+    with ExitStack() as stack:
+        services = []
+        for side in ('source', 'target'):
+            cfg = new_config(backend, 'runner-' + side)
+            cfg.migration_workspace = str(tmp_path / side)
+            cfg.account_id, cfg.user_id = 'acme', 'alice'
+            cfg.retrieval_mode = mode
+            cfg.skill_sedimentation_enabled = False
+            cfg.index_interval, cfg.index_workers = 3600, 2
+            cfg.directory_summary_enabled = False
+            cfg.vector_db_type = os.environ.get('MIGRATION_TEST_VECTOR_BACKEND', 'opengauss')
+            cfg.chroma_persist_directory = str(tmp_path / (side + '-chroma'))
+            cfg.milvus_uri = os.environ.get('OGMEM_TEST_MILVUS_URI', 'http://127.0.0.1:19530')
+            cfg.milvus_collection_name = 'runner_' + uuid.uuid4().hex
+            service = create_service(cfg)
+            stack.callback(close_service, service)
+            services.append(service)
+        source, target = services
+        def write(service, key, text):
+            return service.get_write_api().write_memory(replace(
+                memory(key, category='preference', content=text), provenance_ids=[]), ctx)['target_uri']
+        incoming = write(source, 'incoming', 'incoming salamander')
+        package = tmp_path / 'runner.tar.gz'
+        InstanceMigration(source).export(package, task='runner-source')
+        original = write(target, 'original', 'original tortoise')
+        context = multiprocessing.get_context('spawn')
+        parent, child = context.Pipe()
+        process = context.Process(target=_standalone_index_process, args=(cfg, child))
+        process.start()
+        child.close()
+        def rpc(command):
+            parent.send(command)
+            assert parent.poll(20), 'index subprocess did not respond'
+            return parent.recv()
+        def running_after(generation):
+            for _ in range(100):
+                state = rpc('state')
+                if state[0] == 'state' and state[1] > generation and state[2]:
+                    return state[1]
+                time.sleep(.05)
+            pytest.fail('index subprocess did not rebuild clients')
+        try:
+            assert parent.poll(20) and parent.recv() == 'ready'
+            assert rpc('project')[0] == 'projected'
+            initial_generation = rpc('state')[1]
+            migration = InstanceMigration(target)
+            with SourceSnapshot(migration.gate, 'runner-snapshot', timeout=5).scope():
+                assert rpc('project') == ('blocked',)
+            migration.preview(package)
+            with monkeypatch.context() as failure:
+                failure.setattr(Rebuilder, 'verify', lambda *a: (_ for _ in ()).throw(RuntimeError('injected')))
+                with pytest.raises(RuntimeError, match='injected'):
+                    migration.merge(package, task='runner-rollback')
+            restored_generation = running_after(initial_generation)
+            assert target.get_read_api().read_memory(original, ctx).content_excerpt == 'original tortoise'
+            assert rpc('project')[0] == 'projected'
+            def progress(**fields):
+                if fields.get('phase') == 'merging':
+                    assert rpc('project') == ('blocked',)
+            assert migration.merge(package, task='runner-merge', progress=progress)['phase'] == 'succeeded'
+            running_after(restored_generation)
+            assert rpc('project')[0] == 'projected'
+            assert target.get_read_api().read_memory(incoming, ctx).content_excerpt == 'incoming salamander'
+            if mode == 'default':
+                assert rpc('state')[3] > 0
+        finally:
+            if process.is_alive():
+                parent.send('close')
+            process.join(20)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            assert process.exitcode == 0
