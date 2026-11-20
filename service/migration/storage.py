@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from functools import wraps
 from itertools import groupby
 from typing import Protocol
 
@@ -40,8 +41,23 @@ class MigrationStorage(Protocol):
     def close(self) -> None: ...
 
 
+def _rollback_sql_failure(function):
+    @wraps(function)
+    def call(self, *args, **kwargs):
+        try:
+            return function(self, *args, **kwargs)
+        except BaseException:
+            # Release this adapter's uncommitted locks before recovery uses its
+            # dedicated connection. Earlier committed batches are in the backup.
+            self.conn.rollback()
+            raise
+    return call
+
+
 class SQLStorage:
     backend = "sql"
+    supported_extra_tables = frozenset()
+    snapshot_events = ('UPSERT_CONTEXT', 'PROJECT_GRAPH')
 
     def __init__(self, cfg):
         import psycopg2
@@ -73,8 +89,14 @@ class SQLStorage:
             raise
 
     def validate_restore(self, inv):
-        # SQL identity constraints are checked by the canonical record validator.
-        pass
+        from core.sql_payload import validate_sql_strings
+
+        for kind in ("nodes", "archives", "relations"):
+            for record in inv.records(kind):
+                try:
+                    validate_sql_strings(record)
+                except ValueError as exc:
+                    raise PackageError(f"{exc} in {kind}") from exc
 
     def description(self):
         with self.conn.cursor() as cur:
@@ -89,6 +111,9 @@ class SQLStorage:
             "database_type": self.dialect.name,
             "database_version": version[1] if version else None,
         }
+
+    def _commit(self):
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
@@ -115,15 +140,15 @@ class SQLStorage:
                 "skill_candidates",
                 "skill_candidate_evidence",
                 "skill_example_evidence",
-                "tool_result_artifacts",
+                "tool_result_artifacts", "spaces", "space_items", "space_jobs",
             }
-            for table in sorted(tables & unsupported):
+            for table in sorted(tables & (unsupported - self.supported_extra_tables)):
                 cur.execute(f"SELECT 1 FROM {table} LIMIT 1")
                 if cur.fetchone():
                     raise PackageError(f"unsupported business data: {table}")
             cur.execute(
                 "SELECT 1 FROM outbox_events WHERE status IN ('PENDING','PROCESSING','FAILED','DLQ') "
-                "AND event_type NOT IN ('UPSERT_CONTEXT','PROJECT_GRAPH') LIMIT 1"
+                "AND event_type NOT IN %s LIMIT 1", (self.snapshot_events,)
             )
             if cur.fetchone():
                 raise PackageError("unfinished business operations; finish them before migration")
@@ -138,7 +163,7 @@ class SQLStorage:
                     cur.execute(f"SELECT 1 FROM {table} LIMIT 1")
                     if cur.fetchone():
                         raise PackageError("target storage is not empty")
-        self.conn.commit()
+        self._commit()
 
     def records(self, kind):
         if kind == "nodes":
@@ -167,8 +192,39 @@ class SQLStorage:
                     if edge["from_uri"] != row["uri"]:
                         raise PackageError("embedded relation source differs from node")
                     yield {k: edge[k] for k in EDGE_FIELDS}
-        self.conn.commit()
+        self._commit()
 
+    @_rollback_sql_failure
+    def merge_nodes(self, records):
+        """Apply planned changes under exclusive maintenance; preserve runtime metadata."""
+        from psycopg2.extras import Json
+
+        columns = [key for key in NODE_FIELDS if key not in {'uri', 'account_id'}]
+        for record in records:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT set_config('app.account_id', %s, true)", (record['account_id'],))
+                assignments = ','.join(
+                    'metadata=metadata || %s::jsonb' if key == 'metadata' else f'{key}=%s'
+                    for key in columns)
+                values = [Json(record[key]) if key == 'metadata' else record[key] for key in columns]
+                cur.execute(f'UPDATE context_nodes SET {assignments} WHERE uri=%s AND account_id=%s',
+                            [*values, record['uri'], record['account_id']])
+                updated = cur.rowcount
+            if not updated:
+                self.restore('nodes', [record])
+        self._commit()
+
+    @_rollback_sql_failure
+    def replace_relations(self, records):
+        """Replace each affected source's complete planned edge set once."""
+        for source, group in groupby(records, key=lambda record: record['from_uri']):
+            account = identity(source)[0]
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT set_config('app.account_id', %s, true)", (account,))
+                cur.execute('DELETE FROM relation_edges WHERE from_uri=%s AND account_id=%s', (source, account))
+            self.restore('relations', group)
+
+    @_rollback_sql_failure
     def restore(self, kind, records):
         from psycopg2.extras import Json
 
@@ -180,25 +236,38 @@ class SQLStorage:
         }[kind]
         if kind == "relations":
             columns = (*columns, "account_id")
+        # Inventory orders relations by source URI; build each mirror only once.
+        groups = (
+            groupby(records, key=lambda r: r["from_uri"])
+            if kind == "relations" else ((None, records),)
+        )
+        n = 0
         with self.conn.cursor() as cur:
-            for n, record in enumerate(records, 1):
-                r = dict(record)
-                if kind == "relations":
-                    r["account_id"] = identity(r["from_uri"])[0]
-                cur.execute("SELECT set_config('app.account_id', %s, true)", (r["account_id"],))
-                values = [Json(r[k]) if k in {"metadata", "messages"} else r[k] for k in columns]
-                cur.execute(
-                    f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join(['%s'] * len(columns))})",
-                    values,
-                )
-                if kind == "relations":
+            for source, group in groups:
+                edges = []
+                for record in group:
+                    r = dict(record)
+                    if kind == "relations":
+                        r["account_id"] = identity(r["from_uri"])[0]
+                        edges.append(record)
+                    cur.execute("SELECT set_config('app.account_id', %s, true)", (r["account_id"],))
+                    values = [Json(r[k]) if k in {"metadata", "messages"} else r[k] for k in columns]
                     cur.execute(
-                        "UPDATE context_nodes SET relations=relations || %s::jsonb WHERE uri=%s",
-                        (Json([record]), record["from_uri"]),
+                        f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join(['%s'] * len(columns))})",
+                        values,
                     )
-                if n % 256 == 0:
-                    self.conn.commit()
-        self.conn.commit()
+                    n += 1
+                    if n % 256 == 0:
+                        self._commit()
+                if kind == "relations":
+                    # The final insert may have committed and reset the tenant setting.
+                    account = identity(source)[0]
+                    cur.execute("SELECT set_config('app.account_id', %s, true)", (account,))
+                    cur.execute(
+                        "UPDATE context_nodes SET relations=%s::jsonb WHERE uri=%s AND account_id=%s",
+                        (Json(edges), source, account),
+                    )
+        self._commit()
 
 
 class AGFSStorage:
@@ -210,18 +279,57 @@ class AGFSStorage:
         from fs.agfs_adapter.client import create_agfs_client
 
         self.cfg = cfg
-        self.client = client if client is not None else create_agfs_client(cfg)
+        from pyagfs import AGFSClient
+
+        self._owns_client = client is None
+        self.client = client if client is not None else create_agfs_client(cfg, http_client_class=AGFSClient)
         self.prefix = cfg.agfs_mount_prefix.rstrip("/")
 
     def description(self):
         return {"backend": self.backend, "database_type": None, "database_version": None}
 
     def close(self):
-        pass
+        if self._owns_client:
+            close = getattr(self.client, 'close', None)
+            if callable(close):
+                close()
+            self._owns_client = False
+
+    def _call(self, name, *args, **kwargs):
+        from core.operation_deadline import check_deadline, remaining_seconds
+        remaining = remaining_seconds()
+        timeout = getattr(self.client, 'timeout', None)
+        if remaining is not None and timeout is not None:
+            self.client.timeout = min(timeout, remaining)
+        try:
+            result = getattr(self.client, name)(*args, **kwargs)
+            check_deadline()
+            return result
+        finally:
+            if timeout is not None:
+                self.client.timeout = timeout
+
+    def _read(self, path):
+        from core.operation_deadline import remaining_seconds
+        if remaining_seconds() is None:
+            return self._call('read', path)
+        chunks, offset = [], 0
+        while True:
+            chunk = self._call('read', path, offset=offset, size=1024 * 1024)
+            if not chunk:
+                return b''.join(chunks)
+            chunks.append(chunk)
+            offset += len(chunk)
 
     def _ls(self, path):
         try:
-            return self.client.ls(path)
+            entries = self._call('ls', path)
+            from core.operation_deadline import check_deadline
+            from service.migration.tree_backup import entry_directory
+            for entry in entries:
+                check_deadline()
+                entry_directory(entry)
+            return entries
         except Exception as exc:
             from fs.agfs_adapter.agfs_context_fs import _is_not_found_error
 
@@ -239,7 +347,7 @@ class AGFSStorage:
         ):
             raise PackageError("unfinished AGFS mutation; recover before export")
         if ".meta.json" in names:
-            raw = json.loads(self.client.read(path + "/.meta.json"))
+            raw = json.loads(self._read(path + "/.meta.json"))
             if raw.get("category") == "state" and identity(raw.get("uri", ""))[1][0] == "sessions":
                 if include_runtime:
                     yield path, raw
@@ -276,7 +384,7 @@ class AGFSStorage:
         for e in self._ls(path):
             if e.get("isDir"):
                 raise PackageError("outbox contains recovery/dead-letter state")
-            event = json.loads(self.client.read(path + "/" + e["name"]))
+            event = json.loads(self._read(path + "/" + e["name"]))
             if event.get("event_type") not in {
                 "UPSERT_CONTEXT",
                 "PROJECT_GRAPH",
@@ -297,7 +405,7 @@ class AGFSStorage:
             # the recoverable state when the main file is absent.
             for item in self._ls(account):
                 if item["name"] in {"state.json", "state.json.bak"}:
-                    state = json.loads(self.client.read(account + "/" + item["name"]))
+                    state = json.loads(self._read(account + "/" + item["name"]))
                     if state.get("candidates") or state.get("example_evidence"):
                         raise PackageError("unsupported AGFS skill candidate/evidence data")
 
@@ -306,7 +414,7 @@ class AGFSStorage:
             raise PackageError("scene extensions are not supported by migration v1")
         # A nonexistent source prefix is a configuration error, not an empty export.
         if not empty:
-            self.client.ls(self.prefix or "/")
+            self._call('ls', self.prefix or '/')
         self._check_skill_data()
         # Consume the scan before publishing a package or writing a target.
         for _ in self._walk(self.prefix + "/accounts", include_runtime=empty):
@@ -343,7 +451,7 @@ class AGFSStorage:
             ("abstract", ".abstract.md"),
             ("overview", ".overview.md"),
         ]:
-            r[field] = self.client.read(path + "/" + file).decode("utf-8")
+            r[field] = self._read(path + "/" + file).decode("utf-8")
         return r
 
     def records(self, kind):
@@ -359,7 +467,7 @@ class AGFSStorage:
             elif kind == "relations":
                 names = {e["name"] for e in self._ls(path)}
                 if ".relations.json" in names:
-                    edges = json.loads(self.client.read(path + "/.relations.json"))
+                    edges = json.loads(self._read(path + "/.relations.json"))
                     if not isinstance(edges, list):
                         raise PackageError("invalid relations file")
                     for edge in edges:
@@ -383,6 +491,30 @@ class AGFSStorage:
                     raise
             self.client.mkdir(current)
 
+    def merge_nodes(self, records):
+        from fs.agfs_adapter.agfs_context_fs import uri_to_path
+
+        for record in records:
+            path = self.prefix + uri_to_path(record['uri'])
+            names = {entry['name'] for entry in self._ls(path)}
+            if '.meta.json' not in names:
+                self.restore('nodes', [record])
+                continue
+            old = json.loads(self._read(path + '.meta.json'))
+            meta = {**old, **record['metadata'],
+                    **{key: record[key] for key in MIRRORS if key in record and key != 'account_id'}}
+            for name, text in [('content.md', record['content']), ('.abstract.md', record['abstract']),
+                               ('.overview.md', record['overview']),
+                               ('.meta.json', json.dumps(meta, ensure_ascii=False))]:
+                self.client.write(path + name, text.encode('utf-8'))
+
+    def replace_relations(self, records):
+        from fs.agfs_adapter.agfs_context_fs import uri_to_path
+
+        for source, group in groupby(records, key=lambda record: record['from_uri']):
+            path = self.prefix + uri_to_path(source) + '.relations.json'
+            self.client.write(path, json.dumps(list(group), ensure_ascii=False).encode('utf-8'))
+
     def restore(self, kind, records):
         from fs.agfs_adapter.agfs_context_fs import uri_to_path
 
@@ -390,7 +522,7 @@ class AGFSStorage:
             # Inventory orders relations by source URI; read/write once per group.
             for source_uri, group in groupby(records, key=lambda r: r["from_uri"]):
                 path = self.prefix + uri_to_path(source_uri) + ".relations.json"
-                edges = json.loads(self.client.read(path))
+                edges = json.loads(self._read(path))
                 edges.extend(group)
                 self.client.write(path, json.dumps(edges, ensure_ascii=False).encode())
             return
@@ -412,7 +544,10 @@ class AGFSStorage:
 
 @contextmanager
 def storage(cfg):
-    if cfg.storage_backend == "sql":
+    if getattr(cfg, 'shared_spaces_enabled', False):
+        from service.migration.shared_storage import SharedStorage
+        adapter = SharedStorage(cfg)
+    elif cfg.storage_backend == "sql":
         adapter = SQLStorage(cfg)
     elif cfg.storage_backend == "agfs":
         adapter = AGFSStorage(cfg)
