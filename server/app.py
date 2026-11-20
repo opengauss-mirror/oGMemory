@@ -43,8 +43,10 @@ from server.mcp_tools import (
 )
 from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
+from server.migration_api import create_migration_blueprint
 from server.scene_api import create_scene_blueprint
 from server.space_management import create_shared_search_blueprint
+from service.migration.admission import business_wsgi
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
@@ -125,8 +127,8 @@ def _get_service() -> MemoryService:
         with _service_lock:
             if _service is None:
                 cfg = get_config()
-                _service = MemoryService(config=cfg)
-                _service.start_extraction_recovery()
+                from server.service_factory import create_service
+                _service = create_service(cfg)
                 logger.info("MemoryService initialized (config loaded)")
                 # Attach to perf recorder so token snapshots work
                 try:
@@ -137,6 +139,9 @@ def _get_service() -> MemoryService:
     return _service
 
 
+app.wsgi_app = business_wsgi(app.wsgi_app, _get_service)
+
+
 def _shutdown_service() -> None:
     """Close the process-wide service once, if it was initialized."""
     global _service
@@ -144,7 +149,8 @@ def _shutdown_service() -> None:
     if service is None:
         return
     try:
-        service.shutdown()
+        from server.service_factory import close_service
+        close_service(service)
     except Exception:
         logger.exception("MemoryService shutdown failed")
 
@@ -272,6 +278,7 @@ def _error_response(exc: Exception):
 app.register_blueprint(
     create_memory_viewer_blueprint(_get_service, _build_authenticated_context, _error_response)
 )
+app.register_blueprint(create_migration_blueprint(_get_service))
 app.register_blueprint(
     create_scene_blueprint(_get_service, _build_authenticated_context, _error_response)
 )
