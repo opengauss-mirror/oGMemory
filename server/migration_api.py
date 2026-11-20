@@ -98,8 +98,21 @@ def create_migration_blueprint(get_service):
             raise BadRequest('invalid migration control JSON') from exc
         if not isinstance(body, dict):
             raise PackageError('invalid migration request')
-        queue = jobs()
         kind = body.get('kind')
+        if not isinstance(kind, str) or kind not in {'export', 'preflight', 'import', 'recover'}:
+            raise PackageError('unknown migration operation')
+        required = ['request_id']
+        if kind in {'preflight', 'import'}:
+            required.append('artifact_id')
+        if kind == 'import':
+            required.append('preflight_id')
+        if kind == 'recover':
+            required.append('recover_task')
+        for field in required:
+            if not isinstance(body.get(field), str):
+                raise PackageError(f'{field} must be a UUID string')
+            UUID(body[field])
+        queue = jobs()
         if kind == 'import':
             if body.get('maintenance_confirmed') is not True:
                 raise PackageError('请确认暂停目标业务并导入。')

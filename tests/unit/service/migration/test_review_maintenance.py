@@ -134,3 +134,26 @@ def test_sql_snapshot_stalled_handshake_is_bounded(tmp_path):
     finally:
         stop.set()
         thread.join(3)
+
+
+def test_memory_write_structured_maintenance_response(tmp_path, monkeypatch):
+    import server.app as app_module
+    from service.migration.admission import business_wsgi
+
+    admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'instance'))
+    def after_turn(params):
+        with admission.backend(write=True):
+            pytest.fail('write must not start')
+    service = SimpleNamespace(_admission=admission, after_turn=after_turn, _cfg=SimpleNamespace(
+        http_ip_allowlist=[], mcp_default_toolset='all', mcp_enable_write_tools=True,
+        mcp_max_request_bytes=1048576))
+    monkeypatch.setattr(app_module, '_service', service)
+    monkeypatch.setattr(app_module, '_build_authenticated_context', lambda p: SimpleNamespace(agent_id='agent'))
+    monkeypatch.setattr(app_module.app, 'wsgi_app', business_wsgi(app_module.app.wsgi_app, lambda: service))
+    admission.store.enter('export', mode='export', resources={})
+    result = app_module.app.test_client().post('/api/v1/memories/write', json={
+        'text': 'remember this', 'session_id': 'session'})
+    assert result.status_code == 503, result.json
+    assert result.json['error_detail']['code'] == 'MIGRATION_MAINTENANCE'
+    assert result.headers['Retry-After'] == '5'
+    admission.store.wait_drained('export', 0)

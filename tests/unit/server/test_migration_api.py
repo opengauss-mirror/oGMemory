@@ -141,3 +141,15 @@ def test_status_reads_gate_after_interrupted_export_cleanup(client, instance):
     assert response.status_code == 200
     assert response.json['maintenance'] is None
     assert migration.gate.status() is None
+
+
+@pytest.mark.parametrize('fields', [
+    {'kind': []}, {'kind': {}}, {'request_id': None}, {'request_id': 7},
+    {'kind': 'preflight', 'artifact_id': None},
+    {'kind': 'import', 'maintenance_confirmed': True, 'preflight_id': []},
+    {'kind': 'recover', 'recover_task': None},
+])
+def test_invalid_control_fields_return_bad_request(client, fields):
+    body = {'kind': 'export', 'request_id': str(uuid.uuid4()), **fields}
+    response = client.post('/api/v1/migration/jobs', json=body, headers=HEADERS)
+    assert response.status_code == 400

@@ -708,18 +708,19 @@ def handle_write_memory():
         service = _get_service()
         if not mcp_write_tools_enabled(service._cfg):
             raise PermissionError("memory write tools are disabled")
-        return jsonify(
-            write_memory(
-                service,
-                text=params.get("text"),
-                session_id=params.get("sessionId") or params.get("session_id"),
-                agent_id=ctx.agent_id,
-                client_request_id=params.get("client_request_id"),
-                force_extract=_parse_boolean(params.get("force_extract"), "force_extract"),
-                wait=_parse_boolean(params.get("wait"), "wait"),
-                request_context=ctx,
-            )
+        result = write_memory(
+            service,
+            text=params.get("text"),
+            session_id=params.get("sessionId") or params.get("session_id"),
+            agent_id=ctx.agent_id,
+            client_request_id=params.get("client_request_id"),
+            force_extract=_parse_boolean(params.get("force_extract"), "force_extract"),
+            wait=_parse_boolean(params.get("wait"), "wait"),
+            request_context=ctx,
         )
+        if (result.get("error_detail") or {}).get("code") == "MIGRATION_MAINTENANCE":
+            return _lifecycle_result_response(result)
+        return jsonify(result)
     except Exception as exc:
         return _error_response(exc)
 
