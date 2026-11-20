@@ -209,14 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--dry-run", action="store_true")
     p_sync.add_argument("--prune", action="store_true")
 
-    p_migration = sub.add_parser("migration", help="Run the offline migration-only GUI/API")
-    p_migration.add_argument("--config", required=True)
-    p_migration.add_argument("--workspace", required=True)
-    p_migration.add_argument("--maintenance-confirmed", action="store_true")
-    p_migration.add_argument("--asset-root", default=None)
-    p_migration.add_argument("--max-upload-mib", type=int, default=10240)
-    p_migration.add_argument("--host", default="127.0.0.1")
-    p_migration.add_argument("--port", type=int, default=8091)
+    from cli.commands.migration import add_arguments
+    add_arguments(sub.add_parser("migration", help="Export, merge and recover through the running service"))
 
     return parser
 
@@ -238,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd = args.command
 
     if cmd == "migration":
-        from server.migration_server import run
+        from cli.commands.migration import run
         return run(args)
     elif cmd == "check":
         from cli.commands.check import run
