@@ -210,6 +210,10 @@ class Admission:
             if not inspect.ismethod(function):
                 continue
             write = not name.startswith(reads) or name.startswith(("get_or_create", "get_or_init"))
+            if name == 'load_content':
+                from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
+                if isinstance(storage, AGFSSpaceBridge):
+                    write = False  # Hydrates authorized immutable bodies only.
             # mkdir and rm issue one HTTP request. In particular write()
             # retries internally: a final rejection cannot settle earlier timeouts.
             from pyagfs.client import AGFSClient

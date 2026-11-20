@@ -182,3 +182,18 @@ def test_shared_search_does_not_update_last_used_during_export(tmp_path):
     assert search.search(ctx, 'example', ['s'])['total'] == 1
     cur = repo.pool.get_connection.return_value.cursor.return_value.__enter__.return_value
     assert any('UPDATE space_items' in str(call) for call in cur.execute.call_args_list)
+
+
+def test_agfs_shared_hydration_is_read_admission(tmp_path):
+    from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
+
+    bridge = object.__new__(AGFSSpaceBridge)
+    gate = MaintenanceStore(tmp_path / 'hydrate.db', 'hydrate')
+    Admission(gate).guard(bridge)
+    gate.enter('export', mode='export', resources={})
+    assert bridge.load_content([]) == []
+    gate.wait_drained('export', 0)
+    gate.reopen('export')
+    gate.enter('import', mode='import', resources={})
+    with pytest.raises(MaintenanceError):
+        bridge.load_content([])
