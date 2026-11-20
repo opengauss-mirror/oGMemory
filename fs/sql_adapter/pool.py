@@ -302,6 +302,13 @@ class SharedConnectionPool:
             conn.close()
         self._semaphore.release()
 
+    def discard_connection(self, conn):
+        """Retire an unconfirmed session without returning it to idle reuse."""
+        try:
+            conn.close()
+        finally:
+            self._semaphore.release()
+
     @contextmanager
     def deadline_connection(self, deadline):
         """Use a bounded, nonblocking session within the shared connection limit."""

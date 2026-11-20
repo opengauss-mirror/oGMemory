@@ -226,6 +226,25 @@ func AGFS_Write(clientID int64, path *C.char, data unsafe.Pointer, dataSize C.in
 	return C.CString(fmt.Sprintf(`{"message": "Written %d bytes"}`, n))
 }
 
+//export AGFS_WriteChunk
+func AGFS_WriteChunk(clientID int64, path *C.char, data unsafe.Pointer, dataSize C.int64_t, offset C.int64_t, truncate C.int) *C.char {
+	if dataSize < 0 || dataSize > 1024*1024 || offset < 0 {
+		return C.CString(fmt.Sprintf(`{"error_id": %d}`, storeError(fmt.Errorf("invalid write chunk bounds"))))
+	}
+	globalFSMu.RLock()
+	fs := globalFS
+	globalFSMu.RUnlock()
+	flags := filesystem.WriteFlagCreate | filesystem.WriteFlagSync
+	if truncate != 0 {
+		flags |= filesystem.WriteFlagTruncate
+	}
+	n, err := fs.Write(C.GoString(path), C.GoBytes(data, C.int(dataSize)), int64(offset), flags)
+	if err != nil {
+		return C.CString(fmt.Sprintf(`{"error_id": %d}`, storeError(err)))
+	}
+	return C.CString(fmt.Sprintf(`{"bytes_written": %d}`, n))
+}
+
 //export AGFS_Create
 func AGFS_Create(clientID int64, path *C.char) *C.char {
 	p := C.GoString(path)

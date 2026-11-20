@@ -509,6 +509,15 @@ class SQLContextFS(PoolAdapterMixin):
             except ValueError:
                 raise AccessDeniedError(uri, ctx.account_id, "Invalid URI format")
 
+    def _validate_write_access(self, uris, ctx):
+        """Validate only before acquiring a write connection."""
+        try:
+            for uri in uris:
+                self._ensure_accessible(uri, ctx)
+        except AccessDeniedError as exc:
+            exc.sql_write_not_started = True
+            raise
+
     def _extract_account_id(self, uri: str) -> str:
         """Extract account_id from URI for row-level storage."""
         components = parse_uri(uri)
@@ -859,7 +868,7 @@ class SQLContextFS(PoolAdapterMixin):
             ConcurrentModificationError: On optimistic lock failure.
             RuntimeError: If a code-resource DELETE remains unfinished.
         """
-        self._ensure_accessible(node.uri, ctx)
+        self._validate_write_access((node.uri,), ctx)
         if self._is_code_resource_node(node):
             raise RuntimeError("code resource writes require write_node_with_outbox")
         account_id = self._extract_account_id(node.uri)
@@ -891,8 +900,9 @@ class SQLContextFS(PoolAdapterMixin):
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
-        except ConcurrentModificationError:
+        except ConcurrentModificationError as exc:
             conn.rollback()
+            exc.sql_rollback_confirmed = True
             raise
         except Exception:
             conn.rollback()
@@ -923,7 +933,7 @@ class SQLContextFS(PoolAdapterMixin):
         if outbox_event is None:
             return self.write_node(node, ctx)
 
-        self._ensure_accessible(node.uri, ctx)
+        self._validate_write_access((node.uri,), ctx)
         account_id = self._extract_account_id(node.uri)
         expected_version = node.metadata.get(
             "_expected_version", node.metadata.get("expected_version")
@@ -988,8 +998,9 @@ class SQLContextFS(PoolAdapterMixin):
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
-        except ConcurrentModificationError:
+        except ConcurrentModificationError as exc:
             conn.rollback()
+            exc.sql_rollback_confirmed = True
             raise
         except Exception:
             conn.rollback()
@@ -1238,7 +1249,7 @@ class SQLContextFS(PoolAdapterMixin):
             AccessDeniedError: If account_id doesn't match.
             NodeNotFoundError: If node doesn't exist.
         """
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access((uri,), ctx)
 
         conn = self._get_connection()
         try:
@@ -1277,8 +1288,9 @@ class SQLContextFS(PoolAdapterMixin):
                 if cur.rowcount == 0:
                     raise NodeNotFoundError(uri)
             conn.commit()
-        except NodeNotFoundError:
+        except NodeNotFoundError as exc:
             conn.rollback()
+            exc.sql_rollback_confirmed = True
             raise
         except Exception:
             conn.rollback()
@@ -1299,7 +1311,7 @@ class SQLContextFS(PoolAdapterMixin):
             return 0
 
         for uri in targets:
-            self._ensure_accessible(uri, ctx)
+            self._validate_write_access((uri,), ctx)
         account_ids = {self._extract_account_id(uri) for uri in targets}
         if account_ids != {ctx.account_id}:
             raise AccessDeniedError(
@@ -1418,7 +1430,7 @@ class SQLContextFS(PoolAdapterMixin):
             AccessDeniedError: If account_id doesn't match.
             NodeNotFoundError: If node doesn't exist.
         """
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access((uri,), ctx)
 
         conn = self._get_connection()
         try:
@@ -1437,8 +1449,9 @@ class SQLContextFS(PoolAdapterMixin):
                 if cur.rowcount == 0:
                     raise NodeNotFoundError(uri)
             conn.commit()
-        except NodeNotFoundError:
+        except NodeNotFoundError as exc:
             conn.rollback()
+            exc.sql_rollback_confirmed = True
             raise
         except Exception:
             conn.rollback()
@@ -1646,8 +1659,7 @@ class SQLContextFS(PoolAdapterMixin):
             AccessDeniedError: If either URI account doesn't match.
             NodeNotFoundError: If source node doesn't exist.
         """
-        self._ensure_accessible(from_uri, ctx)
-        self._ensure_accessible(to_uri, ctx)
+        self._validate_write_access((from_uri, to_uri), ctx)
         account_id = self._extract_account_id(from_uri)
 
         from_prefix = from_uri.rstrip("/") + "/"
@@ -1860,8 +1872,9 @@ class SQLContextFS(PoolAdapterMixin):
                                 ),
                             )
             conn.commit()
-        except NodeNotFoundError:
+        except NodeNotFoundError as exc:
             conn.rollback()
+            exc.sql_rollback_confirmed = True
             raise
         except Exception:
             conn.rollback()

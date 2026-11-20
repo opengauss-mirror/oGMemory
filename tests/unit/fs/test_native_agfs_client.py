@@ -65,6 +65,51 @@ def test_native_crud_binary_unicode_and_concurrency(native):
     assert client.stat(mount + "/empty")["isDir"]
 
 
+def test_native_stream_backup_restores_binary_files(native, tmp_path):
+    from io import BytesIO
+
+    from service.migration.tree_backup import AGFSTreeBackup
+
+    client, mount, _ = native
+    root = mount + "/business"
+    client.mkdir(root)
+    payload = bytes(range(256)) * 9000
+
+    class BoundedStream(BytesIO):
+        def read(self, size=-1):
+            assert 0 < size <= 1024 * 1024
+            return super().read(size)
+
+    client.write_stream(root + "/binary", BoundedStream(payload))
+    assert client.read(root + "/binary") == payload
+    client.write_stream(root + "/empty", BytesIO(b""))
+    backup = AGFSTreeBackup(client, [root], lambda: {"mount": mount})
+    destination = tmp_path / "backup"
+    manifest = backup.capture(destination)
+    client.write_stream(root + "/binary", BytesIO(b"short"))
+    assert client.read(root + "/binary") == b"short"
+    client.write(root + "/extra", b"discard")
+    backup.restore(destination, manifest)
+    assert client.read(root + "/binary") == payload
+    assert client.read(root + "/empty") == b""
+    assert {entry["name"] for entry in client.ls(root)} == {"binary", "empty"}
+
+
+def test_native_rejected_create_does_not_block_snapshot(native, tmp_path):
+    from service.migration.admission import Admission
+    from service.migration.maintenance import MaintenanceStore
+
+    client, mount, _ = native
+    admission = Admission(MaintenanceStore(tmp_path / "gate.db", "native"))
+    admission.guard(client)
+    client.mkdir(mount + "/existing")
+    with pytest.raises(AGFSHTTPError) as error:
+        client.mkdir(mount + "/existing")
+    assert error.value.status_code == 409
+    admission.store.enter("snapshot", mode="export", resources={})
+    admission.store.wait_drained("snapshot", 0)
+
+
 def _claim_files(config, mount, owner, ready, results):
     client = NativeAGFSClient(os.environ["AGFS_NATIVE_LIBRARY"], config)
     claimed = []

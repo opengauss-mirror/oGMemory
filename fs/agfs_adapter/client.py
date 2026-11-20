@@ -17,6 +17,10 @@ _mount_lock = threading.Lock()
 _mounts = {}
 
 
+class NativeAGFSHTTPError(AGFSHTTPError):
+    """The synchronous C call has returned; no remote write remains in flight."""
+
+
 class NativeAGFSClient:
 
     def __init__(self, library_path, config_path):
@@ -109,11 +113,11 @@ class NativeAGFSClient:
         message = self._string(self.lib.AGFS_GetLastError(error_id))
         lower = message.lower()
         if "not found" in lower or "no such file" in lower:
-            raise AGFSHTTPError(message, status_code=404)
+            raise NativeAGFSHTTPError(message, status_code=404)
         if "already exists" in lower or "file exists" in lower:
-            raise AGFSHTTPError(message, status_code=409)
+            raise NativeAGFSHTTPError(message, status_code=409)
         if "permission denied" in lower or "access denied" in lower:
-            raise AGFSHTTPError(message, status_code=403)
+            raise NativeAGFSHTTPError(message, status_code=403)
         raise AGFSClientError(message)
 
     def _json(self, method, *args):
@@ -141,6 +145,26 @@ class NativeAGFSClient:
 
     def write(self, path, data):
         return self._file_op("Write", path, data, len(data))["message"]
+
+    def write_stream(self, path, stream):
+        """Restore a file through the C ABI with bounded transfer buffers."""
+        write = getattr(self.lib, "AGFS_WriteChunk", None)
+        if write is None:
+            raise AGFSClientError("native AGFS library requires WriteChunk for migration recovery")
+        write.argtypes = [c.c_int64, c.c_char_p, c.c_void_p, c.c_int64, c.c_int64, c.c_int]
+        write.restype = c.c_void_p
+        with self._volume_lock(path, shared=False):
+            offset = 0
+            while True:
+                chunk = stream.read(1024 * 1024)
+                value = json.loads(self._string(write(self.id, path.encode(), chunk, len(chunk), offset, int(offset == 0))))
+                if 'error_id' in value:
+                    self._error(value['error_id'])
+                if value.get('bytes_written') != len(chunk):
+                    raise AGFSClientError('incomplete AGFS recovery write')
+                offset += len(chunk)
+                if not chunk:
+                    break
 
     def create(self, path):
         return self._json("Create", path.encode())
