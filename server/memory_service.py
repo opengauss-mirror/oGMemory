@@ -120,6 +120,7 @@ from service.extraction_retry import (
     retry_failed_source,
     source_only_recovery,
 )
+from service.extraction_recovery_discovery import AGENT_TURN_PENDING, AGENT_TURN_TASK
 from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
@@ -1769,7 +1770,7 @@ class MemoryService:
 
     @contextmanager
     def _parallel_session_summary(self, messages, session_time, ctx, session_id, write_api,
-                                  candidate_checkpoint=None):
+                                  candidate_checkpoint=None, publication_scope=None):
         """Join summary generation at the owner-thread write boundary."""
         from concurrent.futures import Future, ThreadPoolExecutor
         from contextvars import copy_context
@@ -1780,7 +1781,8 @@ class MemoryService:
         if restored is not None:
             self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
                                              candidate_checkpoint=candidate_checkpoint,
-                                             accepted_candidates=restored[0])
+                                              accepted_candidates=restored[0],
+                                              publication_scope=publication_scope)
             yield lambda: None
             return
         llm = self.get_llm()
@@ -1812,6 +1814,7 @@ class MemoryService:
                     self._generate_and_write_summary(
                         messages, session_time, ctx, session_id, write_api,
                         candidate_checkpoint=candidate_checkpoint, candidate_future=future,
+                        publication_scope=publication_scope,
                     )
                     written = True
 
@@ -1838,6 +1841,7 @@ class MemoryService:
         candidate_checkpoint=None,
         candidate_future=None,
         accepted_candidates=None,
+        publication_scope=None,
     ) -> None:
         """Generate L0 structured summary for a session and write to storage."""
         from core.model_stage import wait_model_result
@@ -1847,26 +1851,23 @@ class MemoryService:
             if accepted_candidates is None and candidate_checkpoint is not None:
                 restored = candidate_checkpoint.load()
                 accepted_candidates = restored[0] if restored is not None else None
-            if accepted_candidates is not None:
-                plans = write_api._write_checkpointed_candidates(accepted_candidates, ctx, candidate_checkpoint)
-                if accepted_candidates and not plans:
-                    raise RuntimeError("summary rejected before writing")
-                return
-            candidate = (wait_model_result(candidate_future) if candidate_future is not None else
-                         self._generate_summary_candidate(messages, session_time, session_id, self.get_llm()))
-            check_deadline()
-            if candidate is None:
-                if candidate_checkpoint is not None:
-                    candidate_checkpoint.accept([], 0, 0)
-                return
-            if candidate_checkpoint is not None:
+            candidate = None
+            if accepted_candidates is None:
+                candidate = (wait_model_result(candidate_future) if candidate_future is not None else
+                             self._generate_summary_candidate(messages, session_time, session_id, self.get_llm()))
                 check_deadline()
-                accepted = candidate_checkpoint.accept([candidate], 1, 0)
-                plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
-                if not plans:
-                    raise RuntimeError("summary rejected before writing")
-            else:
-                write_api.write_memory(candidate, ctx)
+            with (publication_scope or nullcontext)():
+                if candidate_checkpoint is not None:
+                    if accepted_candidates is None:
+                        accepted_candidates = candidate_checkpoint.accept([candidate] if candidate else [],
+                                                                           int(candidate is not None), 0)
+                    plans = write_api._write_checkpointed_candidates(accepted_candidates, ctx, candidate_checkpoint)
+                    if accepted_candidates and not plans:
+                        raise RuntimeError("summary rejected before writing")
+                elif candidate is not None:
+                    write_api.write_memory(candidate, ctx)
+            if candidate is None:
+                return
             logger.info(
                 "L0 summary written: session=%s len=%d",
                 session_id[:8], len(candidate.content),
@@ -2082,7 +2083,7 @@ class MemoryService:
                 logger.warning("Lifecycle extraction recovery session=%s archive=%s attempt=%d error=%s",
                                session_id, journal.batch["archive_id"], failures, exc)
 
-    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal):
+    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal, *, publication_scope=None):
         batch = journal.batch
         messages = batch["messages"]
         session_time = _parse_session_time(batch.get("session_time"))
@@ -2093,9 +2094,10 @@ class MemoryService:
 
         chunks = journal.chunks(make_chunks)
         for index, chunk in enumerate(chunks):
-            write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
-                                     session_id=session_id, session_time=session_time,
-                                     candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
+            with (publication_scope or nullcontext)():
+                write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
+                                         session_id=session_id, session_time=session_time,
+                                         candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
         aggregated = {"candidates_extracted": 0, "candidates_filtered": 0,
                       "writes_completed": 0, "writes_skipped": 0, "writes_failed": 0, "plans": []}
         from service.extraction_retry import source_only_reason
@@ -2107,7 +2109,8 @@ class MemoryService:
                     continue
                 checkpoint = journal.checkpoint(slot)
                 candidates, extracted, filtered = checkpoint.load()
-                plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
+                with (publication_scope or nullcontext)():
+                    plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
                 if slot == "summary":
                     continue
                 stored_candidates.extend(candidates)
@@ -2121,8 +2124,9 @@ class MemoryService:
             logger.warning("Extraction completed from preserved source session=%s archive=%s reason=%s",
                            session_id, batch["archive_id"], reason)
             failures = journal.unresolved_node_failures()
-            graph = write_api.finish_partial_relations(stored_candidates, stored_plans, ctx,
-                                                      checkpoint=journal.checkpoint("chunk:0"))
+            with (publication_scope or nullcontext)():
+                graph = write_api.finish_partial_relations(stored_candidates, stored_plans, ctx,
+                                                          checkpoint=journal.checkpoint("chunk:0"))
             return {**aggregated, "degraded": True,
                     "recovery_mode": "partial" if aggregated["writes_completed"] else "source_only",
                     "failed_nodes": failures, "graph": graph,
@@ -2130,7 +2134,8 @@ class MemoryService:
         from extraction.node_processing import NodeProcessingPartialError
         failures = []
         with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api,
-                                            journal.checkpoint("summary")) as before_write:
+                                            journal.checkpoint("summary"),
+                                            publication_scope) as before_write:
             for index, chunk in enumerate(chunks):
                 check_deadline()
                 try:
@@ -2138,7 +2143,8 @@ class MemoryService:
                         messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
                         session_time=session_time, session_summary=batch["session_summary"],
                         tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
-                        candidate_checkpoint=journal.checkpoint(f"chunk:{index}"), before_write=before_write)
+                        candidate_checkpoint=journal.checkpoint(f"chunk:{index}"), before_write=before_write,
+                        **({"publication_scope": publication_scope} if publication_scope else {}))
                 except NodeProcessingPartialError as exc:
                     failures.extend({"slot": f"chunk:{index}", **failure} for failure in exc.failures)
                     continue
@@ -4506,10 +4512,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_guard_session_mutation
     def commit_session_buffer(self, params: dict) -> dict:
-        if self._tool_result_governance is not None:
-            return self._tool_result_governance.commit_session_buffer(params)
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
+        buf = self.get_session_manager().get_or_create(session_id, ctx)
+        pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
+        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+            self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return {"ok": False, "status": "processing", "retryable": True,
+                    "reason": "agent_extraction_pending"}
+        if self._tool_result_governance is not None:
+            return self._tool_result_governance.commit_session_buffer(params)
         return self.get_session_manager().commit(
             session_id,
             ctx,
@@ -5622,6 +5634,121 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "request_id": client_request_id, "source_status": "CHECKPOINTED", "semantic_status": "PENDING",
                 "recovery_task": task, "last_error": str(error), **fields}
 
+    def _agent_turn_journal(self, ctx):
+        from session.session_manager import generate_archive_id
+
+        mgr = self.get_session_manager()
+        buf = mgr.get_or_create(ctx.session_id, ctx)
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        if pending:
+            if pending.get("agent_async"):
+                return ExtractionBatchJournal.resume(mgr, buf, ctx), None
+            return None, 1
+        request_id = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+        if not request_id:
+            return None, None
+        if buf.extraction_in_progress or buf.lifecycle_prepare_in_progress or buf.compaction_prepare_archive_id:
+            return None, 1
+        receipts = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+        for receipt in receipts.values():
+            if needs_projection_refresh(receipt):
+                resolved = self._resolve_write_outcome(receipt)
+                if resolved["projection_status"] in {"PENDING", "UNKNOWN"}:
+                    return None, 1
+        source = list(buf.messages[buf.extraction_watermark:])
+        if not source:
+            raise RecoveryNeedsConfirmationError("accepted agent turn has no pending source")
+        state = self._build_incremental_extraction_state(buf, incremental=source)
+        buf.runtime_extensions.pop(AGENT_TURN_PENDING)
+        try:
+            journal = ExtractionBatchJournal(
+                mgr, buf, ctx, source, archive_id=generate_archive_id(),
+                messages=state["messages"], session_time=state["session_time"],
+                session_summary=buf.extraction_summary, tool_stats_text=state["tool_stats_text"],
+                client_request_id=request_id,
+                request_source_ids=receipts.get(request_id, {}).get("source_message_ids", ()),
+                agent_async=True,
+            )
+        except Exception:
+            buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+            raise
+        return journal, None
+
+    def _dispose_agent_turn(self, mgr, buf, ctx):
+        with buf.session_state_save_lock:
+            with buf.extraction_lock:
+                pending = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
+                queued = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+                if not queued and not pending.get("agent_async"):
+                    return None
+                if buf.ordinary_turns_in_progress:
+                    return {"disposed": False, "flushed": False, "status": "processing",
+                            "retryable": True, "reason": "ordinary_turn_in_progress"}
+                waiting = {message.id for message in buf.messages[buf.extraction_watermark:]}
+                waiting.difference_update(pending.get("message_ids", ()))
+                if waiting and not queued:
+                    entries = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+                    request_id = next((key for key, outcome in reversed(entries.items())
+                                       if outcome.get("source_status") == "BUFFERED"
+                                       and not waiting.isdisjoint(outcome.get("source_message_ids", ()))), None)
+                    if not request_id:
+                        return {"disposed": False, "flushed": False, "status": "processing",
+                                "retryable": True, "reason": "agent_extraction_pending"}
+                    buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+            if waiting and not queued and not mgr.save_session_state(buf.session_id, ctx):
+                with buf.extraction_lock:
+                    buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
+                raise RecoveryPersistenceError("agent turn flush could not be saved")
+        self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+        return {"disposed": True, "flushed": False, "status": "background_flush_dispatched"}
+
+    @staticmethod
+    def _archived_extraction_outcome(write_result, request_id):
+        degraded = bool(write_result.get("degraded") or write_result.get("recovery_mode") == "source_only")
+        outcome = {"semantic_status": "DEGRADED" if degraded else "COMPLETE",
+                   "request_status": "DEGRADED" if degraded else "PROJECTING",
+                   "accepted": True, "writes_completed": write_result.get("writes_completed", 0),
+                   "candidates_extracted": write_result.get("candidates_extracted", 0)}
+        if degraded:
+            outcome["recovery_mode"] = write_result.get("recovery_mode", "source_only")
+            outcome["failed_nodes"] = deepcopy(write_result.get("failed_nodes", []))
+            outcome["error_detail"] = {
+                "code": "EXTRACTION_PARTIAL" if outcome["recovery_mode"] == "partial" else "EXTRACTION_SOURCE_ONLY",
+                "component": "extraction", "request_id": request_id, "retry_action": "manual_review",
+                "cause": {"message": str(write_result.get("reason", "source preserved after recovery"))[:1000]},
+            }
+        return outcome
+
+    def _process_agent_turn(self, ctx, journal, publication_scope):
+        mgr = journal.manager
+        batch = journal.batch
+        request_id, archive_id = batch["client_request_id"], batch["archive_id"]
+        snapshot = [SessionMessage(**message) for message in batch["snapshot"]]
+        write_api = self.get_write_api()
+        with mgr.parallel_archive_compression(snapshot, ctx.session_id, ctx, journal) as compression:
+            write_result = (self._chunk_and_extract_recoverable(
+                write_api, ctx, ctx.session_id, journal, publication_scope=publication_scope,
+            ) if batch["messages"] else {})
+        if self._write_result_has_failures(write_result):
+            if not journal.has_retryable_write_failure():
+                raise RecoveryNeedsConfirmationError("memory write outcome requires confirmation")
+            raise ExtractionIncompleteError("memory extraction write failed")
+        with publication_scope():
+            commit = mgr.commit_snapshot(
+                ctx.session_id, snapshot, ctx, wait=True, archive_id=archive_id,
+                compression_work=compression, compression_checkpoint=journal,
+            )
+            if not commit.get("archived"):
+                if commit.get("status") == "needs_confirmation":
+                    raise RecoveryNeedsConfirmationError(commit.get("error") or "archive requires confirmation")
+                raise RecoveryPersistenceError(commit.get("error") or "agent turn archive not committed")
+            if write_result.get("candidates_extracted", 0):
+                journal.buffer.extraction_summary = _update_extraction_summary(
+                    journal.buffer.extraction_summary, write_result)
+            self._invalidate_identity_cache_if_profile_written(ctx.session_id, write_result)
+            journal.finish(outcome=self._archived_extraction_outcome(write_result, request_id),
+                           resolve_outcome=self._resolve_write_outcome)
+
     def _refresh_write_outcomes(self, ctx):
         """Persist completed projection receipts under the existing session fence."""
         try:
@@ -5843,6 +5970,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         client_request_id = str(
             params.get("clientRequestId") or params.get("client_request_id") or ""
         ).strip()
+        async_capture = params.get("wait") is False and bool(client_request_id)
         automatic_card_identity = (self._cfg.card_format_enabled or self._cfg.node_processing_enabled) and not client_request_id
         if automatic_card_identity:
             client_request_id = "card-" + uuid4().hex
@@ -5871,7 +5999,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         def _save_idempotency_state() -> bool:
             if (
-                self._tool_result_externalizer is None
+                not async_capture and self._tool_result_externalizer is None
                 and not getattr(self._cfg, "session_state_bridge_enabled", True)
                 and not isinstance(self._write_api, _CheckpointWriteAPI)
             ):
@@ -5933,7 +6061,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
         pending_request_retry = bool(client_request_id and pending.get("client_request_id") == client_request_id)
-        if client_request_id and buf.request_completed(client_request_id) and not pending_request_retry:
+        if client_request_id and buf.request_completed(client_request_id) and (async_capture or not pending_request_retry):
             if not _save_idempotency_state():
                 return {
                     "ok": False,
@@ -6062,6 +6190,30 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             params, "forceExtract", "force_extract", default=False
         )
 
+        if async_capture:
+            frozen_ids = set(pending.get("message_ids", ()))
+            waiting = [message for message in buf.messages if message.id not in frozen_ids]
+            ready = bool(waiting) and (force_extract or sum(m.estimated_tokens for m in waiting) >= threshold)
+            previous = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+            if ready and self.get_write_api() is None:
+                return {"ok": False, "status": "failed", "retryable": True,
+                        "error": "write API unavailable for asynchronous extraction"}
+            if ready:
+                buf.runtime_extensions[AGENT_TURN_PENDING] = client_request_id
+            receipt = _complete_request({"ok": True, "status": "accumulating", "pending_tokens": pending_tokens})
+            if not receipt.get("ok"):
+                if previous is None:
+                    buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
+                else:
+                    buf.runtime_extensions[AGENT_TURN_PENDING] = previous
+            elif ready:
+                self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return receipt
+
+        if pending.get("agent_async") or buf.runtime_extensions.get(AGENT_TURN_PENDING):
+            return {"ok": False, "status": "processing", "retryable": True,
+                    "error": "asynchronous extraction is processing this session"}
+
         if pending_tokens < threshold and not force_extract and not buf.pending_extraction_ids():
             return _complete_request(
                 {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens,
@@ -6153,21 +6305,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         def _finish_archived_batch(write_result=None):
             write_result = write_result or {}
             if extraction_journal is not None:
-                degraded = bool(write_result.get("degraded") or write_result.get("recovery_mode") == "source_only")
-                outcome = {"semantic_status": "DEGRADED" if degraded else "COMPLETE",
-                           "request_status": "DEGRADED" if degraded else "PROJECTING",
-                           "accepted": True,
-                           "writes_completed": write_result.get("writes_completed", 0),
-                           "candidates_extracted": write_result.get("candidates_extracted", 0)}
-                if degraded:
-                    outcome["recovery_mode"] = write_result.get("recovery_mode", "source_only")
-                    outcome["failed_nodes"] = deepcopy(write_result.get("failed_nodes", []))
-                    outcome["error_detail"] = {"code": ("EXTRACTION_PARTIAL" if outcome["recovery_mode"] == "partial"
-                                                       else "EXTRACTION_SOURCE_ONLY"), "component": "extraction",
-                        "request_id": extraction_journal_request_id, "retry_action": "manual_review",
-                        "cause": {"message": str(write_result.get("reason", "source preserved after recovery"))[:1000]}}
                 completed_outcome.update(extraction_journal.finish(
-                    outcome=outcome, resolve_outcome=self._resolve_write_outcome,
+                    outcome=self._archived_extraction_outcome(write_result, extraction_journal_request_id),
+                    resolve_outcome=self._resolve_write_outcome,
                     current_request_id=client_request_id, current_source_ids=request_source_ids))
                 return len(archive_snapshot)
             removed = buf.remove_messages_by_id(archive_snapshot_ids)
@@ -6885,6 +7025,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
         kind = lifecycle_kind(buf)
+        pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
+        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+            self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return {"ok": False, "status": "processing", "retryable": True,
+                    "session_id": session_id, "reason": "agent_extraction_pending"}
         if buf.pending_extraction_ids() and kind != "compaction":
             return {"ok": False, "status": "needs_confirmation", "retryable": False,
                     "session_id": session_id,
@@ -7507,6 +7652,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         operation = _DisposeOperationLease(buf)
         source_stack = ExitStack()
         try:
+            deferred = self._dispose_agent_turn(mgr, buf, ctx)
+            if deferred is not None:
+                return deferred
             with buf.extraction_lock:
                 if buf.ordinary_turns_in_progress:
                     return {"disposed": False, "flushed": False, "status": "processing",
@@ -7774,6 +7922,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         with buf.extraction_lock:
             extension = deepcopy(buf.runtime_extensions.get(EXTENSION_KEY))
+            agent_turn_pending = bool(buf.runtime_extensions.get(AGENT_TURN_PENDING))
         if extension is not None:
             batch = extension.get("batch") if isinstance(extension, dict) else None
             if (not isinstance(extension, dict) or extension.get("version") != 1
@@ -7800,6 +7949,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "status": failure.get("status", "pending"),
                     "retryable": failure.get("retryable", True),
                     "extraction_in_progress": False, "dispose_in_progress": False}
+
+        if agent_turn_pending:
+            self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return {"idle": False, "reason": "agent_extraction_pending", "status": "queued",
+                    "retryable": True, "extraction_in_progress": False, "dispose_in_progress": False}
 
         if drain_outbox:
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)

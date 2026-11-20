@@ -31,6 +31,12 @@ from core.operation_deadline import check_deadline, remaining_seconds, write_out
 logger = get_logger(__name__)
 
 
+class ArchivePreparationRequired(Exception):
+    def __init__(self, candidate, plan):
+        self.candidate = candidate
+        self.plan = plan
+
+
 def _check_prewrite_deadline():
     """Only use before physical storage is invoked, never after its outcome."""
     try:
@@ -152,7 +158,10 @@ class ContextWriter:
     def write_candidate(
         self,
         candidate: CandidateMemory,
-        ctx: RequestContext
+        ctx: RequestContext,
+        *,
+        build_archive=None,
+        before_persistence=None,
     ) -> WritePlan:
         """Resolve managed memory identities before committing their nodes."""
         _check_prewrite_deadline()
@@ -178,8 +187,10 @@ class ContextWriter:
         def commit(
             candidate: CandidateMemory, ctx: RequestContext, identity_plan: WritePlan | None = None,
         ) -> WritePlan:
+            preparation = ({"build_archive": build_archive, "before_persistence": before_persistence}
+                           if build_archive is not None or before_persistence is not None else {})
             return self._write_candidate(
-                candidate, ctx, identity_plan, on_persistence=mark_persistence,
+                candidate, ctx, identity_plan, on_persistence=mark_persistence, **preparation,
             )
 
         def recover_receipt():
@@ -216,6 +227,8 @@ class ContextWriter:
                     committed = recover_receipt()
                     return committed or commit(candidate, ctx)
             return commit(candidate, ctx)
+        except ArchivePreparationRequired:
+            raise
         except OperationDeadlineExceededError as exc:
             if not persistence_started:
                 raise WriteDeadlineExceededError(str(exc)) from exc
@@ -245,6 +258,8 @@ class ContextWriter:
         identity_plan: WritePlan | None = None,
         *,
         on_persistence: Callable[[bool], None] | None = None,
+        build_archive=None,
+        before_persistence=None,
     ) -> WritePlan:
         """Write a single candidate memory.
 
@@ -389,7 +404,8 @@ class ContextWriter:
                         )
                     else:
                         try:
-                            node = self._archive_builder.build(candidate, plan, ctx)
+                            build = build_archive or self._archive_builder.build
+                            node = build(candidate, plan, ctx)
                         except OperationDeadlineExceededError as exc:
                             raise WriteDeadlineExceededError(str(exc)) from exc
                     attach_receipt(self._fs, node, candidate, ctx)
@@ -437,6 +453,8 @@ class ContextWriter:
                         persist = self._fs.write_node
                         write_args = (node, ctx)
                     _check_prewrite_deadline()
+                    if before_persistence is not None:
+                        before_persistence()
                     if candidate.write_operation_id:
                         bind_operation_target(self._fs, self._identity_resolver.uris, candidate, ctx, node.uri)
                     try:
@@ -502,7 +520,7 @@ class ContextWriter:
                     lock.release()
 
             except ConcurrentModificationError as e:
-                if identity_plan is not None or candidate.target_uri:
+                if identity_plan is not None or candidate.target_uri or before_persistence is not None:
                     raise
                 if attempt < max_retries - 1:
                     # Retry with exponential backoff, capped to the

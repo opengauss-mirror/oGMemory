@@ -10,6 +10,8 @@ from core.models import RequestContext
 from core.write_contract import OUTCOMES_KEY, needs_projection_refresh
 
 DISCOVERY_KEY = "memory_extraction_recovery_discovery"
+AGENT_TURN_PENDING = "memory_agent_turn_pending"
+AGENT_TURN_TASK = "agent-turn"
 _STATE_URI = re.compile(r"^ctx://([^/]+)/sessions/([^/]+)/state(?:\.json)?$")
 logger = logging.getLogger(__name__)
 
@@ -17,13 +19,19 @@ logger = logging.getLogger(__name__)
 def recovery_discovery_hint(payload):
     """Project the source owner and task identity into session metadata."""
     extensions = payload.get("runtime_extensions", {})
-    hint = {"projection_pending": any(needs_projection_refresh(outcome)
-            for outcome in extensions.get(OUTCOMES_KEY, {}).get("entries", {}).values())}
+    hint = {
+        "projection_pending": any(needs_projection_refresh(outcome)
+            for outcome in extensions.get(OUTCOMES_KEY, {}).get("entries", {}).values()),
+        "agent_turn_pending": bool(extensions.get(AGENT_TURN_PENDING)),
+    }
     extension = extensions.get("memory_extraction_recovery", {})
     batch = extension.get("batch")
     if extension.get("version") != 1 or not isinstance(batch, dict) or "lifecycle" in batch:
         return hint
     task = batch.get("retry_task")
+    if batch.get("agent_async") and (not isinstance(task, dict)
+                                    or task.get("status") in {"queued", "running", "failed"}):
+        hint["agent_turn_pending"] = True
     if isinstance(task, dict):
         task = {key: task[key] for key in ("id", "status", "attempts") if key in task}
     elif (task is None and isinstance(batch.get("snapshot"), list)
@@ -31,7 +39,8 @@ def recovery_discovery_hint(payload):
         task = {"id": batch.get("archive_id"), "status": "queued", "recovered_source": True}
     else:
         return hint
-    return {**hint, "owner": batch.get("owner"), "archive_id": batch.get("archive_id"), "task": task}
+    return {**hint, "owner": batch.get("owner"), "archive_id": batch.get("archive_id"),
+            "task": task, "agent_async": batch.get("agent_async", False)}
 
 
 class ExtractionRecoveryDiscovery:
@@ -128,11 +137,14 @@ class ExtractionRecoveryDiscovery:
                 self._projection_handler(ctx)
             except Exception:
                 logger.exception("Cannot refresh write projection receipts for %s", uri)
-        if not isinstance(hint, dict) or hint.get("owner") != owner:
+        if not isinstance(hint, dict):
             return None
         task = hint.get("task")
-        if (not isinstance(task, dict) or task.get("status") not in {"queued", "running", "failed"}
-                or not isinstance(task.get("id"), str) or not task["id"]
-                or task["id"] != hint.get("archive_id")):
-            return None
-        return ctx, dict(task)
+        if (hint.get("owner") == owner and not hint.get("agent_async")
+                and isinstance(task, dict) and task.get("status") in {"queued", "running", "failed"}
+                and isinstance(task.get("id"), str) and task["id"]
+                and task["id"] == hint.get("archive_id")):
+            return ctx, dict(task)
+        if hint.get("agent_turn_pending"):
+            return ctx, {"id": AGENT_TURN_TASK, "status": "queued"}
+        return None

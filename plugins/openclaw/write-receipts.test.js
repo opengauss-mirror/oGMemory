@@ -7,11 +7,13 @@ import plugin, { callHttp, runCompactControlFlow } from "./index.js";
 async function receiptServer(t, buffered = false, requestId = "server-receipt", replies = []) {
   const calls = [];
   const server = createServer(async (req, res) => {
-    let body = "";
-    for await (const chunk of req) body += chunk;
-    calls.push({ method: req.method, path: req.url, headers: req.headers, body: JSON.parse(body || "{}") });
+    let rawBody = "";
+    for await (const chunk of req) rawBody += chunk;
+    const body = JSON.parse(rawBody || "{}");
+    calls.push({ method: req.method, path: req.url, headers: req.headers, body });
     const accepted = req.method === "POST";
-    const [status, response] = replies[calls.length - 1] ?? [accepted ? 202 : 200, {
+    const reply = replies[calls.length - 1];
+    const [status, response] = (typeof reply === "function" ? reply(body) : reply) ?? [accepted ? 202 : 200, {
       ok: true, request_id: requestId, request_status: accepted ? "ACCEPTED" : "SUCCEEDED",
       source_status: buffered ? "BUFFERED" : "ARCHIVED",
       retry_action: accepted && !buffered ? "poll" : "none",
@@ -126,6 +128,61 @@ function receiptEngine(url, toolResultExternalizationEnabled = false) {
   return factory();
 }
 
+test("compaction delegates to the runtime while the session is extracting", async (t) => {
+  const { url, calls } = await receiptServer(t, false, "unused", [
+    [200, { ok: false, status: "processing", reason: "agent_extraction_pending", retryable: true }],
+  ]);
+  const result = await runCompactControlFlow({
+    cfg: { compactTakeoverEnabled: true },
+    params: { sessionId: "live-session" },
+    call: (method, params) => callHttp(url, method, params),
+    runtimeDelegate: async () => ({ ok: true, compacted: true }),
+  });
+
+  assert.equal(result.compacted, true);
+  assert.deepEqual(calls.map(({ path }) => path), ["/api/v1/prepare_compaction"]);
+});
+
+test("ordinary turns continue through assemble on a durable source receipt", async (t) => {
+  const accept = (body) => [202, {
+    ok: true, accepted: true, request_id: body.clientRequestId,
+    request_status: "ACCEPTED", source_status: "BUFFERED",
+    semantic_status: "PENDING", terminal: false, retry_action: "poll",
+  }];
+  const { url, calls } = await receiptServer(t, false, "fixture", [
+    accept, [200, { messages: [], estimatedTokens: 0 }], accept,
+  ]);
+  const engine = receiptEngine(url, true);
+  const first = {
+    sessionId: "field-notes", userId: "alice", agentId: "worker",
+    messages: [
+      { role: "user", content: "I recorded an outage in the maintenance log." },
+      { role: "assistant", content: "I will include that in the handoff." },
+    ],
+    runtimeContext: { currentMessageId: "turn-1" },
+  };
+  const next = {
+    ...first, messages: [...first.messages, { role: "user", content: "When did it start?" }],
+    runtimeContext: { currentMessageId: "turn-2" },
+  };
+  const firstReceipt = await engine.afterTurn(first);
+  await engine.assemble(next);
+  const nextReceipt = await engine.afterTurn({
+    ...next, messages: [...next.messages, { role: "assistant", content: "I will check the log." }],
+  });
+
+  assert.deepEqual(calls.map(({ method, path }) => [method, path]), [
+    ["POST", "/api/v1/after_turn"],
+    ["POST", "/api/v1/compose"],
+    ["POST", "/api/v1/after_turn"],
+  ]);
+  assert.equal(firstReceipt.source_status, "BUFFERED");
+  assert.equal(firstReceipt.semantic_status, "PENDING");
+  assert.deepEqual([calls[0].body.wait, calls[2].body.wait], [false, false]);
+  assert.equal(firstReceipt.request_id, calls[0].body.clientRequestId);
+  assert.equal(nextReceipt.request_id, calls[2].body.clientRequestId);
+});
+
 const pendingSourceReceipt = {
   ok: false, request_id: "original-request", request_status: "DEGRADED",
   source_status: "ARCHIVED", semantic_status: "DEGRADED", projection_status: "PENDING",
@@ -148,7 +205,7 @@ for (const [name, reply, observationStatus] of [
       [200, { ok: true, request_id: "next-request", request_status: "SUCCEEDED", retry_action: "none" }],
     ]);
     const engine = receiptEngine(url, true);
-    const snapshot = { sessionId: "resume-poll", userId: "alice", agentId: "worker",
+    const snapshot = { sessionId: "resume-poll", userId: "alice", agentId: "worker", wait: true,
       prePromptMessageCount: 0, messages: [{ role: "user", content: "Remember blue." }] };
     const pending = await engine.afterTurn({
       ...snapshot, runtimeContext: { currentMessageId: "inbound-1" },
@@ -187,7 +244,7 @@ test("missing write receipt stays unconfirmed and the next queued turn completes
   const errors = [];
   t.mock.method(console, "error", (line) => errors.push(line));
   const engine = receiptEngine(url, true);
-  const snapshot = { sessionId: "receipt-missing", userId: "alice", agentId: "worker",
+  const snapshot = { sessionId: "receipt-missing", userId: "alice", agentId: "worker", wait: true,
     prePromptMessageCount: 0, messages: [{ role: "user", content: "Remember blue." }] };
   const unresolved = await engine.afterTurn({ ...snapshot, runtimeContext: { currentMessageId: "inbound-1" } });
   const next = await engine.afterTurn({ ...snapshot, runtimeContext: { currentMessageId: "inbound-2" } });
@@ -209,7 +266,11 @@ test("missing write receipt stays unconfirmed and the next queued turn completes
 });
 
 test("identical dialogue in distinct runtime turns has separate stable receipts", async (t) => {
-  const { url, calls } = await receiptServer(t, true);
+  const accepted = (body) => [202, {
+    ok: true, accepted: true, request_id: body.clientRequestId, request_status: "ACCEPTED",
+    source_status: "BUFFERED", retry_action: "none",
+  }];
+  const { url, calls } = await receiptServer(t, true, undefined, [accepted, accepted, accepted]);
   const engine = receiptEngine(url);
   const snapshot = { sessionId: "repeated-dialogue", userId: "alice", agentId: "worker",
     prePromptMessageCount: 0, messages: [

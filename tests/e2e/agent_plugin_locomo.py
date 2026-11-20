@@ -142,6 +142,8 @@ class ReadOnlyQaProxy:
                         "session_id": payload.get("sessionId") or payload.get("session_id"),
                         "client_request_id": payload.get("clientRequestId") or payload.get("client_request_id"),
                         "request_id": result.get("request_id"),
+                        "wait": payload.get("wait"),
+                        "accepted": result.get("accepted"),
                         "user_message_fingerprints": _user_message_fingerprints(payload),
                         "http_status": response.status_code,
                         "duration_seconds": time.monotonic() - started,
@@ -409,24 +411,33 @@ class PluginAdapter:
                     state = row.get("request_status")
                     if state in {"FAILED", "NEEDS_CONFIRMATION"} or (state == "DEGRADED" and not request_id):
                         raise self.common.WriteRequestTerminal(row)
+                    if row.get("wait") is False and state != "DEGRADED":
+                        if (row.get("accepted") is not True or not row.get("client_request_id")
+                                or row.get("request_id") != row["client_request_id"]
+                                or not 200 <= row["http_status"] < 300
+                                or row.get("source_status") not in {"BUFFERED", "CHECKPOINTED", "ARCHIVED", "RAW_ARCHIVED"}):
+                            break
+                        continue
                     if request_id and state and (state == "DEGRADED" or row.get("source_status") != "BUFFERED"):
                         self.common.wait_write_request(self.args, sid, request_id,
                             observations=self.proxy.request_observations, deadline=deadline)
                     else:
                         self.common.wait_idle(self.args, sid, observations=self.proxy.request_observations,
                                               deadline=deadline)
-                return reply, usage, sorted(ids)
+                else:
+                    return reply, usage, sorted(ids)
             if time.monotonic() >= deadline:
                 raise self.common.WriteObservationTimeout(f"plugin write acknowledgement unobserved: {key}")
             time.sleep(1)
 
     def settle(self, sid):
-        result = self.common.flush_source(self.args, sid)
+        deadline = time.monotonic() + self.args.write_wait_timeout
+        result = self.common.flush_source(self.args, sid, deadline=deadline)
         requests_by_id = {row.get("request_id") or row.get("client_request_id"): row for row in self.proxy.observed_writes
                           if row["session_id"] == sid and (row.get("request_id") or row.get("client_request_id"))
                           and row.get("request_status")}
         result["requests"] = [self.common.write_status_summary(self.common.wait_write_request(
-            self.args, sid, request_id, observations=self.proxy.request_observations))
+            self.args, sid, request_id, observations=self.proxy.request_observations, deadline=deadline))
             for request_id in requests_by_id]
         return result
 
