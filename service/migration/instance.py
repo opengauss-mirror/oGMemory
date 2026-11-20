@@ -1,6 +1,4 @@
 """Migration execution for services registered in the local instance gate."""
-import hashlib
-import json
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
@@ -8,7 +6,7 @@ from pathlib import Path
 from service.migration.bundle import backup_components, configuration_binding
 from service.migration.engine import MigrationService
 from service.migration.maintenance import MaintenanceError
-from service.migration.package import open_package
+from service.migration.package import open_package, package_identity
 from service.migration.participants import wait_participants
 from service.migration.rebuild import Rebuilder
 from service.migration.recovery import RecoveryImport
@@ -137,7 +135,6 @@ class InstanceMigration:
         from service.migration.space_scope import incoming_scope
 
         with open_package(source) as package, self._execution(task) as (_, factory):
-            request = {'manifest_sha256': hashlib.sha256(json.dumps(
-                package.manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+            request = package_identity(package.manifest)
             with incoming_scope(package) as (incoming, _), factory(request, incoming) as recovery:
                 return recovery.recover(task, progress=progress)

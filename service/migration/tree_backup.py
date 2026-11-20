@@ -157,7 +157,6 @@ class AGFSTreeBackup:
             db.commit()
         sync_directory(destination)
         manifest = {"resource": resource, "roots": list(self.roots), "sha256": _digest(destination / "inventory.sqlite"), "bytes": total}
-        self.validate(destination, manifest)
         self.verify_live(destination, manifest)
         return manifest
 

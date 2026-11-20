@@ -14,7 +14,13 @@ from urllib.parse import unquote, urlsplit
 from cli import __version__
 from service.migration.assets import Assets
 from service.migration.description import compatibility, describe
-from service.migration.package import DATASETS, PackageError, open_package, write_package
+from service.migration.package import (
+    DATASETS,
+    PackageError,
+    open_package,
+    package_identity,
+    write_package,
+)
 from service.migration.records import (
     archive_uri,
     identity,
@@ -364,8 +370,7 @@ class MigrationService:
         from service.migration.space_selection import confirm_selection, select_spaces
 
         with open_package(source) as package, ExitStack() as lifetime:
-            request_identity = {'manifest_sha256': hashlib.sha256(json.dumps(
-                package.manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+            request_identity = package_identity(package.manifest)
             incoming, spaces = lifetime.enter_context(incoming_scope(package))
             assets = self._validate_source(package, incoming)
             recovery = lifetime.enter_context(recovery_factory(request_identity, incoming))

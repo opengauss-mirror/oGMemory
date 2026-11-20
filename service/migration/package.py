@@ -44,6 +44,12 @@ class PackageLimits:
             raise ValueError("package limits must be positive integers")
 
 
+def package_identity(manifest):
+    """Bind import and recovery to the same validated manifest representation."""
+    return {'manifest_sha256': hashlib.sha256(json.dumps(
+        manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+
+
 def _unique_object(pairs):
     result = {}
     for key, value in pairs:

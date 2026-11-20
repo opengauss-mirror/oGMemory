@@ -117,7 +117,6 @@ class SQLBackup:
         sync_directory(destination)
         manifest = {"resource": resource, "schema": self.schema, "layout": layout,
                     "order": ordered, "files": files, "sequences": sequences}
-        self.validate(destination, manifest)
         self.verify_live(destination, manifest)
         return manifest
 

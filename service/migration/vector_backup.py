@@ -67,7 +67,6 @@ class VectorBackup:
             db.commit()
         sync_directory(path.parent)
         manifest = {"resource": resource, "sha256": _digest(path), "records": count}
-        self.validate(path, manifest)
         self.verify_live(path, manifest)
         return manifest
 

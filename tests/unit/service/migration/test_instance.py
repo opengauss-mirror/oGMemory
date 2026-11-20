@@ -133,3 +133,25 @@ def test_initialized_content_reader_remains_available_during_export(instance):
                 assert service._get_context_fs() is fs
         finally:
             migration.gate.reopen('read-during-export')
+
+
+def test_close_failure_cannot_reopen_with_old_index(instance, tmp_path, monkeypatch):
+    _, migration, _ = instance
+    source = package(tmp_path)
+    failed = []
+    original = Rebuilder.close
+    def fail_once(self):
+        if not failed:
+            failed.append(self)
+            raise RuntimeError('injected close failure')
+        return original(self)
+    monkeypatch.setattr(Rebuilder, 'close', fail_once)
+    try:
+        with pytest.raises(RuntimeError, match='injected close failure'):
+            migration.merge(source, task='close-failed')
+        assert migration.gate.status() is not None
+        migration.recover(source, task='close-failed')
+        assert migration.gate.status() is not None or failed[0].vector is None, 'admission reopened while migration vector remained live'
+    finally:
+        for obj in failed:
+            original(obj)
