@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, Final
 
@@ -105,6 +106,12 @@ GPT_4O_MINI = "gpt-4o-mini"
 GPT_4_TURBO = "gpt-4-turbo"
 
 
+class _StreamCallbackError(Exception):
+    def __init__(self, error: Exception):
+        self.error = error
+        super().__init__(str(error))
+
+
 class OpenAILLM(LLM):
     """OpenAI LLM with JSON mode fallback and token tracking.
 
@@ -162,7 +169,7 @@ class OpenAILLM(LLM):
         self._client = OpenAI(timeout=request_timeout_seconds, **client_kwargs)
         self.token_tracker = TokenTracker(model=self._model)
 
-    def _create_completion(self, **kwargs):
+    def _create_completion(self, *, on_text_delta=None, **kwargs):
         remaining = remaining_seconds()
         client = (self._client if remaining is None else
                   self._client.with_options(timeout=min(120.0, remaining), max_retries=0))
@@ -179,9 +186,9 @@ class OpenAILLM(LLM):
                 kwargs["timeout"] = min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining
         attempted = False
         try:
-            if (kwargs.get("extra_body") or {}).get("stream") is True:
-                body = dict(kwargs["extra_body"])
-                body.pop("stream")
+            if on_text_delta is not None or (kwargs.get("extra_body") or {}).get("stream") is True:
+                body = dict(kwargs.get("extra_body") or {})
+                body.pop("stream", None)
                 kwargs["stream_options"] = {
                     **(body.pop("stream_options", None) or {}),
                     "include_usage": True,
@@ -191,7 +198,7 @@ class OpenAILLM(LLM):
                     check_deadline()
                     attempted = True
                     with client.beta.chat.completions.stream(**kwargs) as stream:
-                        if remaining is not None:
+                        if remaining is not None or on_text_delta is not None:
                             for _event in stream:
                                 try:
                                     check_deadline()
@@ -202,6 +209,11 @@ class OpenAILLM(LLM):
                                     if snapshot.usage is not None:
                                         return snapshot
                                     raise
+                                if on_text_delta is not None and _event.type == "content.delta":
+                                    try:
+                                        on_text_delta(_event.delta)
+                                    except Exception as exc:
+                                        raise _StreamCallbackError(exc) from exc
                         return stream.get_final_completion()
                 except LengthFinishReasonError as exc:
                     return exc.completion
@@ -993,6 +1005,8 @@ class OpenAILLM(LLM):
         messages: list[dict],
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
+        *,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> tuple[list[dict], str]:
         prepared_messages = []
         for msg in messages:
@@ -1021,6 +1035,7 @@ class OpenAILLM(LLM):
             response = self._create_completion(
                 model=self._model,
                 messages=prepared_messages,
+                **({"on_text_delta": on_text_delta} if on_text_delta is not None else {}),
                 **tool_parameters,
                 **self._completion_parameters(self._temperature),
             )
@@ -1047,6 +1062,8 @@ class OpenAILLM(LLM):
 
             return tool_calls, content
 
+        except _StreamCallbackError as exc:
+            raise exc.error
         except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError,
                 ToolCallProtocolError, UsagePersistenceError):
             raise
@@ -1195,10 +1212,14 @@ class CachedOpenAILLM(OpenAILLM):
         messages: list[dict],
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
+        *,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> tuple[list[dict], str]:
         """Cached version of messages-based tool use."""
         # For now, delegate to parent (caching messages is complex)
-        return super().complete_with_tools_messages(messages, tools, tool_choice)
+        return super().complete_with_tools_messages(
+            messages, tools, tool_choice, on_text_delta=on_text_delta
+        )
 
     def clear_cache(self) -> None:
         """Clear the response cache."""

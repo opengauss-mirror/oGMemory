@@ -14,6 +14,7 @@ from commit.write_receipts import operation_digest
 from core.models import CandidateMemory, ContextNode
 from core.model_stage import stage_digest
 from core.write_contract import OUTCOMES_KEY, store_outcome, merge_source_outcome
+from service.extraction_receipts import compact_plans
 
 EXTENSION_KEY = "memory_extraction_recovery"
 logger = logging.getLogger(__name__)
@@ -265,6 +266,11 @@ class ExtractionBatchJournal:
                 old_outcomes = deepcopy(self.buffer.runtime_extensions.get(OUTCOMES_KEY))
                 client_request_id = batch.get("client_request_id", "")
                 receipt = deepcopy(outcome or {})
+                receipt["plans"] = compact_plans(
+                    operation["plan"] for name, slot in batch["slots"].items()
+                    if not name.startswith("raw:")
+                    for operation in slot.get("operations", {}).values()
+                    if operation.get("status") == "complete" and operation.get("plan"))
                 references = [tuple(item) for item in batch.get("outbox_events", [])]
                 references.extend(current_outbox_events(self.ctx.account_id) or [])
                 receipt.update(request_id=client_request_id, archive_id=batch["archive_id"],
@@ -301,6 +307,7 @@ class ExtractionBatchJournal:
                     if (pending_receipt.get("source_status") == "BUFFERED" and source_ids
                             and not batch_ids.isdisjoint(source_ids)) or request_id == client_request_id:
                         merged = merge_source_outcome(pending_receipt, {**batch_receipt, "request_id": request_id}, batch["message_ids"])
+                        merged["plans"] = compact_plans(pending_receipt.get("plans", []) + batch_receipt["plans"])
                         if request_id == current_request_id and request_id != client_request_id:
                             self.buffer.mark_request_completed(request_id)
                         merged = store_outcome(self.buffer, request_id, merged,
