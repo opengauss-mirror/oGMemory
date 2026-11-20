@@ -12,11 +12,44 @@ import threading
 import time
 
 from core.interfaces import VectorIndex
-from core.lexical import LexicalIndex, lexical_record_from_index_record
+from core.lexical import (
+    HybridLexicalIndex,
+    LexicalIndex,
+    lexical_record_from_index_record,
+    lexical_scopes_from_index_records,
+)
 from core.models import IndexRecord
 from core.projection_ownership import check_projection_owner
 
 logger = logging.getLogger(__name__)
+
+
+def create_projection_writer(config, vector_index):
+    if not config.retrieval_uses_lexical_projection:
+        return vector_index
+
+    from providers.lexical_index import create_lexical_index
+
+    lexical = None
+    try:
+        lexical = create_lexical_index(config)
+        if not isinstance(lexical, HybridLexicalIndex):
+            raise TypeError("inverted index provider lacks durable checkpoint capabilities")
+        writer = CompositeProjectionWriter(vector_index, lexical)
+        writer.set_failure_callbacks(
+            records_failed=lambda records: lexical.mark_scopes_dirty(lexical_scopes_from_index_records(records)),
+            scope_unknown_failed=lexical.mark_all_scopes_dirty,
+        )
+        return writer
+    except Exception:
+        for resource in (lexical, vector_index):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.warning("Resource cleanup failed after lexical initialization error", exc_info=True)
+        raise
 
 
 class CompositeProjectionWriter:
@@ -24,7 +57,7 @@ class CompositeProjectionWriter:
 
     def __init__(
         self,
-        vector: VectorIndex,
+        vector: VectorIndex | None,
         lexical: LexicalIndex,
         projection_lock: threading.RLock | None = None,
     ) -> None:
@@ -35,6 +68,8 @@ class CompositeProjectionWriter:
         self._on_records_failed = None
         self._on_scope_unknown_failed = None
         self._vector_close_event = threading.Event()
+        if vector is None:
+            self._vector_close_event.set()
         self._vector_close_thread: threading.Thread | None = None
         self._vector_close_result = True
         self._vector_close_error: Exception | None = None
@@ -67,13 +102,14 @@ class CompositeProjectionWriter:
                 check_projection_owner()
                 self._best_effort_callback(self._on_records_failed, records)
                 raise
-            try:
-                self.vector_index.upsert(records)
-            except Exception:
-                check_projection_owner()
-                self._best_effort_callback(self._on_records_failed, records)
-                self._best_effort_lexical_delete([record.id for record in records])
-                raise
+            if self.vector_index is not None:
+                try:
+                    self.vector_index.upsert(records)
+                except Exception:
+                    check_projection_owner()
+                    self._best_effort_callback(self._on_records_failed, records)
+                    self._best_effort_lexical_delete([record.id for record in records])
+                    raise
 
     def _best_effort_lexical_delete(self, record_ids: list[str]) -> None:
         try:
@@ -85,7 +121,8 @@ class CompositeProjectionWriter:
         if not ids:
             return
         with self._projection_lock:
-            self.vector_index.delete(ids)
+            if self.vector_index is not None:
+                self.vector_index.delete(ids)
             try:
                 self.lexical_index.delete(ids)
             except Exception:
@@ -94,23 +131,23 @@ class CompositeProjectionWriter:
 
     def delete_account_data(self, account_id: str) -> int:
         with self._projection_lock:
-            count = self.vector_index.delete_account_data(account_id)
+            count = self.vector_index.delete_account_data(account_id) if self.vector_index is not None else None
             try:
-                self.lexical_index.delete_scope(account_id=account_id)
+                lexical_count = self.lexical_index.delete_scope(account_id=account_id)
             except Exception:
                 self._best_effort_callback(self._on_scope_unknown_failed)
                 raise
-        return count
+            return lexical_count if count is None else count
 
     def delete_by_owner_space(self, account_id: str, owner_space: str) -> int:
         with self._projection_lock:
-            count = self.vector_index.delete_by_owner_space(account_id, owner_space)
+            count = self.vector_index.delete_by_owner_space(account_id, owner_space) if self.vector_index is not None else None
             try:
-                self.lexical_index.delete_scope(account_id=account_id, owner_space=owner_space)
+                lexical_count = self.lexical_index.delete_scope(account_id=account_id, owner_space=owner_space)
             except Exception:
                 self._best_effort_callback(self._on_scope_unknown_failed)
                 raise
-        return count
+            return lexical_count if count is None else count
 
     def close(self, timeout: float = 5.0) -> bool:
         if self._closed:
@@ -138,7 +175,7 @@ class CompositeProjectionWriter:
             self._projection_lock.release()
 
     def _start_vector_close(self) -> None:
-        if self._vector_close_thread is not None:
+        if self.vector_index is None or self._vector_close_thread is not None:
             return
 
         def close_vector() -> None:

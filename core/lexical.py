@@ -26,6 +26,7 @@ INDEXABLE_METADATA_FIELDS = frozenset(
         "agent_memory_unit_key",
         "unit_revision",
         "agent_memory_version",
+        "canonical_revision",
         "grounding",
     }
 )

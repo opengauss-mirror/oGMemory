@@ -7,6 +7,8 @@ import time
 from typing import Any
 
 from core.lexical import LexicalHit, LexicalRecord
+from core.memory_names import AGFS_SEARCH_DIRECTORY_PATTERN
+from core.operation_deadline import check_deadline, remaining_seconds
 from providers.lexical_index.sql_index import (
     PreparedSQLLexicalRecord,
     SQLNativeProjectionStore,
@@ -257,6 +259,8 @@ def supports_native_bm25(cursor) -> bool:
 class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
     """openGauss BM25 provider backed by the native BM25 access method."""
 
+    supported_filters = DatabaseNativeLexicalIndex.supported_filters | {"agfs_leaves_only"}
+
     def __init__(
         self,
         *,
@@ -343,6 +347,7 @@ class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
         if top_k < 1 or not query.strip():
             return []
         query = self._bounded_query(query)
+        leaves_only = filters.pop("agfs_leaves_only", False)
 
         started = time.monotonic()
         conn = self._borrow()
@@ -350,6 +355,9 @@ class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
             with conn.cursor() as cur:
                 self._configure_bm25_session(cur, top_k)
                 where_sql, params = self._filter_where(filters)
+                if leaves_only:
+                    where_sql += " AND d.uri !~ %s"
+                    params = (*params, AGFS_SEARCH_DIRECTORY_PATTERN)
                 index_name = f"idx_{self._table}_native_bm25"
                 cur.execute(
                     f"""
@@ -382,7 +390,12 @@ class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
             self._return(conn)
 
     def _configure_bm25_session(self, cur, top_k: int) -> None:
-        settings = [("statement_timeout", str(self._query_timeout_ms))]
+        check_deadline()
+        remaining = remaining_seconds()
+        timeout_ms = self._query_timeout_ms if remaining is None else min(
+            self._query_timeout_ms, max(1, int(remaining * 1000)),
+        )
+        settings = [("statement_timeout", str(timeout_ms))]
         configured_topk = self._bm25_topk or max(5, min(200, top_k))
         # openGauss expands beyond bm25_topk when LIMIT requests more rows.
         settings.append(("bm25_topk", str(max(configured_topk, min(200, top_k)))))

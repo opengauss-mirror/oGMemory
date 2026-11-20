@@ -12,7 +12,9 @@ from core.models import ContextNode
 class CanonicalNodeScanner(Protocol):
     """Read active canonical nodes without exposing storage internals."""
 
-    def projection_is_quiescent(self, *, account_id: str) -> bool: ...
+    def projection_is_quiescent(self, *, account_id: str) -> bool | None:
+        """Report projected writes, or return None when background preparation is needed."""
+        ...
 
     def scan_active_nodes(
         self,

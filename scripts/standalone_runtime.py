@@ -132,8 +132,8 @@ def main():
         from providers.unified_config import OgMemConfig
         cfg = OgMemConfig.load(str(resolved))
         # This entrypoint includes AGFS and its standalone index runner.
-        if cfg.storage_backend != 'agfs' or cfg.retrieval_hybrid_enabled:
-            raise ValueError('standalone runtime requires AGFS storage without SQL hybrid retrieval')
+        if cfg.storage_backend != 'agfs':
+            raise ValueError('standalone runtime requires AGFS storage')
         os.chdir('/opt/ogmem')
         if cfg.uses_bundled_agfs_server:
             Path('/data/agfs').mkdir(parents=True, exist_ok=True)

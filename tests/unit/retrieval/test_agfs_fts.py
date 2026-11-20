@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from core.lexical import LexicalHit
 from core.models import ContextNode, RequestContext, RetrievalConfig
 from retrieval.agfs_retriever import AGFSRetrieval
 
@@ -140,3 +141,66 @@ def test_fts_reuses_memory_snapshot_for_agent_skill_search():
         assert [hit.uri for hit in skill_result.hits] == [skill]
     finally:
         pipeline.fts.close(5)
+
+
+def test_opengauss_bm25_reads_canonical_agfs_nodes_in_native_rank_order():
+    fs = SearchFS()
+    first = fs.add("a-first", "fresh canonical text")
+    second = fs.add("z-second", "another canonical passage")
+
+    class NativeIndex:
+        def search(self, query, top_k, filters):
+            assert query == "salamander"
+            assert top_k == 50
+            assert filters == {
+                "account_id": "acme", "owner_space": ["user:alice", "user_alice"],
+                "context_type": "MEMORY", "category": ["entity"],
+                "memory_directory": ["entities"], "level": [0, 1, 2],
+            }
+            return [
+                LexicalHit("second", 4.0, {"uri": f"{second}/content.md", "account_id": "acme", "owner_space": "user:alice"}),
+                LexicalHit("first", 2.0, {"uri": f"{first}/content.md", "account_id": "acme", "owner_space": "user:alice"}),
+            ]
+
+    class Backfill:
+        def ensure_ready(self, ctx, scopes):
+            assert ctx == _CTX
+            assert scopes == ["user:alice", "user_alice"]
+            return True
+
+    pipeline = AGFSRetrieval(fs, RetrievalConfig(), lexical_index=NativeIndex(), lexical_backfill=Backfill())
+    result = pipeline.run("salamander", _CTX, context_type="MEMORY", categories=["entity"],
+                          memory_directories=["entities"], fill_content_for_top_k=2)
+
+    assert [(hit.uri, hit.content_excerpt, hit.match_reason) for hit in result.hits] == [
+        (second, "another canonical passage", "openGauss BM25 match"),
+        (first, "fresh canonical text", "openGauss BM25 match"),
+    ]
+    assert result.trace.stages[0].metrics["lexical"] == "ready"
+
+
+def test_native_retrieval_resolves_distinct_winners_and_score_ties_before_stopping():
+    fs = SearchFS()
+    first_tie = fs.add("a-tie", "first matching canonical passage")
+    second_tie = fs.add("b-tie", "second matching canonical passage")
+    winner = fs.add("winner", "best matching canonical passage")
+    lower = fs.add("lower", "another canonical passage")
+
+    class NativeIndex:
+        def search(self, query, top_k, filters):
+            return [
+                LexicalHit(str(i), score, {"uri": uri, "account_id": "acme", "owner_space": "user:alice"})
+                for i, (uri, score) in enumerate((
+                    (lower, 1.0), (second_tie, 5.0), (winner, 9.0),
+                    (f"{winner}/content.md", 10.0), (first_tie, 5.0),
+                ))
+            ]
+
+    pipeline = AGFSRetrieval(fs, RetrievalConfig(), lexical_index=NativeIndex())
+    result = pipeline.run("salamander", _CTX, context_type="MEMORY", top_k=2)
+
+    assert [hit.uri for hit in result.hits] == [winner, first_tie]
+    stage = result.trace.stages[0]
+    assert stage.metrics["native_candidate_count"] == 4
+    assert stage.input_count == 3
+    assert result.partial is False

@@ -172,7 +172,7 @@ def test_nonempty_target_and_memory_index_rejected(tmp_path):
         vector_db_type="memory"
     ).to_provider_config()
     target.index_factory = Rebuilder
-    target.cfg.retrieval_hybrid_enabled = False
+    target.cfg.retrieval_uses_lexical_projection = False
     with pytest.raises(PackageError, match="persistent"):
         target.preflight(path)
 

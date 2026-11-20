@@ -163,8 +163,10 @@ def test_pool_reuse_is_conditional(same_dsn, dialect, backend, provider, share):
     service = MemoryService.__new__(MemoryService)
     service._init_lock = threading.RLock()
     service._vector_index = None
+    service._projection_index = None
     service._cfg = SimpleNamespace(storage_backend=backend, sql_connection_string="host=storage dbname=memory",
-                                  sql_dialect=dialect, retrieval_hybrid_enabled=False)
+                                  sql_dialect=dialect, retrieval_uses_lexical_projection=False,
+                                  retrieval_lexical_provider="none")
     service._provider_cfg = Mock(vector_db_type=provider,
         opengauss_connection_string="host=storage dbname=memory" if same_dsn else "host=other dbname=memory")
     pool = object()
