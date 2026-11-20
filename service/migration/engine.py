@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 from cli import __version__
 from service.migration.assets import Assets
-from service.migration.description import compatibility, describe
+from service.migration.description import compatibility, describe, model_dimension
 from service.migration.package import (
     DATASETS,
     PackageError,
@@ -219,7 +219,7 @@ class MigrationService:
                 adapter.check()
                 progress(phase="snapshotting")
                 source_backend = adapter.backend
-                environment = describe(self.cfg, adapter)
+                environment = describe(self.cfg, adapter, load_model=False)
 
                 def read(kind):
                     for record in adapter.records(kind):
@@ -248,6 +248,8 @@ class MigrationService:
                     inv.finish()
             # All records and attachment bytes are fixed. Release the source write
             # barrier before compression; later source changes are not included.
+            if environment["embedding"]["provider"] == "st":
+                environment["embedding"]["dimension"] = model_dimension(self.cfg, "st")
             progress(phase="exporting", counts=inv.summary())
             staged = Path(tmp) / "package.tar.gz"
             datasets = {kind: inv.records(kind) for kind in DATASETS}

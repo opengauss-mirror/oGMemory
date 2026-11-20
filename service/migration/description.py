@@ -29,7 +29,7 @@ def model_dimension(cfg, provider):
             close()
 
 
-def describe(cfg, adapter):
+def describe(cfg, adapter, *, load_model=True):
     provider = getattr(cfg, "embedding_provider", None) or getattr(cfg, "provider", None)
     vector_free = getattr(cfg, "agfs_retrieval_enabled", False)
     if vector_free:
@@ -49,7 +49,7 @@ def describe(cfg, adapter):
         "embedding": {
             "provider": provider,
             "model": model,
-            "dimension": None if vector_free else model_dimension(cfg, provider),
+            "dimension": None if vector_free or (provider == "st" and not load_model) else model_dimension(cfg, provider),
             # Current providers do not expose a reliable resolved model revision.
             "model_version": None,
         },

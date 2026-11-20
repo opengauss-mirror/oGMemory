@@ -107,3 +107,33 @@ def test_snapshot_bounds_real_http_read_wait(tmp_path):
         server.shutdown()
         thread.join(2)
         server.server_close()
+
+
+def test_source_model_discovery_runs_after_writes_reopen(tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from service.migration.engine import MigrationService
+    from service.migration.package import open_package
+
+    gate = MaintenanceStore(tmp_path / 'model-gate.db', 'model-review')
+    observed = []
+    def create_embedder():
+        observed.append(gate.status())
+        token = gate.admit(write=True)
+        gate.finish_operation(token)
+        return SimpleNamespace(dimension=384)
+    cfg = SimpleNamespace(embedding_provider='st', provider='st', st_model='test-model',
+        vector_db_type='chroma', shared_spaces_enabled=False,
+        to_provider_config=lambda: SimpleNamespace(create_embedder=create_embedder))
+    @contextmanager
+    def adapter_factory(cfg):
+        yield SimpleNamespace(backend='sql', check=lambda: None,
+            description=lambda: dict(backend='sql', database_type='opengauss', database_version='7'),
+            records=lambda kind: iter(()))
+    snapshot = SourceSnapshot(gate, 'export-model', timeout=1)
+    destination = tmp_path / 'model.tar.gz'
+    MigrationService(cfg, adapter_factory=adapter_factory, snapshot_scope=snapshot.scope).export(destination)
+    assert observed == [None]
+    with open_package(destination) as package:
+        assert package.manifest['source_environment']['embedding']['dimension'] == 384
