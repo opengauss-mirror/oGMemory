@@ -562,7 +562,8 @@ class AGFSStorage:
 @contextmanager
 def storage(cfg):
     if getattr(cfg, 'shared_spaces_enabled', False):
-        raise PackageError('shared-space migration is not supported')
+        from service.migration.shared_storage import SharedStorage
+        adapter = SharedStorage(cfg)
     elif cfg.storage_backend == "sql":
         adapter = SQLStorage(cfg)
     elif cfg.storage_backend == "agfs":

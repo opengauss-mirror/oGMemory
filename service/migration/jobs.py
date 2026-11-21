@@ -99,7 +99,7 @@ class InstanceJobs:
             raise PackageError('request identity is already bound to another operation')
         return previous
 
-    def submit(self, kind, *, identity, artifact=None, recover_task=None, authorize=lambda: None):
+    def submit(self, kind, *, identity, artifact=None, recover_task=None, authorize=lambda: None, shared_selection=None):
         identity = str(uuid.UUID(identity))
         if kind not in {'export', 'preflight', 'import', 'recover'}:
             raise PackageError('unknown migration operation')
@@ -119,7 +119,7 @@ class InstanceJobs:
         except OSError as exc:
             raise MaintenanceError('another migration task is running') from exc
         job = dict(id=identity, kind=kind, artifact_id=artifact, recover_task=recover_task,
-                   status='running', phase='queued', created_at=time.time())
+                   status='running', phase='queued', created_at=time.time(), shared_selection=shared_selection)
         try:
             previous = self._existing(identity, kind, artifact, recover_task)
             if previous:
@@ -155,7 +155,8 @@ class InstanceJobs:
                 with source.open('rb') as stream:
                     result['archive_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
             elif kind == 'import':
-                result = self.migration.merge(source, task=task, progress=progress)
+                options = {'shared_selection': job['shared_selection']} if job.get('shared_selection') is not None else {}
+                result = self.migration.merge(source, task=task, progress=progress, **options)
             else:
                 result = self.migration.recover(source, task=job['recover_task'], progress=progress)
             if kind in {'import', 'recover'}:

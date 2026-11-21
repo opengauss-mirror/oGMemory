@@ -83,7 +83,14 @@ def records_for_node(r):
             if record.level == 0:
                 record.metadata["categories"] = node.metadata.get("categories", [])
         return records
-    return build_index_records(node)
+    records = build_index_records(node)
+    if node.owner_space.startswith('space:'):
+        for record in records:
+            record.filters.update(space_key=node.owner_space.removeprefix('space:'),
+                                  authorization_resource_id=node.uri,
+                                  content_rev=r['version'], state=r['status'])
+            record.metadata['content_rev'] = r['version']
+    return records
 
 
 def batches(iterator, size=64):
