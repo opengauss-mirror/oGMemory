@@ -181,7 +181,7 @@ def test_incomplete_target_index_and_memory_backend_rejected(tmp_path):
     ).to_provider_config()
     target.index_factory = Rebuilder
     target.cfg.retrieval_uses_lexical_projection = False
-    with pytest.raises(PackageError, match="向量后端必须一致"):
+    with pytest.raises(PackageError, match="persistent"):
         target.preview(path)
 
 

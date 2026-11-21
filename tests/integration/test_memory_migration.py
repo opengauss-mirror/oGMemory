@@ -186,7 +186,7 @@ def test_same_storage_migration_and_new_process_retrieval(
     target = new_config(target_backend, "target")
     target.opengauss_dimension = 16
     assert vector_backend in {"opengauss", "chroma", "milvus"}
-    source.vector_db_type = target.vector_db_type = vector_backend
+    target.vector_db_type = vector_backend
     if vector_backend == "chroma":
         pytest.importorskip("chromadb")
         target.chroma_persist_directory = str(tmp_path / "chroma")

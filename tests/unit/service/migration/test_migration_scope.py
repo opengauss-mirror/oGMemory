@@ -31,25 +31,32 @@ def test_same_storage_allows_model_and_dimension_changes():
     assert source == before and cfg.st_model == 'new-model'
 
 
-@pytest.mark.parametrize('change', ['content', 'database', 'vector', 'missing', 'unknown_database', 'unknown_vector'])
 @pytest.mark.parametrize('operation', ['preview', 'merge'])
-def test_unsupported_source_rejected_before_target_access(tmp_path, change, operation):
+def test_unsupported_source_rejected_before_target_access(tmp_path, operation):
     source = source_environment()
-    if change == 'content':
-        source['content_storage'].update(backend='agfs', database_type=None)
-    elif change in {'database', 'unknown_database'}:
-        source['content_storage']['database_type'] = 'postgresql' if change == 'database' else None
-    elif change in {'vector', 'unknown_vector'}:
-        source['vector_storage']['backend'] = 'chroma' if change == 'vector' else None
+    source['content_storage'].update(backend='agfs', database_type=None)
     path = tmp_path / 'source.tar.gz'
     write_package(path, {kind: [] for kind in DATASETS},
                   source_backend=source['content_storage']['backend'], source_version='test',
-                  source_environment=None if change == 'missing' else source)
+                  source_environment=source)
     def forbidden(*args, **kwargs):
         pytest.fail('unsupported source reached target resources or backup')
     migration = MigrationService(target_config(), adapter_factory=forbidden, index_factory=forbidden)
-    with pytest.raises(PackageError, match='同源迁移'):
+    with pytest.raises(PackageError, match='相同内容存储类型'):
         if operation == 'preview':
             migration.preview(path)
         else:
             migration.merge(path, task='rejected', recovery_factory=forbidden, llm=None)
+
+
+@pytest.mark.parametrize('database', ['opengauss', 'postgresql', None])
+@pytest.mark.parametrize('vector', ['opengauss', 'chroma', 'milvus', 'none', None])
+def test_database_and_vector_transitions_are_allowed(database, vector):
+    source = source_environment()
+    source['content_storage']['database_type'] = database
+    source['vector_storage']['backend'] = vector
+    validate_migration_scope({'source_environment': source, 'source_backend': 'sql'}, target_config())
+
+
+def test_legacy_package_uses_declared_content_backend():
+    validate_migration_scope({'source_backend': 'sql'}, target_config())
