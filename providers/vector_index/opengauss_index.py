@@ -445,6 +445,25 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                             (self._table_name, record_id))
             check()
 
+    @staticmethod
+    def _stored_metadata(record):
+        # Legacy SQL predicates read category/type from metadata as well.
+        metadata = {key: value for key, value in record.metadata.items() if key != "_embedding"}
+        return indexed_metadata({**metadata, **{
+            key: record.filters[key] for key in ("category", "context_type")
+            if key in record.filters
+        }})
+
+    def validate_records(self, records: list[IndexRecord]) -> None:
+        """Validate the actual SQL projection before migration writes content."""
+        from core.sql_payload import validate_sql_strings
+
+        for record in records:
+            validate_sql_strings([
+                record.id, record.uri, record.text, record.filters,
+                self._stored_metadata(record),
+            ])
+
     def upsert(self, records: list[IndexRecord]) -> None:
         """Add or update records in the index.
 
@@ -464,13 +483,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 embedding_str = _vec_literal(embedding)
                 filters_json = Json(record.filters)
-                # Legacy SQL predicates read these fields from metadata; keep
-                # that projection aligned with the canonical filter values.
-                metadata = dict(record.metadata)
-                metadata.pop("_embedding")
-                metadata.update({key: record.filters[key] for key in ("category", "context_type")
-                                 if key in record.filters})
-                metadata_json = Json(indexed_metadata(metadata))
+                metadata_json = Json(self._stored_metadata(record))
 
                 # Extract explicit security columns from filters
                 acct = record.filters.get("account_id")
@@ -615,8 +628,18 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         # Reject inconsistent source_end_sec and invalid legacy provenance too.
         return [record for record in records if contains_time(record.metadata, timestamp)]
 
-    def check_migration_target(self) -> None:
-        if self.count():
+    def migration_identity(self) -> dict:
+        from fs.sql_adapter.resource_identity import sql_resource_identity
+
+        conn = self._get_connection()
+        try:
+            return {"backend": self._sql_dialect, "dimension": self._dimension,
+                    **sql_resource_identity(conn, [self._table_name])}
+        finally:
+            self._return_connection(conn)
+
+    def check_migration_target(self, *, empty=True, include_embedding=True) -> None:
+        if empty and self.count():
             raise ValueError("target vector index is not empty")
         conn = self._get_connection()
         try:
@@ -633,7 +656,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             conn.rollback()
             self._return_connection(conn)
 
-    def get_record(self, record_id: str) -> IndexRecord | None:
+    def get_record(self, record_id: str, *, include_embedding: bool = True) -> IndexRecord | None:
         """Fetch one :class:`IndexRecord` by id.
 
         Returns ``None`` when no row matches. Used by
@@ -682,6 +705,31 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             self._return_connection(conn)
         records = {str(row["id"]):self._row_to_record(row) for row in rows}
         return [records.get(record_id) for record_id in record_ids]
+
+    def iter_records(self, batch_size: int = 256):
+        """Bounded keyset scan for shadow copying; not a cross-store snapshot."""
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        conn = self._get_connection()
+        try:
+            last = None
+            while True:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    clause = "WHERE id > %s" if last is not None else ""
+                    params = (last, batch_size) if last is not None else (batch_size,)
+                    cur.execute(
+                        f"SELECT id,uri,level,text,filters,metadata,embedding "
+                        f"FROM {self._table_name} {clause} ORDER BY id LIMIT %s", params,
+                    )
+                    rows = cur.fetchall()
+                if not rows:
+                    return
+                for row in rows:
+                    yield self._row_to_record(row)
+                last = rows[-1]["id"]
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
 
     @staticmethod
     def _row_to_record(row):
@@ -887,6 +935,12 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             else:
                 clauses.append("COALESCE(owner_space, filters->>'owner_space') = %(f_owner_space)s")
             params["f_owner_space"] = owner
+        # Shared projections keep their authoritative scope and revision in
+        # filters, independently of descriptive metadata.
+        for key in ("space_key", "authorization_resource_id", "content_rev", "state"):
+            if key in f:
+                clauses.append(f"filters @> %(f_{key})s::jsonb")
+                params[f"f_{key}"] = json.dumps({key: f[key]})
         if "resource_type" in f:
             resource_type = f["resource_type"]
             if isinstance(resource_type, list):

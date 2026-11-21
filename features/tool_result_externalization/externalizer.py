@@ -90,6 +90,20 @@ class BoundedDaemonIORunner:
         self._inflight_lock = threading.Lock()
         self._inflight_by_key: dict[str, int] = {}
 
+    def wait_idle(self, timeout: float) -> bool:
+        """Prove all submitted I/O finished while the caller blocks new requests."""
+        deadline = time.monotonic() + timeout
+        acquired = 0
+        try:
+            while acquired < self.max_inflight:
+                if not self._slots.acquire(timeout=max(0, deadline - time.monotonic())):
+                    return False
+                acquired += 1
+            return True
+        finally:
+            for _ in range(acquired):
+                self._slots.release()
+
     def run(self, operation, *, deadline: float, operation_key: str | None = None):
         from fs.sql_adapter.session_mutation import active_session_guard
         guard = active_session_guard()

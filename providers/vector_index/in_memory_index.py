@@ -273,7 +273,7 @@ class InMemoryVectorIndex(VectorIndex):
             key=lambda record: record.uri,
         )
 
-    def get_record(self, record_id: str) -> IndexRecord | None:
+    def get_record(self, record_id: str, *, include_embedding: bool = True) -> IndexRecord | None:
         """Get a record by ID (for testing).
 
         Args:

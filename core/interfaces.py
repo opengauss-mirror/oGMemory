@@ -293,22 +293,29 @@ class VectorIndex(Protocol):
         """
         ...
 
-    def check_migration_target(self) -> None:
-        """Reject unsupported/nonpersistent, nonempty or incompatible targets.
+    def check_migration_target(self, *, empty: bool = True, include_embedding: bool = True) -> None:
+        """Reject unsupported/nonpersistent or incompatible targets.
+
+        Require an empty target only when ``empty=True``; merges preserve
+        existing compatible records.
 
         Implementations validate their stored index constraints against their
-        configured dimension without inserting probe records. Providers must
+        configured dimension without inserting probe records. include_embedding=False
+        permits metadata-only inspection but must still check the stored dimension.
+        Providers must
         pass the shared migration contract tests before opting in.
         """
         raise ValueError("vector backend does not support persistent migration")
 
-    def get_record(self, record_id: str) -> "IndexRecord | None":
+    def get_record(self, record_id: str, *, include_embedding: bool = True) -> "IndexRecord | None":
         """Fetch one :class:`IndexRecord` by id (round-trip).
 
         Preserve the full text and the agreed filters (account_id, owner_space,
         category, context_type and resource_type when present), independently
         of backend serialization. Required business metadata must remain in
         metadata; moving filter fields there does not satisfy this contract.
+        With include_embedding=False, providers may omit only the numeric
+        _embedding payload; text, filters and business metadata remain complete.
 
         Returns ``None`` when no row matches. ``search_by_vector``
         only returns a 200-char abstract to keep the SeedHit payload
