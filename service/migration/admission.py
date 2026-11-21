@@ -346,6 +346,28 @@ def control_client(client, admission, prefix):
     readers = {name: getattr(client, name) for name in ('read', 'cat', 'ls') if callable(getattr(client, name, None))}
     admission.guard(client)
     root = posixpath.normpath('/' + prefix.strip('/'))
+    def control_path(path, *, parents=False):
+        normalized = posixpath.normpath(path)
+        relative = normalized[len(root.rstrip('/')) + 1:] if normalized.startswith(root.rstrip('/') + '/') else ''
+        parts = relative.split('/')
+        return (parts[0] == '_system' or
+                (len(parts) >= 3 and parts[0] == 'accounts' and parts[2] == '_system') or
+                (parents and (normalized in {'/', root} or
+                              (parts[0] == 'accounts' and len(parts) <= 2))))
+    for method in ('write', 'write_stream', 'mkdir', 'rm', 'mv', 'create'):
+        mutation = getattr(client, method, None)
+        if not callable(mutation):
+            continue
+        signature = inspect.signature(mutation)
+        @wraps(mutation)
+        def mutate(*args, _method=method, _mutation=mutation, _signature=signature, **kwargs):
+            paths = [value for key, value in _signature.bind(*args, **kwargs).arguments.items()
+                     if key in {'path', 'source', 'destination', 'src', 'dst'}]
+            if not paths or not all(control_path(path, parents=_method == 'mkdir') for path in paths):
+                raise MaintenanceError('control client cannot mutate business storage')
+            with admission.backend(write=True, content=False):
+                return _mutation(*args, **kwargs)
+        setattr(client, method, mutate)
     for name, original in readers.items():
         @wraps(original)
         def read(path, *args, _original=original, _name=name, **kwargs):
