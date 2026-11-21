@@ -19,10 +19,14 @@ import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import Json, RealDictCursor
 
+from core.errors import OperationDeadlineExceededError
+from core.operation_deadline import check_deadline, remaining_seconds
 from fs.sql_adapter.pool import SharedConnectionPool
 from memorybot.scheduling import as_utc, due_run, next_run
 
 TERMINAL = frozenset({"succeeded", "cancelled", "failed"})
+GC_OPERATION = "maintenance:file_gc"
+UPLOAD_OPERATION = "maintenance:upload_intent"
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 TABLES = frozenset(
     re.findall(r"CREATE TABLE IF NOT EXISTS (bot_\w+)", SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -238,6 +242,32 @@ class UnitOfWork:
                 params.append(_adapt(value))
         return sql.SQL(" AND ").join(clauses) if clauses else sql.SQL("TRUE"), params
 
+    def _matching_reference_rows(self, table, columns, needles, *, limit=None, fields=()):
+        remaining = remaining_seconds()
+        if remaining is not None:
+            self.cursor.execute("SET LOCAL statement_timeout = %s", (max(1, int(remaining * 1000)),))
+        where, params = self._where({})
+        like = sql.SQL(" OR ").join(
+            sql.SQL("CAST({} AS TEXT) LIKE %s").format(_key(column))
+            for column in columns
+            for _ in needles
+        )
+        projection = sql.SQL(", ").join(map(_key, fields)) if fields else sql.SQL("*")
+        self.cursor.execute(
+            sql.SQL("SELECT {} FROM {} WHERE {} AND ({}){}").format(
+                projection, _key(table), where, like,
+                sql.SQL(" LIMIT %s") if limit is not None else sql.SQL(""),
+            ),
+            params + [f"%{needle}%" for _ in columns for needle in needles]
+            + ([limit + 1] if limit is not None else []),
+        )
+        rows = self.cursor.fetchall()
+        if limit is not None and len(rows) > limit:
+            raise OperationDeadlineExceededError("Maintenance reference limit exceeded")
+        for row in rows:
+            check_deadline()
+            yield dict(row)
+
     def get(
         self, table: str, filters: dict, for_update: bool = False, *, nowait: bool = False
     ) -> dict | None:
@@ -299,6 +329,13 @@ class UnitOfWork:
         self, table: str, missing: set[str], rows: builtins.list[dict]
     ) -> None:
         if not missing or not rows:
+            return
+        if table == "bot_request":
+            for request in rows:
+                if request["operation"] in {GC_OPERATION, UPLOAD_OPERATION}:
+                    self._pending_file_references.update(missing - {request["request_id"]})
+                else:
+                    self._pending_file_references.update(missing)
             return
         if table != "bot_step":
             self._pending_file_references.update(missing)
@@ -1272,6 +1309,7 @@ class BotStore:
         *,
         before: datetime | str,
         has_memory_reference: Callable[[UnitOfWork, dict], bool],
+        reference_scan_limit: int | None = None,
     ) -> dict | None:
         """Check references under the file lock in the caller's scoped transaction."""
         file = tx.get("bot_file", {"file_id": file_id}, for_update=True)
@@ -1293,16 +1331,10 @@ class BotStore:
         if task and task["state"] not in TERMINAL:
             return None
         for table, columns in FILE_REFERENCE_COLUMNS.items():
-            where, params = tx._where({})
-            matches = sql.SQL(" OR ").join(
-                sql.SQL("CAST({} AS TEXT) LIKE %s").format(_key(column)) for column in columns
-            )
-            tx.cursor.execute(
-                sql.SQL("SELECT * FROM {} WHERE {} AND ({})").format(_key(table), where, matches),
-                params + [f"%{file_id}%"] * len(columns),
-            )
-            for row in tx.cursor.fetchall():
-                record = dict(row)
+            fields = (*columns, "file_id") if table == "bot_file" else columns
+            for record in tx._matching_reference_rows(
+                table, columns, [file_id], limit=reference_scan_limit, fields=fields
+            ):
                 if table == "bot_file" and record["file_id"] == file_id:
                     continue
                 if file_id in _file_references(table, record):

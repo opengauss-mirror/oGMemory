@@ -10,6 +10,7 @@ from memorybot.config import BotConfig
 from memorybot.conversation import ChatRun
 from memorybot.execution import Execution, _CancelledError
 from memorybot.gateway import OutcomeUnknownError, WorkPendingError
+from memorybot.maintenance import BotMaintenance
 from memorybot.models import BotError, new_id
 from memorybot.store import LeaseLost
 from memorybot.tasks import delivery, ingestion, memory_write
@@ -35,6 +36,8 @@ class BotWorker:
         self.config = config or BotConfig()
         self.templates = templates
         self.owner_id = new_id("worker")
+        self.maintenance = BotMaintenance(store, files, gateway, self.config)
+        self._maintenance_lock = threading.Lock()
 
     def run_forever(self, stop_event=None):
         stop_event = stop_event or threading.Event()
@@ -60,6 +63,13 @@ class BotWorker:
             thread.join()
 
     def run_once(self, owner_id=None):
+        if self._maintenance_lock.acquire(blocking=False):
+            try:
+                self.maintenance.run_once()
+            except Exception:
+                logger.exception("memoryBot maintenance failed")
+            finally:
+                self._maintenance_lock.release()
         self.store.trigger_due(
             max_pending=self.config.max_pending, max_user_pending=self.config.max_user_pending
         )
