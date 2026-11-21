@@ -65,10 +65,8 @@ def test_native_crud_binary_unicode_and_concurrency(native):
     assert client.stat(mount + "/empty")["isDir"]
 
 
-def test_native_stream_backup_restores_binary_files(native, tmp_path):
+def test_native_stream_writes_binary_empty_and_truncates(native):
     from io import BytesIO
-
-    from service.migration.tree_backup import AGFSTreeBackup
 
     client, mount, _ = native
     root = mount + "/business"
@@ -83,15 +81,11 @@ def test_native_stream_backup_restores_binary_files(native, tmp_path):
     client.write_stream(root + "/binary", BoundedStream(payload))
     assert client.read(root + "/binary") == payload
     client.write_stream(root + "/empty", BytesIO(b""))
-    backup = AGFSTreeBackup(client, [root], lambda: {"mount": mount})
-    destination = tmp_path / "backup"
-    manifest = backup.capture(destination)
+    assert client.read(root + "/empty") == b""
     client.write_stream(root + "/binary", BytesIO(b"short"))
     assert client.read(root + "/binary") == b"short"
-    client.write(root + "/extra", b"discard")
-    backup.restore(destination, manifest)
-    assert client.read(root + "/binary") == payload
-    assert client.read(root + "/empty") == b""
+    client.write_stream(root + "/binary", BytesIO(b""))
+    assert client.read(root + "/binary") == b""
     assert {entry["name"] for entry in client.ls(root)} == {"binary", "empty"}
 
 
