@@ -13,8 +13,9 @@ from service.migration.maintenance import MaintenanceError
 
 def _content_path(path):
     """Conservative classification of AGFS payload mutations, excluding runtime trees."""
+    import posixpath
     from pathlib import PurePosixPath
-    parts = PurePosixPath(str(path)).parts
+    parts = PurePosixPath(posixpath.normpath(str(path))).parts
     # Coordination files have an exact reserved layout, never a basename rule.
     import re
     if any(re.fullmatch(r'\..+\.resource-mutation-lock(?:-[0-9a-f]{32})?', p) for p in parts):
