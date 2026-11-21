@@ -14,11 +14,21 @@ selection:
     Read source, current_user and tool_statistics. Select all applicable memory types
     from catalog for information worth retaining. Use the type definitions below.
 
+    {% if span_instructions is defined %}
+    Do not produce memory content, call tools, or decide whether to create, update or merge memories.
+    Identify message ranges using the following instructions:
+    {{ span_instructions }}
+    Return one JSON object with spans and extraction_categories. Each span's
+    categories guide memory prefetch. extraction_categories selects types
+    from catalog without duplicates. Use empty extraction_categories if selection
+    remains uncertain. Use empty spans when nothing is worth retaining.
+    {% else %}
     Only select types. Do not produce memory content, select or call tools, or decide
     whether to create, update or merge memories.
     Return exactly one complete JSON object whose only field is categories, a string array.
     Use names exactly as listed in catalog, without duplicates.
     Return {"categories":[]} when there is no extraction task.
+    {% endif %}
     Do not include explanations, Markdown fences or additional fields.
 
     If the input contains validation_feedback, the previous response failed validation.

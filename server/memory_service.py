@@ -8,12 +8,13 @@ Used by both:
 from __future__ import annotations
 
 import importlib.metadata as _metadata
+import json
 import logging
 import os
 import re as _re
 import threading
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import copy_context
 from copy import deepcopy
@@ -1736,11 +1737,7 @@ class MemoryService:
         )
 
     @staticmethod
-    def _generate_summary_candidate(messages, session_time, session_id, llm):
-        """Generate the summary candidate from a frozen source snapshot."""
-        from extraction.summary_generator import SessionSummaryGenerator
-
-        check_deadline()
+    def _session_summary_source(messages):
         lines, participants = [], set()
         for msg in messages:
             role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
@@ -1751,12 +1748,19 @@ class MemoryService:
                 lines.append(f"{role}: {content}")
                 if role not in ("system", "assistant"):
                     participants.add(role)
-        messages_text = "\n".join(lines)
+        return "\n".join(lines), ", ".join(sorted(participants))
+
+    @staticmethod
+    def _generate_summary_candidate(messages, session_time, session_id, llm):
+        """Generate the summary candidate from a frozen source snapshot."""
+        from extraction.summary_generator import SessionSummaryGenerator
+
+        check_deadline()
+        messages_text, participants = MemoryService._session_summary_source(messages)
         if not messages_text.strip():
             return None
-        participants_str = ", ".join(sorted(participants))
         generator = SessionSummaryGenerator(llm=llm)
-        summary = generator.generate(messages_text, session_time, participants_str)
+        summary = generator.generate(messages_text, session_time, participants)
         check_deadline()
         if summary:
             formatted = generator.format_summary(summary)
@@ -1764,7 +1768,7 @@ class MemoryService:
                 logger.info("Skipping blank L0 summary: session=%s", session_id[:8])
                 return None
             return generator.build_candidate(
-                summary, formatted, session_time, participants_str, session_id,
+                summary, formatted, session_time, participants, session_id,
             )
         return None
 
@@ -1780,11 +1784,8 @@ class MemoryService:
 
     @contextmanager
     def _parallel_session_summary(self, messages, session_time, ctx, session_id, write_api,
-                                  candidate_checkpoint=None, publication_scope=None):
+                                  candidate_checkpoint=None, publication_scope=None, candidate_future=None):
         """Join summary generation at the owner-thread write boundary."""
-        from concurrent.futures import Future, ThreadPoolExecutor
-        from contextvars import copy_context
-
         from core.model_stage import stage_collector_scope, wait_model_result
 
         restored = candidate_checkpoint.load() if candidate_checkpoint is not None else None
@@ -1804,10 +1805,12 @@ class MemoryService:
             if cached is not None:
                 future = Future()
                 future.set_result(CandidateMemory(**cached["candidate"]) if cached["candidate"] else None)
+            elif candidate_future is not None:
+                future = candidate_future
             else:
                 future = pool.submit(copy_context().run, self._generate_summary_candidate,
                                      deepcopy(messages), session_time, session_id, llm)
-            written, saved = False, cached is not None
+            written, saved = False, cached is not None or candidate_future is not None
 
             def collect():
                 nonlocal saved
@@ -2093,7 +2096,8 @@ class MemoryService:
                 logger.warning("Lifecycle extraction recovery session=%s archive=%s attempt=%d error=%s",
                                session_id, journal.batch["archive_id"], failures, exc)
 
-    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal, *, publication_scope=None):
+    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal, *, publication_scope=None,
+                                       summary_future=None):
         batch = journal.batch
         messages = batch["messages"]
         session_time = _parse_session_time(batch.get("session_time"))
@@ -2145,7 +2149,7 @@ class MemoryService:
         failures = []
         with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api,
                                             journal.checkpoint("summary"),
-                                            publication_scope) as before_write:
+                                            publication_scope, candidate_future=summary_future) as before_write:
             for index, chunk in enumerate(chunks):
                 check_deadline()
                 try:
@@ -5759,15 +5763,136 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
         return outcome
 
+    def _agent_turn_summary_request(self, ctx, journal, snapshot):
+        from extraction.summary_generator import SUMMARY_PROMPT, SUMMARY_SCHEMA
+        from service.extraction_retry import source_only_reason
+        from session.compressor import SessionCompressor
+
+        batch = journal.batch
+        messages = batch["messages"]
+        if not messages or source_only_reason():
+            return None
+        archived = [{"role": m.role, "content": m.content, "id": m.id, "created_at": m.created_at}
+                    for m in snapshot]
+        summary_rows = [(m["id"], m["role"], m["content"]) for m in archived if m["role"] != "assistant"]
+        if (any(not isinstance(m["content"], str) for m in archived)
+                or summary_rows != [(m["id"], m["role"], m["content"]) for m in messages]):
+            return None
+        source, participants = self._session_summary_source(messages)
+        if not source or len(source) > 8000:
+            return None
+        summary_checkpoint = journal.checkpoint("summary")
+        if (not journal.has_stage("agent_turn_summaries")
+                and (journal.has_stage("history_archive") or summary_checkpoint.has_stage("session_summary")
+                     or "summary" in batch["slots"])):
+            return None
+        manager = journal.manager
+        llm = manager._archive_compression_llm()
+        if llm is None or llm is not self.get_llm():
+            return None
+        archive_inputs = manager._archive_compression_inputs(archived, ctx.session_id, ctx, llm, batch["archive_id"])
+        if archive_inputs["prev_overview"] or archive_inputs["prev_abstract"]:
+            return None
+        conversation = [{"role": m["role"], "content": m["content"]} for m in archived]
+        archive_prompt, archive_schema = SessionCompressor.compression_text_request(
+            json.dumps(conversation, ensure_ascii=False))
+        session_time = _parse_session_time(batch.get("session_time"))
+        l0_prompt = SUMMARY_PROMPT.format(
+            session_time=session_time.strftime("%Y-%m-%d") if session_time else "unknown",
+            participants=participants or "unknown",
+            conversation="Use the messages above whose role is not assistant.",
+        )
+        prompt = ("Produce one JSON object. Use all messages for the top-level overview and abstract. "
+                  "Put the second task's fields inside session_summary, based only on its specified messages.\n\n"
+                  + archive_prompt + "\n\n" + l0_prompt)
+        schema = {"type": "object", "properties": {**archive_schema["properties"], "session_summary": SUMMARY_SCHEMA},
+                  "required": [*archive_schema["required"], "session_summary"]}
+        inputs = {"archive": archive_inputs, "session_time": batch.get("session_time"),
+                  "prompt": prompt, "schema": schema}
+        return inputs, llm, session_time, participants
+
+    def _generate_agent_turn_summaries(self, ctx, manager, inputs, messages, llm, session_time, participants):
+        from extraction.summary_generator import SUMMARY_SCHEMA, SessionSummaryGenerator
+
+        check_deadline()
+        try:
+            response = llm.complete_json(inputs["prompt"], inputs["schema"])
+        except (OperationDeadlineExceededError, LLMTransientError):
+            raise
+        except Exception:
+            logger.info("Agent turn joint summary request failed; preparing the two summaries separately")
+            response = None
+        check_deadline()
+        response = response if isinstance(response, dict) else {}
+        overview, abstract = response.get("overview"), response.get("abstract")
+        summary = response.get("session_summary")
+        if (isinstance(overview, str) and overview.strip() and isinstance(abstract, str) and abstract.strip()
+                and isinstance(summary, dict)
+                and all(isinstance(summary.get(key), str) for key in SUMMARY_SCHEMA["required"])):
+            generator = SessionSummaryGenerator(llm)
+            formatted = generator.format_summary(summary)
+            candidate = (generator.build_candidate(summary, formatted, session_time, participants, ctx.session_id)
+                         if formatted.strip() else None)
+        else:
+            overview, abstract = manager._compute_archive_compression(inputs["archive"], llm)
+            candidate = self._generate_summary_candidate(messages, session_time, ctx.session_id, llm)
+        return {"archive": {"overview": overview, "abstract": abstract[:100]},
+                "candidate": asdict(candidate) if candidate is not None else None}
+
+    @contextmanager
+    def _parallel_agent_turn_summaries(self, ctx, journal, snapshot):
+        from core.model_stage import stage_collector_scope, wait_model_result
+
+        request = self._agent_turn_summary_request(ctx, journal, snapshot)
+        if request is None:
+            with journal.manager.parallel_archive_compression(snapshot, ctx.session_id, ctx, journal) as archive:
+                yield archive, None
+            return
+        inputs, llm, session_time, participants = request
+        cached = journal.load_stage("agent_turn_summaries", inputs)
+        archive = {"inputs": inputs["archive"], "llm": llm, "result": cached["archive"] if cached else None}
+        candidate_future = Future()
+        if cached is not None:
+            candidate_future.set_result(CandidateMemory(**cached["candidate"]) if cached["candidate"] else None)
+            yield archive, candidate_future
+            return
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-turn-summaries") as pool:
+            future = pool.submit(copy_context().run, self._generate_agent_turn_summaries,
+                                 ctx, journal.manager, inputs, deepcopy(journal.batch["messages"]),
+                                 llm, session_time, participants)
+
+            def collect():
+                if archive["result"] is None and future.done() and future.exception() is None:
+                    result = future.result()
+                    journal.save_stage("agent_turn_summaries", inputs, result)
+                    archive["result"] = result["archive"]
+                    candidate_future.set_result(
+                        CandidateMemory(**result["candidate"]) if result["candidate"] else None)
+                elif future.done() and future.exception() is not None and not candidate_future.done():
+                    candidate_future.set_exception(future.exception())
+
+            with stage_collector_scope(collect):
+                try:
+                    yield archive, candidate_future
+                finally:
+                    try:
+                        wait_model_result(future)
+                    except Exception:
+                        if not future.done() or future.exception() is None:
+                            raise
+                    else:
+                        collect()
+
     def _process_agent_turn(self, ctx, journal, publication_scope):
         mgr = journal.manager
         batch = journal.batch
         request_id, archive_id = batch["client_request_id"], batch["archive_id"]
         snapshot = [SessionMessage(**message) for message in batch["snapshot"]]
         write_api = self.get_write_api()
-        with mgr.parallel_archive_compression(snapshot, ctx.session_id, ctx, journal) as compression:
+        with self._parallel_agent_turn_summaries(ctx, journal, snapshot) as (compression, summary_future):
             write_result = (self._chunk_and_extract_recoverable(
                 write_api, ctx, ctx.session_id, journal, publication_scope=publication_scope,
+                summary_future=summary_future,
             ) if batch["messages"] else {})
         if self._write_result_has_failures(write_result):
             if not journal.has_retryable_write_failure():

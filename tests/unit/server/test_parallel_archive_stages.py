@@ -32,17 +32,64 @@ class StageModel:
         return {"facts_and_details": "Nora repaired the receiver."}
 
 
-def stage_setup():
+def stage_setup(*, assistant_text="", user_text="Nora repaired the receiver."):
     ctx = RequestContext("stage-test", "reader", "agent", "stage-session", "trace")
     fs = MemoryFS()
     model = StageModel()
     manager = SessionManager(get_context_fs=lambda: fs, get_llm=lambda: model)
     buffer = manager.get_or_create(ctx.session_id, ctx)
-    source = buffer.add("user", "Nora repaired the receiver.", message_id="source-one")
+    source = buffer.add("user", user_text, message_id="source-one")
+    snapshot = [source]
+    if assistant_text:
+        snapshot.append(buffer.add("assistant", assistant_text, message_id="assistant-one"))
     messages = [asdict(source)]
-    journal = ExtractionBatchJournal(manager, buffer, ctx, [source], archive_id="staged-archive",
+    journal = ExtractionBatchJournal(manager, buffer, ctx, snapshot, archive_id="staged-archive",
         messages=messages, session_time=None, session_summary="", tool_stats_text="")
     return ctx, fs, model, manager, source, journal
+
+
+@pytest.mark.parametrize(("source", "assistant", "facts", "abstract"), [
+    ("Nora repaired the receiver.", "I'll record the repair.", "Nora repaired the receiver.", "Receiver repaired."),
+    ("Hello!", "Good morning!", "", "Brief greetings."),
+], ids=["l0-facts", "empty-l0"])
+def test_agent_turn_joint_summary_preserves_archive_and_reuses_stage(source, assistant, facts, abstract):
+    from extraction.summary_generator import SUMMARY_SCHEMA
+    from session.models import SessionMessage
+
+    ctx, _, model, manager, _, journal = stage_setup(user_text=source, assistant_text=assistant)
+    service = MemoryService.__new__(MemoryService)
+    service.get_llm = lambda: model
+    archive_summary = {"overview": f"## Main Topics\n- {abstract}", "abstract": abstract}
+    l0_summary = dict.fromkeys(SUMMARY_SCHEMA["properties"], "")
+    l0_summary["facts_and_details"] = facts
+    expected_content = f"### Facts\n{facts}" if facts else None
+
+    def complete_json(prompt, schema):
+        model.calls.append(prompt)
+        if "session_summary" in schema["properties"]:
+            return {**archive_summary, "session_summary": l0_summary}
+        return archive_summary if "overview" in schema["properties"] else l0_summary
+
+    model.complete_json = complete_json
+    api = SimpleNamespace(_write_checkpointed_candidates=lambda *args: [SimpleNamespace(action="create")])
+    batch = journal.batch
+    snapshot = [SessionMessage(**message) for message in batch["snapshot"]]
+    with service._parallel_agent_turn_summaries(ctx, journal, snapshot) as (archive, future):
+        with service._parallel_session_summary(batch["messages"], None, ctx, ctx.session_id, api,
+                                                journal.checkpoint("summary"), candidate_future=future):
+            pass
+    assert archive["result"] == archive_summary
+    accepted, extracted, filtered = journal.checkpoint("summary").load()
+    assert [candidate.content for candidate in accepted] == ([expected_content] if expected_content else [])
+    assert (extracted, filtered) == (int(bool(facts)), 0)
+    assert manager._resolve_archive_compression(batch["snapshot"], ctx.session_id, ctx, archive, journal) == (
+        archive_summary["overview"], archive_summary["abstract"])
+    with service._parallel_agent_turn_summaries(ctx, journal, snapshot) as (replay, future):
+        assert replay["result"] == archive_summary
+        assert getattr(future.result(), "content", None) == expected_content
+    assert len(model.calls) == 1
+    assert model.calls[0].count(source) == 1
+    assert "Use the messages above whose role is not assistant." in model.calls[0]
 
 
 @pytest.mark.parametrize("background", [False, True])

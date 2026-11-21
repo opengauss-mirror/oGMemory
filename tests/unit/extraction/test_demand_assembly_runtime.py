@@ -47,6 +47,33 @@ def prepared_task(result, *, mode="eager"):
     return extractor, prepared
 
 
+def test_eager_turn_combines_span_identification_and_category_selection():
+    llm = Mock()
+    llm.complete_json.return_value = {
+        "spans": [{"start": 0, "end": 0, "reason": "project details", "categories": ["event"]}],
+        "extraction_categories": ["entity"],
+    }
+    extractor = Extractor(llm, mode="eager", node_processing_enabled=True)
+    extractor._structure_prepared_span_dual = Mock(return_value=[])
+    source = "I built the Beacon project with SQL."
+    messages = [
+        {"role": "user", "content": source},
+        {"role": "assistant", "content": "Thanks for the context."},
+    ]
+
+    extractor.extract(messages, CTX)
+
+    prepared = extractor._structure_prepared_span_dual.call_args.args[0]
+    request = assemble_prepared(extractor, prepared, CTX)
+    assert prepared.span.categories == ["event"]
+    assert request.contract.categories == {"entity"}
+    assert {"extract_entity", "edit_memory", "append_memory"} == set(request.contract.tool_names)
+    prompt = llm.complete_json.call_args.args[0]
+    assert prompt.count(source) == 1
+    assert "exactly 2 indexed messages" in prompt
+    llm.complete_json.assert_called_once()
+
+
 @pytest.mark.parametrize("mode", ["eager", "lazy"])
 def test_valid_empty_stops_before_native_extraction(mode):
     extractor, prepared = prepared_task({"categories": []}, mode=mode)

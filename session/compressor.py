@@ -65,7 +65,12 @@ class SessionCompressor:
         conversation = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}" for msg in messages
         )
+        return SessionCompressor.compression_text_request(conversation, prev_overview, prev_abstract)
 
+    @staticmethod
+    def compression_text_request(
+        conversation: str, prev_overview: str = "", prev_abstract: str = "",
+    ) -> tuple[str, dict]:
         prev_section = ""
         if prev_overview or prev_abstract:
             prev_section = (
