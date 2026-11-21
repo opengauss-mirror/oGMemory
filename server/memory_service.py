@@ -340,7 +340,7 @@ def _serialize_lazy_initialization(attribute: str):
             with self._init_lock:
                 admission = getattr(self, "_admission", None)
                 if (admission is not None and getattr(self, attribute) is None
-                        and attribute in {"_sql_pool", "_vector_index", "_trace_event_store"}):
+                        and attribute in {"_sql_pool", "_vector_index", "_trace_event_store", "_scene_manager"}):
                     with admission.scope(write=True):
                         return method(self, *args, **kwargs)
                 return method(self, *args, **kwargs)
@@ -2320,9 +2320,16 @@ class MemoryService:
         if self._control_store is None:
             if self._use_sql_metadata:
                 from server.sql_control_plane_store import SQLControlPlaneStore
-                self._control_store = SQLControlPlaneStore(
-                    pool=self._get_shared_sql_pool(),
-                )
+                admission = getattr(self, '_admission', None)
+                with admission.backend(write=True, content=False) if admission is not None else nullcontext():
+                    store = SQLControlPlaneStore(pool=self._get_shared_sql_pool())
+                if admission is not None:
+                    # Control reads remain available; only durable mutations
+                    # participate in business write admission.
+                    for name in ('write_json', 'write_code_workspace_sync_state',
+                                 'mutate_code_workspace_sync_state'):
+                        setattr(store, name, admission.wrap(getattr(store, name), write=True, backend=True, content=False))
+                self._control_store = store
             elif _HAS_AGFS:
                 # Control reads remain available while business clients are drained.
                 client = (AGFSClient(api_base_url=self._agfs_base_url) if self._cfg.agfs_transport == "http"
@@ -3401,6 +3408,7 @@ class MemoryService:
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
 
+    @_serialize_lazy_initialization("_scene_manager")
     def _ensure_scene_runtime(self):
         if not self._cfg.scene_enabled or self._scene_manager is not None:
             return
@@ -3419,8 +3427,8 @@ class MemoryService:
                 raise RuntimeError("scene memory requires a configured durable scene-store adapter")
             pool = self._get_shared_sql_pool()
             config = SceneConfig().merged(self._cfg.scene_options)
-            repository = SQLSceneRepository(pool)
-            provider = SQLSceneConfigProvider(pool, default=config)
+            repository = self._guard_storage(SQLSceneRepository(pool))
+            provider = self._guard_storage(SQLSceneConfigProvider(pool, default=config))
             from copy import copy
 
             from providers.lexical_index.factory import create_lexical_index
@@ -3430,8 +3438,13 @@ class MemoryService:
             lexical_config.retrieval_lexical_options = {
                 **self._cfg.retrieval_lexical_options, "table_name": "scene_lexical_v1",
             }
-            candidate_index = LazySceneIndex(lambda: create_lexical_index(lexical_config),
-                                             projection_queue=repository)
+            def create_scene_index():
+                return self._guard_storage(create_lexical_index(lexical_config))
+
+            factory = create_scene_index
+            if self._admission is not None:
+                factory = self._admission.wrap(factory, write=True, backend=True, content=False)
+            candidate_index = LazySceneIndex(factory, projection_queue=repository)
             refresh_projection = SceneIndexRefresh(repository, candidate_index)
 
             def projection_refresh():
@@ -3444,13 +3457,15 @@ class MemoryService:
                     archive_store=self._get_archive_store(), candidate_index=candidate_index,
                 )
                 manager = SceneMemoryManager(
-                    SQLSceneJobStore(pool), adapter,
+                    self._guard_storage(SQLSceneJobStore(pool)), adapter,
                     SceneDecisionEngine(self.get_llm(), config, evidence_reader=adapter),
                     config=config, config_provider=provider, projection_refresh=projection_refresh,
                 )
                 scene_service = SceneService(
                     repository, adapter, manager, provider, self._get_shared_embedder(),
                 )
+                if self._admission is not None:
+                    manager.process_next = self._admission.wrap(manager.process_next, write=True)
                 if self._cfg.scene_generation_enabled:
                     manager.start()
             except Exception:

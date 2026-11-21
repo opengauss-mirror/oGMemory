@@ -1,6 +1,7 @@
 """Instance operation scopes and guards on actual backend calls."""
 import asyncio
 import inspect
+import sys
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -10,6 +11,42 @@ from functools import partial, wraps
 from service.migration.maintenance import MaintenanceError
 
 
+def _content_path(path):
+    """Conservative classification of AGFS payload mutations, excluding runtime trees."""
+    from pathlib import PurePosixPath
+    parts = PurePosixPath(str(path)).parts
+    if any(p.startswith('.') and '-lock' in p for p in parts):
+        return False
+    if any(p in {'.outbox', '.outbox-done', '.lexical-outbox', '.write_operations',
+                 '_system', '.ogmemory'} for p in parts):
+        return False
+    if 'accounts' in parts:
+        i = parts.index('accounts')
+        tail = parts[i + 2:]
+        if tail and tail[0] in {'traces', 'tool-results'}:
+            return False
+        if tail and tail[0] == 'sessions':
+            return len(tail) >= 3 and tail[2] == 'history'
+    return True
+
+
+def _content_arguments(*args, **kwargs):
+    value = args[0] if args else next((kwargs[k] for k in ('node', 'uri', 'path') if k in kwargs), None)
+    uri = getattr(value, 'uri', value)
+    if isinstance(uri, str) and uri.startswith('ctx://'):
+        from service.migration.records import runtime_node
+        return not runtime_node({'uri': uri})
+    return _content_path(uri) if isinstance(uri, str) else True
+
+
+def _content_storage(storage):
+    return not type(storage).__module__.startswith((
+        'providers.vector_index', 'providers.lexical_index', 'index.',
+        'commit.outbox_store', 'commit.sql_outbox_store', 'scene.',
+        'session.trace', 'providers.trace', 'fs.agfs_adapter.agfs_trace_store',
+    ))
+
+
 @dataclass
 class Operation:
     token: str
@@ -17,6 +54,7 @@ class Operation:
     write: bool = False
     active: bool = True
     uncertain: bool = False
+    content: bool = False
 
 
 class Admission:
@@ -36,19 +74,20 @@ class Admission:
         return threading.get_ident(), task
 
     @contextmanager
-    def scope(self, *, write=False, _shutdown=False):
+    def scope(self, *, write=False, _shutdown=False, _content=False):
         inherited = self._operation.get()
         if inherited is not None and inherited.owner == self._owner():
             if not inherited.active:
                 raise MaintenanceError("operation has ended")
             if write:
-                self.require_write()
+                self.require_write(content=_content)
             yield
             return
         with self._lock:
             if self._closing and not _shutdown:
                 raise MaintenanceError('business process is stopping')
-            operation = Operation(self.store.admit(write=write, participant=self.participant), self._owner(), write)
+            operation = Operation(self.store.admit(write=write, participant=self.participant, content=_content),
+                                  self._owner(), write, content=_content)
         marker = self._operation.set(operation)
         try:
             yield
@@ -67,7 +106,7 @@ class Admission:
         if self._operation.get() is not None:
             raise MaintenanceError('maintenance cannot run inside a business operation')
         token = self.store.owned_operation(task, self.participant)
-        operation = Operation(token, self._owner(), True)
+        operation = Operation(token, self._owner(), True, content=True)
         marker = self._operation.set(operation)
         try:
             yield
@@ -81,18 +120,35 @@ class Admission:
             finally:
                 self._operation.reset(marker)
 
-    def require_write(self):
+    def require_write(self, *, content=False):
         with self._lock:
             operation = self._operation.get()
             if operation is None or not operation.active:
                 raise MaintenanceError("storage mutation requires an active operation")
-            if not operation.write:
-                self.store.upgrade(operation.token)
+            if not operation.write or (content and not operation.content):
+                self.store.upgrade(operation.token, content=content)
+                operation.content = operation.content or content
                 operation.write = True
 
     @contextmanager
-    def backend(self, *, write, http_rejections=False):
-        with self.scope(write=write):
+    def content_scope(self):
+        """Own a complete persistence operation independently of request lifetime."""
+        current = self._operation.get()
+        if current is not None and current.owner == self._owner() and current.content:
+            with self.scope(write=True):
+                yield
+            return
+        marker = self._operation.set(None)
+        try:
+            with self.scope(write=True, _content=True):
+                yield
+        finally:
+            self._operation.reset(marker)
+
+    @contextmanager
+    def backend(self, *, write, http_rejections=False, content=True):
+        lifetime = self.content_scope() if write and content else self.scope(write=write)
+        with lifetime:
             try:
                 yield
             except BaseException as exc:
@@ -111,9 +167,8 @@ class Admission:
                 rejected = (isinstance(exc, NativeAGFSHTTPError) or
                             (isinstance(exc, AccessDeniedError)
                              and getattr(exc, 'sql_write_not_started', False) is True) or
-                            (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
-                             and getattr(exc, 'sql_rollback_confirmed', False) is True) or
-                            (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
+                            (getattr(exc, 'sql_rollback_confirmed', False) is True) or
+                            (isinstance(exc, (AccessDeniedError, ConcurrentModificationError, NodeNotFoundError))
                              and getattr(exc, 'agfs_rejection_settled', False) is True) or
                             (http_rejections and confirmed_rejection(exc)))
                 if write and not rejected:
@@ -125,7 +180,7 @@ class Admission:
         with self._lock:
             if self._closing:
                 raise MaintenanceError('business process is stopping')
-            token = self.store.admit(write=True, participant=self.participant)
+            token = self.store.admit(write=True, participant=self.participant, content=False)
         operation = Operation(token, (), True)
 
         def run():
@@ -151,37 +206,57 @@ class Admission:
             raise
         return thread
 
-    def wrap(self, function, *, write=False, backend=False, http_rejections=False):
-        scope = partial(self.backend, http_rejections=http_rejections) if backend else self.scope
+    def wrap(self, function, *, write=False, backend=False, http_rejections=False, content=True):
+        def scope_for(args, kwargs):
+            payload = content(*args, **kwargs) if callable(content) else content
+            return (partial(self.backend, http_rejections=http_rejections, content=payload)
+                    if backend else self.scope)
         if inspect.isasyncgenfunction(function):
             @wraps(function)
             async def async_iterate(*args, **kwargs):
-                with scope(write=write):
+                with scope_for(args, kwargs)(write=write):
                     async for value in function(*args, **kwargs):
                         yield value
             return async_iterate
         if inspect.isgeneratorfunction(function):
             @wraps(function)
             def iterate(*args, **kwargs):
-                with scope(write=write):
+                with scope_for(args, kwargs)(write=write):
                     yield from function(*args, **kwargs)
             return iterate
         if inspect.isgeneratorfunction(getattr(function, "__wrapped__", None)):
             @wraps(function)
             @contextmanager
             def context(*args, **kwargs):
-                with scope(write=write), function(*args, **kwargs) as value:
-                    yield value
+                # Only acquisition/release are backend calls. The caller's
+                # exception is not evidence of an unfinished remote mutation.
+                payload = content(*args, **kwargs) if callable(content) else content
+                lifetime = self.content_scope() if write and payload else self.scope(write=write)
+                with lifetime:
+                    manager = function(*args, **kwargs)
+                    with scope_for(args, kwargs)(write=write):
+                        value = manager.__enter__()
+                    try:
+                        yield value
+                    except BaseException:
+                        error = sys.exc_info()
+                        with scope_for(args, kwargs)(write=write):
+                            suppressed = manager.__exit__(*error)
+                        if not suppressed:
+                            raise
+                    else:
+                        with scope_for(args, kwargs)(write=write):
+                            manager.__exit__(None, None, None)
             return context
         if inspect.iscoroutinefunction(function):
             @wraps(function)
             async def asynchronous(*args, **kwargs):
-                with scope(write=write):
+                with scope_for(args, kwargs)(write=write):
                     return await function(*args, **kwargs)
             return asynchronous
         @wraps(function)
         def call(*args, **kwargs):
-            with scope(write=write):
+            with scope_for(args, kwargs)(write=write):
                 return function(*args, **kwargs)
         return call
 
@@ -208,6 +283,10 @@ class Admission:
                 from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
                 if isinstance(storage, AGFSSpaceBridge):
                     write = False  # Hydrates authorized immutable bodies only.
+            if name in {"load_snapshot", "load_active", "contributions", "pending_projections", "export"}:
+                from scene.sql_store import _SQLStore
+                if isinstance(storage, _SQLStore):
+                    write = False  # Scene reads do not publish or claim work.
             # mkdir and rm issue one HTTP request. In particular write()
             # retries internally: a final rejection cannot settle earlier timeouts.
             from pyagfs.client import AGFSClient
@@ -218,15 +297,31 @@ class Admission:
                 def write_once(path, data, max_retries=0, _write=original_write):
                     return _write(path, data, max_retries=0)
                 function = write_once
-            setattr(storage, name, self.wrap(function, write=write, backend=True,
-                                             http_rejections=single_attempt))
+            content = _content_arguments if _content_storage(storage) else False
+            if name in {'session_recovery_lock', 'resource_mutation_lock', 'memory_identity_lock', 'processing_lease'}:
+                content = False
+            from fs.agfs_adapter.client import NativeAGFSClient
+            if write and isinstance(storage, (AGFSClient, NativeAGFSClient)):
+                @wraps(function)
+                def transport(*args, _function=function, _write=write,
+                              _rejections=single_attempt, **kwargs):
+                    paths = [v for v in args[:2] if isinstance(v, str)]
+                    paths.extend(kwargs[k] for k in ('path', 'src', 'dst') if k in kwargs)
+                    payload = any(_content_path(p) for p in paths) if paths else True
+                    return self.wrap(_function, write=_write, backend=True,
+                                     http_rejections=_rejections, content=payload)(*args, **kwargs)
+                setattr(storage, name, transport)
+            else:
+                setattr(storage, name, self.wrap(function, write=write, backend=True,
+                                                 http_rejections=single_attempt, content=content))
         # AGFS reads may finish an acknowledged deletion. That branch mutates
         # storage even though its public entry point is a read. Trace reads also
         # repair their indexes through the guarded file mutation primitives.
         for name in ("_recover_acknowledging_delete", "_replace_file", "_remove_if_present", "_mkdir_p"):
             mutation = getattr(storage, name, None)
             if callable(mutation):
-                setattr(storage, name, self.wrap(mutation, write=True, backend=True))
+                setattr(storage, name, self.wrap(mutation, write=True, backend=True,
+                                                  content=_content_arguments if _content_storage(storage) else False))
         storage._migration_guard = self
         return storage
 
@@ -275,7 +370,7 @@ def install(service, admission):
             # Admission precedes adapter construction, which may initialize a
             # schema or a directory before its returned methods can be guarded.
             constructing = _cached is None or getattr(service, _cached, None) is None
-            with admission.backend(write=constructing):
+            with admission.backend(write=constructing, content=False):
                 if _cached == '_migration_context_fs':
                     with service._init_lock:
                         value = getattr(service, _cached, None)

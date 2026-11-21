@@ -78,7 +78,7 @@ class SpaceRepository(SpaceJobRepository):
     @contextmanager
     def transaction(self, account_id, space_id=None, *, write=True):
         admission = getattr(self, '_migration_admission', None)
-        with admission.scope(write=write) if admission is not None else nullcontext():
+        with (admission.content_scope() if write else admission.scope()) if admission is not None else nullcontext():
             conn = self.pool.get_connection()
             discard = False
             try:
