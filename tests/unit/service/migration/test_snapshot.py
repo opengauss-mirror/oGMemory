@@ -117,3 +117,34 @@ def test_keyword_move_destination_is_checked(tmp_path):
             client.mv('/local/accounts/acme/sessions/s/state/file',
                       destination='/local/accounts/acme/users/alice/memories/preferences/x/content.md')
     assert calls == []
+
+
+def test_runtime_to_content_move_requires_content_permit():
+    from service.migration.admission import _content_arguments
+    assert _content_arguments('ctx://acme/sessions/s/state',
+                              'ctx://acme/users/alice/memories/preferences/x')
+
+
+@pytest.mark.parametrize('failure', ['statement', 'commit'])
+def test_shared_transaction_preserves_unknown_commit(tmp_path, failure):
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+    from server.space_repository import SpaceRepository
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'space')
+    repo = object.__new__(SpaceRepository)
+    repo._migration_admission = Admission(gate)
+    conn = Mock()
+    conn.cursor.return_value = nullcontext(Mock())
+    repo.pool = Mock(get_connection=Mock(return_value=conn))
+    if failure == 'commit':
+        conn.commit.side_effect = TimeoutError('commit confirmation lost')
+    with pytest.raises((ValueError, TimeoutError)):
+        with repo.transaction('acme'):
+            if failure == 'statement':
+                raise ValueError('rejected')
+    gate.enter('snapshot', mode='export', resources={})
+    if failure == 'commit':
+        with pytest.raises(TimeoutError):
+            gate.wait_drained('snapshot', 0)
+    else:
+        gate.wait_drained('snapshot', 0)

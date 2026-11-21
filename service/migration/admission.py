@@ -32,12 +32,14 @@ def _content_path(path):
 
 
 def _content_arguments(*args, **kwargs):
-    value = args[0] if args else next((kwargs[k] for k in ('node', 'uri', 'path') if k in kwargs), None)
-    uri = getattr(value, 'uri', value)
-    if isinstance(uri, str) and uri.startswith('ctx://'):
+    values = list(args) + [kwargs[k] for k in ('node', 'uri', 'path', 'from_uri', 'to_uri') if k in kwargs]
+    uris = [getattr(value, 'uri', value) for value in values]
+    uris = [uri for uri in uris if isinstance(uri, str) and uri.startswith('ctx://')]
+    if uris:
         from service.migration.records import runtime_node
-        return not runtime_node({'uri': uri})
-    return _content_path(uri) if isinstance(uri, str) else True
+        return any(not runtime_node({'uri': uri}) for uri in uris)
+    value = args[0] if args else kwargs.get('path')
+    return _content_path(value) if isinstance(value, str) else True
 
 
 def _content_storage(storage):
