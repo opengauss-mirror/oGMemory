@@ -98,20 +98,16 @@ class Admission:
             except BaseException as exc:
                 # Only backend mutations can be uncertain, not rejected parameters
                 # or business result dictionaries. Never release on a guessed timeout.
-                from pyagfs.exceptions import AGFSClientError
-                from requests.exceptions import HTTPError
-
                 from core.errors import (
                     AccessDeniedError,
                     ConcurrentModificationError,
                     NodeNotFoundError,
                 )
-                from fs.agfs_adapter.client import NativeAGFSHTTPError
+                from fs.agfs_adapter.client import NativeAGFSHTTPError, confirmed_rejection
 
                 # pyagfs wraps HTTP rejections but preserves their exception context.
                 # Only definite filesystem rejections are complete; timeouts and
                 # gateway/server errors can still leave remote writes in flight.
-                cause = exc.__context__
                 rejected = (isinstance(exc, NativeAGFSHTTPError) or
                             (isinstance(exc, AccessDeniedError)
                              and getattr(exc, 'sql_write_not_started', False) is True) or
@@ -119,9 +115,7 @@ class Admission:
                              and getattr(exc, 'sql_rollback_confirmed', False) is True) or
                             (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
                              and getattr(exc, 'agfs_rejection_settled', False) is True) or
-                            (http_rejections and isinstance(exc, AGFSClientError) and isinstance(cause, HTTPError)
-                             and cause.response is not None
-                             and cause.response.status_code in {403, 404, 409}))
+                            (http_rejections and confirmed_rejection(exc)))
                 if write and not rejected:
                     self._operation.get().uncertain = True
                 raise

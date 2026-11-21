@@ -1,12 +1,14 @@
 package localfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
@@ -397,6 +399,9 @@ func (fs *LocalFS) Rename(oldPath, newPath string) error {
 	// Rename/move
 	err := os.Rename(oldLocalPath, newLocalPath)
 	if err != nil {
+		if os.IsExist(err) || errors.Is(err, syscall.ENOTEMPTY) {
+			return filesystem.NewAlreadyExistsError("rename", newPath)
+		}
 		return fmt.Errorf("failed to rename: %w", err)
 	}
 

@@ -25,10 +25,15 @@ def confirmed_rejection(exc):
     """A single request returned a filesystem rejection, not a transport failure."""
     from requests.exceptions import HTTPError
 
+    if isinstance(exc, NativeAGFSHTTPError):
+        return True
     cause = exc.__context__
-    return (isinstance(exc, NativeAGFSHTTPError)
-            or (isinstance(exc, AGFSClientError) and isinstance(cause, HTTPError)
-                and cause.response is not None and cause.response.status_code in {403, 404, 409}))
+    if not isinstance(exc, AGFSClientError) or not isinstance(cause, HTTPError) or cause.response is None:
+        return False
+    response = cause.response
+    if response.status_code in {403, 404, 409}:
+        return True
+    return False
 
 
 class NativeAGFSClient:

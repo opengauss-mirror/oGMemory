@@ -174,3 +174,29 @@ def test_unsettled_create_conflict_keeps_permit(tmp_path, monkeypatch, failure):
     gate.enter('export', mode='export', resources={})
     with pytest.raises(TimeoutError):
         gate.wait_drained('export', 0)
+
+
+@pytest.mark.parametrize('status,error,endpoint,expected', [
+    (500, 'failed to rename: rename /staging /target: file exists', 'rename', False),
+    (500, 'failed to rename: rename /staging /target: file exists', 'files', False),
+    (500, 'Internal server error', 'rename', False),
+    (502, 'failed to rename: rename /staging /target: file exists', 'rename', False),
+])
+def test_legacy_rename_rejection_requires_exact_http_evidence(status, error, endpoint, expected):
+    from pyagfs.exceptions import AGFSClientError
+    from requests import Request, Response
+    from requests.exceptions import HTTPError
+
+    from fs.agfs_adapter.client import confirmed_rejection
+
+    response = Response()
+    response.status_code = status
+    response.request = Request('POST', 'http://agfs/' + endpoint).prepare()
+    response._content = json.dumps({'error': error}).encode()
+    try:
+        try:
+            raise HTTPError(response=response)
+        except HTTPError:
+            raise AGFSClientError(error)
+    except AGFSClientError as exc:
+        assert confirmed_rejection(exc) is expected
