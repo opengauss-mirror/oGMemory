@@ -45,7 +45,7 @@ def test_agfs_stale_version_releases_only_settled_operation(tmp_path, monkeypatc
 def test_full_service_control_reads_during_import(tmp_path, monkeypatch):
     from providers.unified_config import OgMemConfig
     from server.memory_service import MemoryService
-    from tests.unit.service.migration.test_tree_backup import LocalClient
+    from tests.migration_fixtures import LocalClient
 
     (tmp_path / 'files').mkdir()
     monkeypatch.setattr('server.memory_service.AGFSClient', lambda **kw: LocalClient(tmp_path / 'files'))
@@ -105,7 +105,7 @@ def test_sql_snapshot_stalled_handshake_is_bounded(tmp_path):
 
     from providers.unified_config import OgMemConfig
     from service.migration.snapshot import SourceSnapshot
-    from service.migration.storage import SQLStorage
+    from service.migration.sql_snapshot import SnapshotConnection
 
     stop = threading.Event()
     listener = socket.socket()
@@ -128,7 +128,7 @@ def test_sql_snapshot_stalled_handshake_is_bounded(tmp_path):
     try:
         started = time.monotonic()
         with pytest.raises(TimeoutError), SourceSnapshot(gate, 'snapshot', timeout=.15).scope():
-            SQLStorage(cfg)
+            SnapshotConnection(cfg.sql_connection_string, started + .15)
         assert time.monotonic() - started < 1
         assert gate.status() is None
     finally:
