@@ -382,7 +382,7 @@ def test_real_admin_api_migration_flow(tmp_path, monkeypatch, request):
     preview = job(dst, {"kind": "preflight", "artifact_id": artifact})
     comparison = preview["result"]["compatibility"]
     assert comparison["source"]["content_storage"]["backend"] == "agfs"
-    assert comparison["target"]["content_storage"]["backend"] == "sql"
+    assert comparison["target"]["content_storage"]["backend"] == target.storage_backend
     assert "content_storage.backend" in comparison["changes"]
     result = job(dst, {"kind": "import", "artifact_id": artifact, "preflight_id": preview["id"]})
     # Normal source service may refresh directory summaries before snapshot.
@@ -404,6 +404,7 @@ def test_native_lexical_rebuild(tmp_path):
 
     source, target = new_config("sql", "lex-source"), new_config("sql", "lex-target")
     target.retrieval_hybrid_enabled = True
+    target.retrieval_lexical_provider = "opengauss_native"
     with storage(source) as adapter:
         for kind, rows in fixtures().items():
             adapter.restore(kind, rows)
