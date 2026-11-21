@@ -36,6 +36,7 @@ if os.path.isfile(_dotenv_path):
         pass
 
 logger = logging.getLogger("ogmem.config")
+DEFAULT_AGENT_TURN_WORKERS = 10
 
 # Hard-coded allowlist for secret helper executables. Keep empty by default so
 # command-based API key helpers are disabled until an explicit code change
@@ -678,6 +679,8 @@ class OgMemConfig:
     # -- Memory extraction -----------------------------------------------------
     extraction_mode: str = "eager"  # "eager" (prefetch + single-shot) or "lazy" (ReAct loop)
     after_turn_threshold: int = 400
+    agent_turn_workers: int = DEFAULT_AGENT_TURN_WORKERS
+    agent_turn_scheduler_owner: bool = True
     rolling_compress_enabled: bool = True
     rolling_compress_fallback_enabled: bool = False
     compact_prepare_token_ttl: int = 300
@@ -780,6 +783,10 @@ class OgMemConfig:
         return url.scheme == "http" and url.hostname in {"127.0.0.1", "localhost"} and url.port == 1833
 
     def __post_init__(self) -> None:
+        if type(self.agent_turn_workers) is not int or self.agent_turn_workers < 1:
+            raise ValueError("memory.extraction.agent_turn_workers must be a positive integer")
+        if type(self.agent_turn_scheduler_owner) is not bool:
+            raise ValueError("agent_turn_scheduler_owner must be a boolean")
         if self.agfs_transport not in {"http", "native"}:
             raise ValueError("agfs.transport must be http or native")
         if isinstance(self.decision, dict):
@@ -2231,6 +2238,13 @@ class OgMemConfig:
                 400,
                 int,
             ),
+            agent_turn_workers=_resolve(
+                memory.get("extraction", {}).get("agent_turn_workers"),
+                "OGMEM_AGENT_TURN_WORKERS",
+                DEFAULT_AGENT_TURN_WORKERS,
+                int,
+            ),
+            agent_turn_scheduler_owner=_resolve_bool(None, "OGMEM_AGENT_TURN_SCHEDULER_OWNER", True),
             rolling_compress_enabled=_resolve_bool(
                 memory.get("rolling_compress_enabled"),
                 "OGMEM_ROLLING_COMPRESS_ENABLED",

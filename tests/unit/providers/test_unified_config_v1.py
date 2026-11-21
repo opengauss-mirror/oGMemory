@@ -10,6 +10,24 @@ import pytest
 from providers.unified_config import OgMemConfig
 
 
+def test_agent_scheduler_defaults_to_ten_workers(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGMEM_AGENT_TURN_WORKERS", raising=False)
+
+    assert OgMemConfig().agent_turn_workers == 10
+    assert OgMemConfig.load(str(tmp_path / "ogmem.yaml")).agent_turn_workers == 10
+
+
+def test_agent_scheduler_uses_configured_capacity_and_process_role(tmp_path, monkeypatch):
+    config = tmp_path / "ogmem.yaml"
+    config.write_text("memory:\n  extraction:\n    agent_turn_workers: 2\n", encoding="utf-8")
+    monkeypatch.setenv("OGMEM_AGENT_TURN_SCHEDULER_OWNER", "false")
+
+    cfg = OgMemConfig.load(str(config))
+
+    assert cfg.agent_turn_workers == 2
+    assert cfg.agent_turn_scheduler_owner is False
+
+
 @pytest.mark.parametrize("mode", ["vector_free", "agfs"])
 def test_vector_free_sqlite_bm25_loads_with_only_llm_and_agfs_config(tmp_path, mode):
     config = tmp_path / "ogmem.yaml"

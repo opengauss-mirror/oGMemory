@@ -64,12 +64,12 @@ def test_one_second_graph_defer_finishes_in_native_legacy_loop(graph_db, monkeyp
     service._default_account_id = ctx.account_id
     waits = []
 
-    class ObservedStop(threading.Event):
+    class ObservedWakeup(threading.Event):
         def wait(self, timeout=None):
             waits.append(timeout)
             return super().wait(timeout)
 
-    service._outbox_stop = ObservedStop()
+    service._outbox_wakeup = ObservedWakeup()
     finished = threading.Event()
     run_once = worker.run_once
 
@@ -93,6 +93,7 @@ def test_one_second_graph_defer_finishes_in_native_legacy_loop(graph_db, monkeyp
         assert finished.wait(3)
     finally:
         service._outbox_stop.set()
+        service._outbox_wakeup.set()
         service._outbox_thread.join(timeout=1)
     elapsed = time.perf_counter() - started
     completed = outbox.get_event(ctx.account_id, event.event_id)
