@@ -100,10 +100,10 @@ def compatibility(source, target):
         notices.append("部分模型维度无法获取，显示为未知；不能据此判断模型维度相同。")
     if not vector_free and target["embedding"]["dimension"] is None:
         notices.append("目标模型维度尚未验证，导入前仍须通过模型探测与索引维度校验。")
-    if any(name.startswith("content_storage.") for name in changes):
-        notices.append("内容存储或数据库发生变化，将按目标存储适配器恢复。")
-    if not vector_free and "vector_storage.backend" in changes:
-        notices.append("向量后端发生变化，将在已通过支持检查的目标后端重建索引。")
+    if "content_storage.database_type" in changes:
+        notices.append("SQL 数据库类型发生变化，将按目标数据库约束校验并恢复。")
+    if "vector_storage.backend" in changes:
+        notices.append("向量后端发生变化，将按目标检索模式恢复索引。")
     return {"source": source, "target": target, "changes": changes, "notices": notices}
 
 
