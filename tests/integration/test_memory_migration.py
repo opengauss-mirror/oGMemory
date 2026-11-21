@@ -336,7 +336,7 @@ def test_relation_projection_rebuild(tmp_path):
         assert cur.fetchone()[0] == 0
 
 
-def test_real_admin_api_migration_flow(tmp_path, monkeypatch, request):
+def exercise_admin_api_migration(tmp_path, monkeypatch, request, target_backend="agfs"):
     import time
 
     from flask import Flask
@@ -345,7 +345,7 @@ def test_real_admin_api_migration_flow(tmp_path, monkeypatch, request):
     from server.migration_api import create_migration_blueprint
     from server.service_factory import close_service, create_service
 
-    source, target = new_config("agfs", "source"), new_config("agfs", "target")
+    source, target = new_config("agfs", "source"), new_config(target_backend, "target")
     source.root_api_key = target.root_api_key = "isolated-test-key"
     with storage(source) as adapter:
         for kind, rows in fixtures().items():
@@ -432,11 +432,11 @@ def test_native_lexical_rebuild(tmp_path):
         lexical.close()
 
 
-def test_sql_relation_authority_and_embedded_fallback(tmp_path):
+def exercise_sql_relation_authority(tmp_path, target_backend="sql"):
     from core.models import RelationEdge, RequestContext
     from providers.relation_store.sql_relation_store import SQLRelationStore
 
-    source, target = new_config("sql", "relations"), new_config("sql", "relations-target")
+    source, target = new_config("sql", "relations"), new_config(target_backend, "relations-target")
     data = fixtures()
     with storage(source) as adapter:
         for kind, rows in data.items():
@@ -1854,3 +1854,11 @@ def test_maintenance_preserves_newer_session_from_other_service(tmp_path, monkey
     finally:
         close_service(first)
         close_service(second)
+
+
+def test_real_admin_api_migration_flow(tmp_path, monkeypatch, request):
+    exercise_admin_api_migration(tmp_path, monkeypatch, request)
+
+
+def test_sql_relation_authority_and_embedded_fallback(tmp_path):
+    exercise_sql_relation_authority(tmp_path)
