@@ -35,7 +35,7 @@ logger = logging.getLogger("index-service")
 
 
 def _create_storage(cfg, *, invalidate_lexical_scopes=None):
-    """Open the canonical storage and Outbox used by the API."""
+    """Use the same storage backend as the API, not an unrelated AGFS outbox."""
     if cfg.storage_backend == "sql" or cfg.shared_spaces_enabled:
         from commit.sql_outbox_store import SQLOutboxStore
         from fs.sql_adapter import SQLContextFS
@@ -47,97 +47,208 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None):
             cfg.sql_connection_string, pool_size=cfg.sql_pool_size,
             dialect=cfg.sql_dialect,
         )
-        if cfg.storage_backend == "agfs":
-            from fs.agfs_adapter.client import create_agfs_client
-            from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
+        client = fs = None
+        try:
+            if cfg.storage_backend == "agfs":
+                from fs.agfs_adapter.client import create_agfs_client
+                from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
 
-            fs = AGFSSpaceBridge(pool, create_agfs_client(cfg), cfg.agfs_mount_prefix)
-        else:
-            fs = SQLContextFS(pool=pool)
-        return fs, SQLOutboxStore(pool=pool, fs=fs), pool
+                client = create_agfs_client(cfg)
+                fs = AGFSSpaceBridge(pool, client, cfg.agfs_mount_prefix)
+            else:
+                fs = SQLContextFS(pool=pool)
+            return fs, SQLOutboxStore(pool=pool, fs=fs), pool
+        except BaseException:
+            try:
+                close = getattr(fs, 'close', None)
+                if callable(close) and close() is False:
+                    raise RuntimeError('shared content reader has not stopped')
+            finally:
+                try:
+                    close = getattr(client, 'close', None)
+                    if callable(close):
+                        close()
+                finally:
+                    pool.close_all()
+            raise
 
-    from fs.agfs_adapter.client import create_agfs_client
     from commit.outbox_store import OutboxStore
     from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from fs.agfs_adapter.client import create_agfs_client
 
     client = create_agfs_client(cfg)
-    fs = AGFSContextFS(client=client, mount_prefix=cfg.agfs_mount_prefix)
-    outbox = OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix,
-                         invalidate_lexical_scopes=invalidate_lexical_scopes)
-    return fs, outbox, None
+    try:
+        fs = AGFSContextFS(client=client, mount_prefix=cfg.agfs_mount_prefix)
+        return fs, OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix,
+                               invalidate_lexical_scopes=invalidate_lexical_scopes), None
+    except BaseException:
+        close = getattr(client, 'close', None)
+        if callable(close):
+            close()
+        raise
+
+
+def _build_service(cfg, admission):
+    """Construct only index resources, while holding the process write permit."""
+    from providers.config import ProviderConfig
+    from service.index_service import IndexService
+
+    closers = []
+    def remember(obj, *, vector=False):
+        close = (getattr(obj, 'release_for_migration', None) if vector else None)
+        close = close or getattr(obj, 'close_all', None) or getattr(obj, 'close', None)
+        if callable(close):
+            closers.append(close)
+        return obj
+    def cleanup():
+        # Preserve a failed close for explicit lifecycle retry.
+        while closers:
+            if closers[-1]() is False:
+                raise RuntimeError("index resource has not finished closing")
+            closers.pop()
+    try:
+        provider_cfg = ProviderConfig.from_ogmem_config(cfg)
+        embedder = vector_index = None
+        if not cfg.agfs_retrieval_enabled:
+            embedder = remember(provider_cfg.create_embedder())
+            vector_index = admission.guard(remember(provider_cfg.create_vector_index(), vector=True))
+        from providers.composite_index import create_projection_writer
+        projection = create_projection_writer(cfg, vector_index)
+        if projection is not vector_index:
+            remember(projection)
+            admission.guard(projection.lexical_index)
+            admission.guard(projection)
+        lexical = getattr(projection, 'lexical_index', None)
+        fs, outbox_store, storage_pool = _create_storage(
+            cfg, invalidate_lexical_scopes=lexical.mark_scopes_dirty if lexical is not None else None)
+        if storage_pool is not None:
+            remember(storage_pool)
+        else:
+            admission.guard(remember(fs._client))
+        if cfg.shared_spaces_enabled and cfg.storage_backend == 'agfs':
+            remember(fs._stage_pool)
+            admission.guard(remember(fs._agfs._client))
+            remember(fs)
+        fs = admission.guard(fs)
+        outbox_store = admission.guard(outbox_store)
+        llm = remember(provider_cfg.create_llm())
+        usage_pool = storage_pool
+        if cfg.sql_connection_string:
+            from fs.sql_adapter.model_usage_store import SQLModelUsageStore
+            from fs.sql_adapter.pool import SharedConnectionPool
+            if usage_pool is None:
+                usage_pool = remember(SharedConnectionPool(
+                    cfg.sql_connection_string, pool_size=cfg.sql_pool_size, dialect=cfg.sql_dialect))
+            usage_store = SQLModelUsageStore(usage_pool)
+            for provider in (llm, embedder):
+                tracker = getattr(provider, 'token_tracker', None)
+                if tracker is not None:
+                    tracker.set_usage_store(usage_store)
+        service = IndexService(
+            outbox_store=outbox_store, embedder=embedder, vector_index=projection,
+            get_account_ids=lambda: [cfg.account_id], interval_seconds=cfg.index_interval,
+            worker_count=cfg.index_workers, fs=fs, llm=llm,
+            directory_summary_enabled=getattr(cfg, 'directory_summary_enabled', False),
+            admission=admission)
+        return service, cleanup
+    except BaseException:
+        cleanup()
+        raise
+
+
+class CoordinatedIndexRunner:
+    """Register the official standalone producer in the instance migration gate."""
+    def __init__(self, cfg, *, build_service=_build_service):
+        from pathlib import Path
+
+        from service.migration.maintenance import MaintenanceError, MaintenanceStore
+        from service.migration.participants import Participant
+
+        self.cfg, self.build_service = cfg, build_service
+        self.service = self.cleanup = None
+        workspace = Path(cfg.migration_workspace).expanduser().resolve()
+        self.store = MaintenanceStore(workspace / 'maintenance.sqlite', str(workspace))
+        self.participant = Participant(self.store, pause=self.pause, refresh=self.refresh, resume=self.resume)
+        self.admission = self.participant.admission
+        try:
+            try:
+                with self.admission.scope(write=True):
+                    self.resume()
+                self.participant._paused = False
+            except MaintenanceError:
+                if self.store.status() is None:
+                    raise
+                self.participant._paused = True
+            self.participant.start()
+        except BaseException:
+            self.participant.close()
+            raise
+
+    def resume(self):
+        if self.service is not None:
+            return
+        with self.admission.backend(write=True):
+            self.service, self.cleanup = self.build_service(self.cfg, self.admission)
+            try:
+                self.service.start()
+            except BaseException:
+                self.pause()
+                raise
+
+    def pause(self):
+        if self.service is not None:
+            self.service.stop(wait=True)
+        if self.cleanup is not None:
+            self.cleanup()
+        self.service = self.cleanup = None
+        return True
+
+    def refresh(self):
+        # pause already discarded all process-local index/storage clients.
+        if self.service is not None:
+            raise RuntimeError('index service must stop before refresh')
+
+    def get_aggregated_stats(self):
+        service = self.service
+        return service.get_aggregated_stats() if service is not None else {}
+
+    def close(self, timeout=30):
+        from service.migration.maintenance import MaintenanceError
+        p = self.participant
+        try:
+            with self.admission.scope(write=True, _shutdown=True):
+                p.stop.set()
+                if p._thread is not None:
+                    p._thread.join(timeout)
+                    if p._thread.is_alive():
+                        raise MaintenanceError('index lifecycle callback is still running')
+                with self.admission._lock:
+                    self.admission._closing = True
+                self.pause()
+        except BaseException:
+            p.stop.clear()
+            if p._thread is not None and not p._thread.is_alive():
+                p._thread = None
+                p.start()
+            raise
+        p.close()
 
 
 def main():
-    from providers.composite_index import create_projection_writer
-    from providers.config import ProviderConfig
     from providers.unified_config import get_config
-    from service.index_service import init_index_service
-
     cfg = get_config()
-    provider_cfg = ProviderConfig.from_ogmem_config(cfg)
-
-    embedder = vector_index = None
-    if not cfg.agfs_retrieval_enabled:
-        embedder = provider_cfg.create_embedder()
-        vector_index = provider_cfg.create_vector_index()
-    projection_index = create_projection_writer(cfg, vector_index)
-
-    lexical_index = getattr(projection_index, "lexical_index", None)
-    fs, outbox_store, storage_pool = _create_storage(
-        cfg, invalidate_lexical_scopes=lexical_index.mark_scopes_dirty if lexical_index is not None else None,
-    )
-
-    logger.info("Config: provider=%s, embedding=%s, vector_db=%s, storage=%s, inverted_index=%s",
-                cfg.provider, cfg.openai_embedding_model if embedder is not None else "none",
-                cfg.vector_db_type if vector_index is not None else "none", cfg.storage_backend,
-                cfg.retrieval_lexical_provider)
+    service = CoordinatedIndexRunner(cfg)
     logger.info("Params: account=%s, interval=%ds, workers=%d",
                 cfg.account_id, cfg.index_interval, cfg.index_workers)
 
-    llm = provider_cfg.create_llm()
-
-    usage_pool = storage_pool
-    if cfg.sql_connection_string:
-        from fs.sql_adapter.model_usage_store import SQLModelUsageStore
-        from fs.sql_adapter.pool import SharedConnectionPool
-
-        if usage_pool is None:
-            usage_pool = SharedConnectionPool(
-                cfg.sql_connection_string, pool_size=cfg.sql_pool_size, dialect=cfg.sql_dialect,
-            )
-        usage_store = SQLModelUsageStore(usage_pool)
-        for provider in (llm, embedder):
-            tracker = getattr(provider, 'token_tracker', None)
-            if tracker is not None:
-                tracker.set_usage_store(usage_store)
-
-    service = init_index_service(
-        outbox_store=outbox_store,
-        embedder=embedder,
-        vector_index=projection_index,
-        get_account_ids=lambda: [cfg.account_id],
-        interval_seconds=cfg.index_interval,
-        worker_count=cfg.index_workers,
-        fs=fs,
-        llm=llm,
-        directory_summary_enabled=getattr(cfg, 'directory_summary_enabled', False),
-    )
-
     def shutdown(signum, frame):
         logger.info("Received signal %d, stopping...", signum)
-        service.stop(wait=True)
-        for resource in (projection_index, fs):
-            close = getattr(resource, "close", None)
-            if callable(close):
-                close()
-        if usage_pool is not None:
-            usage_pool.close_all()
+        service.close()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    service.start()
     logger.info("IndexService running (Ctrl+C to stop)")
 
     last_stats = None
