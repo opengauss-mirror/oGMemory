@@ -383,7 +383,7 @@ def test_real_admin_api_migration_flow(tmp_path, monkeypatch, request):
     comparison = preview["result"]["compatibility"]
     assert comparison["source"]["content_storage"]["backend"] == "agfs"
     assert comparison["target"]["content_storage"]["backend"] == target.storage_backend
-    assert "content_storage.backend" in comparison["changes"]
+    assert ("content_storage.backend" in comparison["changes"]) == (source.storage_backend != target.storage_backend)
     result = job(dst, {"kind": "import", "artifact_id": artifact, "preflight_id": preview["id"]})
     # Normal source service may refresh directory summaries before snapshot.
     # Validate the exported business records and actual target projection.
