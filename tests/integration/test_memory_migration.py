@@ -172,23 +172,16 @@ def fixtures():
     }
 
 
-@pytest.mark.parametrize(
-    "source_backend,target_backend",
-    [("agfs", "agfs"), ("sql", "sql")],
-)
-@pytest.mark.parametrize(
-    "vector_backend", os.environ.get("MIGRATION_TEST_VECTOR_BACKENDS", "opengauss").split(",")
-)
-def test_same_storage_migration_and_new_process_retrieval(
-    tmp_path, source_backend, target_backend, vector_backend, request
-):
+def exercise_migration(tmp_path, source_backend, target_backend, vector_backend, request,
+                       *, source_vector_backend=None):
     source = new_config(source_backend, "source")
     target = new_config(target_backend, "target")
     if target_backend == "sql":
         target.sql_dialect = "auto"
     target.opengauss_dimension = 16
     assert vector_backend in {"opengauss", "chroma", "milvus"}
-    source.vector_db_type = target.vector_db_type = vector_backend
+    target.vector_db_type = vector_backend
+    source.vector_db_type = source_vector_backend or vector_backend
     if vector_backend == "chroma":
         pytest.importorskip("chromadb")
         target.chroma_persist_directory = str(tmp_path / "chroma")
@@ -273,6 +266,19 @@ print('NEW_PROCESS_RETRIEVAL_OK',cfg.storage_backend)
     assert "NEW_PROCESS_RETRIEVAL_OK" in result.stdout
     repeated = MigrationService(target, asset_root=target_assets).preview(package)
     assert repeated["counts"]["new"] == 0
+
+
+@pytest.mark.parametrize(
+    "source_backend,target_backend",
+    [("agfs", "agfs"), ("sql", "sql")],
+)
+@pytest.mark.parametrize(
+    "vector_backend", os.environ.get("MIGRATION_TEST_VECTOR_BACKENDS", "opengauss").split(",")
+)
+def test_same_storage_migration_and_new_process_retrieval(
+    tmp_path, source_backend, target_backend, vector_backend, request
+):
+    exercise_migration(tmp_path, source_backend, target_backend, vector_backend, request)
 
 
 def assert_merged_package(path, target, result, expected, asset_root=None):
