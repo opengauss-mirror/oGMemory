@@ -61,6 +61,10 @@ def create_memory_viewer_blueprint(
     def index():
         return send_from_directory(_STATIC_DIR, "index.html")
 
+    @blueprint.get("/memory-viewer/migration")
+    def migration_instructions():
+        return send_from_directory(_STATIC_DIR, 'migration.html')
+
     @blueprint.get("/memory-viewer/<path:asset_path>")
     def asset(asset_path: str):
         return send_from_directory(_STATIC_DIR, asset_path)
