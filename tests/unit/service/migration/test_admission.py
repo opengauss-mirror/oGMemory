@@ -150,7 +150,7 @@ def test_agfs_read_remains_available_during_snapshot(admission, tmp_path):
     from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
     from service.migration.storage import AGFSStorage
     from tests.unit.service.migration.test_engine import config, node
-    from tests.unit.service.migration.test_tree_backup import LocalClient
+    from tests.migration_fixtures import LocalClient
 
     class AdapterClient(LocalClient):
         def read(self, path, offset=0, size=-1):

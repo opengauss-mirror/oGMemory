@@ -74,8 +74,6 @@ class InstanceMigration:
                     except Exception:
                         return False
                 self._track(adapter, ('merge_nodes', 'restore', 'replace_relations'), task, settled=settled)
-                if getattr(cfg, 'shared_spaces_enabled', False):
-                    self._track(adapter, ('restore_space_catalog', 'publish_space_projections'), task, settled=settled)
                 yield adapter
 
             def index_factory(cfg):
@@ -126,15 +124,15 @@ class InstanceMigration:
                                       asset_root=self.asset_root)
             yield engine, recovery_factory
 
-    def merge(self, source, *, task, progress=lambda **kw: None, shared_selection=None):
+    def merge(self, source, *, task, progress=lambda **kw: None):
         with self._execution(task) as (engine, factory):
             return engine.merge(source, task=task, recovery_factory=factory,
-                                llm=self.service.get_llm(), progress=progress, shared_selection=shared_selection)
+                                llm=self.service.get_llm(), progress=progress)
 
     def recover(self, source, *, task, progress=lambda **kw: None):
-        from service.migration.space_scope import incoming_scope
+        from service.migration.engine import inventory
 
         with open_package(source) as package, self._execution(task) as (_, factory):
             request = package_identity(package.manifest)
-            with incoming_scope(package) as (incoming, _), factory(request, incoming) as recovery:
+            with inventory(package.root / 'incoming.sqlite', package.records) as incoming, factory(request, incoming) as recovery:
                 return recovery.recover(task, progress=progress)
