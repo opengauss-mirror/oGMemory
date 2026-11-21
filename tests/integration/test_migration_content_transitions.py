@@ -276,3 +276,11 @@ def test_cross_content_sessions_identifier(tmp_path, identity_case):
 
 def test_cross_content_directory_alias(tmp_path):
     common.test_agfs_directory_source_alias_preserves_backend_semantics(tmp_path, 'sql')
+
+
+def test_cross_content_admin_api(tmp_path, monkeypatch, request):
+    common.exercise_admin_api_migration(tmp_path, monkeypatch, request, target_backend='sql')
+
+
+def test_cross_content_sql_relation_authority(tmp_path):
+    common.exercise_sql_relation_authority(tmp_path, target_backend='agfs')
