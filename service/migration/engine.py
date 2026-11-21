@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 from cli import __version__
 from service.migration.assets import Assets
-from service.migration.description import compatibility, describe, model_dimension, validate_migration_scope
+from service.migration.description import compatibility, describe, model_dimension
 from service.migration.package import (
     DATASETS,
     PackageError,
@@ -280,7 +280,6 @@ class MigrationService:
             }
 
     def _validate_source(self, package, inv):
-        validate_migration_scope(package.manifest, self.cfg)
         assets = Assets(self.asset_root, package.root)
         assets.validate(package, inv, check_target=False)
         # Reject malformed typed Agent records before any target writes.

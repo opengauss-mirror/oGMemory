@@ -105,9 +105,3 @@ def compatibility(source, target):
     if not vector_free and "vector_storage.backend" in changes:
         notices.append("向量后端发生变化，将在已通过支持检查的目标后端重建索引。")
     return {"source": source, "target": target, "changes": changes, "notices": notices}
-
-
-def validate_migration_scope(manifest, cfg):
-    """Allow database/model changes while retaining the content backend."""
-    if manifest["source_backend"] != cfg.storage_backend:
-        raise PackageError("当前仅支持相同内容存储类型迁移：AGFS→AGFS 或 SQL→SQL。")
