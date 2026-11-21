@@ -89,9 +89,31 @@ def test_runtime_and_projection_writes_do_not_block_snapshot(tmp_path):
     client.write = MethodType(lambda self, path, data: None, client)
     admission.guard(client)
     with SourceSnapshot(gate, 'runtime').scope():
-        client.write('/local/accounts/acme/users/u/memories/x/.outbox/e.json', b'{}')
+        with admission.backend(write=True, content=False):
+            client.write('/local/accounts/acme/users/u/memories/x/.outbox/e.json', b'{}')
         client.write('/local/accounts/acme/sessions/s/state/content.md', b'{}')
         with pytest.raises(MaintenanceError):
             client.write('/local/accounts/acme/users/u/memories/x/content.md', b'changed')
     assert not _content_path('/local/accounts/acme/sessions/s/state/content.md')
     assert _content_path('/local/accounts/acme/sessions/s/history/a/content.md')
+
+
+@pytest.mark.parametrize('name', ['_system', '.outbox', '.foo-lock', 'traces', 'tool-results'])
+def test_business_names_do_not_bypass_content_barrier(tmp_path, name):
+    from service.migration.admission import _content_path
+    assert _content_path(f'/local/accounts/acme/users/alice/memories/preferences/{name}/content.md')
+
+
+def test_keyword_move_destination_is_checked(tmp_path):
+    from types import MethodType
+    from fs.agfs_adapter.client import NativeAGFSClient
+    client = object.__new__(NativeAGFSClient)
+    calls = []
+    client.mv = MethodType(lambda self, source, destination: calls.append(destination), client)
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'move')
+    Admission(gate).guard(client)
+    with SourceSnapshot(gate, 'snapshot').scope():
+        with pytest.raises(MaintenanceError):
+            client.mv('/local/accounts/acme/sessions/s/state/file',
+                      destination='/local/accounts/acme/users/alice/memories/preferences/x/content.md')
+    assert calls == []

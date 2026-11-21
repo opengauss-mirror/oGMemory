@@ -15,15 +15,16 @@ def _content_path(path):
     """Conservative classification of AGFS payload mutations, excluding runtime trees."""
     from pathlib import PurePosixPath
     parts = PurePosixPath(str(path)).parts
-    if any(p.startswith('.') and '-lock' in p for p in parts):
-        return False
-    if any(p in {'.outbox', '.outbox-done', '.lexical-outbox', '.write_operations',
-                 '_system', '.ogmemory'} for p in parts):
-        return False
+    # Coordination files have an exact reserved layout, never a basename rule.
+    import re
+    if any(re.fullmatch(r'\..+\.resource-mutation-lock(?:-[0-9a-f]{32})?', p) for p in parts):
+        return parts[-1] in {'content.md', '.meta.json', '.abstract.md', '.overview.md', '.relations.json'}
     if 'accounts' in parts:
         i = parts.index('accounts')
         tail = parts[i + 2:]
-        if tail and tail[0] in {'traces', 'tool-results'}:
+        if tail and tail[0] in {'_system', '.outbox', '.outbox-done', '.lexical-outbox', 'traces', 'tool-results'}:
+            return False
+        if len(tail) >= 4 and tail[0] in {'users', 'agents'} and tail[2:4] == ('memories', '.write_operations'):
             return False
         if tail and tail[0] == 'sessions':
             return len(tail) >= 3 and tail[2] == 'history'
@@ -62,6 +63,7 @@ class Admission:
         self.store = store
         self.participant = participant
         self._operation = ContextVar(f"migration-admission-{id(self)}", default=None)
+        self._runtime_backend = ContextVar(f'migration-runtime-{id(self)}', default=False)
         self._lock = threading.RLock()
         self._closing = False
 
@@ -149,6 +151,7 @@ class Admission:
     def backend(self, *, write, http_rejections=False, content=True):
         lifetime = self.content_scope() if write and content else self.scope(write=write)
         with lifetime:
+            runtime = self._runtime_backend.set(not content)
             try:
                 yield
             except BaseException as exc:
@@ -174,6 +177,8 @@ class Admission:
                 if write and not rejected:
                     self._operation.get().uncertain = True
                 raise
+            finally:
+                self._runtime_backend.reset(runtime)
 
     def launch(self, target, *, args=(), kwargs=None, name=None, daemon=True):
         """Reserve the child's write permit before it can be delayed by scheduling."""
@@ -302,12 +307,16 @@ class Admission:
                 content = False
             from fs.agfs_adapter.client import NativeAGFSClient
             if write and isinstance(storage, (AGFSClient, NativeAGFSClient)):
+                signature = inspect.signature(function)
                 @wraps(function)
                 def transport(*args, _function=function, _write=write,
-                              _rejections=single_attempt, **kwargs):
-                    paths = [v for v in args[:2] if isinstance(v, str)]
-                    paths.extend(kwargs[k] for k in ('path', 'src', 'dst') if k in kwargs)
+                              _signature=signature, _rejections=single_attempt, **kwargs):
+                    bound = _signature.bind(*args, **kwargs).arguments
+                    paths = [value for key, value in bound.items()
+                             if key in {'path', 'src', 'dst', 'source', 'destination'}]
                     payload = any(_content_path(p) for p in paths) if paths else True
+                    if self._runtime_backend.get():
+                        payload = False  # Actual content adapters still acquire their own permit.
                     return self.wrap(_function, write=_write, backend=True,
                                      http_rejections=_rejections, content=payload)(*args, **kwargs)
                 setattr(storage, name, transport)
@@ -321,7 +330,9 @@ class Admission:
             mutation = getattr(storage, name, None)
             if callable(mutation):
                 setattr(storage, name, self.wrap(mutation, write=True, backend=True,
-                                                  content=_content_arguments if _content_storage(storage) else False))
+                                                  content=(lambda *a, **kw: not self._runtime_backend.get()
+                                                           and _content_arguments(*a, **kw))
+                                                  if _content_storage(storage) else False))
         storage._migration_guard = self
         return storage
 
