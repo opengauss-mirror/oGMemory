@@ -160,3 +160,48 @@ def test_scene_transaction_releases_only_confirmed_rollback(tmp_path, rollback_f
         with a.backend(write=True), store._transaction('acme'):
             raise ValueError('business conflict')
     assert_drain(a, blocked=rollback_fails)
+
+
+@pytest.mark.parametrize('exists', [False, True])
+@pytest.mark.parametrize('prior_unknown', [False, True])
+def test_atomic_resource_conflict_settles_after_cleanup(tmp_path, exists, prior_unknown):
+    from core.errors import ConcurrentModificationError
+    from tests.unit.fs.test_agfs_context_fs import _atomic_code_stack, _atomic_code_context, _atomic_code_node
+    _, fs, outbox = _atomic_code_stack()
+    ctx = _atomic_code_context()
+    if exists:
+        node = _atomic_code_node()
+        fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
+    a = admission(tmp_path)
+    a.guard(fs)
+    stale = _atomic_code_node(expected_version=2)
+    with a.scope():
+        if prior_unknown:
+            with pytest.raises(TimeoutError), a.backend(write=True):
+                raise TimeoutError('unconfirmed prior mutation')
+        with pytest.raises(ConcurrentModificationError):
+            fs.write_node_with_outbox(stale, ctx, outbox.build_write_event(stale))
+    assert_drain(a, blocked=prior_unknown)
+
+
+@pytest.mark.parametrize('failed_cleanup', ['candidate', 'lock'])
+def test_atomic_resource_conflict_keeps_unknown_cleanup(tmp_path, failed_cleanup, monkeypatch):
+    from core.errors import ConcurrentModificationError
+    from tests.unit.fs.test_agfs_context_fs import _atomic_code_stack, _atomic_code_context, _atomic_code_node
+    client, fs, outbox = _atomic_code_stack()
+    a = admission(tmp_path)
+    a.guard(fs)
+    if failed_cleanup == 'candidate':
+        monkeypatch.setattr(fs, '_remove_tree_if_present', lambda _: False)
+    else:
+        original_rm = client.rm
+        def remove(path, **kwargs):
+            if path.endswith('.resource-mutation-lock'):
+                raise TimeoutError('unknown lock deletion')
+            return original_rm(path, **kwargs)
+        monkeypatch.setattr(client, 'rm', remove)
+    node = _atomic_code_node(expected_version=2)
+    with pytest.raises(ConcurrentModificationError) as error:
+        fs.write_node_with_outbox(node, _atomic_code_context(), outbox.build_write_event(node))
+    assert not getattr(error.value, 'agfs_rejection_settled', False)
+    assert_drain(a, blocked=True)

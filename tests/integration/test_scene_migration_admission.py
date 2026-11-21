@@ -47,6 +47,7 @@ def test_scene_runtime_configuration_worker_and_resume(tmp_path, monkeypatch):
         monkeypatch.setattr(service, 'get_llm', lambda: Mock())
         monkeypatch.setattr(service, 'start_extraction_recovery', lambda: None)
         monkeypatch.setattr(service, 'get_auth_service', lambda: Mock(role_control_active=lambda: False))
+        _check_sql_control_plane(service, gate, monkeypatch)
         ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.MEMBER)
         # Cold runtime construction must not create schema during export.
         gate.enter('cold', mode='export', resources={})
@@ -101,3 +102,32 @@ def test_scene_runtime_configuration_worker_and_resume(tmp_path, monkeypatch):
         with admin.cursor() as cursor:
             cursor.execute('DROP DATABASE ' + database)
         admin.close()
+
+
+def _check_sql_control_plane(service, gate, monkeypatch):
+    import importlib
+    module = importlib.import_module('server.app')
+    root = RequestContext('acme', 'root', 'agent', 's', 't', Role.ROOT)
+    service.get_key_manager().create_account('acme', 'admin')
+    with monkeypatch.context() as patch:
+        patch.setattr(module, '_service', service)
+        patch.setattr(module, '_build_authenticated_context', lambda _: root)
+        patch.setattr(service, 'get_auth_service', lambda: Mock(role_control_active=lambda: True))
+        client = module.app.test_client()
+        gate.enter('control-export', mode='export', resources={})
+        response = client.post('/api/v1/admin/accounts/acme/users',
+                               json={'user_id': 'new-user'}, buffered=True)
+        assert response.status_code == 503
+        assert response.headers['Retry-After'] == '5'
+        assert {u['user_id'] for u in service.get_key_manager().get_users('acme')} == {'admin'}
+        assert client.get('/api/v1/admin/accounts', buffered=True).status_code == 200
+        gate.wait_drained('control-export', 0)
+        gate.reopen('control-export')
+        assert client.post('/api/v1/admin/accounts/acme/users',
+                           json={'user_id': 'new-user'}, buffered=True).status_code == 200
+        gate.enter('control-import', mode='import', resources={})
+        assert client.get('/api/v1/admin/accounts', buffered=True).status_code == 200
+        assert client.post('/api/v1/admin/accounts/acme/users',
+                           json={'user_id': 'another'}, buffered=True).status_code == 503
+        gate.wait_drained('control-import', 0)
+        gate.reopen('control-import')

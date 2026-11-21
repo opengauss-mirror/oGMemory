@@ -280,3 +280,27 @@ def test_native_context_lock_business_rejection_drains(native, tmp_path):
         fs.archive_node(uri.replace('acme', 'other'), ctx)
     admission.store.enter('snapshot', mode='export', resources={})
     admission.store.wait_drained('snapshot', 0)
+
+
+def test_native_atomic_resource_version_conflict_drains(native, tmp_path):
+    from commit.outbox_store import OutboxStore
+    from core.errors import ConcurrentModificationError
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from service.migration.admission import Admission
+    from service.migration.maintenance import MaintenanceStore
+    from tests.unit.fs.test_agfs_context_fs import _atomic_code_node, _atomic_code_context
+
+    client, mount, _ = native
+    a = Admission(MaintenanceStore(tmp_path / 'gate.db', 'native-conflict'))
+    fs = a.guard(AGFSContextFS(client=a.guard(client), mount_prefix=mount))
+    outbox = OutboxStore(client=client, fs=fs, mount_prefix=mount)
+    ctx = _atomic_code_context()
+    stale = _atomic_code_node(expected_version=2)
+    with pytest.raises(ConcurrentModificationError):
+        fs.write_node_with_outbox(stale, ctx, outbox.build_write_event(stale))
+    node = _atomic_code_node()
+    fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
+    with pytest.raises(ConcurrentModificationError):
+        fs.write_node_with_outbox(stale, ctx, outbox.build_write_event(stale))
+    a.store.enter('snapshot', mode='export', resources={})
+    a.store.wait_drained('snapshot', 0)

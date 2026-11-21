@@ -1253,6 +1253,7 @@ class AGFSContextFS:
         candidate_path = lock_path + "-" + owner_token
         deadline = time.monotonic() + timeout_seconds
         acquired = False
+        rejection = None
         lease_stop = Event()
         lease_lost = Event()
         lease_thread = None
@@ -1297,22 +1298,31 @@ class AGFSContextFS:
                 lost=lease_lost,
             )
             lease.ensure_owned()
-            yield lease
+            try:
+                yield lease
+            except ConcurrentModificationError as exc:
+                if getattr(exc, 'agfs_write_not_started', False) is True:
+                    rejection = exc
+                raise
             lease.ensure_owned()
         finally:
             lease_stop.set()
             if lease_thread is not None:
                 lease_thread.join()
-            self._remove_tree_if_present(candidate_path)
+            cleaned = self._remove_tree_if_present(candidate_path)
+            released = False
             if acquired:
                 try:
                     if self._owns_resource_mutation_lock(lock_path, owner_token):
                         self._client.rm(lock_path, recursive=True)
+                        released = True
                 except Exception:
                     logger.warning(
                         "Failed to release AGFS code-resource mutation lock: %s",
                         lock_path,
                     )
+            if rejection is not None and cleaned and released:
+                rejection.agfs_rejection_settled = True
 
     @contextmanager
     def session_recovery_lock(self, uri: str, ctx: RequestContext, *, timeout_seconds=1.0):
@@ -1905,11 +1915,9 @@ class AGFSContextFS:
             existing_meta_raw = self._read_optional_raw(meta_path)
             if existing_meta_raw is None:
                 if expected_version != 0:
-                    raise ConcurrentModificationError(
-                        node.uri,
-                        expected_version,
-                        0,
-                    )
+                    error = ConcurrentModificationError(node.uri, expected_version, 0)
+                    error.agfs_write_not_started = True
+                    raise error
                 self._remove_empty_code_resource_destination(
                     final_node_path,
                     lease,
@@ -1940,11 +1948,9 @@ class AGFSContextFS:
             ):
                 raise RuntimeError("invalid committed AGFS code-resource version")
             if expected_version != actual_version:
-                raise ConcurrentModificationError(
-                    node.uri,
-                    expected_version,
-                    actual_version,
-                )
+                error = ConcurrentModificationError(node.uri, expected_version, actual_version)
+                error.agfs_write_not_started = True
+                raise error
 
             existing = self.read_node(node.uri, ctx)
             if self._canonical_node_index_records(existing) != event_records:
