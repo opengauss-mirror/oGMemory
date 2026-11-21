@@ -47,17 +47,27 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None):
             cfg.sql_connection_string, pool_size=cfg.sql_pool_size,
             dialect=cfg.sql_dialect,
         )
+        client = fs = None
         try:
             if cfg.storage_backend == "agfs":
                 from fs.agfs_adapter.client import create_agfs_client
                 from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
 
-                fs = AGFSSpaceBridge(pool, create_agfs_client(cfg), cfg.agfs_mount_prefix)
+                client = create_agfs_client(cfg)
+                fs = AGFSSpaceBridge(pool, client, cfg.agfs_mount_prefix)
             else:
                 fs = SQLContextFS(pool=pool)
             return fs, SQLOutboxStore(pool=pool, fs=fs), pool
         except BaseException:
-            pool.close_all()
+            try:
+                close = getattr(fs, 'close', None)
+                if callable(close) and close() is False:
+                    raise RuntimeError('shared content reader has not stopped')
+            finally:
+                close = getattr(client, 'close', None)
+                if callable(close):
+                    close()
+                pool.close_all()
             raise
 
     from commit.outbox_store import OutboxStore

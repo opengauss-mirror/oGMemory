@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -75,3 +75,20 @@ def test_migration_preserves_injected_client():
     client = SimpleNamespace()
     storage = AGFSStorage(SimpleNamespace(agfs_mount_prefix="/memory"), client=client)
     assert storage.client is client
+
+
+def test_shared_runner_closes_client_if_bridge_initialization_fails(monkeypatch):
+    from scripts.run_index_service import _create_storage
+    pool, client = MagicMock(), MagicMock()
+    monkeypatch.setattr('fs.sql_adapter.pool.SharedConnectionPool', lambda *a, **kw: pool)
+    monkeypatch.setattr('fs.agfs_adapter.client.create_agfs_client', lambda cfg: client)
+    def fail(*a, **kw):
+        raise RuntimeError('bridge schema/init failed')
+    monkeypatch.setattr('fs.agfs_adapter.space_bridge.AGFSSpaceBridge', fail)
+    cfg = SimpleNamespace(storage_backend='agfs', shared_spaces_enabled=True,
+                          sql_connection_string='test', sql_pool_size=1,
+                          sql_dialect='opengauss', agfs_mount_prefix='/local')
+    with pytest.raises(RuntimeError):
+        _create_storage(cfg)
+    pool.close_all.assert_called_once()
+    client.close.assert_called_once()

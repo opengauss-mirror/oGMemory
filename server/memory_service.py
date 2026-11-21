@@ -2989,11 +2989,10 @@ class MemoryService:
 
             projection_index = create_projection_writer(self._cfg, vector_index)
             if self._cfg.retrieval_uses_lexical_projection:
-                self._lexical_index = projection_index.lexical_index
+                self._lexical_index = self._guard_storage(projection_index.lexical_index)
             # Publish the resource tree only after required lexical
             # initialization succeeds, so transient failures remain retryable.
             self._vector_index = self._guard_storage(vector_index)
-            self._lexical_index = self._guard_storage(self._lexical_index)
             self._projection_index = self._guard_storage(projection_index)
             logger.info("Retrieval projections ready: vector=%s lexical=%s",
                         type(vector_index).__name__, self._cfg.retrieval_lexical_provider)
