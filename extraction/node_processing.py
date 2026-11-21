@@ -5,7 +5,7 @@ import re
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import ExitStack
+from contextlib import nullcontext
 from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -86,17 +86,25 @@ def _independent_candidates(candidates, failures):
     return candidates, failures
 
 
+def topic_directory_scope(write_api, ctx):
+    if not write_api._node_processing_enabled:
+        return nullcontext()
+    resolver = write_api._writer._identity_resolver
+    directories = [
+        resolver.uris.get_directory_uri(schema.memory_type, ctx).rstrip("/")
+        for schema in resolver.schemas.list_compatible_enabled()
+        if schema.memory_type in CATEGORIES
+    ]
+    return resolver.lock_directories(directories, ctx)
+
+
 def serialized_topics(function):
-    """Keep topic selection and commit in the existing owner-directory fences."""
+    """Serialize topic decisions for callers using synchronous publication."""
     @wraps(function)
     def wrapped(self, messages, ctx, *args, **kwargs):
-        with ExitStack() as stack:
-            if self._node_processing_enabled:
-                resolver = self._writer._identity_resolver
-                schemas = resolver.schemas.list_compatible_enabled()
-                directories = [resolver.uris.get_directory_uri(schema.memory_type, ctx).rstrip("/")
-                               for schema in schemas if schema.memory_type in CATEGORIES]
-                stack.enter_context(resolver.lock_directories(directories, ctx))
+        if kwargs.get("publication_scope") is not None:
+            return function(self, messages, ctx, *args, **kwargs)
+        with topic_directory_scope(self, ctx):
             return function(self, messages, ctx, *args, **kwargs)
     return wrapped
 

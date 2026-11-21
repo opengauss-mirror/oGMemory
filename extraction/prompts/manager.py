@@ -84,7 +84,15 @@ class PromptManager:
                 raise ValueError(f"Failed to parse template {path}{location}: {exc}") from exc
             if not isinstance(template_data, dict):
                 raise ValueError(f"Template {path} must be a YAML mapping")
-            missing = [key for key in _REQUIRED_SECTIONS if not template_data.get(key)]
+            required = (
+                ("system_prompt", "next_step", "read_candidates")
+                if template_name == "extraction_decision" else _REQUIRED_SECTIONS
+            )
+            missing = [key for key in required if not template_data.get(key)]
+            if template_name == "extraction_decision" and any(
+                not isinstance(template_data.get(key), str) for key in required
+            ):
+                raise ValueError("Decision template requires text for system_prompt, next_step and read_candidates")
             if missing:
                 raise ValueError(
                     f"Template {path} missing required section(s): {', '.join(missing)}"
@@ -107,6 +115,7 @@ class PromptManager:
         section: str,
         *,
         categories: Collection[str] | None = None,
+        purpose: str = "native",
         **variables: Any,
     ) -> str:
         """Render a specific section of a template with Jinja2.
@@ -126,6 +135,10 @@ class PromptManager:
             return ""
 
         raw = template_data.get(section, "")
+        if purpose != "native" and purpose not in template_data.get("assembly_purposes", ()):
+            raise UnsupportedAssemblyTemplateError(f"{template_name}: unsupported purpose {purpose}")
+        if isinstance(raw, list):
+            raw = [block for block in raw if not isinstance(block, dict) or purpose in block.get("purposes", (purpose,))]
         if categories is not None and section in ("system_prompt", "examples"):
             _, declared = self._assembly_data(template_name)
             selected = frozenset(categories)
@@ -153,6 +166,26 @@ class PromptManager:
             raise ValueError("selection.input requires runtime_input_json")
         raw_text = self._section_text(raw, section)
         return self._render_text(template_name, section, raw_text, variables)
+
+    def validate_purpose(self, template_name, purpose):
+        template = self.load(template_name)
+        purposes = template.get("assembly_purposes", [])
+        if not isinstance(purposes, list) or purpose not in purposes:
+            raise UnsupportedAssemblyTemplateError(f"{template_name}: unsupported purpose {purpose}")
+        final_instruction = template.get("final_content_instruction")
+        if not isinstance(final_instruction, str) or not final_instruction.strip():
+            raise UnsupportedAssemblyTemplateError(f"{template_name}: missing final_content_instruction")
+        for section in ("system_prompt", "examples", "lazy_tools_instruction"):
+            blocks = template.get(section)
+            if not isinstance(blocks, list):
+                raise UnsupportedAssemblyTemplateError(f"{template_name}: invalid {section} for {purpose}")
+            for block in blocks:
+                labels = block.get("purposes") if isinstance(block, dict) else None
+                self._section_text([block], section)
+                if labels is not None and (
+                    not isinstance(labels, list) or not labels or any(label not in purposes for label in labels)
+                ):
+                    raise UnsupportedAssemblyTemplateError(f"{template_name}/{section}: invalid purposes")
 
     def _render_text(self, template_name, section, raw_text, variables):
         if not raw_text:

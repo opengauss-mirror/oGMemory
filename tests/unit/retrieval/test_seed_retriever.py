@@ -588,6 +588,21 @@ class TestSeedRetriever:
         with pytest.raises(RuntimeError, match="backfill is not ready"):
             r.search(query, ctx)
 
+    def test_agfs_hybrid_reports_warming_and_retains_vector_results(self, embedder, ctx):
+        hit = SeedHit(uri="ctx://acct-1/users/u1/memories/entities/seed/content.md", score=1.0, level=2)
+        vector = SimpleNamespace(search_by_vector=lambda *args, **kwargs: [hit])
+        lexical = SimpleNamespace(search=lambda *args, **kwargs: [])
+        backfill = SimpleNamespace(ensure_ready=lambda *args: False)
+        cfg = RetrievalConfig(hybrid_enabled=True, expand_hierarchy=False)
+        query = TypedQuery(text="seed", context_type="MEMORY", categories=[], top_k=1,
+                           account_id=ctx.account_id, owner_space=ctx.user_space_name())
+        retriever = SeedRetriever(vector, embedder, cfg, lexical, backfill, allow_lexical_warming=True)
+
+        result = retriever.search(query, ctx)
+
+        assert result.lexical_warming
+        assert [candidate.uri for candidate in result.initial_candidates] == [hit.uri]
+
     def test_hybrid_provider_missing_security_filters_fails_fast(self, embedder, ctx):
         """P1-2 regression: a lexical provider without account/owner-space
         security filters is a misconfiguration — raise, don't degrade."""

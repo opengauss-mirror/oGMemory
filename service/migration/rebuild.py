@@ -134,7 +134,7 @@ class Rebuilder:
         self.lexical = None
         self.pool = None
         try:
-            if cfg.retrieval_hybrid_enabled:
+            if cfg.retrieval_uses_lexical_projection:
                 from providers.lexical_index import create_lexical_index
 
                 self.lexical = create_lexical_index(cfg)

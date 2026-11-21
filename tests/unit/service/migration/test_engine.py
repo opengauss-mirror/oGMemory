@@ -178,7 +178,7 @@ def test_incomplete_target_index_and_memory_backend_rejected(tmp_path):
         vector_db_type="memory"
     ).to_provider_config()
     target.index_factory = Rebuilder
-    target.cfg.retrieval_hybrid_enabled = False
+    target.cfg.retrieval_uses_lexical_projection = False
     with pytest.raises(PackageError, match="persistent"):
         target.preview(path)
 

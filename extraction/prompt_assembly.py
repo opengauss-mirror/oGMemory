@@ -231,6 +231,7 @@ class PromptParts:
     registry: object = field(default=None, repr=False, compare=False)
     data_prompt: str | None = None
     output_instruction: str = ""
+    purpose: str = "native"
 
     def render(self) -> str:
         prefix = self.system_prompt + self.prefix_data
@@ -240,9 +241,10 @@ class PromptParts:
         return prefix + suffix
 
     def full(self) -> PromptParts:
+        purpose = {"purpose": self.purpose} if self.purpose != "native" else {}
         return replace(self,
-            system_prompt=self.manager.render("extraction", "system_prompt", **self.template_variables),
-            examples=self.manager.render("extraction", "examples") if self.include_examples else "",
+            system_prompt=self.manager.render("extraction", "system_prompt", **purpose, **self.template_variables),
+            examples=self.manager.render("extraction", "examples", **purpose) if self.include_examples else "",
             runtime_instruction=(build_update_instruction(self.registry, include_updates=self.include_updates) + "\n\n"
                                  if self.registry is not None else self.runtime_instruction))
 
@@ -254,13 +256,14 @@ class PromptParts:
         if not hasattr(contract, "scope"):
             contract = AssemblyContract(frozenset(contract), (), "eager", "scoped")
         categories = None if contract.scope == "full" else contract.categories
-        examples = self.manager.render("extraction", "examples", categories=categories)
+        purpose = {"purpose": self.purpose} if self.purpose != "native" else {}
+        examples = self.manager.render("extraction", "examples", categories=categories, **purpose)
         if contract.mode == "lazy":
-            self.manager.render("extraction", "lazy_tools_instruction")
+            self.manager.render("extraction", "lazy_tools_instruction", **purpose)
         return replace(
             self,
             system_prompt=self.manager.render(
-                "extraction", "system_prompt", categories=categories, **self.template_variables
+                "extraction", "system_prompt", categories=categories, **purpose, **self.template_variables
             ),
             examples=examples if self.examples else "",
             runtime_instruction=(
@@ -425,7 +428,7 @@ def compact_prepared_prompt(prepared, contract, *, source_only=False):
 
 def validate_offered_calls(calls, tools):
     names = {tool["name"] for tool in tools}
-    if any(call.get("tool") not in names for call in calls):
+    if any((call.get("name") or call.get("tool")) not in names for call in calls):
         raise ToolCallProtocolError("Extraction returned a tool outside the assembled schemas")
 
 

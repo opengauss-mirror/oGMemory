@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 
 from core.enums import EventType
 from core.models import ContextNode
@@ -20,10 +20,14 @@ def _best_effort_rollback(conn) -> None:
 class SQLCanonicalNodeScanner:
     """Page through active SQL nodes using the shared storage pool."""
 
-    def __init__(self, pool, *, statement_timeout_ms: int = 30_000) -> None:
+    def __init__(
+        self, pool, *, hydrate_nodes: Callable[[list[ContextNode]], Iterable[ContextNode]] | None = None,
+        statement_timeout_ms: int = 30_000,
+    ) -> None:
         if statement_timeout_ms < 1:
             raise ValueError("statement_timeout_ms must be positive")
         self._pool = pool
+        self._hydrate_nodes = hydrate_nodes
         self._statement_timeout_ms = statement_timeout_ms
 
     def _set_statement_timeout(self, cur) -> None:
@@ -93,11 +97,12 @@ class SQLCanonicalNodeScanner:
                 self._pool.return_connection(conn)
             if not rows:
                 return
+            nodes = []
             for row in rows:
                 metadata = row[8]
                 if isinstance(metadata, str):
                     metadata = json.loads(metadata)
-                yield ContextNode(
+                nodes.append(ContextNode(
                     uri=str(row[0]),
                     context_type=str(row[1]),
                     category=str(row[2]),
@@ -107,7 +112,8 @@ class SQLCanonicalNodeScanner:
                     overview=str(row[6] or ""),
                     content=str(row[7] or ""),
                     metadata=dict(metadata or {}),
-                )
+                ))
+            yield from self._hydrate_nodes(nodes) if self._hydrate_nodes is not None else nodes
             last_uri = str(rows[-1][0])
             if len(rows) < page_size:
                 return

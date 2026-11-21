@@ -208,6 +208,7 @@ class RetrievalPipeline:
             typed_queries=typed_queries,
             hits=blocks,
             trace=trace,
+            partial=any(seed.lexical_warming for seed in all_seed_results),
         )
 
     def _expand_by_graph(
@@ -537,6 +538,8 @@ class RetrievalPipeline:
                     root_uris=root_uris,
                 )
             st.output_count = len(result.starting_points) + len(result.initial_candidates)
+            if result.lexical_warming:
+                st.warnings.append("agfs_lexical_warming")
         trace.add_stage(st)
         return result
 

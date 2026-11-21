@@ -34,9 +34,9 @@ configure_third_party_loggers()
 logger = logging.getLogger("index-service")
 
 
-def _create_storage(cfg):
+def _create_storage(cfg, *, invalidate_lexical_scopes=None):
     """Use the same storage backend as the API, not an unrelated AGFS outbox."""
-    if cfg.storage_backend == "sql":
+    if cfg.storage_backend == "sql" or cfg.shared_spaces_enabled:
         from commit.sql_outbox_store import SQLOutboxStore
         from fs.sql_adapter import SQLContextFS
         from fs.sql_adapter.pool import SharedConnectionPool
@@ -48,7 +48,13 @@ def _create_storage(cfg):
             dialect=cfg.sql_dialect,
         )
         try:
-            fs = SQLContextFS(pool=pool)
+            if cfg.storage_backend == "agfs":
+                from fs.agfs_adapter.client import create_agfs_client
+                from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
+
+                fs = AGFSSpaceBridge(pool, create_agfs_client(cfg), cfg.agfs_mount_prefix)
+            else:
+                fs = SQLContextFS(pool=pool)
             return fs, SQLOutboxStore(pool=pool, fs=fs), pool
         except BaseException:
             pool.close_all()
@@ -61,7 +67,8 @@ def _create_storage(cfg):
     client = create_agfs_client(cfg)
     try:
         fs = AGFSContextFS(client=client, mount_prefix=cfg.agfs_mount_prefix)
-        return fs, OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix), None
+        return fs, OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix,
+                               invalidate_lexical_scopes=invalidate_lexical_scopes), None
     except BaseException:
         close = getattr(client, 'close', None)
         if callable(close):
@@ -84,7 +91,8 @@ def _build_service(cfg, admission):
     def cleanup():
         # Preserve a failed close for explicit lifecycle retry.
         while closers:
-            closers[-1]()
+            if closers[-1]() is False:
+                raise RuntimeError("index resource has not finished closing")
             closers.pop()
     try:
         provider_cfg = ProviderConfig.from_ogmem_config(cfg)
@@ -92,11 +100,23 @@ def _build_service(cfg, admission):
         if not cfg.agfs_retrieval_enabled:
             embedder = remember(provider_cfg.create_embedder())
             vector_index = admission.guard(remember(provider_cfg.create_vector_index(), vector=True))
-        fs, outbox_store, storage_pool = _create_storage(cfg)
+        from providers.composite_index import create_projection_writer
+        projection = create_projection_writer(cfg, vector_index)
+        if projection is not vector_index:
+            remember(projection)
+            admission.guard(projection.lexical_index)
+            admission.guard(projection)
+        lexical = getattr(projection, 'lexical_index', None)
+        fs, outbox_store, storage_pool = _create_storage(
+            cfg, invalidate_lexical_scopes=lexical.mark_scopes_dirty if lexical is not None else None)
         if storage_pool is not None:
             remember(storage_pool)
         else:
             admission.guard(remember(fs._client))
+        if cfg.shared_spaces_enabled and cfg.storage_backend == 'agfs':
+            remember(fs._stage_pool)
+            admission.guard(remember(fs._agfs._client))
+            remember(fs)
         fs = admission.guard(fs)
         outbox_store = admission.guard(outbox_store)
         llm = remember(provider_cfg.create_llm())
@@ -113,7 +133,7 @@ def _build_service(cfg, admission):
                 if tracker is not None:
                     tracker.set_usage_store(usage_store)
         service = IndexService(
-            outbox_store=outbox_store, embedder=embedder, vector_index=vector_index,
+            outbox_store=outbox_store, embedder=embedder, vector_index=projection,
             get_account_ids=lambda: [cfg.account_id], interval_seconds=cfg.index_interval,
             worker_count=cfg.index_workers, fs=fs, llm=llm,
             directory_summary_enabled=getattr(cfg, 'directory_summary_enabled', False),
@@ -205,10 +225,6 @@ class CoordinatedIndexRunner:
 def main():
     from providers.unified_config import get_config
     cfg = get_config()
-    if cfg.retrieval_hybrid_enabled:
-        raise RuntimeError(
-            "hybrid retrieval is unsupported by the standalone index service; "
-            "run the SQL-backed MemoryService so every outbox event dual-writes")
     service = CoordinatedIndexRunner(cfg)
     logger.info("Params: account=%s, interval=%ds, workers=%d",
                 cfg.account_id, cfg.index_interval, cfg.index_workers)

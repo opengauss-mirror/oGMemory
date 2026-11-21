@@ -29,3 +29,25 @@ retrieval:
 The switch defaults to `false` and requires a valid `decision` block when enabled. YAML takes precedence over `OGMEM_RETRIEVAL_DECISION_RERANK_ENABLED`. It applies independently of eager/lazy extraction mode. Only ACL-hydrated ordinary-memory candidates are reordered; native scores, code positions, candidate admission and injection budgets remain unchanged. Provider failures preserve native order; operation deadline errors and usage persistence failures propagate. Large inputs can still exceed the provider context limit; failures expose safe HTTP status in `decision_rerank` statistics.
 
 Decision usage reads non-negative integer `usage.input_tokens` and `usage.output_tokens` from the provider response. Their sum contributes to the known-token total, independently of generative LLM usage. Missing or invalid fields are marked as missing usage; available valid fields are retained without estimation. Provider/protocol failures record a failed call, and requests skipped by the switch or candidate count record no call. Responses without usage are not evidence of zero consumption. Persistent and in-memory model metrics expose a separate `decision` category, with calls, failures and missing-usage counts. No additional cache tokens are inferred or added.
+
+## Decision-driven lazy extraction
+
+With `memory.extraction.mode: lazy`, a valid `decision` block selects the JEV controller. An absent or null `decision` block selects the native LLM controller.
+
+```yaml
+memory:
+  extraction:
+    mode: lazy
+    read_probability_threshold: 0.70
+decision:
+  provider: jev
+  base_url: https://decision.example.internal
+  model: multilingual
+  timeout_seconds: 30
+```
+
+JEV chooses whether to read old memory, form memory operations, or finish. It scores authorized unread candidates independently in one request. Lazy extraction reads all candidates at or above `read_probability_threshold` in one tool round. The threshold accepts values in (0, 1] and defaults to 0.70. Calibrate it on representative extraction samples.
+
+For memory formation, the LLM uses the preselected categories, source, read snapshots, and recorded progress to generate a batch of native operations. Native execution validates targets and versions and records feedback for JEV. When the loop requires final JSON, native safety checks run first. JEV then checks whether the recorded and tentative operations cover the complete source. An incomplete batch enters native full-source recovery.
+
+Model transport failures and usage persistence errors propagate to the caller. Output and coverage failures use native recovery. Each physical model request uses the existing usage ledger. Cost comparisons include Decision calls and recovery calls.

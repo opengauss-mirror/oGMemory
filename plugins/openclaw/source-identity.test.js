@@ -11,6 +11,13 @@ import plugin, {
   withSemanticTurnParams,
 } from "./index.js";
 
+function bufferedReceipt(body) {
+  return {
+    ok: true, accepted: true, request_id: body.clientRequestId,
+    request_status: "ACCEPTED", source_status: "BUFFERED",
+  };
+}
+
 test("deployment identity is a fallback, never a replacement for explicit plugin identity", () => {
   const keys = ["OGMEM_ACCOUNT_ID", "OGMEM_USER_ID", "OGMEM_AGENT_ID"];
   const previous = keys.map((key) => process.env[key]);
@@ -446,7 +453,7 @@ test("retryable afterTurn failure is replayed once before the next assemble", as
           },
         };
       }
-      return { ok: true, status: 200, async json() { return { ok: true }; } };
+      return { ok: true, status: 202, async json() { return bufferedReceipt(requests.at(-1).body); } };
     }
     return {
       ok: true,
@@ -586,9 +593,9 @@ test("user_message afterTurn falls back to the exact original checkpoint after o
       if (body.toolResultGovernanceFallbackToken) {
         return {
           ok: true,
-          status: 200,
+          status: 202,
           async json() {
-            return { ok: true, status: "accumulating" };
+            return bufferedReceipt(body);
           },
         };
       }
@@ -704,7 +711,7 @@ test("instance dispose flushes every tracked session", async () => {
       ok: true,
       status: 200,
       async json() {
-        return { ok: true, status: "accumulating" };
+        return method === "after_turn" ? bufferedReceipt(body) : { ok: true };
       },
     };
   };
@@ -793,7 +800,7 @@ test("a checkpoint fallback does not disable externalization for the next checkp
       async json() {
         return method === "compose"
           ? { messages: body.messages || [], estimatedTokens: 0 }
-          : { ok: true };
+          : bufferedReceipt(body);
       },
     };
   };

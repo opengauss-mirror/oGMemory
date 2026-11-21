@@ -273,7 +273,7 @@ for level in ("abstract", "overview", "content"):
 
 `types` 选择要查询的记忆类型；`top_k` 为 `1–20`，`score_threshold` 设置最低相关性分数。读取的 `level` 可选 `abstract`、`overview`、`content` 或 `all`；`max_chars` 为 `1–50000`，同时受服务响应上限约束。
 
-SQL 主存储采用具备原生 BM25 能力的 openGauss 时，可启用混合检索。主存储、向量索引和词法索引使用同一数据库，并在服务与索引 Worker 中应用以下配置：
+向量检索可与 SQLite FTS5 或 openGauss 原生 BM25 融合。服务与索引 Worker 维护 `inverted_index` 指定的索引，查询由 `hybrid_enabled` 控制是否融合。下例使用 openGauss 原生 BM25。
 
 ```yaml
 retrieval:
@@ -283,7 +283,7 @@ retrieval:
   rrf_k: 60
   semantic_weight: 1.0
   lexical_weight: 1.0
-  lexical:
+  inverted_index:
     provider: opengauss_native
 ```
 

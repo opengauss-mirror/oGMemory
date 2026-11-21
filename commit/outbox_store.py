@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import uuid
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import UTC, datetime
 
@@ -19,9 +19,11 @@ from commit.code_resource_events import (
 )
 from commit.outbox_scope import record_persisted_event, remember_persisted_event
 from core.enums import EventType
+from core.errors import ConcurrentModificationError
 from core.interfaces import ContextFS
+from core.lexical import lexical_scopes_from_index_records
 from core.logging_config import get_logger
-from core.models import ContextNode, OutboxEvent, RequestContext
+from core.models import ContextNode, IndexRecord, OutboxEvent, RequestContext
 
 logger = get_logger(__name__)
 _AGENT_PROCESSING_LEASE = ContextVar("agent_processing_lease", default=None)
@@ -64,6 +66,7 @@ class OutboxStore:
     _DELETE_TOMBSTONE_NAME = ".delete_tombstone.json"
     _DELETE_TOMBSTONE_PENDING = "PENDING"
     _DELETE_TOMBSTONE_ACKNOWLEDGING = "ACKNOWLEDGING"
+    _LEXICAL_QUEUE = ".lexical-outbox"
     _NODE_PAYLOAD_NAMES = (
         "content.md",
         ".relations.json",
@@ -72,7 +75,8 @@ class OutboxStore:
         ".meta.json",
     )
 
-    def __init__(self, client: AGFSClient, fs: ContextFS, mount_prefix: str = "/local"):
+    def __init__(self, client: AGFSClient, fs: ContextFS, mount_prefix: str = "/local", *,
+                 invalidate_lexical_scopes=None):
         """Initialize OutboxStore.
 
         Args:
@@ -80,6 +84,7 @@ class OutboxStore:
             fs: ContextFS for URI to path conversion (must be AGFSContextFS)
             mount_prefix: AGFS mount point prefix (default: "/local")
                          Must match the mount_prefix used by AGFSContextFS
+            invalidate_lexical_scopes: Enable durable lexical tracking and invalidate failed scopes before queue cleanup.
 
         Raises:
             ValueError: If mount_prefix contains path traversal patterns
@@ -91,6 +96,77 @@ class OutboxStore:
         self._client = client
         self._fs = fs
         self._mount_prefix = mount_prefix.rstrip("/")
+        self._invalidate_lexical_scopes = invalidate_lexical_scopes
+        self._prepared_lexical_accounts: set[str] = set()
+
+    def _lexical_queue(self, account_id: str) -> str:
+        self._validate_account_id(account_id)
+        return f"{self._mount_prefix}/accounts/{account_id}/{self._LEXICAL_QUEUE}"
+
+    def _lexical_queue_entries(self, account_id: str) -> set[str]:
+        try:
+            return {entry["name"] for entry in self._client.ls(self._lexical_queue(account_id))
+                    if re.fullmatch(r"[a-f0-9-]+\.json", entry["name"])}
+        except Exception as exc:
+            if self._is_not_found_error(exc):
+                return set()
+            raise
+
+    def projection_is_quiescent(self, *, account_id: str) -> bool | None:
+        if account_id not in self._prepared_lexical_accounts:
+            return None
+        return not self._lexical_queue_entries(account_id)
+
+    def prepare_lexical_projection(self, *, account_id: str) -> bool:
+        # Certify legacy node-local events once, outside the retrieval request.
+        if account_id in self._prepared_lexical_accounts:
+            return True
+        if self.count_unfinished(account_id, event_type=EventType.UPSERT_CONTEXT.value)["total"]:
+            return False
+        self._prepared_lexical_accounts.add(account_id)
+        return True
+
+    def _reconcile_lexical_queue(self, account_id: str, listed_events: set[str]) -> None:
+        entries = self._lexical_queue_entries(account_id)
+        queue = self._lexical_queue(account_id)
+        for name in entries - listed_events:
+            path = f"{queue}/{name}"
+            try:
+                raw = self._client.read(path)
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    continue
+                raise
+            data = self._load_event_json(raw)
+            uri, event_id = data["uri"], data["event_id"]
+            if (name != event_id + ".json" or not uri.startswith(f"ctx://{account_id}/")
+                    or data.get("event_type") != EventType.UPSERT_CONTEXT.value):
+                raise ValueError("lexical pending event identity differs from its path")
+            status = self.get_event_status(uri, event_id)
+            if status == "FAILED":
+                records = [IndexRecord(**record) for record in data["payload"]["records"]]
+                scopes = lexical_scopes_from_index_records(records)
+                if records and (not scopes or any(account != account_id for account, _ in scopes)):
+                    raise ValueError("failed lexical event must identify its account and owner scopes")
+                if scopes:
+                    self._invalidate_lexical_scopes(scopes)
+            if status in {"DONE", "FAILED"}:
+                self._rm_if_present(path)
+            elif status is None:
+                try:
+                    with self.processing_lock(uri):
+                        if self.get_event_status(uri, event_id) is None:
+                            self._publish_event_file(self._uri_to_agfs_path(uri) + ".outbox", event_id, raw)
+                except (ConcurrentModificationError, TimeoutError):
+                    continue
+
+    def _finish_lexical_pending(self, node_uri: str, event_id: str) -> None:
+        if self._invalidate_lexical_scopes is not None:
+            account_id = node_uri.removeprefix("ctx://").split("/", 1)[0]
+            try:
+                self._rm_if_present(f"{self._lexical_queue(account_id)}/{event_id}.json")
+            except Exception:
+                logger.warning("Could not remove lexical pending event %s", event_id, exc_info=True)
 
     def _processing_key(self, node_uri: str):
         return (self._client.api_base, self._uri_to_agfs_path(node_uri).rstrip("/"))
@@ -572,24 +648,31 @@ class OutboxStore:
 
         # Get node path and construct outbox path (with mount_prefix)
         node_path = self._uri_to_agfs_path(node_uri)
-        outbox_dir = node_path + ".outbox"
-        event_path = outbox_dir + "/" + event.event_id + ".json"
-        temp_path = outbox_dir + "/.tmp_" + event.event_id + ".json"
+        encoded = serialize_outbox_event(event)
+        track = self._invalidate_lexical_scopes is not None and event.event_type == EventType.UPSERT_CONTEXT.value
+        lock = self.processing_lock(node_uri, timeout_seconds=5) if track else nullcontext()
+        with lock:
+            if track:
+                self._publish_event_file(self._lexical_queue(components["account"]), event.event_id, encoded)
+            self._publish_event_file(node_path + ".outbox", event.event_id, encoded)
 
-        # Ensure .outbox directory exists
+    def _ensure_outbox_directory(self, path: str) -> None:
         try:
-            self._client.mkdir(outbox_dir)
+            self._client.mkdir(path)
         except Exception:
-            pass  # Directory may already exist
+            pass  # The following write distinguishes an existing directory from a failure.
 
-        event_bytes = serialize_outbox_event(event)
+    def _publish_event_file(self, outbox_dir: str, event_id: str, event_bytes: bytes) -> None:
+        self._ensure_outbox_directory(outbox_dir)
+        event_path = f"{outbox_dir}/{event_id}.json"
+        temp_path = f"{outbox_dir}/.tmp_{event_id}.json"
 
         # Write to temporary file first
         try:
             self._client.write(temp_path, event_bytes)
         except Exception as e:
             # Temp write failed - no state change
-            logger.error("Failed to write temp outbox event %s: %s", event.event_id, e)
+            logger.error("Failed to write temp outbox event %s: %s", event_id, e)
             raise
 
         # Move to the final path.  AGFS exposes same-backend atomic rename as
@@ -698,6 +781,7 @@ class OutboxStore:
             event_id = str(data.get("event_id") or name[:-5])
             self._rm_if_present(event_path)
             self._rm_if_present(outbox_dir + "/" + event_id + ".processing")
+            self._finish_lexical_pending(node_uri, event_id)
             cancelled.append(event_id)
         return cancelled
 
@@ -829,6 +913,8 @@ class OutboxStore:
 
         if event.event_type != EventType.DELETE_CONTEXT.value:
             self._persist_done(event, node_uri)
+            if event.event_type == EventType.UPSERT_CONTEXT.value:
+                self._finish_lexical_pending(node_uri, event.event_id)
             if getattr(event, "_outbox_processing_lease", None) is not None:
                 self._remove_processing_file(event_path, event, node_uri)
                 self._remove_processing_file(processing_path, event, node_uri)
@@ -1035,6 +1121,11 @@ class OutboxStore:
             self._scan_outbox_recursive(prefix, results)
         except Exception:
             pass
+        if self._invalidate_lexical_scopes is not None:
+            try:
+                self._reconcile_lexical_queue(account_id, {event.event_id + ".json" for _, event in results})
+            except Exception:
+                logger.warning("Unable to reconcile lexical pending events for %s", account_id, exc_info=True)
         return sorted(results, key=lambda item: (item[1].created_at, item[1].event_id))
 
     def list_pending_events(self, references) -> list[tuple[str, "OutboxEvent"]]:
@@ -1047,7 +1138,7 @@ class OutboxStore:
             self._collect_outbox_events(path, [{"name": event_id + ".json"}], results)
         return results
 
-    def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
+    def count_unfinished(self, account_id: str | None = None, *, event_type: str | None = None) -> dict[str, int]:
         """Count every live account Outbox event without claiming it.
 
         This deliberately differs from :meth:`list_pending`: active processing
@@ -1057,14 +1148,7 @@ class OutboxStore:
         reporting a false idle state.
         """
 
-        if (
-            not isinstance(account_id, str)
-            or not account_id.strip()
-            or ".." in account_id
-            or "/" in account_id
-            or "\\" in account_id
-        ):
-            raise ValueError("account_id is invalid")
+        self._validate_account_id(account_id)
         counts = {"pending": 0, "processing": 0}
         prefix = self._mount_prefix + f"/accounts/{account_id}/"
         try:
@@ -1073,11 +1157,22 @@ class OutboxStore:
             if self._is_not_found_error(exc):
                 return {"pending": 0, "processing": 0, "total": 0}
             raise
-        self._count_unfinished_entries(prefix, entries, counts)
+        self._count_unfinished_entries(prefix, entries, counts, event_type)
         counts["total"] = counts["pending"] + counts["processing"]
         return counts
 
-    def _count_unfinished_recursive(self, path: str, counts: dict[str, int]) -> None:
+    @staticmethod
+    def _validate_account_id(account_id: str | None) -> None:
+        if (
+            not isinstance(account_id, str)
+            or not account_id.strip()
+            or ".." in account_id
+            or "/" in account_id
+            or "\\" in account_id
+        ):
+            raise ValueError("account_id is invalid")
+
+    def _count_unfinished_recursive(self, path: str, counts: dict[str, int], event_type: str | None) -> None:
         try:
             entries = self._client.ls(path)
         except Exception as exc:
@@ -1087,7 +1182,7 @@ class OutboxStore:
             ):
                 return
             raise
-        self._count_unfinished_entries(path, entries, counts)
+        self._count_unfinished_entries(path, entries, counts, event_type)
 
     @staticmethod
     def _is_resource_lock_directory(name: str) -> bool:
@@ -1129,6 +1224,7 @@ class OutboxStore:
         path: str,
         entries: list[dict],
         counts: dict[str, int],
+        event_type: str | None,
     ) -> None:
         """Walk an account tree and count live Outbox records exactly once."""
 
@@ -1141,15 +1237,15 @@ class OutboxStore:
             is_dir = bool(entry.get("is_dir", entry.get("isDir", False)))
             child_path = path.rstrip("/") + "/" + name
             if is_dir and name == ".outbox":
-                self._count_unfinished_outbox(child_path, counts)
+                self._count_unfinished_outbox(child_path, counts, event_type)
             elif (
                 is_dir
-                and name not in {".outbox", ".outbox-done", ".write_operations"}
+                and name not in {".outbox", ".outbox-done", ".write_operations", self._LEXICAL_QUEUE}
                 and not self._is_atomic_resource_staging_directory(name)
             ):
-                self._count_unfinished_recursive(child_path + "/", counts)
+                self._count_unfinished_recursive(child_path + "/", counts, event_type)
 
-    def _count_unfinished_outbox(self, outbox_path: str, counts: dict[str, int]) -> None:
+    def _count_unfinished_outbox(self, outbox_path: str, counts: dict[str, int], event_type: str | None) -> None:
         """Count pending and processing files, including locks and retries."""
 
         entries = self._client.ls(outbox_path + "/")
@@ -1174,6 +1270,8 @@ class OutboxStore:
             data = self._load_event_json(raw)
             if data.get("event_id") != event_id:
                 raise ValueError("Outbox event id does not match its file name")
+            if event_type is not None and data.get("event_type") != event_type:
+                continue
             status = data.get("status", "PENDING")
             if status == "PROCESSING" or event_id in processing_ids:
                 counts["processing"] += 1
@@ -1209,7 +1307,7 @@ class OutboxStore:
                 self._collect_outbox_events(child_path, ev_entries, results)
             elif (
                 is_dir
-                and name not in (".outbox", ".outbox-done", "dlq", ".write_operations")
+                and name not in (".outbox", ".outbox-done", "dlq", ".write_operations", self._LEXICAL_QUEUE)
                 and not self._is_atomic_resource_staging_directory(str(name))
             ):
                 self._scan_outbox_recursive(child_path + "/", results)

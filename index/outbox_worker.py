@@ -120,20 +120,20 @@ class OutboxWorker:
         self._embedder = embedder
         self._projection = (
             VectorProjection(vector_index, embedder)
-            if vector_index is not None and embedder is not None
+            if vector_index is not None
             else None
         )
         self._config = config or WorkerConfig()
         self._fs = fs
         self._llm = llm
         self._directory_summary_enabled = directory_summary_enabled
-        self._bm25_index = bm25_index if self._projection is not None else None
+        self._bm25_index = bm25_index if embedder is not None else None
         self._agent_memory_handler = agent_memory_handler
         self._memory_projection_handler = (
-            memory_projection_handler if self._projection is not None else None
+            memory_projection_handler if embedder is not None else None
         )
         self._edge_projection_store, self._edge_projection_profile = (
-            (edge_projection_components or (None, None)) if self._projection is not None else (None, None)
+            (edge_projection_components or (None, None)) if embedder is not None else (None, None)
         )
         self._graph_poll_accounts = ContextVar("graph_projection_poll_accounts", default=None)
 
@@ -315,11 +315,13 @@ class OutboxWorker:
                 records_upserted=0,
             )
 
-        inputs = self._embedding_scope_inputs(event, records)
-        with distributed_usage_scope(embedding_scope_weights(inputs), inputs=inputs):
-            embeddings = self._projection.embed(records)
-        augmented_records = self._augment_with_embeddings(records, embeddings)
-        self._projection.upsert(augmented_records)
+        projected_records = records
+        if self._projection.has_embeddings:
+            inputs = self._embedding_scope_inputs(event, records)
+            with distributed_usage_scope(embedding_scope_weights(inputs), inputs=inputs):
+                embeddings = self._projection.embed(records)
+            projected_records = self._augment_with_embeddings(records, embeddings)
+        self._projection.upsert(projected_records)
         self._upsert_code_bm25(records)
 
         logger.info(
@@ -365,22 +367,29 @@ class OutboxWorker:
                     and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT", "DELETE_CONTEXT"})
 
     def _current_projection_records(self, event: OutboxEvent, records: list[IndexRecord]) -> list[IndexRecord]:
-        if not (self._is_memory_projection_event(event) or (
+        lexical_only = self._projection is not None and not self._projection.has_embeddings
+        if not (lexical_only or self._is_memory_projection_event(event) or (
                 self._fs is not None and _MEMORY_OWNER_PATTERN.match(event.uri)
                 and "/memories/" in event.uri
                 and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT"})):
             return records
         if self._fs is None:
             raise RuntimeError("memory projection requires canonical node storage")
-        from index.index_record_builder import build_index_records
+        from index.index_record_builder import build_agfs_lexical_records, build_index_records
 
+        ctx = self._build_request_context(event)
         try:
-            node = self._fs.read_node(event.uri, self._build_request_context(event))
+            node = self._fs.read_node(event.uri, ctx)
         except NodeNotFoundError:
+            if lexical_only:
+                self._confirm_node_publication(event, ctx)
             return []
-        if node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+        if lexical_only:
+            current = build_agfs_lexical_records(node)
+        elif node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
             return records
-        current = build_index_records(node)
+        else:
+            current = build_index_records(node)
         event.payload["records"] = [asdict(record) for record in current]
         event.payload["_memory_projection_version"] = node.metadata.get("version")
         event.payload["_memory_projection_fingerprint"] = self._projection_record_fingerprint(current)
@@ -1429,6 +1438,7 @@ class OutboxWorker:
 
             if (
                 self._projection is not None
+                and self._projection.has_embeddings
                 and event.event_type == "UPSERT_CONTEXT"
                 and event.payload.get("agent_memory_version") != 1
             ):

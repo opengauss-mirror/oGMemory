@@ -77,9 +77,16 @@ def test_factory_falls_back_to_sql_connection(monkeypatch):
 def test_factory_rejects_unrelated_provider():
     with pytest.raises(
         ValueError,
-        match="unsupported lexical provider 'memory'; available providers: opengauss_native",
+        match="unsupported lexical provider 'memory'; available providers: opengauss_native, sqlite_fts",
     ):
         factory.create_lexical_index(_config(provider="memory"))
+
+
+def test_factory_creates_shared_sqlite_projection(tmp_path):
+    config = _config(provider="sqlite_fts", options={"path": str(tmp_path / "index.db")})
+    projection = factory.create_lexical_index(config)
+    assert projection.health() == {"provider": "sqlite_fts", "available": True, "records": 0}
+    assert projection.close()
 
 
 def test_factory_rejects_unknown_options():

@@ -9,7 +9,7 @@ Subclasses implement 4 abstract methods for scene-specific behavior:
 - _execute_tool(): execute a single tool call
 - _parse_output(): parse LLM output to structured result
 """
- 
+
 from __future__ import annotations
 
 import json
@@ -20,12 +20,12 @@ from logging import getLogger
 from typing import Any
 from uuid import uuid4
 
-from core.errors import ExtractionIncompleteError
+from core.errors import ExtractionIncompleteError, LLMCallError
 from core.interfaces import LLM
 from core.models import RequestContext
 from core.operation_deadline import check_deadline
-from core.errors import LLMCallError
 from core.tools.operational_tool_spec import OperationalToolSpec, call_with_injection
+from providers.token_tracker import UsagePersistenceError
 
 logger = getLogger(__name__)
 
@@ -454,7 +454,7 @@ class ReactLoop(ABC):
 
             return None, None
 
-        except (ExtractionIncompleteError, LLMCallError):
+        except (ExtractionIncompleteError, LLMCallError, UsagePersistenceError):
             raise
         except Exception as e:
             # Unknown transport failure (e.g. socket error, JSON decode

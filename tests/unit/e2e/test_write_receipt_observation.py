@@ -22,7 +22,7 @@ from evaluation_settlement import collect_settlement, inventory
 
 @pytest.fixture
 def receipt_http():
-    calls, receipts = [], {"state": "ACCEPTED", "buffered": True}
+    calls, receipts = [], {"state": "ACCEPTED", "buffered": True, "source_pending": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def handle_request(self):
@@ -34,12 +34,15 @@ def receipt_http():
             status = 200
             if path.endswith("/after_turn"):
                 status = 202
-                result = {"ok": True, "request_id": "server-1", "request_status": "ACCEPTED",
+                result = {"ok": True, "accepted": True,
+                          "request_id": payload["clientRequestId"] if payload.get("wait") is False else "server-1",
+                          "request_status": "ACCEPTED",
                           "source_status": "BUFFERED", "retry_action": "none"}
             elif "/write-requests/" in path or path.endswith("/write-requests"):
                 result = receipts.get("settled") or {
                     "ok": True, "request_id": request_id, "request_status": receipts["state"],
                     "source_status": "BUFFERED" if receipts["buffered"] else "ARCHIVED",
+                    "projection_status": "DONE" if receipts["state"] == "SUCCEEDED" else "PENDING",
                     "retry_action": "none" if receipts["state"] == "SUCCEEDED" else "poll",
                 }
                 receipts["state"] = "SUCCEEDED"
@@ -51,7 +54,10 @@ def receipt_http():
             elif path.endswith("/dispose"):
                 result = {"ok": True, "disposed": True}
             elif path.endswith("/context"):
-                result = {"ok": True, "archive_count": 1}
+                result = {"ok": True, "archive_count": int(not receipts["source_pending"])}
+                receipts["source_pending"] = max(0, receipts["source_pending"] - 1)
+            elif receipts["source_pending"]:
+                result = {"ok": True, "message_count": 0, "commit_count": 0, "pending_tokens": 0}
             else:
                 result = {"ok": True, "message_count": int(receipts["buffered"]),
                           "commit_count": int(not receipts["buffered"]), "pending_tokens": 0}
@@ -171,6 +177,50 @@ def test_plugin_adapter_flushes_buffered_receipt_with_server_identity(receipt_ht
     evidence = json.loads((tmp_path / "ingest-write-observations.json").read_text())
     assert evidence["observed"][0]["request_id"] == "server-1"
     assert evidence["request_status"][-1]["outcome"]["request_status"] == "SUCCEEDED"
+
+
+def test_async_plugin_turns_wait_for_exact_receipts_at_settlement(receipt_http, tmp_path):
+    args = receipt_http.args
+    args.agent, args.verify_writes, args.output_dir = "openclaw", True, tmp_path
+    adapter = PluginAdapter(args, evaluation)
+    adapter.phase = "ingest"
+    adapter.proxy = ReadOnlyQaProxy(args.ogmemory_url)
+    adapter.proxy.start()
+
+    def invoke(text, key):
+        response = requests.post(adapter.proxy.url + "/api/v1/after_turn", json={
+            "sessionId": "session", "clientRequestId": key, "wait": False,
+            "messages": [{"role": "user", "content": text}],
+        })
+        assert response.status_code == 202
+        assert response.json()["request_status"] == "ACCEPTED"
+        return "Saved.", {}
+
+    adapter.host = SimpleNamespace(invoke=invoke, close=lambda: None)
+    try:
+        assert adapter.ingest("The receiver is tuned to 37 MHz.", "turn-1")[2] == ["session"]
+        assert adapter.ingest("The new battery uses lithium.", "turn-2")[2] == ["session"]
+        assert [call["path"] for call in receipt_http.calls] == ["/api/v1/after_turn"] * 2
+        settled = adapter.settle("session")
+        assert [(row["request_id"], row["request_status"], row["projection_status"])
+                for row in settled["requests"]] == [
+            ("turn-1", "SUCCEEDED", "DONE"), ("turn-2", "SUCCEEDED", "DONE")
+        ]
+    finally:
+        adapter.close()
+
+
+def test_ce_settlement_waits_for_source_after_initial_idle(receipt_http):
+    receipt_http.receipts["source_pending"] = 1
+
+    result = evaluation.flush_source(receipt_http.args, "session")
+
+    assert result["archive_count"] == 1
+    assert result["pending_tokens"] == 0
+    assert [call["path"] for call in receipt_http.calls[:4]] == [
+        "/api/v1/call/wait_until_idle", "/api/v1/sessions/session",
+        "/api/v1/sessions/session/context", "/api/v1/call/wait_until_idle",
+    ]
 
 
 def write_node(root, directory, metadata, content):

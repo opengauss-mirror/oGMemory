@@ -577,7 +577,10 @@ def run(args) -> int:
 
             lexical_dsn = vdb_config.get("connection_string") or db_config["connection_string"]
             if supports_opengauss_bm25(lexical_dsn):
-                generated["retrieval"] = {"hybrid_enabled": True}
+                generated["retrieval"] = {
+                    "hybrid_enabled": True,
+                    "inverted_index": {"provider": "opengauss_native"},
+                }
         value = merge_config(existing, generated)
         changes = changed_fields(existing, value)
         print(info("Changed fields (values hidden): " + (", ".join(changes) or "none")))

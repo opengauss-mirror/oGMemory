@@ -163,6 +163,12 @@ class AGFSSpaceBridge(SQLContextFS):
     def read_node(self, uri, ctx):
         return self._hydrate_node(super().read_node(uri, ctx))
 
+    def hydrate_nodes(self, nodes):
+        """Hydrate a page already scoped by the SQL catalog."""
+        if len(nodes) == 1:
+            return [self._hydrate_node(nodes[0])]
+        return self._map_reads(self._hydrate_node, nodes)
+
     def read_nodes(self, uris, ctx):
         results = super().read_nodes(uris, ctx)
 

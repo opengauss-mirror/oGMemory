@@ -23,7 +23,7 @@ from index.directory_summarizer import (
     DirectorySummary,
     is_directory_uri,
 )
-from index.index_record_builder import build_single_record
+from index.index_record_builder import build_directory_index_records
 from index.vector_projection import VectorProjection
 
 logger = logging.getLogger(__name__)
@@ -109,7 +109,7 @@ class DirectoryEventHandler:
         self._llm = llm
         self._projection = (
             VectorProjection(vector_index, embedder)
-            if vector_index is not None and embedder is not None
+            if vector_index is not None
             else None
         )
         self._max_children = max_children
@@ -437,7 +437,7 @@ class DirectoryEventHandler:
             logger.info("Generated summary for directory %s", dir_uri)
 
             if self._projection is not None:
-                await self._vectorize_directory(dir_uri, dir_node, summary, ctx)
+                await self._index_directory(dir_node, ctx)
 
             self._stats.completed_dirs += 1
             self._stats.pending_dirs = max(0, self._stats.pending_dirs - 1)
@@ -536,84 +536,22 @@ class DirectoryEventHandler:
                 categories=categories,
             )
 
-    async def _vectorize_directory(
+    async def _index_directory(
         self,
-        dir_uri: str,
         dir_node: ContextNode,
-        summary: DirectorySummary,
         ctx: RequestContext,
     ) -> None:
-        """Vectorize directory summary and upsert to index."""
+        """Project the directory summary into the configured indexes."""
         projection = self._projection
         assert projection is not None
-        owner_space = dir_node.owner_space
-        records: list[IndexRecord] = []
-
-        l0_record = build_single_record(
-            uri=dir_uri,
-            level=0,
-            text=summary.abstract,
-            account_id=ctx.account_id,
-            owner_space=owner_space,
-            category=dir_node.category,
-            context_type=dir_node.context_type,
-        )
-
-        new_metadata = dict(l0_record.metadata)
-        new_metadata["node_type"] = "directory"
-        new_metadata["parent_uri"] = dir_node.parent_uri
-        new_metadata["child_count"] = summary.child_count
-        new_metadata["categories"] = summary.categories
-        l0_record = IndexRecord(
-            id=l0_record.id,
-            uri=l0_record.uri,
-            level=l0_record.level,
-            text=l0_record.text,
-            filters=l0_record.filters,
-            metadata=new_metadata,
-        )
-        records.append(l0_record)
-
-        if summary.overview:
-            l1_record = build_single_record(
-                uri=dir_uri,
-                level=1,
-                text=summary.overview,
-                account_id=ctx.account_id,
-                owner_space=owner_space,
-                category=dir_node.category,
-                context_type=dir_node.context_type,
-            )
-
-            new_metadata = dict(l1_record.metadata)
-            new_metadata["node_type"] = "directory"
-            new_metadata["parent_uri"] = dir_node.parent_uri
-            new_metadata["child_count"] = summary.child_count
-            l1_record = IndexRecord(
-                id=l1_record.id,
-                uri=l1_record.uri,
-                level=l1_record.level,
-                text=l1_record.text,
-                filters=l1_record.filters,
-                metadata=new_metadata,
-            )
-            records.append(l1_record)
-
-        embeddings = await asyncio.to_thread(projection.embed, records)
-
-        augmented_records = []
-        for record, embedding in zip(records, embeddings):
-            new_metadata = dict(record.metadata)
-            new_metadata["_embedding"] = embedding
-            augmented_records.append(IndexRecord(
-                id=record.id,
-                uri=record.uri,
-                level=record.level,
-                text=record.text,
-                filters=record.filters,
-                metadata=new_metadata,
-            ))
-
-        await asyncio.to_thread(projection.upsert, augmented_records)
-        self._stats.record_ids.extend(r.id for r in augmented_records)
-        logger.info("Vectorized directory %s with %d records", dir_uri, len(records))
+        records = build_directory_index_records(dir_node, ctx.account_id)
+        if projection.has_embeddings:
+            embeddings = await asyncio.to_thread(projection.embed, records)
+            records = [
+                IndexRecord(record.id, record.uri, record.level, record.text, record.filters,
+                            {**record.metadata, "_embedding": embedding})
+                for record, embedding in zip(records, embeddings)
+            ]
+        await asyncio.to_thread(projection.upsert, records)
+        self._stats.record_ids.extend(record.id for record in records)
+        logger.info("Indexed directory %s with %d records", dir_node.uri, len(records))

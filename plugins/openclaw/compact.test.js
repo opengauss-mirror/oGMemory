@@ -243,7 +243,13 @@ let disposeAttempts = 0;
 let disposeFailuresRemaining = 1;
 let disposeResult = { disposed: true };
 globalThis.fetch = async (url, options) => {
-  lifecycleRequests.push({ url, body: JSON.parse(options.body) });
+  const body = JSON.parse(options.body);
+  lifecycleRequests.push({ url, body });
+  if (url.endsWith("/after_turn")) {
+    return { ok: true, status: 202, json: async () => ({
+      ok: true, accepted: true, request_id: body.clientRequestId, source_status: "BUFFERED",
+    }) };
+  }
   if (url.endsWith("/dispose")) {
     disposeAttempts += 1;
     if (disposeFailuresRemaining > 0) {

@@ -199,6 +199,8 @@ def test_hybrid_initialization_publishes_one_shared_projection(monkeypatch):
 
 
 def test_hybrid_backfill_coordinator_is_created_once(monkeypatch):
+    from index.index_record_builder import build_index_records
+
     cfg = OgMemConfig(
         provider="mock",
         vector_db_type="memory",
@@ -227,10 +229,11 @@ def test_hybrid_backfill_coordinator_is_created_once(monkeypatch):
         assert service._get_lexical_backfill() is backfill
         assert service._get_lexical_backfill() is backfill
 
-    scanner_factory.assert_called_once_with(pool)
+    scanner_factory.assert_called_once_with(pool, hydrate_nodes=None)
     backfill_factory.assert_called_once_with(
         scanner,
         service._lexical_index,
+        record_builder=build_index_records,
         page_size=500,
     )
 

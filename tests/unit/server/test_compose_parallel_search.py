@@ -63,14 +63,14 @@ def test_compose_keeps_agfs_searches_and_reports_partial_summary():
         return SearchMemoryResult(hits=[hit], partial=bool(categories))
 
     api = ReadAPI(SimpleNamespace(run=run))
-    service = MemoryService(config=OgMemConfig(retrieval_mode="agfs"))
+    service = MemoryService(config=OgMemConfig(retrieval_mode="vector_free"))
     service.get_read_api = lambda: api
     items, summaries, stats = service._search_working_set("Remember my preferences", ctx)
 
     assert calls == [(15, None, get_ident()), (1, ["session_summary"], get_ident())]
     assert [item["category"] for item in items] == ["preference"]
     assert [item["category"] for item in summaries] == ["session_summary"]
-    assert stats["retrieval"] == {"mode": "agfs", "status": "partial"}
+    assert stats["retrieval"] == {"mode": "vector_free", "status": "partial"}
 
 
 def test_compose_preserves_sql_session_thread_ownership():

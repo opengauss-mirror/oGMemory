@@ -832,10 +832,11 @@ class TokenTracker(UsageTracker):
             raise UsagePersistenceError('Model usage persistence failed') from exc
 
     def record_failure(self, kind, *, deadline=None):
+        event_id = uuid4().hex
         if kind == 'llm':
             from providers.llm_observation import record_observed_usage
-            record_observed_usage(model=self._model, failed=True, usage_known=False)
-        self._persist(kind, {'failed_calls': 1}, deadline=deadline)
+            record_observed_usage(model=self._model, failed=True, usage_known=False, event_id=event_id)
+        self._persist(kind, {'failed_calls': 1}, event_id=event_id, deadline=deadline)
 
     def record_cache_hit(self, kind, *, deadline=None):
         self._persist(kind + '_cache', {'local_cache_hits': 1}, deadline=deadline)
@@ -868,6 +869,7 @@ class TokenTracker(UsageTracker):
         model: str | None = None,
     ) -> str:
         from providers.llm_observation import record_observed_usage
+        event_id = event_id or uuid4().hex
         record_observed_usage(input_tokens=input_tokens, output_tokens=output_tokens,
                               model=model or self._model, usage_known=usage_known, event_id=event_id)
         self._persist('llm', dict(input_tokens=input_tokens, output_tokens=output_tokens,

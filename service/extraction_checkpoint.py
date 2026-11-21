@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import threading
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 
@@ -14,6 +15,7 @@ from commit.write_receipts import operation_digest
 from core.models import CandidateMemory, ContextNode
 from core.model_stage import stage_digest
 from core.write_contract import OUTCOMES_KEY, store_outcome, merge_source_outcome
+from service.extraction_receipts import compact_plans
 
 EXTENSION_KEY = "memory_extraction_recovery"
 logger = logging.getLogger(__name__)
@@ -51,14 +53,16 @@ class ExtractionBatchJournal:
         restore_outbox_events(batch, ctx.account_id)
         journal._stage_owner = threading.get_ident()
         journal._verified_stage_results = set()
+        journal.publication_scope = nullcontext
         return journal
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
-                 request_messages=None, lifecycle=None, request_source_ids=None):
+                 request_messages=None, lifecycle=None, request_source_ids=None, agent_async=False):
         self.manager, self.buffer, self.ctx = manager, buffer, ctx
         self._stage_owner = threading.get_ident()
         self._verified_stage_results = set()
+        self.publication_scope = nullcontext
         extension = buffer.runtime_extensions.get(EXTENSION_KEY, {})
         batch = extension.get("batch")
         if batch is not None:
@@ -88,6 +92,8 @@ class ExtractionBatchJournal:
                      "outbox_events": []}
             if lifecycle is not None:
                 batch["lifecycle"] = deepcopy(lifecycle)
+            if agent_async:
+                batch["agent_async"] = True
             self._replace(batch)
         self._archive_id = batch["archive_id"]
         restore_outbox_events(batch, ctx.account_id)
@@ -100,9 +106,9 @@ class ExtractionBatchJournal:
             raise RecoveryNeedsConfirmationError("pending extraction batch changed or completed")
         return batch
 
-    def _replace(self, batch):
+    def _replace(self, batch, *, capture_events=True):
         with self.buffer.session_state_save_lock:
-            if batch is not None:
+            if batch is not None and capture_events:
                 batch = dict(batch)
                 references = [tuple(item) for item in batch.get("outbox_events", [])]
                 current = current_outbox_events(self.ctx.account_id)
@@ -124,11 +130,12 @@ class ExtractionBatchJournal:
                         self.buffer.runtime_extensions[EXTENSION_KEY] = prior
                 raise RecoveryPersistenceError("extraction checkpoint could not be saved")
 
-    def mutate(self, update):
-        with self.buffer.session_state_save_lock:
-            batch = deepcopy(self.batch)
-            update(batch)
-            self._replace(batch)
+    def mutate(self, update, *, capture_events=True):
+        with self.publication_scope():
+            with self.buffer.session_state_save_lock:
+                batch = deepcopy(self.batch)
+                update(batch)
+                self._replace(batch, capture_events=capture_events)
 
     def chunks(self, factory):
         chunks = self.batch.get("chunks")
@@ -154,19 +161,22 @@ class ExtractionBatchJournal:
 
     def load_stage(self, name, inputs):
         input_digest = stage_digest(inputs)
-        record = self.batch.get("stage_results", {}).get(name, {}).get(input_digest)
-        if record is None:
+        if input_digest not in self.batch.get("stage_results", {}).get(name, {}):
             return None
-        if (record.get("version") != 1 or record.get("status") != "complete"
-                or record.get("input_sha256") != input_digest
-                or record.get("uri") != self._stage_uri(name, input_digest, record.get("output_sha256"))):
-            raise RecoveryNeedsConfirmationError("model stage reference requires verification")
         from core.errors import NodeNotFoundError
-        try:
-            node = self._stage_fs().read_node(record["uri"], self.ctx)
-        except (NodeNotFoundError, FileNotFoundError):
-            self._verified_stage_results.discard((name, input_digest, record["output_sha256"]))
-            return None
+        with self.publication_scope():
+            record = self.batch.get("stage_results", {}).get(name, {}).get(input_digest)
+            if record is None:
+                return None
+            if (record.get("version") != 1 or record.get("status") != "complete"
+                    or record.get("input_sha256") != input_digest
+                    or record.get("uri") != self._stage_uri(name, input_digest, record.get("output_sha256"))):
+                raise RecoveryNeedsConfirmationError("model stage reference requires verification")
+            try:
+                node = self._stage_fs().read_node(record["uri"], self.ctx)
+            except (NodeNotFoundError, FileNotFoundError):
+                self._verified_stage_results.discard((name, input_digest, record["output_sha256"]))
+                return None
         try:
             saved = json.loads(node.content)
             if (saved["version"] != 1 or saved["owner"] != recovery_owner(self.ctx)
@@ -185,8 +195,9 @@ class ExtractionBatchJournal:
     def save_stage(self, name, inputs, result):
         """Persist one immutable result and keep a compact reference in the batch."""
         input_digest, output_digest = stage_digest(inputs), stage_digest(result)
-        fs = self._stage_fs()
         identity = (name, input_digest, output_digest)
+        if threading.get_ident() != self._stage_owner:
+            raise RecoveryPersistenceError("stage persistence requires its owning thread")
         if identity in self._verified_stage_results:
             return
         uri = self._stage_uri(name, input_digest, output_digest)
@@ -198,7 +209,6 @@ class ExtractionBatchJournal:
                                                                               separators=(",", ":")),
                            metadata={"session_id": self.ctx.session_id, "owner_user_id": self.ctx.user_id,
                                      "owner_agent_id": self.ctx.agent_id, "archive_id": self._archive_id})
-        fs.write_node(node, self.ctx)
         def update(batch):
             batch.setdefault("stage_results", {}).setdefault(name, {})[input_digest] = {
                 "version": 1, "status": "complete", "input_sha256": input_digest,
@@ -206,7 +216,9 @@ class ExtractionBatchJournal:
             uris = batch.setdefault("stage_result_uris", [])
             if uri not in uris:
                 uris.append(uri)
-        self.mutate(update)
+        with self.publication_scope():
+            self._stage_fs().write_node(node, self.ctx)
+            self.mutate(update)
         self._verified_stage_results.add(identity)
 
     def _release_stage_results(self, uris):
@@ -265,6 +277,11 @@ class ExtractionBatchJournal:
                 old_outcomes = deepcopy(self.buffer.runtime_extensions.get(OUTCOMES_KEY))
                 client_request_id = batch.get("client_request_id", "")
                 receipt = deepcopy(outcome or {})
+                receipt["plans"] = compact_plans(
+                    operation["plan"] for name, slot in batch["slots"].items()
+                    if not name.startswith("raw:")
+                    for operation in slot.get("operations", {}).values()
+                    if operation.get("status") == "complete" and operation.get("plan"))
                 references = [tuple(item) for item in batch.get("outbox_events", [])]
                 references.extend(current_outbox_events(self.ctx.account_id) or [])
                 receipt.update(request_id=client_request_id, archive_id=batch["archive_id"],
@@ -301,6 +318,7 @@ class ExtractionBatchJournal:
                     if (pending_receipt.get("source_status") == "BUFFERED" and source_ids
                             and not batch_ids.isdisjoint(source_ids)) or request_id == client_request_id:
                         merged = merge_source_outcome(pending_receipt, {**batch_receipt, "request_id": request_id}, batch["message_ids"])
+                        merged["plans"] = compact_plans(pending_receipt.get("plans", []) + batch_receipt["plans"])
                         if request_id == current_request_id and request_id != client_request_id:
                             self.buffer.mark_request_completed(request_id)
                         merged = store_outcome(self.buffer, request_id, merged,

@@ -7,22 +7,26 @@ fences serialize claims, preserving accepted candidates and write receipts.
 import logging
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from functools import wraps
 from queue import Empty, Queue
+from uuid import uuid4
 
 from commit.outbox_scope import capture_outbox_events
 from core.errors import LLMTransientError, MemoryCardFormatError
+from core.operation_deadline import operation_deadline
 from core.write_contract import error_fields
 from fs.sql_adapter.session_mutation import SessionMutationBusyError
+from providers.token_tracker import request_usage_scope
 from service.extraction_checkpoint import (
     EXTENSION_KEY,
     ExtractionBatchJournal,
     RecoveryNeedsConfirmationError,
     recovery_owner,
 )
+from service.extraction_recovery_discovery import AGENT_TURN_TASK
 
 logger = logging.getLogger(__name__)
 _running = ContextVar("extraction_retry_running", default=None)
@@ -31,6 +35,8 @@ _source_only_reason = ContextVar("extraction_source_only_reason", default="")
 MAX_ATTEMPTS = 2
 MAX_TRANSIENT_ATTEMPTS = 3
 ATTEMPT_SECONDS = 1200
+AGENT_LEASE_SECONDS = 30
+AGENT_WORKERS = 4
 
 
 def is_frozen_source_retry(ctx, batch):
@@ -95,7 +101,9 @@ class ExtractionRetryWorker:
         self._queue = Queue()
         self._lock = threading.Lock()
         self._queued = set()
+        self._agent_wakes = set()
         self._thread = None
+        self._agent_threads = set()
         self._stop = threading.Event()
         self._discover = None
         self._discovery_interval = 5
@@ -185,12 +193,15 @@ class ExtractionRetryWorker:
     def wake(self, ctx, task):
         if task.get("status") not in {"queued", "running", "failed"} or self._stop.is_set():
             return
-        identity = (*recovery_owner(ctx).values(), task["id"])
+        archive_id = AGENT_TURN_TASK if task.get("agent_async") else task["id"]
+        identity = (*recovery_owner(ctx).values(), archive_id)
         with self._lock:
             if identity in self._queued:
+                if archive_id == AGENT_TURN_TASK:
+                    self._agent_wakes.add(identity)
                 return
             self._queued.add(identity)
-            self._queue.put((identity, ctx, task["id"]))
+            self._queue.put((identity, ctx, archive_id))
             self._start_thread()
 
     def _run(self):
@@ -206,30 +217,149 @@ class ExtractionRetryWorker:
                 identity, ctx, archive_id = self._queue.get(timeout=.2)
             except Empty:
                 continue
-            requeued = False
-            try:
-                delay = self.run_once(ctx, archive_id)
-                if delay is not None and not self._stop.is_set():
-                    # Yield to other sources between attempts instead of holding
-                    # the single worker through this source's whole retry budget.
+            if archive_id == AGENT_TURN_TASK:
+                with self._lock:
+                    if len(self._agent_threads) < AGENT_WORKERS:
+                        thread = threading.Thread(
+                            target=self._run_agent_item, args=(identity, ctx), daemon=True,
+                            name="agent-extraction",
+                        )
+                        self._agent_threads.add(thread)
+                        thread.start()
+                        continue
+                self._queue.put((identity, ctx, archive_id))
+                self._queue.task_done()
+                self._stop.wait(.05)
+            else:
+                self._run_item(identity, ctx, archive_id)
+
+    def _run_agent_item(self, identity, ctx):
+        with self._lock:
+            self._agent_wakes.discard(identity)
+        try:
+            self._run_item(identity, ctx, AGENT_TURN_TASK)
+        finally:
+            with self._lock:
+                self._agent_threads.discard(threading.current_thread())
+
+    def _run_item(self, identity, ctx, archive_id):
+        requeued = False
+        try:
+            delay = self.run_once(ctx, archive_id)
+            if delay is not None and not self._stop.is_set():
+                self._stop.wait(min(delay, .2))
+                if not self._stop.is_set():
                     self._queue.put((identity, ctx, archive_id))
                     requeued = True
-                    self._stop.wait(min(delay, .2))
-                    continue
-            except Exception:
-                # Durable queued/running record remains visible for authenticated
-                # recovery; do not turn storage/fencing failures into success.
-                logger.exception("Extraction retry worker stopped a source task")
-            finally:
-                if not requeued:
-                    with self._lock:
+        except Exception:
+            logger.exception("Extraction retry worker stopped a source task")
+        finally:
+            if not requeued:
+                with self._lock:
+                    if identity in self._agent_wakes and not self._stop.is_set():
+                        self._agent_wakes.discard(identity)
+                        self._queue.put((identity, ctx, archive_id))
+                    else:
                         self._queued.discard(identity)
-                self._queue.task_done()
+            self._queue.task_done()
+
+    def _run_agent_turn(self, ctx):
+        service = self.service
+        token = uuid4().hex
+        with service._session_mutation_scope(ctx):
+            journal, delay = service._agent_turn_journal(ctx)
+            if journal is None:
+                return delay
+            task = deepcopy(journal.batch.get("retry_task", {}))
+            if task.get("status") == "needs_confirmation":
+                return None
+            if task.get("lease_until", 0) > time.time() or task.get("next_attempt_at", 0) > time.time():
+                return 1
+            initial = "attempts" not in task
+            source_only = (task.get("source_only") or task.get("attempts", 0) >= MAX_ATTEMPTS
+                           or task.get("transient_attempts", 0) >= MAX_TRANSIENT_ATTEMPTS)
+            task.update(id=journal.batch["archive_id"], status="running", lease_token=token, agent_async=True,
+                        lease_until=time.time() + AGENT_LEASE_SECONDS,
+                        attempts=task.get("attempts", 0) + int(not initial and not source_only))
+            journal.mutate(lambda batch: batch.update(retry_task=task))
+            archive_id = task["id"]
+            request_id = journal.batch["client_request_id"]
+            pinned = journal.manager.begin_managed_operation(ctx.session_id, ctx, create=False)
+
+        @contextmanager
+        def publication_scope():
+            with service._session_mutation_scope(ctx):
+                current = journal.batch.get("retry_task", {})
+                if current.get("lease_token") != token or current.get("lease_until", 0) <= time.time():
+                    raise SessionMutationBusyError("agent extraction lease is no longer owned")
+                yield
+
+        done = threading.Event()
+
+        def renew():
+            while not done.wait(AGENT_LEASE_SECONDS / 3):
+                try:
+                    with publication_scope():
+                        def extend(batch):
+                            batch["retry_task"]["lease_until"] = time.time() + AGENT_LEASE_SECONDS
+                        journal.mutate(extend, capture_events=False)
+                except Exception:
+                    logger.debug("Unable to renew agent extraction lease", exc_info=True)
+
+        heartbeat = threading.Thread(target=renew, name="agent-extraction-lease", daemon=True)
+        heartbeat.start()
+        journal.publication_scope = publication_scope
+        feedback = _format_feedback.set(task.get("format_error", ""))
+        try:
+            with request_usage_scope(ctx), operation_deadline(ATTEMPT_SECONDS):
+                if source_only:
+                    with source_only_recovery(ctx, archive_id, task.get("last_error") or "extraction retries exhausted"):
+                        service._process_agent_turn(ctx, journal, publication_scope)
+                else:
+                    service._process_agent_turn(ctx, journal, publication_scope)
+        except Exception as exc:
+            journal.publication_scope = nullcontext
+            with service._session_mutation_scope(ctx):
+                current = journal.batch.get("retry_task", {})
+                if current.get("lease_token") != token or current.get("lease_until", 0) <= time.time():
+                    return 1
+                transient = isinstance(exc, LLMTransientError)
+                session_busy = isinstance(exc, SessionMutationBusyError)
+                if transient or session_busy:
+                    task["attempts"] -= int(not initial and not source_only)
+                if transient:
+                    task["transient_attempts"] = task.get("transient_attempts", 0) + 1
+                if isinstance(exc, MemoryCardFormatError):
+                    task["format_error"] = str(exc)[:1000]
+                blocked = isinstance(exc, RecoveryNeedsConfirmationError) or (source_only and not session_busy)
+                delay = (1 if session_busy else
+                         min(10 * 2 ** max(0, task["transient_attempts"] - 1), 60) if transient else 2)
+                task.update(status="needs_confirmation" if blocked else "queued",
+                            source_only=bool(source_only), last_error=str(exc)[:1000],
+                            error_detail=error_fields(exc, request_id)["error_detail"],
+                            next_attempt_at=time.time() + delay)
+                task.pop("lease_token", None)
+                task.pop("lease_until", None)
+                journal.mutate(lambda batch: batch.update(retry_task=task))
+            logger.warning("Agent extraction %s for request %s: %s", task["status"], request_id, exc)
+            return None if blocked else 1
+        finally:
+            _format_feedback.reset(feedback)
+            done.set()
+            heartbeat.join()
+            if pinned is not None:
+                pinned.end_operation()
+
+        service._async_drain(account_id=ctx.account_id)
+        # Recheck durable work accepted while the preceding batch was running.
+        return .05
 
     @capture_outbox_events
     def run_once(self, ctx, archive_id):
         """One fenced attempt; return backoff seconds or None for a terminal task."""
         try:
+            if archive_id == AGENT_TURN_TASK:
+                return self._run_agent_turn(ctx)
             delay, attempted = self._run_fenced(ctx, archive_id)
         except SessionMutationBusyError:
             return 1
@@ -242,7 +372,7 @@ class ExtractionRetryWorker:
     def _run_fenced(self, ctx, archive_id):
         with self.service._session_mutation_scope(ctx):
             journal = self._journal(ctx, archive_id)
-            if journal is None:
+            if journal is None or journal.batch.get("agent_async"):
                 return None, False
             if not journal.batch.get("retry_task"):
                 self.register_pending_source(ctx, journal, wake=False)
@@ -315,6 +445,13 @@ class ExtractionRetryWorker:
 
     def close(self, timeout=1):
         self._stop.set()
+        deadline = time.monotonic() + timeout
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout)
-        return self._thread is None or not self._thread.is_alive()
+        with self._lock:
+            threads = list(self._agent_threads)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(max(0, deadline - time.monotonic()))
+        return (self._thread is None or not self._thread.is_alive()) and not any(
+            thread.is_alive() for thread in threads)

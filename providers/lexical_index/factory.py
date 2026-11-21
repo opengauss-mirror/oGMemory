@@ -32,13 +32,16 @@ _OPENGAUSS_NATIVE_OPTIONS = frozenset(
         "operation_timeout_ms",
     }
 )
+_SQLITE_OPTIONS = frozenset({
+    "path", "max_query_terms", "max_query_chars", "max_document_chars", "query_timeout_ms",
+})
 
 
-def _validated_options(config) -> dict[str, Any]:
+def _validated_options(config, supported: frozenset[str], provider: str) -> dict[str, Any]:
     options = dict(getattr(config, "retrieval_lexical_options", {}) or {})
-    unknown = set(options) - _OPENGAUSS_NATIVE_OPTIONS
+    unknown = set(options) - supported
     if unknown:
-        raise ValueError(f"unknown openGauss lexical provider options: {sorted(unknown)}")
+        raise ValueError(f"unknown {provider} lexical provider options: {sorted(unknown)}")
     return options
 
 
@@ -64,7 +67,7 @@ def register_lexical_provider(name: str, provider_factory: LexicalFactory) -> No
 def _create_opengauss_native(config) -> HybridLexicalIndex:
     """Create the built-in database-native openGauss lexical index."""
 
-    options = _validated_options(config)
+    options = _validated_options(config, _OPENGAUSS_NATIVE_OPTIONS, "openGauss")
     options["connection_string"] = (
         options.get("connection_string")
         or getattr(config, "opengauss_connection_string", None)
@@ -111,7 +114,18 @@ def _create_opengauss_native(config) -> HybridLexicalIndex:
     )
 
 
+def _create_sqlite(config) -> HybridLexicalIndex:
+    from providers.lexical_index.sqlite_index import SQLiteLexicalIndex
+
+    options = _validated_options(config, _SQLITE_OPTIONS, "SQLite")
+    path = options.pop("path", None)
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("SQLite lexical projection requires retrieval.inverted_index.options.path")
+    return SQLiteLexicalIndex(path, **{name: int(value) for name, value in options.items()})
+
+
 register_lexical_provider("opengauss_native", _create_opengauss_native)
+register_lexical_provider("sqlite_fts", _create_sqlite)
 
 
 def create_lexical_index(config) -> HybridLexicalIndex:

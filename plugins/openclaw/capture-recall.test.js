@@ -393,6 +393,15 @@ test("trace and context engine share the runtime agent over HTTP", async () => {
     const body = JSON.parse(raw || "{}");
     calls.push({ path: req.url, body });
     res.setHeader("Content-Type", "application/json");
+    if (req.url.endsWith("/after_turn")) {
+      res.statusCode = 202;
+      res.end(JSON.stringify({ ok: true, accepted: true, request_id: body.clientRequestId, source_status: "BUFFERED" }));
+      return;
+    }
+    if (req.url.endsWith("/dispose")) {
+      res.end(JSON.stringify({ disposed: true, flushed: false }));
+      return;
+    }
     res.end(JSON.stringify(req.url.endsWith("/compose")
       ? { messages: [], estimatedTokens: 0 }
       : { ok: true, prepareToken: "prepared", compacted: false }));

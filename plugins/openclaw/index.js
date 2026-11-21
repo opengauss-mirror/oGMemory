@@ -498,6 +498,11 @@ function degradedWriteSettled(result) {
   return degradedSourceArchived(result) && ["DONE", "NOT_REQUIRED"].includes(result.projection_status);
 }
 
+function writeSourceAccepted(result) {
+  return result?.accepted === true && !((result.httpStatus ?? result.http_status) >= 400)
+    && ["BUFFERED", "CHECKPOINTED", "ARCHIVED", "RAW_ARCHIVED"].includes(result.source_status);
+}
+
 function writeRequestNeedsPoll(result) {
   return result.retry_action === "poll"
     || (degradedSourceArchived(result) && result.projection_status === "PENDING");
@@ -571,6 +576,7 @@ export async function pollWriteRequest(baseUrl, params, cfg, initial, deadline) 
 }
 
 export async function callHttp(baseUrl, method, params, cfg = {}) {
+  const acceptOnly = method === "after_turn" && params.wait === false;
   const timeoutMs = cfg.requestTimeoutMs ?? (method === "after_turn" || method === "prepare_compaction" ? 300_000
     : method === "govern_first_view_tool_result" ? 10_000 : 120_000);
   const deadline = performance.now() + timeoutMs;
@@ -606,7 +612,7 @@ export async function callHttp(baseUrl, method, params, cfg = {}) {
       if (method === "after_turn") {
         parsed.http_observations = [writeHttpObservation("POST", `/api/v1/${method}`, resp, parsed, deadline - timeoutMs)];
       }
-      if (method === "after_turn" && parsed.retry_action === "poll") {
+      if (method === "after_turn" && !acceptOnly && parsed.retry_action === "poll") {
         return pollWriteRequest(baseUrl, params, cfg, parsed, deadline);
       }
       const safeErrorBody = parsedBody && parsed && typeof parsed === "object"
@@ -627,7 +633,9 @@ export async function callHttp(baseUrl, method, params, cfg = {}) {
         return {
           ...parsed,
           ok: false,
-          retryable: parsed?.retry_action ? parsed.retry_action === "retry_same_request" : (
+          retryable: parsed?.retry_action ? (
+            parsed.retry_action === "retry_same_request" || (acceptOnly && parsed.retry_action === "poll")
+          ) : (
             (
               retryableSessionConflict
               || [408, 425, 429].includes(resp.status)
@@ -645,6 +653,13 @@ export async function callHttp(baseUrl, method, params, cfg = {}) {
       result.http_observations = [writeHttpObservation("POST", `/api/v1/${method}`, resp, result, deadline - timeoutMs)];
       if (["DEGRADED", "FAILED", "NEEDS_CONFIRMATION"].includes(result.request_status)) result.ok = false;
       if (result.retry_action) result.retryable = result.retry_action === "retry_same_request";
+    }
+    if (acceptOnly) {
+      if (writeSourceAccepted(result) && result.request_id === params.clientRequestId) return result;
+      return {
+        ...result, ok: false, accepted: false, retryable: true,
+        observation_status: "OBSERVATION_RECEIPT_UNCONFIRMED",
+      };
     }
     return (method === "after_turn" || method === "compact") && writeRequestNeedsPoll(result)
       ? pollWriteRequest(baseUrl, params, cfg, result, deadline) : result;
@@ -1384,7 +1399,7 @@ export async function runCompactControlFlow({
   const enhancedParams = buildCompactionParams(params, cfg);
   const prepared = await prepareCompactionWithTransport({ call, params: enhancedParams });
 
-  if (!cfg.compactTakeoverEnabled) {
+  if (!cfg.compactTakeoverEnabled || prepared.reason === "agent_extraction_pending") {
     return delegateCompactionToRuntimeOrThrow({
       params,
       runtimeDelegate,
@@ -2209,8 +2224,9 @@ export default {
         params.semanticTurnSourceNamespace,
         params.semanticTurnId,
       );
-      const lifecycleSucceeded = (result) => degradedWriteSettled(result)
-        || Boolean(result && result.ok !== false
+      const afterTurnConfirmed = (result, params) => params.wait === false
+        ? writeSourceAccepted(result)
+        : degradedWriteSettled(result) || Boolean(result && result.ok !== false
           && !["DEGRADED", "FAILED", "NEEDS_CONFIRMATION"].includes(result.request_status));
       const enqueuePendingAfterTurn = (params) => {
         const sessionKey = afterTurnSessionKey(params);
@@ -2261,10 +2277,11 @@ export default {
         while (queue.length) {
           const attempted = queue[0];
           attempted.attempts = Number(attempted.attempts || 0) + 1;
-          lastResult = attempted.receipt?.retry_action === "poll"
+          const acceptOnly = attempted.params.wait === false;
+          lastResult = !acceptOnly && attempted.receipt?.retry_action === "poll"
             ? await pollWriteRequest(ogmemUrl, attempted.params, authCfg, attempted.receipt, performance.now() + 300_000)
             : await callAsync("after_turn", attempted.params);
-          if (lastResult?.retry_action === "poll") {
+          if (!acceptOnly && lastResult?.retry_action === "poll") {
             attempted.receipt = lastResult;
             break;
           }
@@ -2272,7 +2289,7 @@ export default {
             lastResult?.toolResultGovernanceFallbackToken,
             attempted.fallbackToken,
           );
-          if (lifecycleSucceeded(lastResult)) {
+          if (afterTurnConfirmed(lastResult, attempted.params)) {
             // A concurrent Turn snapshot can supersede the same semantic-turn
             // slot while this request is in flight. Never remove that newer
             // snapshot merely because the older request succeeded.
@@ -2280,6 +2297,7 @@ export default {
             queue.shift();
             continue;
           }
+          if (acceptOnly && lastResult?.observation_status) break;
           if (lastResult?.retryable === false) {
             if (queue[0] !== attempted) break;
             queue.shift();
@@ -2302,7 +2320,7 @@ export default {
                 toolResultGovernanceFallbackToken: fallbackToken,
               });
               if (queue[0] !== attempted) break;
-              if (lifecycleSucceeded(fallbackResult)) {
+              if (afterTurnConfirmed(fallbackResult, attempted.params)) {
                 queue.shift();
                 lastResult = fallbackResult;
                 console.error(
@@ -2313,6 +2331,10 @@ export default {
                     + "later checkpoints remain eligible for externalization",
                 );
                 continue;
+              }
+              if (acceptOnly && fallbackResult?.observation_status) {
+                lastResult = fallbackResult;
+                break;
               }
               queue.shift();
               lastResult = {
@@ -2382,11 +2404,7 @@ export default {
       };
       const flushAndClearSession = async (sessionKey) => {
         let pendingResult = null;
-        if (
-          cfg.toolResultExternalizationEnabled
-          && sessionKey
-          && pendingAfterTurns.has(sessionKey)
-        ) {
+        if (sessionKey && pendingAfterTurns.has(sessionKey)) {
           // afterTurn already made the initial request. Cleanup consumes the
           // remaining bounded retry budget in one call so dispose/session_end
           // cannot remain pending forever when the Artifact store stays down.
@@ -2404,6 +2422,10 @@ export default {
               pendingAfterTurns.has(sessionKey)
               && pendingResult?.retryable !== true
             ) break;
+          }
+          if (pendingAfterTurns.has(sessionKey) && pendingResult?.observation_status
+              && pendingAfterTurns.get(sessionKey)[0].params.wait === false) {
+            return pendingResult;
           }
           if (pendingAfterTurns.has(sessionKey)) {
             const abandonedCheckpoints = (
@@ -2647,7 +2669,7 @@ export default {
           sessionIdentities.set(lifecycleParams.sessionId, identity);
         }
         // Only capture work is skipped; local lifecycle bookkeeping remains active.
-        if (!cfg.autoCapture) return;
+        if (!cfg.autoCapture || !filtered.messages.length) return;
         const semanticTurn = semanticTrackingEnabled
           ? semanticTurnTracker.update(lifecycleParams)
           : null;
@@ -2678,10 +2700,13 @@ export default {
           ...withOgmemSourceParams(externalizationParams, cfg.toolResultExternalizationEnabled),
           ...identity,
           commitTokenThreshold: cfg.commitTokenThreshold,
+          wait: lifecycleParams?.wait ?? false,
         };
 
         if (cfg.toolResultExternalizationEnabled) {
           semanticTurnTracker.enqueue(lifecycleParams, semanticTurn);
+        }
+        if (cfg.toolResultExternalizationEnabled || enhancedParams.wait === false) {
           const sessionKey = afterTurnSessionKey(enhancedParams);
           if (sessionKey && enqueuePendingAfterTurn(enhancedParams)) {
             return serializeAfterTurnFlush(

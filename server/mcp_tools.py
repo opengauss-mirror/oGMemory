@@ -1104,7 +1104,7 @@ def query_memory(
     )
     categories = list(dict.fromkeys(MEMORY_TYPES[t].internal_category for t in requested_types))
     search_top_k = _internal_search_top_k(service, query, top_k)
-    use_agfs = getattr(getattr(service, "_cfg", None), "retrieval_mode", "default") == "agfs"
+    use_agfs = getattr(getattr(service, "_cfg", None), "retrieval_mode", "default") == "vector_free"
     type_filters = {}
     if (use_agfs and types) or any(
         spec.internal_category in categories and name not in requested_types
@@ -1181,8 +1181,9 @@ def query_memory(
         "hits": hits,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
-    if use_agfs:
-        payload["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
+    if use_agfs or result.partial:
+        payload["retrieval"] = {"mode": "vector_free" if use_agfs else "default",
+                                "status": "partial" if result.partial else "complete"}
     response = _truncate_query_payload(payload, _configured_max_response_chars(service))
     recorder = getattr(service, "record_retrieval_metric", None)
     if callable(recorder):

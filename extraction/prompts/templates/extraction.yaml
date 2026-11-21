@@ -1,5 +1,6 @@
 # Extraction prompt components. Unlabelled blocks are always included.
 assembly_version: 1
+assembly_purposes: [native, memory_generation]
 selection:
   instruction: |
     Select the memory types needed for this memory extraction task.
@@ -593,42 +594,64 @@ identity_block: |
   Profile facts MUST be BY this user AND ABOUT this user.
   Other speakers: stable attributes/preferences → their entity, occurrences → event, not this user's profile/preference. Keep the actual subject.
   ==
-lazy_tools_instruction: |
-  ## Available Tools
+lazy_tools_instruction:
+  - id: observation_tools
+    purposes: [native]
+    text: |+
+      ## Available Tools
 
-  - `read(uri)` — Read an existing memory node by URI
-  - `list(uri)` — List child nodes under a directory
-  - `extract_*` — Extract memories of specific types
+      - `read(uri)` — Read an existing memory node by URI
+      - `list(uri)` — List child nodes under a directory
+  - id: memory_tools
+    text: |+
+      - `extract_*` — Extract memories of specific types
 
-  ## Extraction Strategy
+  - id: observation_strategy
+    purposes: [native]
+    text: |+
+      ## Extraction Strategy
 
-  **Direct extraction** when content is clear and simple.
+      **Direct extraction** when content is clear and simple.
 
-  **Explore first** when:
-  - Content is ambiguous or could fit multiple categories
-  - Prefetch URIs look relevant
-  - May duplicate/conflict with existing memory (e.g., "I moved to NYC" vs existing location)
+      **Explore first** when:
+      - Content is ambiguous or could fit multiple categories
+      - Prefetch URIs look relevant
+      - May duplicate/conflict with existing memory (e.g., "I moved to NYC" vs existing location)
 
-  ## After Exploration
+      ## After Exploration
 
-  When you have read existing memories, consider:
+      When you have read existing memories, consider:
 
-  **Classification adjustment**: Is my initial category correct?
-  - If event has problem→solution→outcome → may be case
-  - If preference has clear time boundary → may be event
-  - If entity is actually about the user → may be profile
+      **Classification adjustment**: Is my initial category correct?
+      - If event has problem→solution→outcome → may be case
+      - If preference has clear time boundary → may be event
+      - If entity is actually about the user → may be profile
 
-  **Duplicate/conflict handling**:
-  - Same routing_key with new info → update/merge, not create new
-  - Conflicting info → check timestamps; newer may update older
-  - Same event mentioned multiple times → skip if identical
-  - **UPDATE RULES — NEVER lose detail:**
-    When updating an existing memory, PRESERVE all specific details from the old version. Only ADD new information.
-    Bad: old="won first place at regionals performing 'Finding Freedom'" → new="won a dance competition" (LOST piece name!)
-    Good: old + "Additionally received a trophy for this achievement."
-    If the new info only adds context (dates, outcomes) → merge, not replace.
+  - id: update_rules
+    text: |+
+      **Duplicate/conflict handling**:
+      - Same routing_key with new info → update/merge, not create new
+      - Conflicting info → check timestamps; newer may update older
+      - Same event mentioned multiple times → skip if identical
+      - **UPDATE RULES — NEVER lose detail:**
+        When updating an existing memory, PRESERVE all specific details from the old version. Only ADD new information.
+        Bad: old="won first place at regionals performing 'Finding Freedom'" → new="won a dance competition" (LOST piece name!)
+        Good: old + "Additionally received a trophy for this achievement."
+        If the new info only adds context (dates, outcomes) → merge, not replace.
 
-  **Confidence calibration**: Adjust based on:
-  - How well evidence matches extracted content
-  - Whether similar memories already exist
-  - Ambiguity level in source text
+      **Confidence calibration**: Adjust based on:
+      - How well evidence matches extracted content
+      - Whether similar memories already exist
+      - Ambiguity level in source text
+  - id: form_memory_task
+    purposes: [memory_generation]
+    text: |+
+      Form all remaining source-supported memory operations in this batch.
+      Several operations may use the same tool for different targets. Provide every required field.
+      For a new or unbound operation, omit both target_uri and expected_version.
+      To update an existing target, use an offered update tool or fields and copy both values
+      from the same successful full read of that target. Never fill in an empty URI or a placeholder version.
+      For corrections, change the affected facts and preserve unaffected details. Evidence must come from the current source.
+final_content_instruction: |-
+  Return only a JSON array of memory operations, each with a name and an input object.
+  Use the allowed schemas below. Return [] when you cannot form any remaining operation.

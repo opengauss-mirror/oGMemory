@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from agent_plugin_locomo import AgentHost, ROOT, _write_yaml
 
@@ -26,6 +27,15 @@ class DshHost(AgentHost):
                 "DSH_PERMISSION_MODE": "read-only",
             }
         )
+        result = self._run([self.args.dsh_command, "--version"], "prepare-version", record=False)
+        self.version = (result.stdout or result.stderr).strip()
+        manifest = ROOT / "tests/e2e/environments/dsh/package.json"
+        required = json.loads(manifest.read_text(encoding="utf-8"))["dependencies"]["@deepseek-ai/dsh"]
+        if self.version.removeprefix("v") != required:
+            raise RuntimeError(
+                f"DSH LoCoMo requires {required}, found {self.version!r}. "
+                "Set --dsh-command to the pinned evaluation executable."
+            )
         if getattr(self.args, "disable_host_tools", False):
             self.tools_patch = self.runtime / "disable-host-tools.patch.yaml"
             _write_yaml(
@@ -76,8 +86,6 @@ class DshHost(AgentHost):
                 },
             },
         )
-        result = self._run([self.args.dsh_command, "--version"], "prepare-version", record=False)
-        self.version = (result.stdout or result.stderr).strip()
         self._run(
             [self.args.dsh_command, "--profile", "headless", "--dump-config"],
             "prepare-config",

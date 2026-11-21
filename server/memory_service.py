@@ -113,6 +113,8 @@ from service.extraction_checkpoint import (
     recovery_owner,
     request_message_id,
 )
+from service.extraction_receipts import read as read_extraction_receipt
+from service.extraction_recovery_discovery import AGENT_TURN_PENDING, AGENT_TURN_TASK
 from service.extraction_retry import (
     MAX_ATTEMPTS,
     ExtractionRetryWorker,
@@ -129,10 +131,10 @@ from session.topic_buffer import SlotContent
 
 try:
     from pyagfs import AGFSClient
-    from fs.agfs_adapter.client import create_agfs_client
 
     from commit.outbox_store import OutboxStore
     from fs.agfs_adapter import AGFSContextFS, AGFSTraceEventStore
+    from fs.agfs_adapter.client import create_agfs_client
     from providers.relation_store.agfs_relation_store import AGFSRelationStore
     from service.api import MemoryWriteAPI, ReadAPI
     _HAS_AGFS = True
@@ -752,7 +754,6 @@ class MemoryService:
 
         self._llm = None
         self._decision_client = None
-        self._decision_client_lock = threading.Lock()
         self._write_api = None
         self._read_api = None
         self._agfs_fts = None
@@ -1045,7 +1046,7 @@ class MemoryService:
             return SQLContextFS(pool=self._get_shared_sql_pool())
         if _HAS_AGFS:
             client = self._get_agfs_client()
-            if self._agfs_retrieval_enabled and getattr(self._cfg, "retrieval_agfs_fts_enabled", True):
+            if self._cfg.retrieval_uses_agfs_fts:
                 return AGFSContextFS(client=client, mount_prefix=self._mount_prefix,
                                      on_node_change=self._on_agfs_node_change)
             return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
@@ -1078,8 +1079,15 @@ class MemoryService:
             )
         if _HAS_AGFS:
             client = self._get_agfs_client()
-            return OutboxStore(client=client, fs=fs, mount_prefix=self._mount_prefix)
+            invalidate = self._invalidate_lexical_scopes if self._cfg.retrieval_uses_lexical_projection else None
+            return OutboxStore(
+                client=client, fs=fs, mount_prefix=self._mount_prefix,
+                invalidate_lexical_scopes=invalidate,
+            )
         return None
+
+    def _invalidate_lexical_scopes(self, scopes) -> None:
+        self._get_shared_projection_index().lexical_index.mark_scopes_dirty(scopes)
 
     def _get_relation_store(self):
         """Create the appropriate RelationStore implementation based on config."""
@@ -1096,7 +1104,7 @@ class MemoryService:
 
     @property
     def _agfs_retrieval_enabled(self) -> bool:
-        return getattr(self._cfg, "retrieval_mode", "default") == "agfs"
+        return getattr(self._cfg, "retrieval_mode", "default") == "vector_free"
 
     def _graph_enabled(self):
         return getattr(self._cfg,"graph_backend","none") == "sql"
@@ -1801,7 +1809,7 @@ class MemoryService:
 
     @contextmanager
     def _parallel_session_summary(self, messages, session_time, ctx, session_id, write_api,
-                                  candidate_checkpoint=None):
+                                  candidate_checkpoint=None, publication_scope=None):
         """Join summary generation at the owner-thread write boundary."""
         from concurrent.futures import Future, ThreadPoolExecutor
         from contextvars import copy_context
@@ -1812,7 +1820,8 @@ class MemoryService:
         if restored is not None:
             self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
                                              candidate_checkpoint=candidate_checkpoint,
-                                             accepted_candidates=restored[0])
+                                              accepted_candidates=restored[0],
+                                              publication_scope=publication_scope)
             yield lambda: None
             return
         llm = self.get_llm()
@@ -1844,6 +1853,7 @@ class MemoryService:
                     self._generate_and_write_summary(
                         messages, session_time, ctx, session_id, write_api,
                         candidate_checkpoint=candidate_checkpoint, candidate_future=future,
+                        publication_scope=publication_scope,
                     )
                     written = True
 
@@ -1870,6 +1880,7 @@ class MemoryService:
         candidate_checkpoint=None,
         candidate_future=None,
         accepted_candidates=None,
+        publication_scope=None,
     ) -> None:
         """Generate L0 structured summary for a session and write to storage."""
         from core.model_stage import wait_model_result
@@ -1879,26 +1890,23 @@ class MemoryService:
             if accepted_candidates is None and candidate_checkpoint is not None:
                 restored = candidate_checkpoint.load()
                 accepted_candidates = restored[0] if restored is not None else None
-            if accepted_candidates is not None:
-                plans = write_api._write_checkpointed_candidates(accepted_candidates, ctx, candidate_checkpoint)
-                if accepted_candidates and not plans:
-                    raise RuntimeError("summary rejected before writing")
-                return
-            candidate = (wait_model_result(candidate_future) if candidate_future is not None else
-                         self._generate_summary_candidate(messages, session_time, session_id, self.get_llm()))
-            check_deadline()
-            if candidate is None:
-                if candidate_checkpoint is not None:
-                    candidate_checkpoint.accept([], 0, 0)
-                return
-            if candidate_checkpoint is not None:
+            candidate = None
+            if accepted_candidates is None:
+                candidate = (wait_model_result(candidate_future) if candidate_future is not None else
+                             self._generate_summary_candidate(messages, session_time, session_id, self.get_llm()))
                 check_deadline()
-                accepted = candidate_checkpoint.accept([candidate], 1, 0)
-                plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
-                if not plans:
-                    raise RuntimeError("summary rejected before writing")
-            else:
-                write_api.write_memory(candidate, ctx)
+            with (publication_scope or nullcontext)():
+                if candidate_checkpoint is not None:
+                    if accepted_candidates is None:
+                        accepted_candidates = candidate_checkpoint.accept([candidate] if candidate else [],
+                                                                           int(candidate is not None), 0)
+                    plans = write_api._write_checkpointed_candidates(accepted_candidates, ctx, candidate_checkpoint)
+                    if accepted_candidates and not plans:
+                        raise RuntimeError("summary rejected before writing")
+                elif candidate is not None:
+                    write_api.write_memory(candidate, ctx)
+            if candidate is None:
+                return
             logger.info(
                 "L0 summary written: session=%s len=%d",
                 session_id[:8], len(candidate.content),
@@ -2114,7 +2122,7 @@ class MemoryService:
                 logger.warning("Lifecycle extraction recovery session=%s archive=%s attempt=%d error=%s",
                                session_id, journal.batch["archive_id"], failures, exc)
 
-    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal):
+    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal, *, publication_scope=None):
         batch = journal.batch
         messages = batch["messages"]
         session_time = _parse_session_time(batch.get("session_time"))
@@ -2125,9 +2133,10 @@ class MemoryService:
 
         chunks = journal.chunks(make_chunks)
         for index, chunk in enumerate(chunks):
-            write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
-                                     session_id=session_id, session_time=session_time,
-                                     candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
+            with (publication_scope or nullcontext)():
+                write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
+                                         session_id=session_id, session_time=session_time,
+                                         candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
         aggregated = {"candidates_extracted": 0, "candidates_filtered": 0,
                       "writes_completed": 0, "writes_skipped": 0, "writes_failed": 0, "plans": []}
         from service.extraction_retry import source_only_reason
@@ -2139,7 +2148,8 @@ class MemoryService:
                     continue
                 checkpoint = journal.checkpoint(slot)
                 candidates, extracted, filtered = checkpoint.load()
-                plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
+                with (publication_scope or nullcontext)():
+                    plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
                 if slot == "summary":
                     continue
                 stored_candidates.extend(candidates)
@@ -2153,8 +2163,9 @@ class MemoryService:
             logger.warning("Extraction completed from preserved source session=%s archive=%s reason=%s",
                            session_id, batch["archive_id"], reason)
             failures = journal.unresolved_node_failures()
-            graph = write_api.finish_partial_relations(stored_candidates, stored_plans, ctx,
-                                                      checkpoint=journal.checkpoint("chunk:0"))
+            with (publication_scope or nullcontext)():
+                graph = write_api.finish_partial_relations(stored_candidates, stored_plans, ctx,
+                                                          checkpoint=journal.checkpoint("chunk:0"))
             return {**aggregated, "degraded": True,
                     "recovery_mode": "partial" if aggregated["writes_completed"] else "source_only",
                     "failed_nodes": failures, "graph": graph,
@@ -2162,7 +2173,8 @@ class MemoryService:
         from extraction.node_processing import NodeProcessingPartialError
         failures = []
         with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api,
-                                            journal.checkpoint("summary")) as before_write:
+                                            journal.checkpoint("summary"),
+                                            publication_scope) as before_write:
             for index, chunk in enumerate(chunks):
                 check_deadline()
                 try:
@@ -2170,7 +2182,8 @@ class MemoryService:
                         messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
                         session_time=session_time, session_summary=batch["session_summary"],
                         tool_stats_text=batch["tool_stats_text"], archive_id=batch["archive_id"],
-                        candidate_checkpoint=journal.checkpoint(f"chunk:{index}"), before_write=before_write)
+                        candidate_checkpoint=journal.checkpoint(f"chunk:{index}"), before_write=before_write,
+                        **({"publication_scope": publication_scope} if publication_scope else {}))
                 except NodeProcessingPartialError as exc:
                     failures.extend({"slot": f"chunk:{index}", **failure} for failure in exc.failures)
                     continue
@@ -2464,7 +2477,7 @@ class MemoryService:
                     hints={"include_all_memories": True},
                 )
             if agfs_retrieval and result is not None:
-                stats["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
+                stats["retrieval"] = {"mode": "vector_free", "status": "partial" if result.partial else "complete"}
             if self._graph_enabled() and result is not None and result.trace is not None:
                 stats["graph_expansion"] = dict(result.trace.graph_expansion)
             if result and result.hits:
@@ -2521,7 +2534,7 @@ class MemoryService:
             try:
                 summary_result = summary.result() if summary is not None else summary_search()
                 if agfs_retrieval and summary_result is not None and summary_result.partial:
-                    stats["retrieval"] = {"mode": "agfs", "status": "partial"}
+                    stats["retrieval"] = {"mode": "vector_free", "status": "partial"}
                 if summary_result and summary_result.hits:
                     summary_items = [
                         {
@@ -2954,10 +2967,10 @@ class MemoryService:
 
     # -- Lazy resource getters ------------------------------------------------
 
-    @_serialize_lazy_initialization("_vector_index")
-    def _get_shared_vector_index(self):
-        """Lazy-init shared vector index (same instance for read + outbox worker)."""
-        if self._vector_index is None:
+    @_serialize_lazy_initialization("_projection_index")
+    def _get_shared_projection_index(self):
+        """Return the outbox sink for the configured retrieval projections."""
+        if self._projection_index is None:
             # Use the same conservative identity as the session mutation guard.
             from fs.sql_adapter.pool import sql_connection_identity
             pool = None
@@ -2968,73 +2981,58 @@ class MemoryService:
                     and vector_dsn
                     and sql_connection_identity(vector_dsn) == sql_connection_identity(self._cfg.sql_connection_string)):
                 pool = self._get_shared_sql_pool()
-            vector_index = (self._provider_cfg.create_vector_index(pool=pool) if pool is not None
-                            else self._provider_cfg.create_vector_index())
-            projection_index = vector_index
-            lexical_index = None
-            if getattr(self._cfg, "retrieval_hybrid_enabled", False):
-                try:
-                    from core.lexical import HybridLexicalIndex
-                    from providers.composite_index import CompositeProjectionWriter
-                    from providers.lexical_index import create_lexical_index
+            vector_index = None
+            if not self._agfs_retrieval_enabled:
+                vector_index = (self._provider_cfg.create_vector_index(pool=pool) if pool is not None
+                                else self._provider_cfg.create_vector_index())
+            from providers.composite_index import create_projection_writer
 
-                    lexical_index = create_lexical_index(self._cfg)
-                    if not isinstance(lexical_index, HybridLexicalIndex):
-                        raise TypeError(
-                            "hybrid lexical provider lacks durable checkpoint capabilities"
-                        )
-                    projection_index = CompositeProjectionWriter(
-                        vector_index,
-                        lexical_index,
-                    )
-                    from core.lexical import lexical_scopes_from_index_records
-
-                    projection_index.set_failure_callbacks(
-                        records_failed=lambda records: lexical_index.mark_scopes_dirty(
-                            lexical_scopes_from_index_records(records)
-                        ),
-                        scope_unknown_failed=lexical_index.mark_all_scopes_dirty,
-                    )
-                except Exception:
-                    for resource in (lexical_index, vector_index):
-                        close = getattr(resource, "close", None)
-                        if callable(close):
-                            try:
-                                close()
-                            except Exception:
-                                logger.warning(
-                                    "Resource cleanup failed after lexical initialization error",
-                                    exc_info=True,
-                                )
-                    raise
+            projection_index = create_projection_writer(self._cfg, vector_index)
+            if self._cfg.retrieval_uses_lexical_projection:
+                self._lexical_index = projection_index.lexical_index
             # Publish the resource tree only after required lexical
             # initialization succeeds, so transient failures remain retryable.
             self._vector_index = self._guard_storage(vector_index)
+            self._lexical_index = self._guard_storage(self._lexical_index)
             self._projection_index = self._guard_storage(projection_index)
-            self._lexical_index = self._guard_storage(lexical_index)
-            logger.info("Shared vector_index ready: %s", type(self._vector_index).__name__)
-        return self._vector_index
-
-    def _get_shared_projection_index(self):
-        """Return the outbox sink that keeps vector and lexical projections aligned."""
-        self._get_shared_vector_index()
+            logger.info("Retrieval projections ready: vector=%s lexical=%s",
+                        type(vector_index).__name__, self._cfg.retrieval_lexical_provider)
         return self._projection_index
+
+    def _get_shared_vector_index(self):
+        """Return the shared vector index for vector queries and prefetch."""
+        if self._vector_index is None:
+            self._get_shared_projection_index()
+        return self._vector_index
 
     @_serialize_lazy_initialization("_lexical_backfill")
     def _get_lexical_backfill(self):
         """Return the lifecycle-owned lexical backfill coordinator."""
-        if not getattr(self._cfg, "retrieval_hybrid_enabled", False):
+        if not self._cfg.retrieval_uses_lexical_projection:
             return None
         if self._lexical_backfill is None:
-            self._get_shared_vector_index()
             if self._lexical_index is None:
-                raise RuntimeError("hybrid retrieval requires a lexical index")
-            from fs.sql_adapter.node_scanner import SQLCanonicalNodeScanner
+                self._get_shared_projection_index()
+            from index.index_record_builder import build_agfs_lexical_records, build_index_records
             from providers.lexical_backfill import LexicalBackfill
 
+            if self._use_sql_metadata:
+                from fs.sql_adapter.node_scanner import SQLCanonicalNodeScanner
+
+                bridge = self._get_space_content_store()
+                scanner = SQLCanonicalNodeScanner(
+                    self._get_shared_sql_pool(),
+                    hydrate_nodes=bridge.hydrate_nodes if bridge is not None else None,
+                )
+            else:
+                from fs.agfs_adapter.node_scanner import AGFSCanonicalNodeScanner
+
+                fs = self._get_context_fs()
+                scanner = AGFSCanonicalNodeScanner(fs, outbox=self._get_outbox_store(fs))
             self._lexical_backfill = LexicalBackfill(
-                SQLCanonicalNodeScanner(self._get_shared_sql_pool()),
+                scanner,
                 self._lexical_index,
+                record_builder=build_agfs_lexical_records if self._agfs_retrieval_enabled else build_index_records,
                 page_size=getattr(self._cfg, "retrieval_backfill_page_size", 500),
             )
         return self._lexical_backfill
@@ -3080,7 +3078,8 @@ class MemoryService:
         agfs_retrieval = self._agfs_retrieval_enabled
         directory_summary_enabled = bool(getattr(self._cfg, "directory_summary_enabled", False))
         return OutboxWorker(
-            vector_index=None if agfs_retrieval else self._get_shared_projection_index(),
+            vector_index=(self._get_shared_projection_index()
+                          if not agfs_retrieval or self._cfg.retrieval_uses_lexical_projection else None),
             embedder=None if agfs_retrieval else self._get_shared_embedder(),
             fs=fs,
             llm=self.get_llm() if directory_summary_enabled else None,
@@ -3310,10 +3309,10 @@ class MemoryService:
         if self._lexical_index is not None and self._projection_index is not None:
             try:
                 if not self._projection_index.close(timeout=join_timeout):
-                    logger.warning("Hybrid retrieval indexes did not close before deadline")
+                    logger.warning("Retrieval projections did not close before deadline")
                     return
             except Exception as exc:
-                logger.warning("Failed to close hybrid retrieval indexes: %s", exc)
+                logger.warning("Failed to close retrieval projections: %s", exc)
                 return
             self._projection_index = None
             self._lexical_index = None
@@ -3344,16 +3343,16 @@ class MemoryService:
             self._outbox_stop.clear()
 
 
+    @_serialize_lazy_initialization("_decision_client")
     def get_decision_client(self):
         """One optional protocol client shared by retrieval and lazy extraction."""
         config = getattr(self._cfg, "decision", None)
         if config is None:
             return None
-        with self._decision_client_lock:
-            if self._decision_client is None:
-                from providers.decision import JevDecisionClient
-                self._decision_client = self._bind_model_usage(JevDecisionClient(config))
-            return self._decision_client
+        if self._decision_client is None:
+            from providers.decision import JevDecisionClient
+            self._decision_client = self._bind_model_usage(JevDecisionClient(config))
+        return self._decision_client
 
     def _rerank_decision_evidence(self, query, working_set):
         if not self._cfg.retrieval_decision_rerank_enabled:
@@ -3556,6 +3555,9 @@ class MemoryService:
                 uri_resolver=uri_resolver,
 internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_mode=self._cfg.extraction_mode,
+                decision_client=(self.get_decision_client()
+                                 if self._cfg.extraction_mode == "lazy" else None),
+                read_probability_threshold=self._cfg.read_probability_threshold,
                 source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
                 card_format_enabled=self._cfg.card_format_enabled,
                 dual_pass_enabled=self._cfg.dual_pass_enabled,
@@ -3664,10 +3666,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 include_agent_memories=self._cfg.agent_memory_enabled,
                 max_top_k=self._cfg.retrieval_max_top_k,
                 default_top_k=self._cfg.retrieval_default_top_k,
+                lexical_top_k=self._cfg.retrieval_lexical_top_k,
             )
+            lexical_backfill = self._get_lexical_backfill()
             pipeline = AGFSRetrieval(
-                fs, cfg, fts_enabled=getattr(self._cfg, "retrieval_agfs_fts_enabled", True),
-                fts_ranker=getattr(self._cfg, "retrieval_agfs_fts_ranker", "literal"),
+                fs, cfg, fts_enabled=self._cfg.retrieval_uses_agfs_fts,
+                fts_ranker=self._cfg.retrieval_agfs_fts_ranker,
+                lexical_index=self._lexical_index, lexical_backfill=lexical_backfill,
             )
             self._agfs_fts = pipeline.fts
             self._read_api = ReadAPI(
@@ -3758,8 +3763,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     vector_index,
                     embedder,
                     cfg,
-                    self._lexical_index,
+                    self._lexical_index if cfg.hybrid_enabled else None,
                     lexical_backfill,
+                    allow_lexical_warming=self._cfg.storage_backend == "agfs",
                 ),
                 hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
                 assembly=ResultRanker(cfg, relation_store=relation_store),
@@ -4331,7 +4337,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             topic_buffer.set_pending_injection(hits)
             response = {"ok": True, "prefetched": len(hits)}
             if self._agfs_retrieval_enabled and result is not None:
-                response["retrieval"] = {"mode": "agfs", "status": "partial" if result.partial else "complete"}
+                response["retrieval"] = {"mode": "vector_free", "status": "partial" if result.partial else "complete"}
             return response
         except Exception as exc:
             logger.warning("prefetch failed: %s", exc, exc_info=True)
@@ -4552,10 +4558,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_guard_session_mutation
     def commit_session_buffer(self, params: dict) -> dict:
-        if self._tool_result_governance is not None:
-            return self._tool_result_governance.commit_session_buffer(params)
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
+        buf = self.get_session_manager().get_or_create(session_id, ctx)
+        pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
+        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+            self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return {"ok": False, "status": "processing", "retryable": True,
+                    "reason": "agent_extraction_pending"}
+        if self._tool_result_governance is not None:
+            return self._tool_result_governance.commit_session_buffer(params)
         return self.get_session_manager().commit(
             session_id,
             ctx,
@@ -5668,6 +5680,121 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "request_id": client_request_id, "source_status": "CHECKPOINTED", "semantic_status": "PENDING",
                 "recovery_task": task, "last_error": str(error), **fields}
 
+    def _agent_turn_journal(self, ctx):
+        from session.session_manager import generate_archive_id
+
+        mgr = self.get_session_manager()
+        buf = mgr.get_or_create(ctx.session_id, ctx)
+        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        if pending:
+            if pending.get("agent_async"):
+                return ExtractionBatchJournal.resume(mgr, buf, ctx), None
+            return None, 1
+        request_id = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+        if not request_id:
+            return None, None
+        if buf.extraction_in_progress or buf.lifecycle_prepare_in_progress or buf.compaction_prepare_archive_id:
+            return None, 1
+        receipts = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+        for receipt in receipts.values():
+            if needs_projection_refresh(receipt):
+                resolved = self._resolve_write_outcome(receipt)
+                if resolved["projection_status"] in {"PENDING", "UNKNOWN"}:
+                    return None, 1
+        source = list(buf.messages[buf.extraction_watermark:])
+        if not source:
+            raise RecoveryNeedsConfirmationError("accepted agent turn has no pending source")
+        state = self._build_incremental_extraction_state(buf, incremental=source)
+        buf.runtime_extensions.pop(AGENT_TURN_PENDING)
+        try:
+            journal = ExtractionBatchJournal(
+                mgr, buf, ctx, source, archive_id=generate_archive_id(),
+                messages=state["messages"], session_time=state["session_time"],
+                session_summary=buf.extraction_summary, tool_stats_text=state["tool_stats_text"],
+                client_request_id=request_id,
+                request_source_ids=receipts.get(request_id, {}).get("source_message_ids", ()),
+                agent_async=True,
+            )
+        except Exception:
+            buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+            raise
+        return journal, None
+
+    def _dispose_agent_turn(self, mgr, buf, ctx):
+        with buf.session_state_save_lock:
+            with buf.extraction_lock:
+                pending = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
+                queued = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+                if not queued and not pending.get("agent_async"):
+                    return None
+                if buf.ordinary_turns_in_progress:
+                    return {"disposed": False, "flushed": False, "status": "processing",
+                            "retryable": True, "reason": "ordinary_turn_in_progress"}
+                waiting = {message.id for message in buf.messages[buf.extraction_watermark:]}
+                waiting.difference_update(pending.get("message_ids", ()))
+                if waiting and not queued:
+                    entries = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+                    request_id = next((key for key, outcome in reversed(entries.items())
+                                       if outcome.get("source_status") == "BUFFERED"
+                                       and not waiting.isdisjoint(outcome.get("source_message_ids", ()))), None)
+                    if not request_id:
+                        return {"disposed": False, "flushed": False, "status": "processing",
+                                "retryable": True, "reason": "agent_extraction_pending"}
+                    buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+            if waiting and not queued and not mgr.save_session_state(buf.session_id, ctx):
+                with buf.extraction_lock:
+                    buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
+                raise RecoveryPersistenceError("agent turn flush could not be saved")
+        self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+        return {"disposed": True, "flushed": False, "status": "background_flush_dispatched"}
+
+    @staticmethod
+    def _archived_extraction_outcome(write_result, request_id):
+        degraded = bool(write_result.get("degraded") or write_result.get("recovery_mode") == "source_only")
+        outcome = {"semantic_status": "DEGRADED" if degraded else "COMPLETE",
+                   "request_status": "DEGRADED" if degraded else "PROJECTING",
+                   "accepted": True, "writes_completed": write_result.get("writes_completed", 0),
+                   "candidates_extracted": write_result.get("candidates_extracted", 0)}
+        if degraded:
+            outcome["recovery_mode"] = write_result.get("recovery_mode", "source_only")
+            outcome["failed_nodes"] = deepcopy(write_result.get("failed_nodes", []))
+            outcome["error_detail"] = {
+                "code": "EXTRACTION_PARTIAL" if outcome["recovery_mode"] == "partial" else "EXTRACTION_SOURCE_ONLY",
+                "component": "extraction", "request_id": request_id, "retry_action": "manual_review",
+                "cause": {"message": str(write_result.get("reason", "source preserved after recovery"))[:1000]},
+            }
+        return outcome
+
+    def _process_agent_turn(self, ctx, journal, publication_scope):
+        mgr = journal.manager
+        batch = journal.batch
+        request_id, archive_id = batch["client_request_id"], batch["archive_id"]
+        snapshot = [SessionMessage(**message) for message in batch["snapshot"]]
+        write_api = self.get_write_api()
+        with mgr.parallel_archive_compression(snapshot, ctx.session_id, ctx, journal) as compression:
+            write_result = (self._chunk_and_extract_recoverable(
+                write_api, ctx, ctx.session_id, journal, publication_scope=publication_scope,
+            ) if batch["messages"] else {})
+        if self._write_result_has_failures(write_result):
+            if not journal.has_retryable_write_failure():
+                raise RecoveryNeedsConfirmationError("memory write outcome requires confirmation")
+            raise ExtractionIncompleteError("memory extraction write failed")
+        with publication_scope():
+            commit = mgr.commit_snapshot(
+                ctx.session_id, snapshot, ctx, wait=True, archive_id=archive_id,
+                compression_work=compression, compression_checkpoint=journal,
+            )
+            if not commit.get("archived"):
+                if commit.get("status") == "needs_confirmation":
+                    raise RecoveryNeedsConfirmationError(commit.get("error") or "archive requires confirmation")
+                raise RecoveryPersistenceError(commit.get("error") or "agent turn archive not committed")
+            if write_result.get("candidates_extracted", 0):
+                journal.buffer.extraction_summary = _update_extraction_summary(
+                    journal.buffer.extraction_summary, write_result)
+            self._invalidate_identity_cache_if_profile_written(ctx.session_id, write_result)
+            journal.finish(outcome=self._archived_extraction_outcome(write_result, request_id),
+                           resolve_outcome=self._resolve_write_outcome)
+
     def _refresh_write_outcomes(self, ctx):
         """Persist completed projection receipts under the existing session fence."""
         try:
@@ -5805,8 +5932,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             ctx=ctx,
         )
         claim_status = buf.claim_request(client_request_id)
-        if claim_status == "completed":
-            return self._after_turn(params)
         if claim_status == "processing":
             batch = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
             if batch.get("client_request_id") == client_request_id:
@@ -5825,7 +5950,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
         try:
-            result = self._after_turn(params)
+            force_extract = self._param_bool(params, "forceExtract", "force_extract", default=False)
+            for _ in range(2 if force_extract else 1):
+                result = self._after_turn(params)
+                if not (result.get("ok", True) and result.get("status") == "accumulating"):
+                    break
         except Exception:
             buf.release_request(client_request_id)
             raise
@@ -5889,6 +6018,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         client_request_id = str(
             params.get("clientRequestId") or params.get("client_request_id") or ""
         ).strip()
+        async_capture = params.get("wait") is False and bool(client_request_id)
         automatic_card_identity = (self._cfg.card_format_enabled or self._cfg.node_processing_enabled) and not client_request_id
         if automatic_card_identity:
             client_request_id = "card-" + uuid4().hex
@@ -5917,7 +6047,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         def _save_idempotency_state() -> bool:
             if (
-                self._tool_result_externalizer is None
+                not async_capture and self._tool_result_externalizer is None
                 and not getattr(self._cfg, "session_state_bridge_enabled", True)
                 and not isinstance(self._write_api, _CheckpointWriteAPI)
             ):
@@ -5928,6 +6058,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         completed_outcome = {}
 
         def _complete_request(result: dict) -> dict:
+            live_plans = {(plan.get("action"), plan.get("target_uri")): plan
+                          for plan in result.get("plans", [])}
             if client_request_id and result.get("ok", True):
                 previous_completed = list(buf.completed_request_ids)
                 previous_outcomes = deepcopy(buf.runtime_extensions.get(OUTCOMES_KEY))
@@ -5961,6 +6093,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             elif completed_outcome:
                 result.update(status="accumulating", request_status="ACCEPTED",
                               source_status="BUFFERED", semantic_status="PENDING")
+            if live_plans and "plans" in result:
+                result["plans"] = [live_plans.get((plan.get("action"), plan.get("target_uri")), plan)
+                                   for plan in result["plans"]]
             return result
         governance_fallback_token = params.get(
             "toolResultGovernanceFallbackToken"
@@ -5979,7 +6114,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch", {})
         pending_request_retry = bool(client_request_id and pending.get("client_request_id") == client_request_id)
-        if client_request_id and buf.request_completed(client_request_id) and not pending_request_retry:
+        accepted_receipt = (read_extraction_receipt(buf, ctx, client_request_id, include_accepted=True)
+                            if not async_capture and client_request_id and self._param_bool(
+                                params, "forceExtract", "force_extract", default=False) else None)
+        accepted_retry = accepted_receipt is not None and accepted_receipt.get("status") == "accepted"
+        if accepted_retry:
+            request_source_ids.update(accepted_receipt["message_ids"])
+        if (client_request_id and buf.request_completed(client_request_id)
+                and (async_capture or not (pending_request_retry or accepted_retry))):
             if not _save_idempotency_state():
                 return {
                     "ok": False,
@@ -5997,8 +6139,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
         after_turn_governance = None
-        if pending_request_retry and is_frozen_source_retry(ctx, pending):
+        if pending_request_retry and (is_frozen_source_retry(ctx, pending) or accepted_retry):
             new_messages = deepcopy(pending["request_messages"])
+        elif accepted_retry:
+            new_messages = [asdict(message) for message in buf.messages if message.id in request_source_ids]
         elif self._tool_result_governance is not None:
             after_turn_governance = self._tool_result_governance.prepare_after_turn(
                 params,
@@ -6049,7 +6193,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_id=session_id,
             )
             request_source_ids.update(governance_result.source_message_ids)
-        elif not pending_request_retry:
+        elif not pending_request_retry and not accepted_retry:
             # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest().
             buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
             for index, msg in enumerate(new_messages):
@@ -6108,6 +6252,30 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             params, "forceExtract", "force_extract", default=False
         )
 
+        if async_capture:
+            frozen_ids = set(pending.get("message_ids", ()))
+            waiting = [message for message in buf.messages if message.id not in frozen_ids]
+            ready = bool(waiting) and (force_extract or sum(m.estimated_tokens for m in waiting) >= threshold)
+            previous = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+            if ready and self.get_write_api() is None:
+                return {"ok": False, "status": "failed", "retryable": True,
+                        "error": "write API unavailable for asynchronous extraction"}
+            if ready:
+                buf.runtime_extensions[AGENT_TURN_PENDING] = client_request_id
+            receipt = _complete_request({"ok": True, "status": "accumulating", "pending_tokens": pending_tokens})
+            if not receipt.get("ok"):
+                if previous is None:
+                    buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
+                else:
+                    buf.runtime_extensions[AGENT_TURN_PENDING] = previous
+            elif ready:
+                self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return receipt
+
+        if pending.get("agent_async") or buf.runtime_extensions.get(AGENT_TURN_PENDING):
+            return {"ok": False, "status": "processing", "retryable": True,
+                    "error": "asynchronous extraction is processing this session"}
+
         if pending_tokens < threshold and not force_extract and not buf.pending_extraction_ids():
             return _complete_request(
                 {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens,
@@ -6125,7 +6293,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         checkpoint_enabled = isinstance(write_api, _CheckpointWriteAPI)
         if checkpoint_enabled:
             mgr.enable_extraction_recovery(session_id, ctx, write_api._fs)
-            if client_request_id and buf.request_completed(client_request_id):
+            if client_request_id and buf.request_completed(client_request_id) and not accepted_retry:
                 return _complete_request({"ok": True, "status": "duplicate"})
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
@@ -6199,21 +6367,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         def _finish_archived_batch(write_result=None):
             write_result = write_result or {}
             if extraction_journal is not None:
-                degraded = bool(write_result.get("degraded") or write_result.get("recovery_mode") == "source_only")
-                outcome = {"semantic_status": "DEGRADED" if degraded else "COMPLETE",
-                           "request_status": "DEGRADED" if degraded else "PROJECTING",
-                           "accepted": True,
-                           "writes_completed": write_result.get("writes_completed", 0),
-                           "candidates_extracted": write_result.get("candidates_extracted", 0)}
-                if degraded:
-                    outcome["recovery_mode"] = write_result.get("recovery_mode", "source_only")
-                    outcome["failed_nodes"] = deepcopy(write_result.get("failed_nodes", []))
-                    outcome["error_detail"] = {"code": ("EXTRACTION_PARTIAL" if outcome["recovery_mode"] == "partial"
-                                                       else "EXTRACTION_SOURCE_ONLY"), "component": "extraction",
-                        "request_id": extraction_journal_request_id, "retry_action": "manual_review",
-                        "cause": {"message": str(write_result.get("reason", "source preserved after recovery"))[:1000]}}
                 completed_outcome.update(extraction_journal.finish(
-                    outcome=outcome, resolve_outcome=self._resolve_write_outcome,
+                    outcome=self._archived_extraction_outcome(write_result, extraction_journal_request_id),
+                    resolve_outcome=self._resolve_write_outcome,
                     current_request_id=client_request_id, current_source_ids=request_source_ids))
                 return len(archive_snapshot)
             removed = buf.remove_messages_by_id(archive_snapshot_ids)
@@ -6307,7 +6463,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return _complete_request(
                 {
                     "ok": True,
-                    "status": "no_extractable_messages",
+                    "status": ("accumulating" if _completion_status() == "accumulating"
+                               else "no_extractable_messages"),
                     "drain": drain_stats,
                     "commit": commit_result,
                     "extraction_run_id": extraction_run_id,
@@ -6930,6 +7087,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
         kind = lifecycle_kind(buf)
+        pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
+        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+            self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return {"ok": False, "status": "processing", "retryable": True,
+                    "session_id": session_id, "reason": "agent_extraction_pending"}
         if buf.pending_extraction_ids() and kind != "compaction":
             return {"ok": False, "status": "needs_confirmation", "retryable": False,
                     "session_id": session_id,
@@ -7552,6 +7714,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         operation = _DisposeOperationLease(buf)
         source_stack = ExitStack()
         try:
+            deferred = self._dispose_agent_turn(mgr, buf, ctx)
+            if deferred is not None:
+                return deferred
             with buf.extraction_lock:
                 if buf.ordinary_turns_in_progress:
                     return {"disposed": False, "flushed": False, "status": "processing",
@@ -7818,6 +7983,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         with buf.extraction_lock:
             extension = deepcopy(buf.runtime_extensions.get(EXTENSION_KEY))
+            agent_turn_pending = bool(buf.runtime_extensions.get(AGENT_TURN_PENDING))
         if extension is not None:
             batch = extension.get("batch") if isinstance(extension, dict) else None
             if (not isinstance(extension, dict) or extension.get("version") != 1
@@ -7844,6 +8010,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "status": failure.get("status", "pending"),
                     "retryable": failure.get("retryable", True),
                     "extraction_in_progress": False, "dispose_in_progress": False}
+
+        if agent_turn_pending:
+            self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+            return {"idle": False, "reason": "agent_extraction_pending", "status": "queued",
+                    "retryable": True, "extraction_in_progress": False, "dispose_in_progress": False}
 
         if drain_outbox:
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
@@ -8233,8 +8404,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if isinstance(health.get("lexical_backfill"), dict)
             else {}
         )
-        hybrid_enabled = bool(self._cfg.retrieval_hybrid_enabled)
-        lexical_healthy = not hybrid_enabled or lexical.get("available") is True
+        hybrid_enabled = self._cfg.retrieval_hybrid_enabled and not self._agfs_retrieval_enabled
+        lexical_configured = getattr(self._cfg, "retrieval_uses_lexical_projection", hybrid_enabled)
+        lexical_healthy = not lexical_configured or lexical.get("available") is True
         backfill_busy = any(
             lexical_backfill.get(key)
             for key in (
@@ -8551,26 +8723,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     pool.return_connection(conn)
                 info["sql"] = "connected"
                 info["sql_dialect"] = self._cfg.sql_dialect
-                if self._cfg.retrieval_hybrid_enabled:
-                    self._get_shared_vector_index()
-                    lexical_health = self._lexical_index.health()
-                    info["lexical"] = lexical_health
-                    if not lexical_health.get("available", False):
-                        raise RuntimeError("required openGauss BM25 projection is unavailable")
-                    backfill_health = self._get_lexical_backfill().health()
-                    info["lexical_backfill"] = backfill_health
-                    if (
-                        backfill_health.get("queued")
-                        or backfill_health.get("running")
-                        or backfill_health.get("at_capacity")
-                        or backfill_health.get("cooldown_failures")
-                        or backfill_health.get("last_errors")
-                        or backfill_health.get("stopping")
-                    ):
-                        info["status"] = "degraded"
-                        info["error"] = "lexical historical projection is not ready"
+            info["lexical_provider"] = self._cfg.retrieval_lexical_provider
+            if self._cfg.retrieval_uses_lexical_projection:
+                if self._lexical_index is None:
+                    self._get_shared_projection_index()
+                lexical_health = self._lexical_index.health()
+                info["lexical"] = lexical_health
+                if not lexical_health.get("available", False):
+                    raise RuntimeError("configured inverted index is unavailable")
+                backfill_health = self._get_lexical_backfill().health()
+                info["lexical_backfill"] = backfill_health
+                if any(backfill_health.get(key) for key in (
+                    "queued", "running", "at_capacity", "cooldown_failures", "last_errors", "stopping",
+                )):
+                    info["status"] = "degraded"
+                    info["error"] = "lexical historical projection is not ready"
             if self._agfs_retrieval_enabled:
-                info["retrieval_mode"] = "agfs"
+                info["retrieval_mode"] = "vector_free"
             elif self._cfg.vector_db_type.strip().casefold() == "milvus":
                 info["vector_db"] = {"type": "milvus", "available": False}
                 # A cached client can outlive a failed server or revoked grant.

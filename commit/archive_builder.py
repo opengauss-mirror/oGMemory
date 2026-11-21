@@ -51,6 +51,16 @@ class ArchiveBuilder:
         self._schema_registry = schema_registry
         self._card_format_enabled = card_format_enabled
 
+    @staticmethod
+    def needs_model(candidate: CandidateMemory, plan: WritePlan) -> bool:
+        fields = plan.merged_fields
+        return plan.action == "merge" and (
+            (candidate.category == "profile" and "existing_abstract" in fields)
+            or (bool(fields.get("existing_content")) and (
+                bool(fields.get("skill_merge")) or "content_append" in fields
+            ))
+        )
+
     def build(
         self,
         candidate: CandidateMemory,
