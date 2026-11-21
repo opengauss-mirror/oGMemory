@@ -8,9 +8,11 @@ from collections import OrderedDict
 
 from core.models import RequestContext
 from core.write_contract import OUTCOMES_KEY, needs_projection_refresh
+from service.extraction_checkpoint import AGENT_TURN_PROJECTION_BARRIER
 
 DISCOVERY_KEY = "memory_extraction_recovery_discovery"
 AGENT_TURN_PENDING = "memory_agent_turn_pending"
+AGENT_TURN_READY_AT = "agent_turn_ready_at_ms"
 AGENT_TURN_TASK = "agent-turn"
 _STATE_URI = re.compile(r"^ctx://([^/]+)/sessions/([^/]+)/state(?:\.json)?$")
 logger = logging.getLogger(__name__)
@@ -20,10 +22,12 @@ def recovery_discovery_hint(payload):
     """Project the source owner and task identity into session metadata."""
     extensions = payload.get("runtime_extensions", {})
     hint = {
-        "projection_pending": any(needs_projection_refresh(outcome)
+        "projection_pending": bool(extensions.get(AGENT_TURN_PROJECTION_BARRIER)) or any(needs_projection_refresh(outcome)
             for outcome in extensions.get(OUTCOMES_KEY, {}).get("entries", {}).values()),
         "agent_turn_pending": bool(extensions.get(AGENT_TURN_PENDING)),
     }
+    if AGENT_TURN_READY_AT in extensions:
+        hint["agent_ready_at_ms"] = extensions[AGENT_TURN_READY_AT]
     extension = extensions.get("memory_extraction_recovery", {})
     batch = extension.get("batch")
     if extension.get("version") != 1 or not isinstance(batch, dict) or "lifecycle" in batch:
@@ -32,6 +36,10 @@ def recovery_discovery_hint(payload):
     if batch.get("agent_async") and (not isinstance(task, dict)
                                     or task.get("status") in {"queued", "running", "failed"}):
         hint["agent_turn_pending"] = True
+        if "ready_at_ms" in batch:
+            hint["agent_ready_at_ms"] = batch["ready_at_ms"]
+        if task:
+            hint["agent_next_attempt_at"] = max(task.get("next_attempt_at", 0), task.get("lease_until", 0))
     if isinstance(task, dict):
         task = {key: task[key] for key in ("id", "status", "attempts") if key in task}
     elif (task is None and isinstance(batch.get("snapshot"), list)
@@ -146,5 +154,8 @@ class ExtractionRecoveryDiscovery:
                 and task["id"] == hint.get("archive_id")):
             return ctx, dict(task)
         if hint.get("agent_turn_pending"):
-            return ctx, {"id": AGENT_TURN_TASK, "status": "queued"}
+            return ctx, {"id": AGENT_TURN_TASK, "status": "queued",
+                         "agent_async": hint.get("agent_async", False),
+                         "ready_at_ms": hint.get("agent_ready_at_ms"),
+                         "next_attempt_at": hint.get("agent_next_attempt_at", 0)}
         return None

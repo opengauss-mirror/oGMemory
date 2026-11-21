@@ -32,6 +32,7 @@ def run_polling(monkeypatch, results, *, stop_after_polls=None, outbox_store=Non
 
     stop = StopEvent()
     service._outbox_stop = stop
+    service._outbox_wakeup = SimpleNamespace(clear=lambda: None, is_set=lambda: False, wait=stop.wait)
 
     class Worker:
         def run_once(self, *, outbox_store, account_ids):
@@ -93,6 +94,16 @@ def test_idle_wait_completes_service_stop(monkeypatch):
 def test_completed_work_observes_service_stop(monkeypatch):
     timeline = run_polling(monkeypatch, [{"succeeded": 1}], stop_after_polls=1)
     assert timeline == ["poll"]
+
+
+def test_agent_projection_drains_inline_when_index_workers_are_zero(monkeypatch):
+    service = MemoryService(config=OgMemConfig(index_workers=0))
+    drain = Mock()
+    monkeypatch.setattr(service, "_async_drain", drain)
+
+    service._wake_agent_projection("agent-account")
+
+    drain.assert_called_once_with(account_id="agent-account")
 
 
 def test_future_pending_deadline_wakes_then_returns_to_idle(monkeypatch):

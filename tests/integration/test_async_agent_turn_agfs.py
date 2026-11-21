@@ -15,7 +15,7 @@ from core.models import CandidateMemory
 from providers.unified_config import OgMemConfig
 from providers.vector_index.in_memory_index import InMemoryVectorIndex
 from server.memory_service import MemoryService
-from service.extraction_checkpoint import EXTENSION_KEY
+from service.extraction_checkpoint import AGENT_TURN_PROJECTION_BARRIER, EXTENSION_KEY
 from session.session_state import SessionState
 
 REQUEST_TIMEOUT = 20
@@ -37,6 +37,7 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
         agent_id="assistant",
         role_control_enabled=False,
         after_turn_threshold=1024,
+        agent_turn_workers=1,
         directory_summary_enabled=False,
         rolling_compress_enabled=False,
         embedding_provider="mock",
@@ -45,10 +46,15 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
     monkeypatch.setattr(retry_module, "AGENT_LEASE_SECONDS", 9)
     monkeypatch.setattr(service, "_generate_summary_candidate", lambda *args, **kwargs: None)
     ctx = service.build_context({"sessionId": "repair-session"})
+    bob_ctx = service.build_context({
+        "accountId": f"async-agent-{uuid4().hex}", "userId": "bob", "sessionId": "inspection-session",
+    })
     extracting, resume_extraction = threading.Event(), threading.Event()
     projecting, resume_projection = threading.Event(), threading.Event()
+    bob_extracting = threading.Event()
     first_source = "I calibrated the receiver to 37 MHz this morning."
     second_source = "I replaced the backup battery with a lithium pack."
+    bob_source = "I inspected the spare antenna at 9 AM."
     first = [
         {"id": "receiver-user", "role": "user", "content": first_source},
         {"id": "receiver-agent", "role": "assistant", "content": "I recorded the calibration."},
@@ -77,7 +83,10 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
                                         ["retry_task"]["lease_until"])
             extracting.set()
             assert resume_extraction.wait(BACKGROUND_TIMEOUT)
-        key = "receiver_calibration" if text == first_source else "battery_replacement"
+        if text == bob_source:
+            bob_extracting.set()
+        key = {first_source: "receiver_calibration", second_source: "battery_replacement",
+               bob_source: "antenna_inspection"}[text]
         return [CandidateMemory(
             category="event", owner_scope="user", routing_key=key, title=text,
             abstract=text, overview=text, content=text, who="Nora", confidence=.99,
@@ -102,19 +111,22 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
             time.sleep(.1)
         pytest.fail("expected the active Agent extraction lease to renew while the model is working")
 
-    def post(path, payload):
+    def post(path, payload, context=ctx):
         return app_module.app.test_client().post(
-            f"/api/v1/{path}", headers=headers, json={"sessionId": ctx.session_id, **payload}
+            f"/api/v1/{path}", headers=headers,
+            json={"sessionId": context.session_id, "accountId": context.account_id,
+                  "userId": context.user_id, "agentId": context.agent_id, **payload},
         )
 
-    def after_turn(request_id, messages, previous=0, *, force=False):
+    def after_turn(request_id, messages, previous=0, *, force=False, context=ctx):
         return post("after_turn", {"clientRequestId": request_id, "wait": False,
                                    "messages": messages, "prePromptMessageCount": previous,
-                                   "forceExtract": force})
+                                   "forceExtract": force}, context=context)
 
-    def receipt(request_id):
+    def receipt(request_id, context=ctx):
         response = app_module.app.test_client().get(
-            f"/api/v1/sessions/{ctx.session_id}/write-requests/{request_id}", headers=headers
+            f"/api/v1/sessions/{context.session_id}/write-requests/{request_id}", headers=headers,
+            query_string={"accountId": context.account_id, "userId": context.user_id, "agentId": context.agent_id},
         )
         assert response.status_code == 200
         return response.get_json()
@@ -122,7 +134,7 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
     def wait_for_receipts():
         deadline = time.monotonic() + BACKGROUND_TIMEOUT
         while time.monotonic() < deadline:
-            outcomes = [receipt(key) for key in ("receiver-turn", "battery-turn")]
+            outcomes = [receipt("receiver-turn"), receipt("battery-turn"), receipt("inspection-turn", bob_ctx)]
             if all(outcome.get("terminal") for outcome in outcomes):
                 return outcomes
             time.sleep(.05)
@@ -174,17 +186,29 @@ def test_same_session_agent_turns_continue_during_background_extraction(monkeypa
                 assert composed.status_code == 200
                 assert second_source in [message["content"] for message in composed.get_json()["messages"]]
                 assert extracted_sources == [first_source]
+                bob_ack = client_requests.submit(
+                    after_turn, "inspection-turn", [{"role": "user", "content": bob_source}],
+                    force=True, context=bob_ctx,
+                ).result(REQUEST_TIMEOUT)
+                assert bob_ack.status_code == 202
+                assert bob_extracting.wait(REQUEST_TIMEOUT)
+                assert extracted_sources == [first_source, bob_source]
+                first_receipt = receipt("receiver-turn")
+                assert first_receipt["projection_status"] == "PENDING"
+                barrier = read_state()["runtime_extensions"][AGENT_TURN_PROJECTION_BARRIER]
+                assert barrier["archive_id"] == first_receipt["archive_id"]
+                assert barrier["event_refs"] == first_receipt["outbox_events"]
             finally:
                 resume_extraction.set()
                 resume_projection.set()
 
         outcomes = wait_for_receipts()
-        assert extracted_sources == [first_source, second_source]
+        assert extracted_sources == [first_source, bob_source, second_source]
         assert [(receipt["request_status"], receipt["source_status"], receipt["projection_status"])
-                for receipt in outcomes] == [("SUCCEEDED", "ARCHIVED", "DONE")] * 2
+                for receipt in outcomes] == [("SUCCEEDED", "ARCHIVED", "DONE")] * 3
         assert all(receipt["outbox_tracking_complete"] for receipt in outcomes)
-        assert [receipt["writes_completed"] for receipt in outcomes] == [1, 1]
-        assert [archive_store.read_archive(ctx.session_id, receipt["archive_id"], ctx).messages[0]["content"]
-                for receipt in outcomes] == [first_source, second_source]
+        assert [receipt["writes_completed"] for receipt in outcomes] == [1, 1, 1]
+        assert [archive_store.read_archive(owner.session_id, saved["archive_id"], owner).messages[0]["content"]
+                for owner, saved in zip((ctx, ctx, bob_ctx), outcomes)] == [first_source, second_source, bob_source]
     finally:
         service.shutdown(join_timeout=10)

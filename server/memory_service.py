@@ -21,6 +21,7 @@ from dataclasses import asdict, replace
 from datetime import UTC
 from datetime import datetime as _dt
 from functools import partial, wraps
+from time import time_ns
 from typing import Any
 from uuid import uuid4
 
@@ -106,6 +107,7 @@ from service.code_workspace_sync import (
     WorkspaceResolutionError,
 )
 from service.extraction_checkpoint import (
+    AGENT_TURN_PROJECTION_BARRIER,
     EXTENSION_KEY,
     ExtractionBatchJournal,
     RecoveryNeedsConfirmationError,
@@ -121,7 +123,7 @@ from service.extraction_retry import (
     retry_failed_source,
     source_only_recovery,
 )
-from service.extraction_recovery_discovery import AGENT_TURN_PENDING, AGENT_TURN_TASK
+from service.extraction_recovery_discovery import AGENT_TURN_PENDING, AGENT_TURN_READY_AT, AGENT_TURN_TASK
 from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
@@ -781,6 +783,7 @@ class MemoryService:
         self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
         self._outbox_stop = threading.Event()
+        self._outbox_wakeup = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._extraction_retry = ExtractionRetryWorker(self)
         self._extraction_discovery = None
@@ -3095,22 +3098,20 @@ class MemoryService:
                 logger.info("OutboxWorker SQL listener thread launched")
                 return
 
-            # AGFS backend: polling loop with multi-account support
-            def _get_account_ids_to_scan():
-                if self._cfg.role_control_enabled:
-                    try:
-                        accounts = self.get_key_manager().get_accounts()
-                        return [a["account_id"] for a in accounts if a.get("account_id")]
-                    except Exception as exc:
-                        logger.warning("Failed to list accounts for outbox scan: %s", exc)
-                return [self._default_account_id]
-
             def _outbox_loop():
                 logger.info("OutboxWorker thread started (idle polling every 5s)")
+                refresh_accounts = True
+                account_ids = [self._default_account_id]
                 while not self._outbox_stop.is_set():
                     wait_seconds = 5
+                    if refresh_accounts or self._outbox_wakeup.is_set():
+                        self._outbox_wakeup.clear()
+                        refresh_accounts = False
+                        try:
+                            account_ids = list(dict.fromkeys(self._extraction_recovery_account_ids()))
+                        except Exception as exc:
+                            logger.warning("Failed to list accounts for outbox scan: %s", exc)
                     try:
-                        account_ids = _get_account_ids_to_scan()
                         stats = worker.run_once(
                             outbox_store=outbox_store,
                             account_ids=account_ids,
@@ -3131,7 +3132,9 @@ class MemoryService:
                                 wait_seconds = min(wait_seconds, delay)
                     except Exception as exc:
                         logger.warning("OutboxWorker poll error: %s", exc)
-                    self._outbox_stop.wait(wait_seconds)
+                    if not self._outbox_stop.is_set():
+                        self._outbox_wakeup.wait(wait_seconds)
+                    refresh_accounts = True
 
             self._outbox_thread = threading.Thread(
                 target=_outbox_loop, daemon=True, name="outbox-worker"
@@ -3140,6 +3143,12 @@ class MemoryService:
             logger.info("OutboxWorker background thread launched")
         except Exception as exc:
             logger.warning("Failed to start OutboxWorker: %s", exc, exc_info=True)
+
+    def _wake_agent_projection(self, account_id: str):
+        if self._cfg.index_workers <= 0:
+            self._async_drain(account_id=account_id)
+            return
+        self._outbox_wakeup.set()
 
     def _async_drain(self, account_id: str | None = None):
         """Background thread wrapper for outbox drain with logging."""
@@ -3209,6 +3218,7 @@ class MemoryService:
         with self._shutdown_lock:
             with self._init_lock:
                 self._outbox_stop.set()
+                self._outbox_wakeup.set()
             self._shutdown_resources(join_timeout)
 
     def _shutdown_resources(self, join_timeout: float) -> None:
@@ -3297,6 +3307,7 @@ class MemoryService:
             self._outbox_listener = None
             self._outbox_thread = None
             self._outbox_stop.clear()
+            self._outbox_wakeup.clear()
 
 
     @_serialize_lazy_initialization("_decision_client")
@@ -4515,7 +4526,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ctx = params.get("_ctx") or self.build_context(params)
         buf = self.get_session_manager().get_or_create(session_id, ctx)
         pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
-        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+        if (buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async")
+                or self._agent_turn_projection_blocks(buf)):
             self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
             return {"ok": False, "status": "processing", "retryable": True,
                     "reason": "agent_extraction_pending"}
@@ -5638,27 +5650,38 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(ctx.session_id, ctx)
-        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        extensions = buf.runtime_extensions
+        pending = extensions.get(EXTENSION_KEY, {}).get("batch")
         if pending:
             if pending.get("agent_async"):
                 return ExtractionBatchJournal.resume(mgr, buf, ctx), None
             return None, 1
-        request_id = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+        request_id = extensions.get(AGENT_TURN_PENDING)
         if not request_id:
             return None, None
         if buf.extraction_in_progress or buf.lifecycle_prepare_in_progress or buf.compaction_prepare_archive_id:
             return None, 1
-        receipts = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
-        for receipt in receipts.values():
-            if needs_projection_refresh(receipt):
-                resolved = self._resolve_write_outcome(receipt)
-                if resolved["projection_status"] in {"PENDING", "UNKNOWN"}:
-                    return None, 1
+        barrier = extensions.get(AGENT_TURN_PROJECTION_BARRIER)
+        receipts = extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+        if barrier is not None:
+            projection = self._agent_turn_projection_status(barrier)
+            if projection == "FAILED":
+                return None, 5
+            if projection not in {"DONE", "NOT_REQUIRED"}:
+                return None, 1
+        else:
+            for receipt in receipts.values():
+                if needs_projection_refresh(receipt):
+                    resolved = self._resolve_write_outcome(receipt)
+                    if resolved["projection_status"] in {"PENDING", "UNKNOWN"}:
+                        return None, 1
         source = list(buf.messages[buf.extraction_watermark:])
         if not source:
             raise RecoveryNeedsConfirmationError("accepted agent turn has no pending source")
         state = self._build_incremental_extraction_state(buf, incremental=source)
-        buf.runtime_extensions.pop(AGENT_TURN_PENDING)
+        extensions.pop(AGENT_TURN_PENDING)
+        ready_at_ms = extensions.pop(AGENT_TURN_READY_AT, None)
+        extensions.pop(AGENT_TURN_PROJECTION_BARRIER, None)
         try:
             journal = ExtractionBatchJournal(
                 mgr, buf, ctx, source, archive_id=generate_archive_id(),
@@ -5666,19 +5689,34 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_summary=buf.extraction_summary, tool_stats_text=state["tool_stats_text"],
                 client_request_id=request_id,
                 request_source_ids=receipts.get(request_id, {}).get("source_message_ids", ()),
-                agent_async=True,
+                agent_async=True, ready_at_ms=ready_at_ms,
             )
         except Exception:
-            buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+            extensions[AGENT_TURN_PENDING] = request_id
+            if ready_at_ms is not None:
+                extensions[AGENT_TURN_READY_AT] = ready_at_ms
+            if barrier is not None:
+                extensions[AGENT_TURN_PROJECTION_BARRIER] = barrier
             raise
         return journal, None
+
+    def _agent_turn_projection_status(self, barrier):
+        return self._resolve_write_outcome({
+            "outbox_tracking_complete": barrier["outbox_tracking_complete"],
+            "outbox_events": barrier["event_refs"],
+        })["projection_status"]
+
+    def _agent_turn_projection_blocks(self, buf):
+        barrier = buf.runtime_extensions.get(AGENT_TURN_PROJECTION_BARRIER)
+        return barrier is not None and self._agent_turn_projection_status(barrier) not in {"DONE", "NOT_REQUIRED"}
 
     def _dispose_agent_turn(self, mgr, buf, ctx):
         with buf.session_state_save_lock:
             with buf.extraction_lock:
                 pending = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
                 queued = buf.runtime_extensions.get(AGENT_TURN_PENDING)
-                if not queued and not pending.get("agent_async"):
+                if (not queued and not pending.get("agent_async") and
+                        not self._agent_turn_projection_blocks(buf)):
                     return None
                 if buf.ordinary_turns_in_progress:
                     return {"disposed": False, "flushed": False, "status": "processing",
@@ -5694,11 +5732,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         return {"disposed": False, "flushed": False, "status": "processing",
                                 "retryable": True, "reason": "agent_extraction_pending"}
                     buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+                    buf.runtime_extensions[AGENT_TURN_READY_AT] = time_ns() // 1_000_000
+                ready_at_ms = buf.runtime_extensions.get(AGENT_TURN_READY_AT)
             if waiting and not queued and not mgr.save_session_state(buf.session_id, ctx):
                 with buf.extraction_lock:
                     buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
+                    buf.runtime_extensions.pop(AGENT_TURN_READY_AT, None)
                 raise RecoveryPersistenceError("agent turn flush could not be saved")
-        self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+        self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued", "ready_at_ms": ready_at_ms})
         return {"disposed": True, "flushed": False, "status": "background_flush_dispatched"}
 
     @staticmethod
@@ -5747,29 +5788,41 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             self._invalidate_identity_cache_if_profile_written(ctx.session_id, write_result)
             journal.finish(outcome=self._archived_extraction_outcome(write_result, request_id),
                            resolve_outcome=self._resolve_write_outcome)
+            return journal.buffer.runtime_extensions.get(AGENT_TURN_READY_AT)
 
     def _refresh_write_outcomes(self, ctx):
         """Persist completed projection receipts under the existing session fence."""
+        self._start_outbox_worker()
         try:
             with self._session_mutation_scope(ctx):
                 manager = self.get_session_manager()
                 buf = manager.get_or_create(ctx.session_id, ctx)
                 with buf.session_state_save_lock:
                     with buf.extraction_lock:
-                        entries = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+                        extensions = buf.runtime_extensions
+                        entries = extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+                        barrier = extensions.get(AGENT_TURN_PROJECTION_BARRIER)
+                        cleared = barrier is not None and self._agent_turn_projection_status(barrier) in {
+                            "DONE", "NOT_REQUIRED",
+                        }
                         updates = {}
                         for request_id, outcome in entries.items():
-                            if needs_projection_refresh(outcome):
+                            if needs_projection_refresh(outcome) or (cleared and
+                                    barrier["archive_id"] in outcome.get("archive_receipts", {})):
                                 resolved = self._resolve_write_outcome(outcome)
                                 if resolved != outcome:
                                     updates[request_id] = resolved
-                        if not updates:
+                        if not updates and not cleared:
                             return
                         previous = {key: entries[key] for key in updates}
                         entries.update(updates)
+                        if cleared:
+                            extensions.pop(AGENT_TURN_PROJECTION_BARRIER)
                     if not manager.save_session_state(ctx.session_id, ctx):
                         with buf.extraction_lock:
                             entries.update(previous)
+                            if cleared:
+                                extensions[AGENT_TURN_PROJECTION_BARRIER] = barrier
                         raise RecoveryNeedsConfirmationError("projection receipt checkpoint was not acknowledged")
         except (SessionMutationBusyError, SessionOperationInProgress):
             return
@@ -6210,22 +6263,31 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             waiting = [message for message in buf.messages if message.id not in frozen_ids]
             ready = bool(waiting) and (force_extract or sum(m.estimated_tokens for m in waiting) >= threshold)
             previous = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+            ready_at_ms = buf.runtime_extensions.get(AGENT_TURN_READY_AT)
+            previous_ready_at_ms = ready_at_ms
             if ready and self.get_write_api() is None:
                 return {"ok": False, "status": "failed", "retryable": True,
                         "error": "write API unavailable for asynchronous extraction"}
             if ready:
                 buf.runtime_extensions[AGENT_TURN_PENDING] = client_request_id
+                if ready_at_ms is None:
+                    ready_at_ms = time_ns() // 1_000_000
+                    buf.runtime_extensions[AGENT_TURN_READY_AT] = ready_at_ms
             receipt = _complete_request({"ok": True, "status": "accumulating", "pending_tokens": pending_tokens})
             if not receipt.get("ok"):
                 if previous is None:
                     buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
                 else:
                     buf.runtime_extensions[AGENT_TURN_PENDING] = previous
+                if previous_ready_at_ms is None:
+                    buf.runtime_extensions.pop(AGENT_TURN_READY_AT, None)
             elif ready:
-                self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+                self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued",
+                                                 "ready_at_ms": ready_at_ms})
             return receipt
 
-        if pending.get("agent_async") or buf.runtime_extensions.get(AGENT_TURN_PENDING):
+        if (pending.get("agent_async") or buf.runtime_extensions.get(AGENT_TURN_PENDING)
+                or self._agent_turn_projection_blocks(buf)):
             return {"ok": False, "status": "processing", "retryable": True,
                     "error": "asynchronous extraction is processing this session"}
 
@@ -7042,7 +7104,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         buf = mgr.get_or_create(session_id, ctx=ctx)
         kind = lifecycle_kind(buf)
         pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
-        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+        if (buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async")
+                or self._agent_turn_projection_blocks(buf)):
             self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
             return {"ok": False, "status": "processing", "retryable": True,
                     "session_id": session_id, "reason": "agent_extraction_pending"}

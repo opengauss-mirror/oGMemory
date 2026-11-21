@@ -20,6 +20,8 @@ from core.operation_deadline import operation_deadline
 from core.write_contract import error_fields
 from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from providers.token_tracker import request_usage_scope
+from providers.unified_config import DEFAULT_AGENT_TURN_WORKERS
+from service.agent_turn_scheduler import AgentTurnQueue
 from service.extraction_checkpoint import (
     EXTENSION_KEY,
     ExtractionBatchJournal,
@@ -36,7 +38,6 @@ MAX_ATTEMPTS = 2
 MAX_TRANSIENT_ATTEMPTS = 3
 ATTEMPT_SECONDS = 1200
 AGENT_LEASE_SECONDS = 30
-AGENT_WORKERS = 4
 
 
 def is_frozen_source_retry(ctx, batch):
@@ -98,11 +99,15 @@ def retry_failed_source(function):
 class ExtractionRetryWorker:
     def __init__(self, service):
         self.service = service
+        config = getattr(service, "_cfg", None)
+        self._agent_workers = getattr(config, "agent_turn_workers", DEFAULT_AGENT_TURN_WORKERS)
+        self._agent_owner = getattr(config, "agent_turn_scheduler_owner", True)
         self._queue = Queue()
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
         self._queued = set()
-        self._agent_wakes = set()
+        self._agent_queue = AgentTurnQueue()
         self._thread = None
+        self._legacy_thread = None
         self._agent_threads = set()
         self._stop = threading.Event()
         self._discover = None
@@ -110,11 +115,12 @@ class ExtractionRetryWorker:
         self._next_discovery = 0
 
     def start_discovery(self, discover, interval=5):
-        self._discover = discover
-        self._discovery_interval = interval
-        self._next_discovery = 0
-        with self._lock:
+        with self._condition:
+            self._discover = discover
+            self._discovery_interval = interval
+            self._next_discovery = 0
             self._start_thread()
+            self._condition.notify()
 
     def _start_thread(self):
         if not self._stop.is_set() and (self._thread is None or not self._thread.is_alive()):
@@ -191,18 +197,31 @@ class ExtractionRetryWorker:
         }, wake=wake)
 
     def wake(self, ctx, task):
-        if task.get("status") not in {"queued", "running", "failed"} or self._stop.is_set():
+        if task.get("status") not in {"queued", "running", "failed"}:
             return
         archive_id = AGENT_TURN_TASK if task.get("agent_async") else task["id"]
-        identity = (*recovery_owner(ctx).values(), archive_id)
-        with self._lock:
-            if identity in self._queued:
-                if archive_id == AGENT_TURN_TASK:
-                    self._agent_wakes.add(identity)
+        with self._condition:
+            if self._stop.is_set():
                 return
-            self._queued.add(identity)
-            self._queue.put((identity, ctx, archive_id))
+            if archive_id == AGENT_TURN_TASK:
+                if not self._agent_owner:
+                    return
+                wall_time = time.time()
+                now = time.monotonic()
+                due_at = now + max(0, (task.get("next_attempt_at") or 0) - wall_time)
+                ready_at_ms = task.get("ready_at_ms")
+                self._agent_queue.wake(
+                    ctx, ready_at_ms if ready_at_ms is not None else int(wall_time * 1000), due_at, now,
+                    pending=ready_at_ms is not None and not task.get("agent_async"),
+                )
+            else:
+                identity = (*recovery_owner(ctx).values(), archive_id)
+                if identity in self._queued:
+                    return
+                self._queued.add(identity)
+                self._queue.put((identity, ctx, archive_id))
             self._start_thread()
+            self._condition.notify()
 
     def _run(self):
         while not self._stop.is_set():
@@ -213,36 +232,49 @@ class ExtractionRetryWorker:
                         self.wake(ctx, task)
                 except Exception:
                     logger.exception("Extraction retry discovery failed")
-            try:
-                identity, ctx, archive_id = self._queue.get(timeout=.2)
-            except Empty:
-                continue
-            if archive_id == AGENT_TURN_TASK:
-                with self._lock:
-                    if len(self._agent_threads) < AGENT_WORKERS:
-                        thread = threading.Thread(
-                            target=self._run_agent_item, args=(identity, ctx), daemon=True,
-                            name="agent-extraction",
+            with self._condition:
+                if self._stop.is_set():
+                    break
+                if self._legacy_thread is None:
+                    try:
+                        legacy = self._queue.get_nowait()
+                    except Empty:
+                        pass
+                    else:
+                        self._legacy_thread = threading.Thread(
+                            target=self._run_legacy_item, args=legacy, daemon=True,
+                            name="extraction-retry-attempt",
                         )
+                        self._legacy_thread.start()
+                deadlines = [self._next_discovery] if self._discover is not None else []
+                if len(self._agent_threads) < self._agent_workers:
+                    turn = self._agent_queue.pop(time.monotonic())
+                    if turn is not None:
+                        thread = threading.Thread(target=self._run_agent_item, args=(turn,), daemon=True,
+                                                  name="agent-extraction")
                         self._agent_threads.add(thread)
                         thread.start()
                         continue
-                self._queue.put((identity, ctx, archive_id))
-                self._queue.task_done()
-                self._stop.wait(.05)
-            else:
-                self._run_item(identity, ctx, archive_id)
+                    due_at = self._agent_queue.next_deadline()
+                    if due_at is not None:
+                        deadlines.append(due_at)
+                timeout = max(0, min(deadlines) - time.monotonic()) if deadlines else None
+                self._condition.wait(timeout=timeout)
 
-    def _run_agent_item(self, identity, ctx):
-        with self._lock:
-            self._agent_wakes.discard(identity)
+    def _run_agent_item(self, turn):
+        delay = None
         try:
-            self._run_item(identity, ctx, AGENT_TURN_TASK)
+            if not self._stop.is_set():
+                delay = self.run_once(turn.ctx, AGENT_TURN_TASK)
+        except Exception:
+            logger.exception("Extraction retry worker stopped an Agent turn")
         finally:
-            with self._lock:
+            with self._condition:
+                self._agent_queue.finish(turn, delay, time.monotonic(), int(time.time() * 1000))
                 self._agent_threads.discard(threading.current_thread())
+                self._condition.notify()
 
-    def _run_item(self, identity, ctx, archive_id):
+    def _run_legacy_item(self, identity, ctx, archive_id):
         requeued = False
         try:
             delay = self.run_once(ctx, archive_id)
@@ -254,14 +286,12 @@ class ExtractionRetryWorker:
         except Exception:
             logger.exception("Extraction retry worker stopped a source task")
         finally:
-            if not requeued:
-                with self._lock:
-                    if identity in self._agent_wakes and not self._stop.is_set():
-                        self._agent_wakes.discard(identity)
-                        self._queue.put((identity, ctx, archive_id))
-                    else:
-                        self._queued.discard(identity)
-            self._queue.task_done()
+            with self._condition:
+                if not requeued:
+                    self._queued.discard(identity)
+                self._queue.task_done()
+                self._legacy_thread = None
+                self._condition.notify()
 
     def _run_agent_turn(self, ctx):
         service = self.service
@@ -273,19 +303,30 @@ class ExtractionRetryWorker:
             task = deepcopy(journal.batch.get("retry_task", {}))
             if task.get("status") == "needs_confirmation":
                 return None
-            if task.get("lease_until", 0) > time.time() or task.get("next_attempt_at", 0) > time.time():
-                return 1
+            now = time.time()
+            delay = max(task.get("lease_until", 0), task.get("next_attempt_at", 0)) - now
+            if delay > 0:
+                return delay
             initial = "attempts" not in task
             source_only = (task.get("source_only") or task.get("attempts", 0) >= MAX_ATTEMPTS
                            or task.get("transient_attempts", 0) >= MAX_TRANSIENT_ATTEMPTS)
             task.update(id=journal.batch["archive_id"], status="running", lease_token=token, agent_async=True,
-                        lease_until=time.time() + AGENT_LEASE_SECONDS,
+                        lease_until=now + AGENT_LEASE_SECONDS,
                         attempts=task.get("attempts", 0) + int(not initial and not source_only))
             journal.mutate(lambda batch: batch.update(retry_task=task))
             archive_id = task["id"]
             request_id = journal.batch["client_request_id"]
+            ready_at_ms = journal.batch.get("ready_at_ms")
             pinned = journal.manager.begin_managed_operation(ctx.session_id, ctx, create=False)
 
+        started_ms = int(time.time() * 1000)
+        started = time.monotonic()
+        ready_wait_ms = started_ms - ready_at_ms if ready_at_ms is not None and started_ms >= ready_at_ms else None
+        logger.info(
+            "Agent turn started session_id=%s request_id=%s archive_id=%s ready_at_ms=%s "
+            "started_at_ms=%d ready_wait_ms=%s attempt=%d",
+            ctx.session_id, request_id, archive_id, ready_at_ms, started_ms, ready_wait_ms, task["attempts"],
+        )
         @contextmanager
         def publication_scope():
             with service._session_mutation_scope(ctx):
@@ -311,12 +352,10 @@ class ExtractionRetryWorker:
         journal.publication_scope = publication_scope
         feedback = _format_feedback.set(task.get("format_error", ""))
         try:
-            with request_usage_scope(ctx), operation_deadline(ATTEMPT_SECONDS):
-                if source_only:
-                    with source_only_recovery(ctx, archive_id, task.get("last_error") or "extraction retries exhausted"):
-                        service._process_agent_turn(ctx, journal, publication_scope)
-                else:
-                    service._process_agent_turn(ctx, journal, publication_scope)
+            recovery = (source_only_recovery(ctx, archive_id, task.get("last_error") or "extraction retries exhausted")
+                        if source_only else nullcontext())
+            with request_usage_scope(ctx), operation_deadline(ATTEMPT_SECONDS), recovery:
+                next_ready_at_ms = service._process_agent_turn(ctx, journal, publication_scope)
         except Exception as exc:
             journal.publication_scope = nullcontext
             with service._session_mutation_scope(ctx):
@@ -341,8 +380,12 @@ class ExtractionRetryWorker:
                 task.pop("lease_token", None)
                 task.pop("lease_until", None)
                 journal.mutate(lambda batch: batch.update(retry_task=task))
-            logger.warning("Agent extraction %s for request %s: %s", task["status"], request_id, exc)
-            return None if blocked else 1
+            logger.warning(
+                "Agent turn attempt ended session_id=%s request_id=%s archive_id=%s status=%s "
+                "duration_ms=%.3f: %s",
+                ctx.session_id, request_id, archive_id, task["status"], (time.monotonic() - started) * 1000, exc,
+            )
+            return None if blocked else delay
         finally:
             _format_feedback.reset(feedback)
             done.set()
@@ -350,9 +393,14 @@ class ExtractionRetryWorker:
             if pinned is not None:
                 pinned.end_operation()
 
-        service._async_drain(account_id=ctx.account_id)
-        # Recheck durable work accepted while the preceding batch was running.
-        return .05
+        logger.info(
+            "Agent turn published session_id=%s request_id=%s archive_id=%s finished_at_ms=%d duration_ms=%.3f",
+            ctx.session_id, request_id, archive_id, int(time.time() * 1000), (time.monotonic() - started) * 1000,
+        )
+        service._wake_agent_projection(ctx.account_id)
+        if next_ready_at_ms is not None:
+            self.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued", "ready_at_ms": next_ready_at_ms})
+        return 0
 
     @capture_outbox_events
     def run_once(self, ctx, archive_id):
@@ -446,10 +494,14 @@ class ExtractionRetryWorker:
     def close(self, timeout=1):
         self._stop.set()
         deadline = time.monotonic() + timeout
+        with self._condition:
+            self._condition.notify_all()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout)
-        with self._lock:
+        with self._condition:
             threads = list(self._agent_threads)
+            if self._legacy_thread is not None:
+                threads.append(self._legacy_thread)
         for thread in threads:
             if thread is not threading.current_thread():
                 thread.join(max(0, deadline - time.monotonic()))
