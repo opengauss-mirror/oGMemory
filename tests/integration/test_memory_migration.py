@@ -184,6 +184,8 @@ def test_four_way_migration_and_new_process_retrieval(
 ):
     source = new_config(source_backend, "source")
     target = new_config(target_backend, "target")
+    if target_backend == "sql":
+        target.sql_dialect = "auto"
     target.opengauss_dimension = 16
     assert vector_backend in {"opengauss", "chroma", "milvus"}
     target.vector_db_type = vector_backend
