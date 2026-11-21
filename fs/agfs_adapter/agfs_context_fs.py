@@ -729,6 +729,14 @@ class AGFSContextFS:
         except ValueError:
             return False
 
+    def _validate_write_access(self, uri: str, ctx: RequestContext) -> None:
+        """Mark deterministic access rejection before starting a mutation."""
+        try:
+            self._ensure_accessible(uri, ctx)
+        except AccessDeniedError as exc:
+            exc.agfs_rejection_settled = True
+            raise
+
     def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
         """Raise AccessDeniedError if URI is not accessible.
 
@@ -1234,7 +1242,7 @@ class AGFSContextFS:
     ) -> Iterator[_ResourceMutationLease]:
         """Serialize code-resource writes and deletes across AGFS processes."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         node_path = self._uri_to_agfs_path(uri)
         final_path = PurePosixPath(node_path.rstrip("/"))
         parent_path = str(final_path.parent) + "/"
@@ -1617,7 +1625,7 @@ class AGFSContextFS:
     ) -> None:
         """Atomically persist the durable-delete marker for a node."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         if mutation_lease is not None:
             if mutation_lease.uri != uri:
                 raise ValueError("mutation lease URI does not match tombstone URI")
@@ -1673,7 +1681,7 @@ class AGFSContextFS:
     ) -> None:
         """Remove a tombstone when deletion has not yet been durably accepted."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         if mutation_lease is not None:
             if mutation_lease.uri != uri:
                 raise ValueError("mutation lease URI does not match tombstone URI")
@@ -1696,7 +1704,7 @@ class AGFSContextFS:
     ) -> None:
         """Delete node payload files while preserving tombstone and Outbox."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         if mutation_lease is not None:
             if mutation_lease.uri != uri:
                 raise ValueError("mutation lease URI does not match payload URI")
@@ -1875,7 +1883,7 @@ class AGFSContextFS:
     ) -> None:
         """Atomically publish a deterministic code node with its UPSERT event."""
 
-        self._ensure_accessible(node.uri, ctx)
+        self._validate_write_access(node.uri, ctx)
         expected_version = node.metadata.get("_expected_version")
         if (
             isinstance(expected_version, bool)
@@ -2214,7 +2222,7 @@ class AGFSContextFS:
             AccessDeniedError: If account_id doesn't match URI prefix
         """
         # Step 0: Access control check
-        self._ensure_accessible(node.uri, ctx)
+        self._validate_write_access(node.uri, ctx)
         recovery = self.active_session_recovery()
         if recovery is not None:
             recovery[0].ensure_owned()
@@ -3072,7 +3080,7 @@ class AGFSContextFS:
 
     def archive_node(self, uri: str, ctx: RequestContext) -> None:
         """Archive a node from AGFS by marking its metadata status ARCHIVED."""
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
 
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
@@ -3080,10 +3088,14 @@ class AGFSContextFS:
         try:
             meta = json.loads(self._read_file(meta_path))
         except NodeNotFoundError:
-            raise NodeNotFoundError(uri)
+            error = NodeNotFoundError(uri)
+            error.agfs_rejection_settled = True
+            raise error
 
         if meta.get("status") != NodeStatus.ACTIVE.value:
-            raise NodeNotFoundError(uri)
+            error = NodeNotFoundError(uri)
+            error.agfs_rejection_settled = True
+            raise error
 
         now = datetime.now(UTC).isoformat()
         meta["status"] = NodeStatus.ARCHIVED.value
@@ -3103,7 +3115,7 @@ class AGFSContextFS:
             NodeNotFoundError: If node doesn't exist
         """
         # Access control check
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
 
         node_path = self._uri_to_agfs_path(uri)
 
@@ -3133,8 +3145,8 @@ class AGFSContextFS:
             NodeNotFoundError: If source node doesn't exist
         """
         # Access control check for both URIs
-        self._ensure_accessible(from_uri, ctx)
-        self._ensure_accessible(to_uri, ctx)
+        self._validate_write_access(from_uri, ctx)
+        self._validate_write_access(to_uri, ctx)
 
         from_path = self._uri_to_agfs_path(from_uri)
         to_path = self._uri_to_agfs_path(to_uri)

@@ -152,8 +152,9 @@ class _SQLStore:
                 cursor.execute("SELECT set_config('statement_timeout', '30000', true)")
                 yield cursor
             connection.commit()
-        except Exception:
+        except BaseException as exc:
             connection.rollback()
+            exc.sql_rollback_confirmed = True
             raise
         finally:
             self.pool.return_connection(connection)

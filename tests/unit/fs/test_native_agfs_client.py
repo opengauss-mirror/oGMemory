@@ -257,3 +257,26 @@ def test_bundled_transport_and_explicit_http_endpoint(tmp_path, monkeypatch):
 
     config.write_text("agfs:\n  transport: native\n")
     assert OgMemConfig.load(str(config)).agfs_transport == "native"
+
+
+def test_native_context_lock_business_rejection_drains(native, tmp_path):
+    from core.errors import AccessDeniedError, NodeNotFoundError
+    from core.models import RequestContext, Role
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from service.migration.admission import Admission
+    from service.migration.maintenance import MaintenanceStore
+
+    client, mount, _ = native
+    admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'native-lock'))
+    fs = admission.guard(AGFSContextFS(client=admission.guard(client), mount_prefix=mount))
+    ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.MEMBER)
+    uri = 'ctx://acme/users/alice/memories/preferences/missing'
+    with pytest.raises(ValueError, match='prepareToken'):
+        with fs.resource_mutation_lock(uri, ctx):
+            raise ValueError('prepareToken required')
+    with pytest.raises(NodeNotFoundError):
+        fs.archive_node(uri, ctx)
+    with pytest.raises(AccessDeniedError):
+        fs.archive_node(uri.replace('acme', 'other'), ctx)
+    admission.store.enter('snapshot', mode='export', resources={})
+    admission.store.wait_drained('snapshot', 0)

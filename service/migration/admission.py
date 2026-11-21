@@ -1,6 +1,7 @@
 """Instance operation scopes and guards on actual backend calls."""
 import asyncio
 import inspect
+import sys
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -111,9 +112,8 @@ class Admission:
                 rejected = (isinstance(exc, NativeAGFSHTTPError) or
                             (isinstance(exc, AccessDeniedError)
                              and getattr(exc, 'sql_write_not_started', False) is True) or
-                            (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
-                             and getattr(exc, 'sql_rollback_confirmed', False) is True) or
-                            (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
+                            (getattr(exc, 'sql_rollback_confirmed', False) is True) or
+                            (isinstance(exc, (AccessDeniedError, ConcurrentModificationError, NodeNotFoundError))
                              and getattr(exc, 'agfs_rejection_settled', False) is True) or
                             (http_rejections and confirmed_rejection(exc)))
                 if write and not rejected:
@@ -170,8 +170,23 @@ class Admission:
             @wraps(function)
             @contextmanager
             def context(*args, **kwargs):
-                with scope(write=write), function(*args, **kwargs) as value:
-                    yield value
+                # Only acquisition/release are backend calls. The caller's
+                # exception is not evidence of an unfinished remote mutation.
+                with self.scope(write=write):
+                    manager = function(*args, **kwargs)
+                    with scope(write=write):
+                        value = manager.__enter__()
+                    try:
+                        yield value
+                    except BaseException:
+                        error = sys.exc_info()
+                        with scope(write=write):
+                            suppressed = manager.__exit__(*error)
+                        if not suppressed:
+                            raise
+                    else:
+                        with scope(write=write):
+                            manager.__exit__(None, None, None)
             return context
         if inspect.iscoroutinefunction(function):
             @wraps(function)
@@ -208,6 +223,10 @@ class Admission:
                 from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
                 if isinstance(storage, AGFSSpaceBridge):
                     write = False  # Hydrates authorized immutable bodies only.
+            if name in {"load_snapshot", "load_active", "contributions", "pending_projections", "export"}:
+                from scene.sql_store import _SQLStore
+                if isinstance(storage, _SQLStore):
+                    write = False  # Scene reads do not publish or claim work.
             # mkdir and rm issue one HTTP request. In particular write()
             # retries internally: a final rejection cannot settle earlier timeouts.
             from pyagfs.client import AGFSClient
