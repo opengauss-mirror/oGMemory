@@ -72,3 +72,14 @@ def test_auto_database_type_is_resolved_before_comparison(monkeypatch, detected)
         with pytest.raises(PackageError, match='SQL 数据库类型必须一致'):
             validate_migration_scope(manifest, cfg)
     assert calls == [('auto', 'isolated-test')]
+
+
+
+@pytest.mark.parametrize("backend", ["agfs", "sql"])
+def test_shared_space_instance_rejected_before_opening_storage(backend):
+    from types import SimpleNamespace
+    from service.migration.storage import storage
+    from service.migration.package import PackageError
+    with pytest.raises(PackageError, match="shared-space migration"):
+        with storage(SimpleNamespace(storage_backend=backend, shared_spaces_enabled=True)):
+            pytest.fail("shared instance must not be opened")

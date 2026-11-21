@@ -118,36 +118,6 @@ def test_warm_archive_getter_is_available_during_export(tmp_path, monkeypatch):
         service.shutdown()
 
 
-def test_shared_body_reads_use_remaining_snapshot_budget(monkeypatch):
-    from core.operation_deadline import operation_deadline
-    from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
-    from service.migration.records import NODE_FIELDS
-    from service.migration.shared_storage import SharedStorage
-    from service.migration.storage import AGFSStorage, SQLStorage
-
-    uri = 'ctx://acme/spaces/team/memories/experience/item'
-    payload = json.dumps(dict(uri=uri, content='body', abstract='body', overview='body')).encode()
-    digest = hashlib.sha256(payload).hexdigest()
-    observed = []
-    class Client:
-        timeout = 30
-        def read(self, path, offset=0, size=None):
-            observed.append((self.timeout, size))
-            return payload[offset:] if size is None else payload[offset:offset + size]
-    client = Client()
-    bridge = object.__new__(AGFSSpaceBridge)
-    bridge._agfs = SimpleNamespace(_mount_prefix='/local', _client=client)
-    pointer = dict(uri=uri, path=bridge._content_directory(uri) + '/' + digest + '.json',
-                   sha256=digest, bytes=len(payload))
-    row = dict(uri=uri, metadata={'agfs_content': pointer})
-    monkeypatch.setattr(SQLStorage, '_rows', lambda *a: iter([row]))
-    adapter = object.__new__(SharedStorage)
-    adapter.bridge = bridge
-    adapter.files = AGFSStorage(SimpleNamespace(agfs_mount_prefix='/local'), client=client)
-    with operation_deadline(.5):
-        assert list(adapter._rows('context_nodes', NODE_FIELDS))[0]['content'] == 'body'
-    assert observed and all(timeout <= .5 and size == 1024 * 1024 for timeout, size in observed)
-    assert client.timeout == 30
 
 
 @pytest.mark.parametrize('failure', ['cleanup', 'transport'])
