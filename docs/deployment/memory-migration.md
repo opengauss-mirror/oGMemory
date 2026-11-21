@@ -7,6 +7,7 @@
 - 使用配置中的 `auth.root_api_key` 连接 Memory Viewer；账号 Admin Key 不能执行实例迁移。迁移范围为全部账号，不受页面当前账号选择影响。
 - 同一实例的 HTTP、MCP、独立索引进程（`ogmem start index`）和后台服务必须位于同一主机，使用同一个持久化 `storage.migration_workspace`（环境变量 `OGMEM_MIGRATION_WORKSPACE`，默认 `.ogmemory/migration`）。应配置绝对路径，并为迁移包、临时数据及完整备份预留空间。不能协调的跨主机进程和绕过服务的直接访问必须停止。
 - 目标使用自己的模型和存储配置。默认检索模式下，模型实际维度须与向量索引一致；已有向量还须具有一致的模型身份。`memory` 向量后端不能作为持久化迁移目标。
+- 使用 AGFS HTTP 存储时，AGFS 服务端须同步升级到本版本，以正确返回已完成的创建冲突；仅更新 Python 服务不能修复旧 AGFS 的错误响应。
 - SQL 全实例迁移使用可绕过租户 RLS 的管理员：PostgreSQL superuser 或 openGauss SYSADMIN；openGauss 数据库使用 `DBCOMPATIBILITY 'PG'`。
 - 迁移保留账号、用户及 Agent 标识，不复制凭证和实例角色；新增归属的访问权限须在目标配置。
 

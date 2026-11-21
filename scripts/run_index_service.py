@@ -64,10 +64,12 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None):
                 if callable(close) and close() is False:
                     raise RuntimeError('shared content reader has not stopped')
             finally:
-                close = getattr(client, 'close', None)
-                if callable(close):
-                    close()
-                pool.close_all()
+                try:
+                    close = getattr(client, 'close', None)
+                    if callable(close):
+                        close()
+                finally:
+                    pool.close_all()
             raise
 
     from commit.outbox_store import OutboxStore

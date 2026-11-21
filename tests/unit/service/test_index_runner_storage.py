@@ -77,9 +77,12 @@ def test_migration_preserves_injected_client():
     assert storage.client is client
 
 
-def test_shared_runner_closes_client_if_bridge_initialization_fails(monkeypatch):
+@pytest.mark.parametrize("close_error", [False, True])
+def test_shared_runner_closes_client_if_bridge_initialization_fails(monkeypatch, close_error):
     from scripts.run_index_service import _create_storage
     pool, client = MagicMock(), MagicMock()
+    if close_error:
+        client.close.side_effect = RuntimeError("client close failed")
     monkeypatch.setattr('fs.sql_adapter.pool.SharedConnectionPool', lambda *a, **kw: pool)
     monkeypatch.setattr('fs.agfs_adapter.client.create_agfs_client', lambda cfg: client)
     def fail(*a, **kw):
