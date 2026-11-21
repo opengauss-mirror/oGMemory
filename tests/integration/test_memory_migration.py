@@ -1980,7 +1980,7 @@ def test_agfs_conflict_and_control_reads_with_full_admission(tmp_path, monkeypat
     from dataclasses import replace
 
     import server.app as app_module
-    from core.errors import ConcurrentModificationError
+    from core.errors import ConcurrentModificationError, NodeNotFoundError
     from core.models import ContextNode, RequestContext, Role
     from server.memory_service import MemoryService
     from server.service_factory import close_service, create_service
@@ -2003,6 +2003,19 @@ def test_agfs_conflict_and_control_reads_with_full_admission(tmp_path, monkeypat
         with pytest.raises(ConcurrentModificationError):
             fs.write_node(replace(node, metadata={'_expected_version': 1}), ctx)
         fs.write_node(replace(node, metadata={'_expected_version': 2}), ctx)
+        with pytest.raises(ConcurrentModificationError):
+            fs.write_node(replace(node, metadata={'_expected_version': 0}), ctx)
+        with pytest.raises(NodeNotFoundError):
+            fs.move_node(node.uri + '-missing', node.uri + '-other', ctx)
+        with pytest.raises(NodeNotFoundError):
+            fs.delete_node(node.uri + '-missing', ctx)
+        archives = service._get_archive_store()
+        gate.enter('warm-archive', mode='export', resources={})
+        try:
+            gate.wait_drained('warm-archive', 2)
+            assert service._get_archive_store() is archives
+        finally:
+            gate.reopen('warm-archive')
         service.get_key_manager().create_account('acme', 'alice')
         monkeypatch.setattr(app_module, '_service', service)
         gate.enter('control-test', mode='import', resources={})

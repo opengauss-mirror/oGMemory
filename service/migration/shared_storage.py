@@ -76,7 +76,7 @@ class SharedStorage(SQLStorage):
         for row in super()._rows(table, columns, where):
             if table == 'context_nodes' and tuple(columns) == NODE_FIELDS:
                 if self.bridge is not None and not row['metadata'].get('agfs_purged'):
-                    self.bridge._load_row(row)
+                    self.bridge._load_row(row, read=self.files._read)
                 row['metadata'] = {key: value for key, value in row['metadata'].items()
                                    if key != 'agfs_content'}
             yield row

@@ -4237,15 +4237,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             logger.info("SessionManager ready")
         return self._session_mgr
 
+    @_serialize_lazy_initialization("_archive_store")
     def _get_archive_store(self):
         """Return an archive store instance.
 
         SQL mode: cached for service lifetime (shared connection pool).
-        AGFS mode: fresh instance each call (self-healing on transient failures).
+        AGFS mode: cache successful initialization; retry transient failures.
         """
+        if self._archive_store is not None:
+            return self._archive_store
         if self._use_sql_metadata:
-            if self._archive_store is not None:
-                return self._archive_store
             if self._archive_store_failed:
                 return None
             try:
@@ -4263,7 +4264,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 from session import SessionArchiveStore
                 client = self._get_agfs_client()
                 agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-                return SessionArchiveStore(fs=agfs)
+                self._archive_store = SessionArchiveStore(fs=agfs)
+                return self._archive_store
             except Exception as exc:
                 logger.error("Failed to create AGFS archive store: %s", exc)
                 return None

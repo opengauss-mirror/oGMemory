@@ -117,7 +117,7 @@ class Admission:
                              and getattr(exc, 'sql_write_not_started', False) is True) or
                             (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
                              and getattr(exc, 'sql_rollback_confirmed', False) is True) or
-                            (isinstance(exc, ConcurrentModificationError)
+                            (isinstance(exc, (ConcurrentModificationError, NodeNotFoundError))
                              and getattr(exc, 'agfs_rejection_settled', False) is True) or
                             (http_rejections and isinstance(exc, AGFSClientError) and isinstance(cause, HTTPError)
                              and cause.response is not None
@@ -217,7 +217,7 @@ class Admission:
             # mkdir and rm issue one HTTP request. In particular write()
             # retries internally: a final rejection cannot settle earlier timeouts.
             from pyagfs.client import AGFSClient
-            single_attempt = isinstance(storage, AGFSClient) and name in {'mkdir', 'rm'}
+            single_attempt = isinstance(storage, AGFSClient) and name in {'mkdir', 'rm', 'mv'}
             if isinstance(storage, AGFSClient) and name == 'write':
                 original_write = function
                 @wraps(original_write)

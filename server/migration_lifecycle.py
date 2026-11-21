@@ -80,8 +80,21 @@ class ServiceLifecycle:
                                       service._default_agent_id, session_id, 'migration', Role.ROOT)
             ctx = manager._session_state_context(session_id, buffer.meta, fallback)
             with service._session_mutation_scope(ctx, refresh=False):
-                if not manager.save_session_state(session_id, ctx):
-                    raise MaintenanceError('session checkpoint could not be persisted')
+                fs = manager._get_context_fs() if callable(manager._get_context_fs) else None
+                if fs is None:
+                    raise MaintenanceError('session checkpoint storage is unavailable')
+                with buffer.session_state_save_lock:
+                    if buffer.durable_state_token is not None:
+                        if not manager._durable_state_matches(buffer, fs, ctx):
+                            continue  # Another process already persisted a newer state.
+                    else:
+                        from session.session_state import SessionState
+                        if any(fs.exists(uri, ctx) for uri in (
+                                SessionState.state_uri(ctx.account_id, session_id),
+                                SessionState.legacy_state_uri(ctx.account_id, session_id))):
+                            continue  # An unversioned cache cannot replace durable state.
+                    if not manager.save_session_state(session_id, ctx):
+                        raise MaintenanceError('session checkpoint could not be persisted')
 
     def refresh(self):
         service = self.service

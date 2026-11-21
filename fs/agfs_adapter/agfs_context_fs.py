@@ -2233,6 +2233,7 @@ class AGFSContextFS:
             return
 
         staging_path = None
+        rejection = None
         if create_only:
             final_path = PurePosixPath(final_node_path.rstrip("/"))
             parent_path = str(final_path.parent) + "/"
@@ -2263,12 +2264,16 @@ class AGFSContextFS:
                         )
                     except (NodeNotFoundError, json.JSONDecodeError):
                         raise exc
-                    raise ConcurrentModificationError(
-                        node.uri, 0, existing.get("version", 1)
-                    ) from exc
+                    from fs.agfs_adapter.client import confirmed_rejection
+                    error = ConcurrentModificationError(node.uri, 0, existing.get("version", 1))
+                    if confirmed_rejection(exc):
+                        rejection = error
+                    raise error from exc
         finally:
             if staging_path:
-                self._remove_tree_if_present(staging_path)
+                cleaned = self._remove_tree_if_present(staging_path)
+                if rejection is not None and cleaned:
+                    rejection.agfs_rejection_settled = True
         if self._on_node_change is not None:
             self._on_node_change(node.uri)
 
@@ -3107,7 +3112,10 @@ class AGFSContextFS:
             self._client.rm(node_path, recursive=True)
         except AGFSClientError as e:
             if _is_not_found_error(e):
-                raise NodeNotFoundError(uri)
+                from fs.agfs_adapter.client import confirmed_rejection
+                error = NodeNotFoundError(uri)
+                error.agfs_rejection_settled = confirmed_rejection(e)
+                raise error from e
             raise
         if self._on_node_change is not None:
             self._on_node_change(uri, subtree=True)
@@ -3133,7 +3141,9 @@ class AGFSContextFS:
 
         # Ensure source exists
         if not self.exists(from_uri, ctx):
-            raise NodeNotFoundError(from_uri)
+            error = NodeNotFoundError(from_uri)
+            error.agfs_rejection_settled = True  # No mutation has started.
+            raise error
 
         # Move the directory
         self._client.mv(from_path, to_path)
