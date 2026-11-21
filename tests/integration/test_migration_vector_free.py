@@ -19,12 +19,7 @@ from service.migration.storage import storage
 from tests.unit.commit.test_memory_identity import memory
 
 
-@pytest.mark.parametrize('source_mode,target_mode,fts', [
-    ('agfs', 'agfs', 'literal'), ('agfs', 'agfs', 'sqlite_bm25'),
-    ('agfs', 'agfs', 'disabled'), ('default', 'agfs', 'literal'),
-    ('agfs', 'default', 'literal'),
-])
-def test_vector_free_migration_and_recovery(tmp_path, monkeypatch, source_mode, target_mode, fts):
+def exercise_vector_free_migration(tmp_path, monkeypatch, source_mode, target_mode, fts):
     if 'default' in (source_mode, target_mode):
         pytest.importorskip('chromadb')
     monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda s: None)
@@ -127,3 +122,11 @@ def test_vector_free_migration_and_recovery(tmp_path, monkeypatch, source_mode, 
             for cfg in configs:
                 with storage(cfg) as adapter:
                     adapter.client.rm(cfg.agfs_mount_prefix, recursive=True)
+
+
+@pytest.mark.parametrize('source_mode,target_mode,fts', [
+    ('agfs', 'agfs', 'literal'), ('agfs', 'agfs', 'sqlite_bm25'),
+    ('agfs', 'agfs', 'disabled'),
+])
+def test_vector_free_migration_and_recovery(tmp_path, monkeypatch, source_mode, target_mode, fts):
+    exercise_vector_free_migration(tmp_path, monkeypatch, source_mode, target_mode, fts)

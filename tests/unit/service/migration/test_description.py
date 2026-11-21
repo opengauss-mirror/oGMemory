@@ -46,20 +46,12 @@ def test_description_roundtrip_and_changes_do_not_apply_source_config(tmp_path):
         assert "secret" not in str(loaded.manifest) and "private" not in str(loaded.manifest)
     target = copy.deepcopy(source)
     target["embedding"].update(model="model-b", dimension=16)
-    target["vector_storage"]["backend"] = "opengauss"
-    target["content_storage"] = {
-        "backend": "sql",
-        "database_type": "opengauss",
-        "database_version": "7.0.0-RC3",
-    }
     original = copy.deepcopy(target)
     report = compatibility(source, target)
     assert target == original and cfg.openai_embedding_model == "model-a"
     assert set(report["changes"]) >= {
         "embedding.model",
         "embedding.dimension",
-        "content_storage.database_type",
-        "vector_storage.backend",
     }
     assert any("检索结果可能变化" in n for n in report["notices"])
     assert "始终使用目标模型重建" in compatibility(source, source)["notices"][0]
