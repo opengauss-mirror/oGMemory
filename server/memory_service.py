@@ -2321,14 +2321,14 @@ class MemoryService:
             if self._use_sql_metadata:
                 from server.sql_control_plane_store import SQLControlPlaneStore
                 admission = getattr(self, '_admission', None)
-                with admission.backend(write=True) if admission is not None else nullcontext():
+                with admission.backend(write=True, content=False) if admission is not None else nullcontext():
                     store = SQLControlPlaneStore(pool=self._get_shared_sql_pool())
                 if admission is not None:
                     # Control reads remain available; only durable mutations
                     # participate in business write admission.
                     for name in ('write_json', 'write_code_workspace_sync_state',
                                  'mutate_code_workspace_sync_state'):
-                        setattr(store, name, admission.wrap(getattr(store, name), write=True, backend=True))
+                        setattr(store, name, admission.wrap(getattr(store, name), write=True, backend=True, content=False))
                 self._control_store = store
             elif _HAS_AGFS:
                 # Control reads remain available while business clients are drained.
@@ -3443,7 +3443,7 @@ class MemoryService:
 
             factory = create_scene_index
             if self._admission is not None:
-                factory = self._admission.wrap(factory, write=True, backend=True)
+                factory = self._admission.wrap(factory, write=True, backend=True, content=False)
             candidate_index = LazySceneIndex(factory, projection_queue=repository)
             refresh_projection = SceneIndexRefresh(repository, candidate_index)
 

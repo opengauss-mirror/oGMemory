@@ -49,8 +49,8 @@ def test_scene_runtime_configuration_worker_and_resume(tmp_path, monkeypatch):
         monkeypatch.setattr(service, 'get_auth_service', lambda: Mock(role_control_active=lambda: False))
         _check_sql_control_plane(service, gate, monkeypatch)
         ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.MEMBER)
-        # Cold runtime construction must not create schema during export.
-        gate.enter('cold', mode='export', resources={})
+        # Import still forbids constructing business runtime.
+        gate.enter('cold', mode='import', resources={})
         with pytest.raises(MaintenanceError):
             service.get_scene_service()
         gate.reopen('cold')
@@ -65,18 +65,15 @@ def test_scene_runtime_configuration_worker_and_resume(tmp_path, monkeypatch):
         app.wsgi_app = business_wsgi(app.wsgi_app, lambda: service)
         client = app.test_client()
         gate.enter('snapshot', mode='export', resources={})
-        with pytest.raises(MaintenanceError):
-            service._scene_source.candidate_index.search('query', SceneSnapshot('acme', 'user:alice', 0), 1)
-        lexical_factory.assert_not_called()
+        # Canonical content writes are covered separately; runtime projections can continue.
         result = client.put('/api/v1/scenes/configuration', buffered=True, json={'revision': 0, 'values': {'max_pending_nodes': 17}})
-        assert result.status_code == 503
-        assert runtime.config_provider.get_effective('acme', 'user:alice').revision == 0
+        assert result.status_code == 200
+        assert runtime.config_provider.get_effective('acme', 'user:alice').revision == 1
         assert client.get('/api/v1/scenes/configuration', buffered=True).status_code == 200
-        with pytest.raises(MaintenanceError):
-            service._scene_manager.process_next('worker')
+        assert service._scene_manager.process_next('worker') is None
         gate.wait_drained('snapshot', 0)
         gate.reopen('snapshot')
-        assert client.put('/api/v1/scenes/configuration', buffered=True, json={'revision': 0, 'values': {}}).status_code == 200
+        assert client.put('/api/v1/scenes/configuration', buffered=True, json={'revision': 1, 'values': {}}).status_code == 200
         # A confirmed rollback from an invalid revision must not poison shutdown.
         assert client.put('/api/v1/scenes/configuration', buffered=True, json={'revision': 0, 'values': {}}).status_code == 400
         gate.enter('after-conflict', mode='export', resources={})
@@ -117,14 +114,13 @@ def _check_sql_control_plane(service, gate, monkeypatch):
         gate.enter('control-export', mode='export', resources={})
         response = client.post('/api/v1/admin/accounts/acme/users',
                                json={'user_id': 'new-user'}, buffered=True)
-        assert response.status_code == 503
-        assert response.headers['Retry-After'] == '5'
-        assert {u['user_id'] for u in service.get_key_manager().get_users('acme')} == {'admin'}
+        assert response.status_code == 200
+        assert {u['user_id'] for u in service.get_key_manager().get_users('acme')} == {'admin', 'new-user'}
         assert client.get('/api/v1/admin/accounts', buffered=True).status_code == 200
         gate.wait_drained('control-export', 0)
         gate.reopen('control-export')
         assert client.post('/api/v1/admin/accounts/acme/users',
-                           json={'user_id': 'new-user'}, buffered=True).status_code == 200
+                           json={'user_id': 'after-export'}, buffered=True).status_code == 200
         # A competing request between read and write causes a confirmed rollback.
         from server.sql_control_plane_store import SQLControlPlaneStore
         from server.api_keys import APIKeyManager
