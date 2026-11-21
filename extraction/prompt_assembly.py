@@ -97,7 +97,8 @@ def lazy_tools_for_contract(extraction_tools, fs, contract):
 
 
 def build_selection_request(
-    registry, tools, source, user_id, *, manager, tool_stats="", validation_feedback=None
+    registry, tools, source, user_id, *, manager, tool_stats="", validation_feedback=None,
+    span_instructions="",
 ):
     catalog = sorted(item["category"] for item in category_catalog(registry, tools))
     declared = manager.load("extraction")["selection"]["types"]
@@ -126,7 +127,8 @@ def build_selection_request(
         runtime["validation_feedback"] = validation_feedback
     return SelectionRequest(
         manager.render(
-            "extraction", "selection", runtime_input_json=json.dumps(runtime, ensure_ascii=False)
+            "extraction", "selection", runtime_input_json=json.dumps(runtime, ensure_ascii=False),
+            **({"span_instructions": span_instructions} if span_instructions else {}),
         ),
         schema,
         frozenset(catalog),
@@ -284,11 +286,12 @@ class AssemblyRequest:
     parts: PromptParts | None
 
 
-def selection_request_for(extractor, source, ctx, tool_stats):
+def selection_request_for(extractor, source, ctx, tool_stats, *, span_instructions=""):
     return build_selection_request(
         extractor._schema_registry, extractor._extraction_tools, source, ctx.user_id,
         manager=extractor._prompt_manager,
         tool_stats=tool_stats,
+        span_instructions=span_instructions,
     )
 
 

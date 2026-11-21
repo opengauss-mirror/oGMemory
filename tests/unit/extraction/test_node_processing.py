@@ -205,9 +205,45 @@ def test_catalog_beyond_sixteen_recalls_matching_object():
     assert uri in llm.calls[0]["prompt"]
 
 
-def node_payload(call):
+def node_payload(call, *, canonical=True):
     prompt = call["prompt"]
-    return json.JSONDecoder().raw_decode(prompt[prompt.index('\n{"source":') + 1:])[0]
+    payload = json.JSONDecoder().raw_decode(prompt[prompt.index('\n{"source":') + 1:])[0]
+    if canonical:
+        uris = {node["id"]: node["uri"] for node in payload["nodes"]}
+        for name in ("related_targets", "primary_candidate_targets", "scope_candidate_targets"):
+            payload[name] = [uris.get(target, target) for target in payload[name]]
+        for question in payload["related_questions"].values():
+            question["target"] = uris[question["target"]]
+        for name in ("fixed_target", "related_target"):
+            if name in payload:
+                payload[name] = uris.get(payload[name], payload[name])
+    return payload
+
+
+def test_short_target_id_applies_the_update_to_the_stored_uri():
+    ctx, fs, llm, api = setup(lambda _: [])
+    target = api.write_memory(card(), ctx)["target_uri"]
+    source = "Caroline's necklace now has a heart charm."
+    draft = replace(card(), write_operation_id="receipt", source_occurrence_id="a" * 64)
+
+    def complete(**call):
+        payload = node_payload(call, canonical=False)
+        target_id = payload["nodes"][0]["id"]
+        assert payload["primary_options"][0]["targets"] == [target_id]
+        assert call["prompt"].count(target) == 1
+        assert target not in json.dumps(call["tools"])
+        assert set(payload["drafts"][0]).isdisjoint({"write_operation_id", "source_occurrence_id"})
+        decision = operation([0], target=target_id, action="update", fact=source)
+        return [{"tool": "process_memory_nodes",
+                 "input": {"operations": [decision], "related_reconciliations": {
+                     key: {"decision": "unchanged"} for key in payload["related_questions"]}}}]
+
+    llm.complete_with_tools = complete
+    api._pipeline.extract = lambda *args, **kwargs: [draft]
+    result = api.commit_session([{"role": "user", "content": source}], ctx)
+    assert result["writes_completed"] == 1
+    assert source in fs.read_node(target, ctx).content
+    assert fs.read_node(target, ctx).metadata["version"] == 2
 
 
 def related_targets(payload):

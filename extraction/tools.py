@@ -382,11 +382,13 @@ class _Span:
     fallback_read_prompt_parts: PromptParts | None = field(default=None, repr=False, compare=False)
     tool_stats_attached: bool = False
     tool_stats_text: str = ""
+    extract_categories: list[str] = field(default_factory=list)
 
 
-def _new_assembly_state():
-    from extraction.prompt_assembly import AssemblyState
-    return AssemblyState()
+def _new_assembly_state(categories=()):
+    from extraction.prompt_assembly import AssemblySelection, AssemblyState
+
+    return AssemblyState(selection=AssemblySelection(frozenset(categories)) if categories else None)
 
 
 @dataclass
@@ -479,7 +481,7 @@ def _coalesce_source_spans(spans: list[_Span], messages: list[dict]) -> list[_Sp
 
 
 # Phase 1 prompt — lightweight, no tool definitions
-_SPAN_PROMPT = """\
+_SPAN_RULES = """\
 Analyze this conversation and identify contiguous message ranges (spans) \
 that contain personal information worth remembering.
 
@@ -502,7 +504,9 @@ For each span, specify:
 - end: message index (inclusive)
 - reason: what extractable information this span contains
 - categories: likely categories from: profile, preference, entity, event, \
-case, pattern, skill, tool
+case, pattern, skill, tool"""
+
+_SPAN_PROMPT = _SPAN_RULES + """
 
 {session_summary_block}\
 Conversation:
@@ -687,7 +691,7 @@ class Extractor:
         language = self._detect_language(messages)
 
         # Phase 1: identify spans worth extracting
-        spans = self._identify_spans(messages, session_time, session_summary)
+        spans = self._identify_spans(messages, session_time, session_summary, ctx, tool_stats_text)
         if not spans:
             user_content_len = sum(
                 len(m.get("content", "") or "")
@@ -748,8 +752,10 @@ class Extractor:
         messages: list[dict],
         session_time: Any | None,
         session_summary: str,
+        ctx: RequestContext | None = None,
+        tool_stats_text: str = "",
     ) -> list[_Span]:
-        """Use a cheap JSON-mode call to find extractable message ranges."""
+        """Identify ranges and select extraction types for simple eager turns."""
         conversation = self._format_indexed_conversation(messages, session_time)
 
         summary_block = ""
@@ -760,12 +766,8 @@ class Extractor:
                 f"{session_summary}\n\n"
             )
 
-        prompt = _SPAN_PROMPT.format(
-            conversation=conversation,
-            session_summary_block=summary_block,
-            message_count=len(messages),
-            max_message_index=max(0, len(messages) - 1),
-        )
+        bounds = {"message_count": len(messages), "max_message_index": max(0, len(messages) - 1)}
+        prompt = _SPAN_PROMPT.format(conversation=conversation, session_summary_block=summary_block, **bounds)
         # A bundled chat transcript may be one user message containing many
         # speaker turns. Bound the schema to real outer message indices so
         # small models do not enumerate dialogue lines until token exhaustion.
@@ -776,6 +778,29 @@ class Extractor:
             spans_schema["items"]["properties"][name].update(
                 minimum=0, maximum=max(0, len(messages) - 1),
             )
+
+        from extraction.prompt_assembly import selection_request_for, supports_assembly
+
+        selection = None
+        if (ctx is not None and self._mode == "eager" and self._node_processing_enabled
+                and not self._activation_enabled and not session_summary and not tool_stats_text
+                and [message.get("role") for message in messages] in (["user"], ["user", "assistant"])
+                and all(isinstance(message.get("content"), str)
+                        and not _TOOL_RESULT_STUB_BLOCK.search(message["content"]) for message in messages)
+                and supports_assembly(self._prompt_manager)
+                and "span_instructions" in self._prompt_manager.load("extraction")["selection"]["instruction"]):
+            request = selection_request_for(
+                self, conversation, ctx, "",
+                span_instructions=_SPAN_RULES.format(**bounds),
+            )
+            combined_schema = {
+                **schema,
+                "properties": {**schema["properties"],
+                               "extraction_categories": request.schema["properties"]["categories"]},
+                "required": ["spans", "extraction_categories"],
+            }
+            if prompt_fits(request.prompt, combined_schema):
+                prompt, schema, selection = request.prompt, combined_schema, request
 
         runtime = _EXTRACTION_RUNTIME.get()
         checkpoint = runtime.checkpoint if runtime is not None and not self._use_lazy_mode() else None
@@ -792,7 +817,8 @@ class Extractor:
                 result = cached
             else:
                 try:
-                    result = run_model_call(observe_call, "phase1", self._llm.complete_json, prompt, schema=schema)
+                    stage = "phase1_with_selection" if selection is not None else "phase1"
+                    result = run_model_call(observe_call, stage, self._llm.complete_json, prompt, schema=schema)
                 except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
                     result = {"spans": [{"start": 0, "end": len(messages) - 1,
                                          "reason": "fallback: span identification output invalid",
@@ -802,7 +828,8 @@ class Extractor:
             check_deadline()
             spans: list[_Span] = []
             n = len(messages)
-            for s in result.get("spans", []):
+            raw_spans = result.get("spans", [])
+            for s in raw_spans:
                 if n <= 1:
                     span_start = 0
                     span_end = 0
@@ -823,11 +850,24 @@ class Extractor:
                 )
                 if span.start <= span.end:
                     spans.append(span)
+            extraction_types = result.get("extraction_categories")
+            if (selection is not None and len(raw_spans) == len(spans) == 1
+                    and all(type(raw_spans[0].get(key)) is int
+                            and raw_spans[0][key] == 0 for key in ("start", "end"))
+                    and all(isinstance(types, list) and types
+                            and all(isinstance(category, str) and category in selection.available
+                                    for category in types)
+                            and len(set(types)) == len(types)
+                            for types in (spans[0].categories, extraction_types))):
+                spans[0].extract_categories = extraction_types
             if checkpoint is not None and cached is None:
-                checkpoint.save_stage("span_identification", inputs, {"spans": [
+                saved = {"spans": [
                     {"start": span.start, "end": span.end, "reason": span.reason,
                      "categories": list(span.categories)} for span in spans
-                ]})
+                ]}
+                if len(spans) == 1 and spans[0].extract_categories:
+                    saved["extraction_categories"] = spans[0].extract_categories
+                checkpoint.save_stage("span_identification", inputs, saved)
             if not spans:
                 logger.warning("Phase 1 returned 0 valid spans for %d messages", len(messages))
             return spans
@@ -1314,7 +1354,9 @@ class Extractor:
             stable_span = replace(prepared.span, prompt_parts=None,
                                   fallback_prompt_parts=None, fallback_read_prompt_parts=None)
             span_inputs = {name: value for name, value in asdict(stable_span).items()
-                           if name not in {"reason", "successful_read_versions"}}
+                           if name not in {"reason", "successful_read_versions", "extract_categories"}}
+            if prepared.span.extract_categories:
+                span_inputs["extract_categories"] = sorted(prepared.span.extract_categories)
             span_inputs["categories"] = sorted(set(span_inputs["categories"]))
             inputs = {"prompt": prepared.prompt, "tools": self._extraction_tools,
                       "model": model_signature(self._llm), "mode": self._mode,
@@ -1686,6 +1728,7 @@ class Extractor:
                 start=0, end=len(messages) - 1,
                 reason="single-file profile update",
                 categories=list(dict.fromkeys(category for span in spans for category in span.categories)),
+                extract_categories=spans[0].extract_categories if len(spans) == 1 else [],
                 message_ids=list(dict.fromkeys([
                     *(message_id for span in spans for message_id in span.message_ids),
                     *(message["id"] for message in messages
@@ -1815,7 +1858,7 @@ class Extractor:
             if message.get("role") == "user"
         ).strip()
         if assembly_state is None:
-            assembly_state = _new_assembly_state()
+            assembly_state = _new_assembly_state(span.extract_categories)
         prompt = self._build_span_prompt(
             span, messages, language,
             session_time, session_summary, tool_stats_text, ctx, assembly_state=assembly_state,
