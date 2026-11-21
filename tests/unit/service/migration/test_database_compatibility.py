@@ -5,7 +5,7 @@ import pytest
 
 from service.migration.description import compatibility, validate_migration_scope
 from tests.unit.service.migration.test_description import environment
-from tests.unit.service.migration.test_migration_scope import target_config
+from types import SimpleNamespace
 
 
 @pytest.mark.parametrize('database', ['opengauss', 'postgresql'])
@@ -18,7 +18,7 @@ def test_database_transition_description(database, vector):
     target['content_storage']['database_type'] = 'postgresql' if database == 'opengauss' else 'opengauss'
     target['vector_storage']['backend'] = 'chroma' if vector != 'chroma' else 'opengauss'
     before = deepcopy(target)
-    validate_migration_scope({'source_backend': 'sql', 'source_environment': source}, target_config())
+    validate_migration_scope({'source_backend': 'sql', 'source_environment': source}, SimpleNamespace(storage_backend='sql'))
     result = compatibility(source, target)
     assert target == before
     assert 'content_storage.database_type' in result['changes']
