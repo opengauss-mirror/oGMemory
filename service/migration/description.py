@@ -115,8 +115,12 @@ def validate_migration_scope(manifest, cfg):
     content = source["content_storage"]
     if content["backend"] != cfg.storage_backend:
         raise PackageError("当前仅支持同源迁移：内容存储类型必须一致。")
-    if cfg.storage_backend == "sql" and content["database_type"] != cfg.sql_dialect:
-        raise PackageError("当前仅支持同源迁移：SQL 数据库类型必须一致。")
+    if cfg.storage_backend == "sql":
+        from fs.sql_adapter.pool import resolve_connection_dialect
+
+        dialect = resolve_connection_dialect(cfg.sql_dialect, getattr(cfg, "sql_connection_string", ""))
+        if content["database_type"] != dialect.name:
+            raise PackageError("当前仅支持同源迁移：SQL 数据库类型必须一致。")
     vector = "none" if getattr(cfg, "agfs_retrieval_enabled", False) else cfg.vector_db_type
     if source["vector_storage"]["backend"] != vector:
         raise PackageError("当前仅支持同源迁移：向量后端必须一致。")

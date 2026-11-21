@@ -53,3 +53,22 @@ def test_unsupported_source_rejected_before_target_access(tmp_path, change, oper
             migration.preview(path)
         else:
             migration.merge(path, task='rejected', recovery_factory=forbidden, llm=None)
+
+
+@pytest.mark.parametrize('detected', ['opengauss', 'postgresql'])
+def test_auto_database_type_is_resolved_before_comparison(monkeypatch, detected):
+    cfg = target_config()
+    cfg.sql_dialect = 'auto'
+    cfg.sql_connection_string = 'isolated-test'
+    calls = []
+    def resolve(value, connection):
+        calls.append((value, connection))
+        return SimpleNamespace(name=detected)
+    monkeypatch.setattr('fs.sql_adapter.pool.resolve_connection_dialect', resolve)
+    manifest = {'source_backend': 'sql', 'source_environment': source_environment()}
+    if detected == 'opengauss':
+        validate_migration_scope(manifest, cfg)
+    else:
+        with pytest.raises(PackageError, match='SQL 数据库类型必须一致'):
+            validate_migration_scope(manifest, cfg)
+    assert calls == [('auto', 'isolated-test')]
