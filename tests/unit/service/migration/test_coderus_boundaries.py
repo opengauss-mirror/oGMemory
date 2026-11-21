@@ -146,20 +146,23 @@ def test_pause_closes_scene_index_before_refresh(tmp_path, close_result):
         service.shutdown()
 
 
-@pytest.mark.parametrize('rollback_fails', [False, True])
-def test_scene_transaction_releases_only_confirmed_rollback(tmp_path, rollback_fails):
+@pytest.mark.parametrize('failure', ['statement', 'rollback', 'commit'])
+def test_scene_transaction_releases_only_confirmed_rollback(tmp_path, failure):
     from scene.sql_store import _SQLStore
     a = admission(tmp_path)
     store = object.__new__(_SQLStore)
     connection = Mock()
     connection.cursor.return_value = nullcontext(Mock())
-    if rollback_fails:
+    if failure == 'rollback':
         connection.rollback.side_effect = TimeoutError('rollback unknown')
+    if failure == 'commit':
+        connection.commit.side_effect = TimeoutError('commit unknown')
     store.pool = Mock(get_connection=Mock(return_value=connection))
     with pytest.raises((ValueError, TimeoutError)):
         with a.backend(write=True), store._transaction('acme'):
-            raise ValueError('business conflict')
-    assert_drain(a, blocked=rollback_fails)
+            if failure != 'commit':
+                raise ValueError('business conflict')
+    assert_drain(a, blocked=failure != 'statement')
 
 
 @pytest.mark.parametrize('exists', [False, True])

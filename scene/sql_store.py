@@ -146,15 +146,18 @@ class _SQLStore:
         if not account_id:
             raise ValueError("account_id is required")
         connection = self.pool.get_connection()
+        committing = False
         try:
             PoolAdapterMixin.bind_tenant(connection, account_id)
             with connection.cursor() as cursor:
                 cursor.execute("SELECT set_config('statement_timeout', '30000', true)")
                 yield cursor
+            committing = True
             connection.commit()
         except BaseException as exc:
             connection.rollback()
-            exc.sql_rollback_confirmed = True
+            if not committing:
+                exc.sql_rollback_confirmed = True
             raise
         finally:
             self.pool.return_connection(connection)
