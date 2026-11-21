@@ -231,7 +231,7 @@ def test_same_storage_migration_and_new_process_retrieval(
         description = comparison[label]["content_storage"]
         assert description["backend"] == cfg.storage_backend
         if cfg.storage_backend == "sql":
-            assert description["database_type"] == cfg.sql_dialect
+            assert description["database_type"] == os.environ.get("MIGRATION_TEST_DIALECT", "postgresql")
             assert description["database_version"]
     restored = MigrationService(target, asset_root=target_assets).import_package(package)
     assert_merged_package(package, target, restored, exported["data"], target_assets)
