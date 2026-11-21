@@ -1,6 +1,7 @@
 """Instance operation scopes and guards on actual backend calls."""
 import asyncio
 import inspect
+import posixpath
 import sys
 import threading
 from contextlib import contextmanager
@@ -13,7 +14,6 @@ from service.migration.maintenance import MaintenanceError
 
 def _content_path(path):
     """Conservative classification of AGFS payload mutations, excluding runtime trees."""
-    import posixpath
     from pathlib import PurePosixPath
     parts = PurePosixPath(posixpath.normpath(str(path))).parts
     # Coordination files have an exact reserved layout, never a basename rule.
@@ -280,6 +280,7 @@ class Admission:
             raise MaintenanceError("storage is already bound to another instance")
         skip = {"close", "close_all", "shutdown", "stop"}
         reads = ("read", "get", "list", "exists", "search", "count", "scan", "iter", "has", "is_", "health", "probe", "check", "validate", "ls", "stat", "cat")
+        content_storage = _content_storage(storage)
         for name in dir(type(storage)):
             if name.startswith("_") or name in skip:
                 continue
@@ -305,7 +306,7 @@ class Admission:
                 def write_once(path, data, max_retries=0, _write=original_write):
                     return _write(path, data, max_retries=0)
                 function = write_once
-            content = _content_arguments if _content_storage(storage) else False
+            content = _content_arguments if content_storage else False
             if name in {'session_recovery_lock', 'resource_mutation_lock', 'memory_identity_lock', 'processing_lease'}:
                 content = False
             from fs.agfs_adapter.client import NativeAGFSClient
@@ -320,8 +321,8 @@ class Admission:
                     payload = any(_content_path(p) for p in paths) if paths else True
                     if self._runtime_backend.get():
                         payload = False  # Actual content adapters still acquire their own permit.
-                    return self.wrap(_function, write=_write, backend=True,
-                                     http_rejections=_rejections, content=payload)(*args, **kwargs)
+                    with self.backend(write=_write, http_rejections=_rejections, content=payload):
+                        return _function(*args, **kwargs)
                 setattr(storage, name, transport)
             else:
                 setattr(storage, name, self.wrap(function, write=write, backend=True,
@@ -335,23 +336,22 @@ class Admission:
                 setattr(storage, name, self.wrap(mutation, write=True, backend=True,
                                                   content=(lambda *a, **kw: not self._runtime_backend.get()
                                                            and _content_arguments(*a, **kw))
-                                                  if _content_storage(storage) else False))
+                                                  if content_storage else False))
         storage._migration_guard = self
         return storage
 
 
 def control_client(client, admission, prefix):
     """Allow only control-namespace reads; every mutation retains admission."""
-    import posixpath
 
     readers = {name: getattr(client, name) for name in ('read', 'cat', 'ls') if callable(getattr(client, name, None))}
     admission.guard(client)
     root = posixpath.normpath('/' + prefix.strip('/'))
-    def control_path(path, *, parents=False):
+    def control_path(path, *, parents=False, listing=False):
         normalized = posixpath.normpath(path)
         relative = normalized[len(root.rstrip('/')) + 1:] if normalized.startswith(root.rstrip('/') + '/') else ''
         parts = relative.split('/')
-        return (parts[0] == '_system' or
+        return ((listing and parts == ['accounts']) or parts[0] == '_system' or
                 (len(parts) >= 3 and parts[0] == 'accounts' and parts[2] == '_system') or
                 (parents and (normalized in {'/', root} or
                               (parts[0] == 'accounts' and len(parts) <= 2))))
@@ -372,12 +372,7 @@ def control_client(client, admission, prefix):
     for name, original in readers.items():
         @wraps(original)
         def read(path, *args, _original=original, _name=name, **kwargs):
-            normalized = posixpath.normpath(path)
-            relative = normalized[len(root.rstrip('/')) + 1:] if normalized.startswith(root.rstrip('/') + '/') else ''
-            parts = relative.split('/')
-            account_listing = _name == 'ls' and parts == ['accounts'] and not args and not kwargs
-            if not (account_listing or parts[0] == '_system' or
-                    (len(parts) >= 3 and parts[0] == 'accounts' and parts[2] == '_system')):
+            if not control_path(path, listing=_name == 'ls' and not args and not kwargs):
                 raise MaintenanceError('control client cannot read business storage')
             return _original(path, *args, **kwargs)
         setattr(client, name, read)
