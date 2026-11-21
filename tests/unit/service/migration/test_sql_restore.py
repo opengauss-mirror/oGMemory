@@ -4,8 +4,9 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
+from tests.migration_support import write_described_package as write_package
 
-from service.migration.package import PackageError, write_package
+from service.migration.package import PackageError
 from service.migration.storage import SQLStorage
 from tests.unit.service.migration.test_engine import Files, archive, node, service
 
@@ -29,7 +30,7 @@ def sql_target():
     return target, adapter
 
 
-def package(tmp_path, field, value):
+def package(tmp_path, field, value, backend="sql"):
     r, a = node(), archive()
     edge = dict(from_uri=r['uri'], to_uri=r['uri'], relation_type='related_to',
                 reason='reason', weight=1.0)
@@ -47,7 +48,7 @@ def package(tmp_path, field, value):
         edge['reason'] = value
     path = tmp_path / 'source.tar.gz'
     write_package(path, {'nodes': [r], 'archives': [a], 'relations': [edge]},
-                  source_backend='agfs', source_version='test')
+                  source_backend=backend, source_version='test')
     return path
 
 
@@ -72,7 +73,7 @@ def test_sql_accepts_literal_escape(tmp_path, field):
 
 
 def test_agfs_preserves_nul_archive(tmp_path):
-    path = package(tmp_path, 'message', 'a\x00b')
+    path = package(tmp_path, 'message', 'a\x00b', backend='agfs')
     target = service(Files())
     target.preview(path)
     assert target.import_package(path)['data']['archives']['count'] == 1

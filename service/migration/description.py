@@ -105,3 +105,18 @@ def compatibility(source, target):
     if not vector_free and "vector_storage.backend" in changes:
         notices.append("向量后端发生变化，将在已通过支持检查的目标后端重建索引。")
     return {"source": source, "target": target, "changes": changes, "notices": notices}
+
+
+def validate_migration_scope(manifest, cfg):
+    """Reject unsupported source transitions before opening target resources."""
+    source = manifest.get("source_environment")
+    if source is None:
+        raise PackageError("迁移包缺少来源环境描述，无法确认同源迁移；请在源端重新导出。")
+    content = source["content_storage"]
+    if content["backend"] != cfg.storage_backend:
+        raise PackageError("当前仅支持同源迁移：内容存储类型必须一致。")
+    if cfg.storage_backend == "sql" and content["database_type"] != cfg.sql_dialect:
+        raise PackageError("当前仅支持同源迁移：SQL 数据库类型必须一致。")
+    vector = "none" if getattr(cfg, "agfs_retrieval_enabled", False) else cfg.vector_db_type
+    if source["vector_storage"]["backend"] != vector:
+        raise PackageError("当前仅支持同源迁移：向量后端必须一致。")

@@ -21,8 +21,7 @@ from tests.unit.commit.test_memory_identity import memory
 
 @pytest.mark.parametrize('source_mode,target_mode,fts', [
     ('agfs', 'agfs', 'literal'), ('agfs', 'agfs', 'sqlite_bm25'),
-    ('agfs', 'agfs', 'disabled'), ('default', 'agfs', 'literal'),
-    ('agfs', 'default', 'literal'),
+    ('agfs', 'agfs', 'disabled'),
 ])
 def test_vector_free_migration_and_recovery(tmp_path, monkeypatch, source_mode, target_mode, fts):
     if 'default' in (source_mode, target_mode):

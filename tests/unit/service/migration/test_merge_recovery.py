@@ -4,11 +4,12 @@ from contextlib import contextmanager
 from copy import deepcopy
 
 import pytest
+from tests.migration_support import write_described_package as write_package
 
 from providers.unified_config import OgMemConfig
 from service.migration.engine import MigrationService, inventory
 from service.migration.maintenance import MaintenanceError, MaintenanceStore
-from service.migration.package import PackageError, write_package
+from service.migration.package import PackageError
 from service.migration.rebuild import Rebuilder
 from service.migration.recovery import RecoveryImport
 from service.migration.storage import AGFSStorage

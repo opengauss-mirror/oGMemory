@@ -77,3 +77,16 @@ class MigrationHarness(MigrationService):
                 return json.loads(result['result'])
             finally:
                 self.adapter_factory, self.index_factory = original_adapter, original_indexes
+
+
+def write_described_package(*args, source_backend, source_version, vector_backend="chroma", database_type="postgresql", **kwargs):
+    """Build synthetic backend fixtures with an explicit source environment."""
+    from service.migration.package import write_package
+    kwargs.setdefault("source_environment", {
+        "embedding": {"provider": "mock", "model": "MockEmbedder", "dimension": 3, "model_version": None},
+        "content_storage": {"backend": source_backend,
+                            "database_type": database_type if source_backend == "sql" else None,
+                            "database_version": None},
+        "vector_storage": {"backend": vector_backend},
+    })
+    return write_package(*args, source_backend=source_backend, source_version=source_version, **kwargs)

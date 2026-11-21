@@ -3,8 +3,9 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from tests.migration_support import write_described_package as write_package
 
-from service.migration.package import PackageError, open_package, write_package
+from service.migration.package import PackageError, open_package
 from service.migration.storage import AGFSStorage
 from tests.migration_support import MigrationHarness as MigrationService
 
@@ -41,6 +42,7 @@ class Files:
 def config():
     return SimpleNamespace(
         storage_backend="agfs",
+        sql_dialect="postgresql",
         agfs_base_url="",
         agfs_mount_prefix="/local",
         vector_db_type="chroma",
@@ -153,7 +155,7 @@ def test_missing_reference_rejected_before_target_writes(tmp_path):
     write_package(
         path,
         {"nodes": [r], "relations": [], "archives": []},
-        source_backend="sql",
+        source_backend="agfs",
         source_version="test",
     )
     target = Files()
@@ -179,7 +181,7 @@ def test_incomplete_target_index_and_memory_backend_rejected(tmp_path):
     ).to_provider_config()
     target.index_factory = Rebuilder
     target.cfg.retrieval_uses_lexical_projection = False
-    with pytest.raises(PackageError, match="persistent"):
+    with pytest.raises(PackageError, match="向量后端必须一致"):
         target.preview(path)
 
 
@@ -243,7 +245,7 @@ def test_cross_account_evidence_rejected_before_writes(tmp_path):
     write_package(
         path,
         {"nodes": [r, other], "relations": [], "archives": []},
-        source_backend="sql",
+        source_backend="agfs",
         source_version="test",
     )
     target = Files()
@@ -265,7 +267,7 @@ def test_uri_aliases_cannot_overwrite_the_same_agfs_path(tmp_path):
     write_package(
         path,
         {"nodes": [r, alias], "relations": [], "archives": []},
-        source_backend="sql",
+        source_backend="agfs",
         source_version="test",
     )
     target = Files()
@@ -477,7 +479,7 @@ def test_package_with_write_receipt_node_rejected_before_restore(tmp_path):
     write_package(
         package,
         {"nodes": [receipt], "relations": [], "archives": []},
-        source_backend="sql",
+        source_backend="agfs",
         source_version="legacy",
     )
     target = Files()
@@ -495,7 +497,7 @@ def test_receipt_metadata_is_removed_without_losing_business_metadata(tmp_path):
     write_package(
         package,
         {"nodes": [r], "relations": [], "archives": []},
-        source_backend="sql",
+        source_backend="agfs",
         source_version="legacy",
     )
     target = Files()
@@ -676,7 +678,7 @@ def test_sql_relation_alias_rejected_before_target_access(tmp_path, graph, endpo
     write_package(
         package,
         {"nodes": [node(), directory], "relations": [edge], "archives": []},
-        source_backend="agfs",
+        source_backend="sql",
         source_version="test",
     )
     importer = service(Files())
@@ -808,7 +810,9 @@ def test_milvus_payload_rejected_before_content_restore(tmp_path, oversize):
         row['content'] = 'small'
     AGFSStorage(config(), source).restore('nodes', [row])
     package = tmp_path / 'source.tar.gz'
-    service(source).export(package)
+    exporter = service(source)
+    exporter.cfg.vector_db_type = 'milvus'
+    exporter.export(package)
     vector = object.__new__(MilvusVectorIndex)
     vector._dimension = 8
     vector.count = lambda: 0
@@ -872,7 +876,7 @@ def test_agfs_target_path_byte_capacity_before_restore(tmp_path, kind, component
         records.append(item)
     package = tmp_path / 'sql-source.tar.gz'
     write_package(package, {'nodes': records, 'archives': archives, 'relations': []},
-                  source_backend='sql', source_version='test')
+                  source_backend='agfs', source_version='test')
     target = Files()
     migration = service(target)
     if component_bytes == 256:
