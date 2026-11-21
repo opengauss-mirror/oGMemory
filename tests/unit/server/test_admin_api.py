@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import server.app as app_module
 from providers.unified_config import OgMemConfig
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
 from server.control_plane_store import ControlPlaneStore
 from server.memory_service import MemoryService
 from server.tenant_admin import TenantAdminService
-import server.app as app_module
 
 
 def _make_service(tmp_path):
@@ -109,3 +109,22 @@ def test_admin_routes_unavailable_when_role_control_disabled(monkeypatch, tmp_pa
 
     assert resp.status_code == 503
     assert "Admin API is unavailable" in resp.get_json()["error"]
+
+
+def test_readonly_admin_keeps_authentication_during_migration(monkeypatch, tmp_path):
+    from service.migration.admission import Admission, business_wsgi
+    from service.migration.maintenance import MaintenanceStore
+    service, member_key = _make_service(tmp_path)
+    service._admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'admin-test'))
+    monkeypatch.setattr(app_module, '_service', service)
+    monkeypatch.setattr(app_module.app, 'wsgi_app', business_wsgi(app_module.app.wsgi_app, lambda: service))
+    service._admission.store.enter('import', mode='import', resources={})
+    client = app_module.app.test_client()
+    headers = {'X-API-Key': 'root-key', 'X-Account-ID': 'acct-1', 'X-User-ID': 'root'}
+    assert client.get('/api/v1/admin/accounts', headers=headers).status_code == 200
+    assert client.get('/api/v1/admin/accounts').status_code == 401
+    assert client.get('/api/v1/admin/accounts', headers={'X-API-Key': member_key}).status_code == 403
+    assert client.post('/api/v1/admin/accounts/acct-1/users', headers=headers, json={}).status_code == 503
+    assert client.head('/api/v1/admin/accounts/acct-1/users', headers=headers, json={'user_id': 'head-created'}).status_code == 503
+    service._admission.store.reopen('import')
+    service.shutdown()

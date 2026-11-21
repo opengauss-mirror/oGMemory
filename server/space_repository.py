@@ -77,21 +77,33 @@ class SpaceRepository(SpaceJobRepository):
 
     @contextmanager
     def transaction(self, account_id, space_id=None, *, write=True):
-        conn = self.pool.get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT set_config('app.account_id', %s, true)", (account_id,))
-                if write:
-                    cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id),))
-                    if space_id:
-                        cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id, space_id),))
-                yield cur
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self.pool.return_connection(conn)
+        admission = getattr(self, '_migration_admission', None)
+        with admission.scope(write=write) if admission is not None else nullcontext():
+            conn = self.pool.get_connection()
+            discard = False
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT set_config('app.account_id', %s, true)", (account_id,))
+                    if write:
+                        cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id),))
+                        if space_id:
+                            cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id, space_id),))
+                    yield cur
+                conn.commit()
+            except BaseException as error:
+                try:
+                    conn.rollback()
+                except BaseException as rollback_error:
+                    discard = True
+                    if admission is not None and write:
+                        admission._operation.get().uncertain = True
+                    raise error from rollback_error
+                raise
+            finally:
+                if discard:
+                    self.pool.discard_connection(conn)
+                else:
+                    self.pool.return_connection(conn)
 
     @staticmethod
     def _admin(ctx):

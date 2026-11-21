@@ -536,7 +536,7 @@ def test_run_mcp_server_accepts_sse_transport(monkeypatch):
         "server.mcp_server.get_config",
         lambda config_path=None: OgMemConfig(mcp_enabled=True),
     )
-    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: service)
+    monkeypatch.setattr("server.mcp_server.create_service", lambda config: service)
     monkeypatch.setattr("server.mcp_server.create_mcp_server", lambda **kwargs: _FakeMcp())
     monkeypatch.setattr("server.mcp_server._run_sse_app", _fake_run_sse_app)
 
@@ -554,7 +554,7 @@ def test_run_mcp_server_rejects_sse_when_http_auth_is_disabled(monkeypatch):
         "server.mcp_server.get_config",
         lambda config_path=None: OgMemConfig(mcp_enabled=True),
     )
-    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _DisabledAuthService())
+    monkeypatch.setattr("server.mcp_server.create_service", lambda config: _DisabledAuthService())
     monkeypatch.setattr(
         "server.mcp_server.create_mcp_server",
         lambda **kwargs: pytest.fail("SSE server must fail before MCPServer is created"),

@@ -21,7 +21,10 @@ def test_gunicorn_worker_starts_recovery_once(monkeypatch):
     from server.gunicorn_config import post_worker_init
     service = _Service()
     monkeypatch.setattr(app_module, "_service", None)
-    monkeypatch.setattr(app_module, "MemoryService", lambda config: service)
+    def factory(config):
+        service.start_extraction_recovery()
+        return service
+    monkeypatch.setattr("server.service_factory.create_service", factory)
     post_worker_init(None)
     assert app_module._get_service() is service
     assert service.recovery_starts == 1
