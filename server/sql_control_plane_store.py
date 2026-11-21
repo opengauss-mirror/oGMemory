@@ -201,6 +201,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         if not callable(mutator):
             raise ValueError("workspace sync mutator must be callable")
         conn = self._get_connection()
+        committing = False
         try:
             with conn.cursor() as cur:
                 self.sql_dialect.ensure_workspace_root(cur, account_id, root_id)
@@ -235,10 +236,13 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                         root_id,
                     ),
                 )
+            committing = True
             conn.commit()
             return result
-        except Exception:
+        except BaseException as exc:
             conn.rollback()
+            if not committing:
+                exc.sql_rollback_confirmed = True
             raise
         finally:
             self._return_connection(conn)
@@ -423,6 +427,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         }[entity]
         defaults = {"role": "user", "key": "", "status": "active", "owner_user_id": "", "created_at": None}
         conn = self._get_connection()
+        committing = False
         try:
             with conn.cursor() as cur:
                 lock_space_account(cur, account_id or "__accounts__")
@@ -479,9 +484,12 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                             raise ValueError(f"user no longer exists: {identity}")
                 if entity in ("users", "agents"):
                     cur.execute("UPDATE cp_accounts SET authz_rev=authz_rev+1 WHERE account_id=%s", (account_id,))
+            committing = True
             conn.commit()
-        except Exception:
+        except BaseException as exc:
             conn.rollback()
+            if not committing:
+                exc.sql_rollback_confirmed = True
             raise
         finally:
             self._return_connection(conn)
@@ -506,6 +514,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         if entity != 'audit_logs':
             raise ValueError(f'Unknown control-plane entity: {entity}')
         conn = self._get_connection()
+        committing = False
         try:
             with conn.cursor() as cur:
                 for event in data.get('events', []):
@@ -515,9 +524,12 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                         event.get('timestamp') or None, event.get('result', ''),
                         event.get('trace_id', ''), Json(event.get('details', {})),
                     ))
+            committing = True
             conn.commit()
-        except Exception:
+        except BaseException as exc:
             conn.rollback()
+            if not committing:
+                exc.sql_rollback_confirmed = True
             raise
         finally:
             self._return_connection(conn)

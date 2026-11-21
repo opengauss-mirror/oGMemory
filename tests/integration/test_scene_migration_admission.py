@@ -125,6 +125,21 @@ def _check_sql_control_plane(service, gate, monkeypatch):
         gate.reopen('control-export')
         assert client.post('/api/v1/admin/accounts/acme/users',
                            json={'user_id': 'new-user'}, buffered=True).status_code == 200
+        # A competing request between read and write causes a confirmed rollback.
+        from server.sql_control_plane_store import SQLControlPlaneStore
+        from server.api_keys import APIKeyManager
+        store = service.get_control_plane_store()
+        path = store.users_path('acme')
+        payload = store.read_json(path, {'users': {}})
+        other = SQLControlPlaneStore(pool=service._get_shared_sql_pool())
+        APIKeyManager(other).register_user('acme', 'racer')
+        payload['users']['racer'] = {'role': 'user', 'key': 'unused', 'status': 'active'}
+        with pytest.raises(ValueError, match='already exists'):
+            store.write_json(path, payload)
+        def reject(_):
+            raise ValueError('workspace conflict')
+        with pytest.raises(ValueError, match='workspace conflict'):
+            store.mutate_code_workspace_sync_state('acme', 'root', reject)
         gate.enter('control-import', mode='import', resources={})
         assert client.get('/api/v1/admin/accounts', buffered=True).status_code == 200
         assert client.post('/api/v1/admin/accounts/acme/users',

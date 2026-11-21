@@ -205,3 +205,38 @@ def test_atomic_resource_conflict_keeps_unknown_cleanup(tmp_path, failed_cleanup
         fs.write_node_with_outbox(node, _atomic_code_context(), outbox.build_write_event(node))
     assert not getattr(error.value, 'agfs_rejection_settled', False)
     assert_drain(a, blocked=True)
+
+
+@pytest.mark.parametrize('method', ['write_json', '_write_json', 'mutate_code_workspace_sync_state'])
+@pytest.mark.parametrize('failure', ['statement', 'rollback', 'commit'])
+@pytest.mark.parametrize('prior_unknown', [False, True])
+def test_sql_control_failure_completion(tmp_path, method, failure, prior_unknown):
+    from server.sql_control_plane_store import SQLControlPlaneStore
+    store = object.__new__(SQLControlPlaneStore)
+    connection, cursor = Mock(), Mock()
+    cursor.fetchone.return_value = ({}, None, None)
+    connection.cursor.return_value = nullcontext(cursor)
+    store._get_connection = lambda: connection
+    store._return_connection = lambda _: None
+    store._snapshots = SimpleNamespace(values={})
+    store._dialect = Mock()
+    if failure == 'commit':
+        connection.commit.side_effect = TimeoutError('commit unknown')
+    else:
+        cursor.execute.side_effect = ValueError('statement rejected')
+        store._dialect.insert_audit_log.side_effect = ValueError('statement rejected')
+        if failure == 'rollback':
+            connection.rollback.side_effect = TimeoutError('rollback unknown')
+    a = admission(tmp_path)
+    arguments = {
+        'write_json': (store.global_accounts_path(), {'accounts': {}}),
+        '_write_json': (store.audit_logs_path('acme'), {'events': [{}]}),
+        'mutate_code_workspace_sync_state': ('acme', 'root', lambda _: {}),
+    }
+    with a.scope():
+        if prior_unknown:
+            with pytest.raises(TimeoutError), a.backend(write=True):
+                raise TimeoutError('earlier unknown write')
+        with pytest.raises((ValueError, TimeoutError)):
+            a.wrap(getattr(store, method), write=True, backend=True)(*arguments[method])
+    assert_drain(a, blocked=prior_unknown or failure != 'statement')
