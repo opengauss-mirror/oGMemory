@@ -99,7 +99,7 @@ def test_destination_never_overwritten(tmp_path):
 @pytest.mark.parametrize(
     "mutation,error",
     [
-        (lambda m: m.update(format_version=2), "unsupported format"),
+        (lambda m: m.update(format_version=3), "unsupported format"),
         (lambda m: m.update(format_version=True), "unsupported format"),
         (lambda m: m.update(source_backend="other"), "unsupported source"),
         (lambda m: m["files"]["entities/nodes.jsonl"].update(records=99), "record count"),
@@ -439,3 +439,71 @@ def test_dataset_member_limit_is_cumulative(tmp_path):
         write(path, datasets([{'text': 'x' * 60}] * 2),
               limits=PackageLimits(max_member_bytes=100))
     assert not path.exists()
+
+
+def test_shared_space_datasets_are_separate_and_versioned(tmp_path):
+    path = tmp_path / 'spaces.tar.gz'
+    rows = [{'table': 'spaces', 'row': {'account_id': 'acme', 'space_id': 'team'}}]
+    space_nodes = [{'uri': 'ctx://acme/spaces/team/memories/item', 'content': 'shared'}]
+    description = {'database_type': 'opengauss', 'schema_sha256': 'a' * 64}
+    write(path, {**datasets(), 'spaces': rows, 'space_nodes': space_nodes}, shared_spaces=description)
+    with open_package(path) as package:
+        assert package.manifest['format_version'] == 2
+        assert package.manifest['shared_spaces'] == description
+        assert list(package.records('nodes')) == []
+        assert list(package.records('spaces')) == rows
+        assert list(package.records('space_nodes')) == space_nodes
+
+
+def test_old_package_has_no_shared_space_records(tmp_path):
+    path = tmp_path / 'ordinary.tar.gz'
+    write(path)
+    with open_package(path) as package:
+        assert package.manifest['format_version'] == 1
+        assert list(package.records('spaces')) == []
+        assert list(package.records('space_nodes')) == []
+
+
+@pytest.mark.parametrize('description', [
+    {}, {'database_type': [], 'schema_sha256': 'a' * 64},
+    {'database_type': 'opengauss', 'schema_sha256': 'invalid'},
+    {'database_type': 'opengauss', 'schema_sha256': 'a' * 64, 'password': 'forbidden'},
+])
+def test_shared_space_description_is_bounded_to_public_fields(tmp_path, description):
+    with pytest.raises(PackageError, match='shared space storage description'):
+        write(tmp_path / 'bad.tar.gz', {**datasets(), 'spaces': [], 'space_nodes': []},
+              shared_spaces=description)
+
+
+def test_shared_space_package_cannot_be_downgraded(tmp_path):
+    path = tmp_path / 'spaces.tar.gz'
+    write(path, {**datasets(), 'spaces': [], 'space_nodes': []},
+          shared_spaces={'database_type': 'opengauss', 'schema_sha256': 'a' * 64})
+
+    def downgrade(entries):
+        for member, raw in entries:
+            if member.name == 'manifest.json':
+                manifest = json.loads(raw)
+                manifest['format_version'] = 1
+                manifest.pop('shared_spaces')
+                raw = json.dumps(manifest).encode()
+            yield member, raw
+
+    repack(path, downgrade)
+    with pytest.raises(PackageError, match='require format version 2'):
+        with open_package(path):
+            pytest.fail('shared data must never be accepted as an ordinary package')
+
+
+def test_shared_space_records_obey_common_record_limit(tmp_path):
+    with pytest.raises(PackageError, match='record exceeds byte limit'):
+        write(tmp_path / 'large.tar.gz',
+              {**datasets(), 'spaces': [{'payload': 'x' * 100}], 'space_nodes': []},
+              shared_spaces={'database_type': 'opengauss', 'schema_sha256': 'a' * 64},
+              limits=PackageLimits(max_record_bytes=64))
+
+
+def test_shared_space_package_requires_both_datasets(tmp_path):
+    with pytest.raises(PackageError, match='datasets must be exactly'):
+        write(tmp_path / 'partial.tar.gz', {**datasets(), 'spaces': []},
+              shared_spaces={'database_type': 'opengauss', 'schema_sha256': 'a' * 64})
