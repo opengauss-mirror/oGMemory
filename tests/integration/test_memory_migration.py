@@ -2035,3 +2035,37 @@ def test_agfs_conflict_and_control_reads_with_full_admission(tmp_path, monkeypat
             wait_participants(gate, 'control-test', 'refresh', timeout=5)
             gate.reopen('control-test')
         close_service(service)
+
+
+@pytest.mark.parametrize('backend', ['sql', 'agfs'])
+def test_maintenance_preserves_newer_session_from_other_service(tmp_path, monkeypatch, backend):
+    from core.models import RequestContext, Role
+    from server.memory_service import MemoryService
+    from server.migration_lifecycle import ServiceLifecycle
+    from server.service_factory import close_service, create_service
+    from session.session_manager import SessionManager
+    from session.session_state import SessionState
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda self: None)
+    cfg = new_config(backend, 'session-checkpoint')
+    cfg.migration_workspace = str(tmp_path / 'gate')
+    cfg.skill_sedimentation_enabled = False
+    first, second = create_service(cfg), create_service(cfg)
+    ctx = RequestContext('acme', 'alice', 'agent', 's', 'review', Role.ROOT)
+    try:
+        for service, content in ((first, 'old message'), (second, 'latest message')):
+            fs = service._get_context_fs()
+            manager = SessionManager(get_context_fs=lambda fs=fs: fs)
+            service._session_mgr = manager
+            manager.add_message('s', 'user', content, ctx)
+            with service._session_mutation_scope(ctx, refresh=False):
+                assert manager.save_session_state('s', ctx)
+        fs = second._get_context_fs()
+        uri = SessionState.state_uri('acme', 's')
+        before = fs.read_node(uri, ctx).content
+        assert 'latest message' in before
+        ServiceLifecycle(first)._save_sessions()
+        assert fs.read_node(uri, ctx).content == before
+    finally:
+        close_service(first)
+        close_service(second)

@@ -208,3 +208,43 @@ def test_unknown_worker_write_is_not_retired_by_maintenance(tmp_path):
         runner.store.reopen("task")
     finally:
         runner.close()
+
+
+def test_coordinated_factory_preserves_lexical_projection_and_close_retry(tmp_path, monkeypatch):
+    from providers.config import ProviderConfig
+    from providers.unified_config import OgMemConfig
+    from scripts import run_index_service as runner_module
+    from service.migration.admission import Admission
+
+    class Lexical:
+        def mark_scopes_dirty(self, scopes):
+            return None
+    class Projection:
+        lexical_index = Lexical()
+        finished = False
+        def close(self):
+            return self.finished
+    class Storage:
+        _client = SimpleNamespace()
+    projection = Projection()
+    cfg = OgMemConfig(storage_backend='agfs', retrieval_mode='vector_free',
+                      retrieval_lexical_provider='opengauss_native')
+    monkeypatch.setattr('providers.composite_index.create_projection_writer', lambda cfg, vector: projection)
+    monkeypatch.setattr(ProviderConfig, 'create_embedder', lambda self: pytest.fail('no model'))
+    monkeypatch.setattr(ProviderConfig, 'create_vector_index', lambda self: pytest.fail('no vector'))
+    monkeypatch.setattr(ProviderConfig, 'create_llm', lambda self: SimpleNamespace())
+    seen = []
+    def storage(cfg, *, invalidate_lexical_scopes=None):
+        seen.append(invalidate_lexical_scopes)
+        return Storage(), SimpleNamespace(), None
+    monkeypatch.setattr(runner_module, '_create_storage', storage)
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'factory')
+    admission = Admission(gate)
+    with admission.scope(write=True):
+        service, cleanup = runner_module._build_service(cfg, admission)
+    assert service._vector_index is projection
+    assert callable(seen[0])
+    with pytest.raises(RuntimeError, match='finished closing'):
+        cleanup()
+    projection.finished = True
+    cleanup()
