@@ -729,14 +729,14 @@ class CodeWorkspaceSyncService:
             scheduler.start()
             self._scheduler = scheduler
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, wait: bool = False) -> None:
         """Stop this process's scheduler without changing durable registry state."""
 
         with self._lock:
             scheduler = self._scheduler
             self._scheduler = None
         if scheduler is not None:
-            scheduler.shutdown(wait=False)
+            scheduler.shutdown(wait=wait)
 
     def _sync_root(
         self,

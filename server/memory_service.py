@@ -134,10 +134,10 @@ from session.topic_buffer import SlotContent
 
 try:
     from pyagfs import AGFSClient
-    from fs.agfs_adapter.client import create_agfs_client
 
     from commit.outbox_store import OutboxStore
     from fs.agfs_adapter import AGFSContextFS, AGFSTraceEventStore
+    from fs.agfs_adapter.client import create_agfs_client
     from providers.relation_store.agfs_relation_store import AGFSRelationStore
     from service.api import MemoryWriteAPI, ReadAPI
     _HAS_AGFS = True
@@ -341,6 +341,11 @@ def _serialize_lazy_initialization(attribute: str):
             if getattr(self, attribute) is not None:
                 return method(self, *args, **kwargs)
             with self._init_lock:
+                admission = getattr(self, "_admission", None)
+                if (admission is not None and getattr(self, attribute) is None
+                        and attribute in {"_sql_pool", "_vector_index", "_trace_event_store", "_scene_manager"}):
+                    with admission.scope(write=True):
+                        return method(self, *args, **kwargs)
                 return method(self, *args, **kwargs)
 
         return _wrapped
@@ -735,7 +740,8 @@ class MemoryService:
 
     def __init__(
         self, config: OgMemConfig | None = None, tool_result_store=None,
-        *, scene_manager=None, scene_ranker=None, scene_source=None,
+        *, scene_manager=None, scene_ranker=None, scene_source=None, admission=None,
+        defer_start=False,
     ):
         cfg = config or get_config()
         _check_shared_agfs_storage(cfg)
@@ -820,12 +826,34 @@ class MemoryService:
         self._tool_result_io_runner = None
         self._tool_result_governance = None
         self._tool_result_source_attestation_key = os.urandom(32)
-        if getattr(self._cfg, "tool_result_externalization_enabled", False):
-            self._initialize_tool_result_externalization(tool_result_store)
-        if self._cfg.skill_sedimentation_enabled:
-            self._start_skill_sedimentation_worker()
-        if self._cfg.shared_spaces_enabled:
-            self._start_space_worker()
+        self._admission = admission
+        if admission is not None:
+            from service.migration.admission import install
+            install(self, admission)
+        if not defer_start and (admission is None or admission.store.status() is None):
+            if getattr(self._cfg, "tool_result_externalization_enabled", False):
+                self._initialize_tool_result_externalization(tool_result_store)
+            if self._cfg.skill_sedimentation_enabled:
+                self._start_skill_sedimentation_worker()
+            if self._cfg.shared_spaces_enabled:
+                self._start_space_worker()
+
+    def _launch_migration_background(self, target, *, args=(), name=None):
+        admission = getattr(self, "_admission", None)
+        if admission is not None:
+            return admission.launch(target, args=args, name=name)
+        options = {"args": args} if args else {}
+        thread = threading.Thread(target=target, daemon=True, name=name, **options)
+        thread.start()
+        return thread
+
+    def _migration_background(self, function):
+        admission = getattr(self, "_admission", None)
+        return admission.wrap(function) if admission is not None else function
+
+    def _guard_storage(self, value):
+        admission = getattr(self, "_admission", None)
+        return admission.guard(value) if admission is not None else value
 
     @_serialize_lazy_initialization("_space_repository")
     def get_space_repository(self):
@@ -839,6 +867,7 @@ class MemoryService:
             self._space_repository = SpaceRepository(
                 self._get_shared_sql_pool(), content_store=self._get_space_content_store(),
             )
+            self._space_repository._migration_admission = getattr(self, '_admission', None)
         return self._space_repository
 
     @_serialize_lazy_initialization("_space_worker")
@@ -1120,7 +1149,7 @@ class MemoryService:
         if profile["representation_version"] == FACTORIZED_REPRESENTATION_VERSION:
             options["component_cache"] = self._get_graph_component_cache()
         # Workers own their claim bookkeeping; canonical jobs are shared SQL rows.
-        return SQLEdgeProjectionStore(pool=self._get_shared_sql_pool(), **options),profile
+        return self._guard_storage(SQLEdgeProjectionStore(pool=self._get_shared_sql_pool(), **options)),profile
 
     @_serialize_lazy_initialization("_trace_event_store")
     def _get_trace_event_store(self):
@@ -1194,6 +1223,9 @@ class MemoryService:
         skill_service = self._get_skill_sedimentation_service()
         if skill_service is None:
             return
+        if self._admission is not None and not getattr(skill_service, "_migration_batch_guarded", False):
+            skill_service.process_batch = self._admission.wrap(skill_service.process_batch, write=True)
+            skill_service._migration_batch_guarded = True
         self._skill_sedimentation_worker = SkillSedimentationWorker(
             skill_service,
             self._skill_account_ids,
@@ -2187,6 +2219,9 @@ class MemoryService:
         return result
 
     def start_extraction_recovery(self):
+        admission = getattr(self, "_admission", None)
+        if admission is not None and admission.store.status() is not None:
+            return
         from service.extraction_recovery_discovery import ExtractionRecoveryDiscovery
         with self._init_lock:
             if self._extraction_discovery is None:
@@ -2292,11 +2327,30 @@ class MemoryService:
         if self._control_store is None:
             if self._use_sql_metadata:
                 from server.sql_control_plane_store import SQLControlPlaneStore
-                self._control_store = SQLControlPlaneStore(
-                    pool=self._get_shared_sql_pool(),
-                )
+                admission = getattr(self, '_admission', None)
+                from service.migration.maintenance import MaintenanceError
+                try:
+                    with admission.backend(write=True, content=False) if admission is not None else nullcontext():
+                        store = SQLControlPlaneStore(pool=self._get_shared_sql_pool())
+                except MaintenanceError:
+                    active = admission.store.status() if admission is not None else None
+                    if not active or active['mode'] != 'import':
+                        raise
+                    store = SQLControlPlaneStore(pool=self._get_shared_sql_pool(), initialize_schema=False)
+                if admission is not None:
+                    # Control reads remain available; only durable mutations
+                    # participate in business write admission.
+                    for name in ('write_json', 'write_code_workspace_sync_state',
+                                 'mutate_code_workspace_sync_state'):
+                        setattr(store, name, admission.wrap(getattr(store, name), write=True, backend=True, content=False))
+                self._control_store = store
             elif _HAS_AGFS:
-                client = self._get_agfs_client()
+                # Control reads remain available while business clients are drained.
+                client = (AGFSClient(api_base_url=self._agfs_base_url) if self._cfg.agfs_transport == "http"
+                          else create_agfs_client(self._cfg))
+                if getattr(self, '_admission', None) is not None:
+                    from service.migration.admission import control_client
+                    client = control_client(client, self._admission, self._mount_prefix)
                 self._control_store = ControlPlaneStore(
                     mount_prefix=self._mount_prefix,
                     client=client,
@@ -2956,11 +3010,11 @@ class MemoryService:
 
             projection_index = create_projection_writer(self._cfg, vector_index)
             if self._cfg.retrieval_uses_lexical_projection:
-                self._lexical_index = projection_index.lexical_index
+                self._lexical_index = self._guard_storage(projection_index.lexical_index)
             # Publish the resource tree only after required lexical
             # initialization succeeds, so transient failures remain retryable.
-            self._vector_index = vector_index
-            self._projection_index = projection_index
+            self._vector_index = self._guard_storage(vector_index)
+            self._projection_index = self._guard_storage(projection_index)
             logger.info("Retrieval projections ready: vector=%s lexical=%s",
                         type(vector_index).__name__, self._cfg.retrieval_lexical_provider)
         return self._projection_index
@@ -3081,6 +3135,9 @@ class MemoryService:
                 return
 
             worker = self._create_outbox_worker(fs)
+
+            if self._admission is not None:
+                worker.run_once = self._admission.wrap(worker.run_once, write=True)
 
             # SQL backend: use notify-based listener for real-time processing
             if self._supports_batch_claim(outbox_store):
@@ -3373,6 +3430,7 @@ class MemoryService:
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
 
+    @_serialize_lazy_initialization("_scene_manager")
     def _ensure_scene_runtime(self):
         if not self._cfg.scene_enabled or self._scene_manager is not None:
             return
@@ -3391,8 +3449,8 @@ class MemoryService:
                 raise RuntimeError("scene memory requires a configured durable scene-store adapter")
             pool = self._get_shared_sql_pool()
             config = SceneConfig().merged(self._cfg.scene_options)
-            repository = SQLSceneRepository(pool)
-            provider = SQLSceneConfigProvider(pool, default=config)
+            repository = self._guard_storage(SQLSceneRepository(pool))
+            provider = self._guard_storage(SQLSceneConfigProvider(pool, default=config))
             from copy import copy
 
             from providers.lexical_index.factory import create_lexical_index
@@ -3402,8 +3460,13 @@ class MemoryService:
             lexical_config.retrieval_lexical_options = {
                 **self._cfg.retrieval_lexical_options, "table_name": "scene_lexical_v1",
             }
-            candidate_index = LazySceneIndex(lambda: create_lexical_index(lexical_config),
-                                             projection_queue=repository)
+            def create_scene_index():
+                return self._guard_storage(create_lexical_index(lexical_config))
+
+            factory = create_scene_index
+            if self._admission is not None:
+                factory = self._admission.wrap(factory, write=True, backend=True, content=False)
+            candidate_index = LazySceneIndex(factory, projection_queue=repository)
             refresh_projection = SceneIndexRefresh(repository, candidate_index)
 
             def projection_refresh():
@@ -3416,13 +3479,15 @@ class MemoryService:
                     archive_store=self._get_archive_store(), candidate_index=candidate_index,
                 )
                 manager = SceneMemoryManager(
-                    SQLSceneJobStore(pool), adapter,
+                    self._guard_storage(SQLSceneJobStore(pool)), adapter,
                     SceneDecisionEngine(self.get_llm(), config, evidence_reader=adapter),
                     config=config, config_provider=provider, projection_refresh=projection_refresh,
                 )
                 scene_service = SceneService(
                     repository, adapter, manager, provider, self._get_shared_embedder(),
                 )
+                if self._admission is not None:
+                    manager.process_next = self._admission.wrap(manager.process_next, write=True)
                 if self._cfg.scene_generation_enabled:
                     manager.start()
             except Exception:
@@ -3970,6 +4035,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 is_index_visible=self._code_workspace_index_visible,
                 context_resolver=self._resolve_workspace_sync_context,
             )
+            if self._admission is not None:
+                sync = self._code_workspace_sync_service
+                sync._scheduled_tick = self._admission.wrap(sync._scheduled_tick, write=True)
             if self._cfg.code_sync_enabled:
                 self._code_workspace_sync_service.start()
         return self._code_workspace_sync_service
@@ -4205,15 +4273,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             logger.info("SessionManager ready")
         return self._session_mgr
 
+    @_serialize_lazy_initialization("_archive_store")
     def _get_archive_store(self):
         """Return an archive store instance.
 
         SQL mode: cached for service lifetime (shared connection pool).
-        AGFS mode: fresh instance each call (self-healing on transient failures).
+        AGFS mode: cache successful initialization; retry transient failures.
         """
+        if self._archive_store is not None:
+            return self._archive_store
         if self._use_sql_metadata:
-            if self._archive_store is not None:
-                return self._archive_store
             if self._archive_store_failed:
                 return None
             try:
@@ -4231,7 +4300,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 from session import SessionArchiveStore
                 client = self._get_agfs_client()
                 agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-                return SessionArchiveStore(fs=agfs)
+                self._archive_store = SessionArchiveStore(fs=agfs)
+                return self._archive_store
             except Exception as exc:
                 logger.error("Failed to create AGFS archive store: %s", exc)
                 return None
@@ -6736,6 +6806,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 buf.end_extraction()
 
         @capture_outbox_events
+        @self._migration_background
         def _background_owned():
             """The child acquires its own connection after the HTTP handoff."""
             nonlocal extraction_journal
@@ -6910,12 +6981,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"ok": False, "status": "failed", "retryable": True, "error": str(exc),
                     "extraction_archive_id": archive_id, "client_request_id": extraction_journal_request_id}
         try:
-            t = threading.Thread(
+            self._launch_migration_background(
                 target=lambda: _run_with_usage_scope(ctx, _background_owned),
-                daemon=True,
                 name=f"extract-{session_id[:8]}",
             )
-            t.start()
         except Exception as exc:
             logger.error(
                 "Failed to spawn background extract thread: run=%s session=%s %s",
@@ -7953,12 +8022,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         source_stack.close()
         try:
             operation.worker_owned = True
-            threading.Thread(
+            self._launch_migration_background(
                 target=self._run_dispose_background,
                 args=(mgr, session_id, params, ctx, buf, source_snapshot, operation),
-                daemon=True,
                 name=f"dispose-{session_id[:8]}",
-            ).start()
+            )
         except Exception as exc:
             operation.release()
             logger.error(
@@ -8787,7 +8855,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 self._internal_tool_usage.clear_session(session_id)
 
-        threading.Thread(target=_write_snapshot, daemon=True, name=f"tool-usage-{session_id[:8]}").start()
+        self._launch_migration_background(_write_snapshot, name=f"tool-usage-{session_id[:8]}")
 
     def get_tool_usage_stats(self, params: dict | None = None) -> dict:
         params = params or {}
@@ -8826,6 +8894,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return stats
 
     def health(self) -> dict:
+        admission = getattr(self, "_admission", None)
+        active = admission.store.status() if admission is not None else None
+        if active and active['mode'] == 'import':
+            return {"backend": "og-memory", "storage_backend": self._cfg.storage_backend,
+                    "status": "maintenance", "migration_phase": active['phase']}
         agfs_required = self._cfg.storage_backend == "agfs"
         sql_required = self._cfg.storage_backend == "sql"
         info: dict = {

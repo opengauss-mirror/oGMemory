@@ -45,6 +45,8 @@ from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
 from server.scene_api import create_scene_blueprint
 from server.space_management import create_shared_search_blueprint
+from server.maintenance_http import MAINTENANCE_HEADERS, MAINTENANCE_STATUS, maintenance_payload
+from service.migration.admission import business_wsgi
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
@@ -125,8 +127,8 @@ def _get_service() -> MemoryService:
         with _service_lock:
             if _service is None:
                 cfg = get_config()
-                _service = MemoryService(config=cfg)
-                _service.start_extraction_recovery()
+                from server.service_factory import create_service
+                _service = create_service(cfg)
                 logger.info("MemoryService initialized (config loaded)")
                 # Attach to perf recorder so token snapshots work
                 try:
@@ -137,6 +139,9 @@ def _get_service() -> MemoryService:
     return _service
 
 
+app.wsgi_app = business_wsgi(app.wsgi_app, _get_service)
+
+
 def _shutdown_service() -> None:
     """Close the process-wide service once, if it was initialized."""
     global _service
@@ -144,7 +149,8 @@ def _shutdown_service() -> None:
     if service is None:
         return
     try:
-        service.shutdown()
+        from server.service_factory import close_service
+        close_service(service)
     except Exception:
         logger.exception("MemoryService shutdown failed")
 
@@ -226,7 +232,13 @@ def _json_object_body() -> dict:
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
     from scene.config import ConfigRevisionError
+    from service.migration.maintenance import MaintenanceError
     from service.operator_service import OperatorServiceBusyError
+
+    if isinstance(exc, MaintenanceError):
+        response = jsonify(maintenance_payload(str(exc)))
+        response.headers.update(MAINTENANCE_HEADERS)
+        return response, MAINTENANCE_STATUS.value
 
     if isinstance(exc, OperatorServiceBusyError):
         return jsonify({"error": str(exc), "retryable": True}), 429
@@ -287,7 +299,10 @@ def _lifecycle_result_ok(result: dict) -> bool:
 
 
 def _lifecycle_result_response(result: dict):
-    return jsonify(result), _lifecycle_result_status(result)
+    response = jsonify(result)
+    if (result.get("error_detail") or {}).get("code") == "MIGRATION_MAINTENANCE":
+        response.headers.update(MAINTENANCE_HEADERS)
+    return response, _lifecycle_result_status(result)
 
 
 def _lifecycle_error_response(exc: Exception, params: dict):
@@ -298,7 +313,10 @@ def _lifecycle_error_response(exc: Exception, params: dict):
     result = normalize_write_result({**response.get_json(), **fields, "ok": False,
                                      "accepted": False, "http_status": status},
                                     fields["error_detail"]["request_id"])
-    return jsonify(result), status
+    output = jsonify(result)
+    if "Retry-After" in response.headers:
+        output.headers["Retry-After"] = response.headers["Retry-After"]
+    return output, status
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -689,18 +707,19 @@ def handle_write_memory():
         service = _get_service()
         if not mcp_write_tools_enabled(service._cfg):
             raise PermissionError("memory write tools are disabled")
-        return jsonify(
-            write_memory(
-                service,
-                text=params.get("text"),
-                session_id=params.get("sessionId") or params.get("session_id"),
-                agent_id=ctx.agent_id,
-                client_request_id=params.get("client_request_id"),
-                force_extract=_parse_boolean(params.get("force_extract"), "force_extract"),
-                wait=_parse_boolean(params.get("wait"), "wait"),
-                request_context=ctx,
-            )
+        result = write_memory(
+            service,
+            text=params.get("text"),
+            session_id=params.get("sessionId") or params.get("session_id"),
+            agent_id=ctx.agent_id,
+            client_request_id=params.get("client_request_id"),
+            force_extract=_parse_boolean(params.get("force_extract"), "force_extract"),
+            wait=_parse_boolean(params.get("wait"), "wait"),
+            request_context=ctx,
         )
+        if (result.get("error_detail") or {}).get("code") == "MIGRATION_MAINTENANCE":
+            return _lifecycle_result_response(result)
+        return jsonify(result)
     except Exception as exc:
         return _error_response(exc)
 

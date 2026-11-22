@@ -65,6 +65,7 @@ from server.mcp_tools import update_skill as update_skill_tool
 from server.mcp_tools import validate_write_arguments
 from server.mcp_tools import write_memory as write_memory_tool
 from server.memory_service import MemoryService
+from server.service_factory import close_service, create_service
 from service.tool_output import parse_tool_output_uri
 
 logger = logging.getLogger("ogmem.mcp")
@@ -262,10 +263,24 @@ def _raw_string_argument(value: Any, info: ValidationInfo) -> Any:
 
 
 class _CaptureMCPRequestContext:
+    def __init__(self, service=None):
+        self.service = service
+
     async def __call__(self, ctx: Any, call_next: Any) -> Any:
+        from service.migration.maintenance import MaintenanceError
+
         token = _CURRENT_MCP_REQUEST_CONTEXT.set(ctx)
         try:
-            return await call_next(ctx)
+            from contextlib import nullcontext
+
+            admission = getattr(self.service, "_admission", None)
+            with admission.scope() if admission is not None else nullcontext():
+                return await call_next(ctx)
+        except MaintenanceError as exc:
+            from mcp.shared.exceptions import MCPError
+
+            raise MCPError(-32004, 'migration_maintenance',
+                           data={'status': 503, 'retryable': True}) from exc
         finally:
             _CURRENT_MCP_REQUEST_CONTEXT.reset(token)
 
@@ -299,7 +314,7 @@ class CodeSearchBudgetInput(BaseModel):
 @lru_cache(maxsize=1)
 def get_memory_service(config_path: str | None = None) -> MemoryService:
     cfg = get_config(config_path)
-    return MemoryService(config=cfg)
+    return create_service(cfg)
 
 
 def create_mcp_server(
@@ -324,7 +339,7 @@ def create_mcp_server(
         ) from exc
 
     cfg = config or getattr(service, "_cfg", None) or get_config()
-    service = service or MemoryService(config=cfg)
+    service = service or create_service(cfg)
     code_toolset = mcp_code_toolset_enabled(cfg)
 
     bind_host = host or cfg.mcp_host
@@ -345,7 +360,7 @@ def create_mcp_server(
         "oGMemory",
         instructions=_mcp_instructions_for_config(cfg),
         version=server_version,
-        middleware=[_CaptureMCPRequestContext()],
+        middleware=[_CaptureMCPRequestContext(service)],
     )
     mcp._ogmemory_runtime_settings = runtime
 
@@ -1659,7 +1674,7 @@ def run_mcp_server(
     cfg = get_config(config_path)
     if not bool(getattr(cfg, "mcp_enabled", True)):
         raise RuntimeError("MCP server is disabled by configuration")
-    service = MemoryService(config=cfg)
+    service = create_service(cfg)
     try:
         if transport == "sse" and not service.get_auth_service().role_control_active():
             raise RuntimeError(
@@ -1682,6 +1697,4 @@ def run_mcp_server(
             return
         mcp.run(transport=transport)
     finally:
-        shutdown = getattr(service, "shutdown", None)
-        if callable(shutdown):
-            shutdown()
+        close_service(service)
