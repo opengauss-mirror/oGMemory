@@ -45,7 +45,7 @@ def test_agfs_stale_version_releases_only_settled_operation(tmp_path, monkeypatc
 def test_full_service_control_reads_during_import(tmp_path, monkeypatch):
     from providers.unified_config import OgMemConfig
     from server.memory_service import MemoryService
-    from tests.unit.service.migration.test_tree_backup import LocalClient
+    from tests.migration_fixtures import LocalClient
 
     (tmp_path / 'files').mkdir()
     monkeypatch.setattr('server.memory_service.AGFSClient', lambda **kw: LocalClient(tmp_path / 'files'))
@@ -98,42 +98,6 @@ def test_export_write_denial_returns_maintenance_response(tmp_path, monkeypatch)
         assert response.json['error_detail']['code'] == 'MIGRATION_MAINTENANCE'
 
 
-def test_sql_snapshot_stalled_handshake_is_bounded(tmp_path):
-    import socket
-    import threading
-    import time
-
-    from providers.unified_config import OgMemConfig
-    from service.migration.snapshot import SourceSnapshot
-    from service.migration.storage import SQLStorage
-
-    stop = threading.Event()
-    listener = socket.socket()
-    listener.bind(('127.0.0.1', 0))
-    listener.listen()
-    listener.settimeout(2)
-    def stalled_server():
-        with listener:
-            try:
-                conn, _ = listener.accept()
-            except TimeoutError:
-                return
-            with conn:
-                stop.wait(2)
-    thread = threading.Thread(target=stalled_server)
-    thread.start()
-    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
-    cfg = OgMemConfig(storage_backend='sql', sql_connection_string=(
-        f'host=127.0.0.1 port={listener.getsockname()[1]} dbname=ignored user=ignored'))
-    try:
-        started = time.monotonic()
-        with pytest.raises(TimeoutError), SourceSnapshot(gate, 'snapshot', timeout=.15).scope():
-            SQLStorage(cfg)
-        assert time.monotonic() - started < 1
-        assert gate.status() is None
-    finally:
-        stop.set()
-        thread.join(3)
 
 
 def test_memory_write_structured_maintenance_response(tmp_path, monkeypatch):

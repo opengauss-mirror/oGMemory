@@ -17,7 +17,7 @@ def write_in_process(root):
 def test_chroma_reopens_after_cross_process_import(tmp_path):
     pytest.importorskip('chromadb')
     from providers.vector_index.chroma_index import ChromaVectorIndex
-    from tests.unit.service.migration.test_vector_backup import record
+    from tests.migration_fixtures import record
 
     root = str(tmp_path / 'chroma')
     original = ChromaVectorIndex(persist_directory=root, dimension=3)

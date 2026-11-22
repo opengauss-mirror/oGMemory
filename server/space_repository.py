@@ -78,9 +78,10 @@ class SpaceRepository(SpaceJobRepository):
     @contextmanager
     def transaction(self, account_id, space_id=None, *, write=True):
         admission = getattr(self, '_migration_admission', None)
-        with admission.scope(write=write) if admission is not None else nullcontext():
+        with (admission.content_scope() if write else admission.scope()) if admission is not None else nullcontext():
             conn = self.pool.get_connection()
             discard = False
+            committing = False
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("SELECT set_config('app.account_id', %s, true)", (account_id,))
@@ -89,8 +90,11 @@ class SpaceRepository(SpaceJobRepository):
                         if space_id:
                             cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id, space_id),))
                     yield cur
+                committing = True
                 conn.commit()
             except BaseException as error:
+                if committing and admission is not None and write:
+                    admission._operation.get().uncertain = True
                 try:
                     conn.rollback()
                 except BaseException as rollback_error:

@@ -65,10 +65,8 @@ def test_native_crud_binary_unicode_and_concurrency(native):
     assert client.stat(mount + "/empty")["isDir"]
 
 
-def test_native_stream_backup_restores_binary_files(native, tmp_path):
+def test_native_stream_writes_binary_empty_and_truncates(native):
     from io import BytesIO
-
-    from service.migration.tree_backup import AGFSTreeBackup
 
     client, mount, _ = native
     root = mount + "/business"
@@ -83,15 +81,11 @@ def test_native_stream_backup_restores_binary_files(native, tmp_path):
     client.write_stream(root + "/binary", BoundedStream(payload))
     assert client.read(root + "/binary") == payload
     client.write_stream(root + "/empty", BytesIO(b""))
-    backup = AGFSTreeBackup(client, [root], lambda: {"mount": mount})
-    destination = tmp_path / "backup"
-    manifest = backup.capture(destination)
+    assert client.read(root + "/empty") == b""
     client.write_stream(root + "/binary", BytesIO(b"short"))
     assert client.read(root + "/binary") == b"short"
-    client.write(root + "/extra", b"discard")
-    backup.restore(destination, manifest)
-    assert client.read(root + "/binary") == payload
-    assert client.read(root + "/empty") == b""
+    client.write_stream(root + "/binary", BytesIO(b""))
+    assert client.read(root + "/binary") == b""
     assert {entry["name"] for entry in client.ls(root)} == {"binary", "empty"}
 
 
@@ -263,3 +257,50 @@ def test_bundled_transport_and_explicit_http_endpoint(tmp_path, monkeypatch):
 
     config.write_text("agfs:\n  transport: native\n")
     assert OgMemConfig.load(str(config)).agfs_transport == "native"
+
+
+def test_native_context_lock_business_rejection_drains(native, tmp_path):
+    from core.errors import AccessDeniedError, NodeNotFoundError
+    from core.models import RequestContext, Role
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from service.migration.admission import Admission
+    from service.migration.maintenance import MaintenanceStore
+
+    client, mount, _ = native
+    admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'native-lock'))
+    fs = admission.guard(AGFSContextFS(client=admission.guard(client), mount_prefix=mount))
+    ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.MEMBER)
+    uri = 'ctx://acme/users/alice/memories/preferences/missing'
+    with pytest.raises(ValueError, match='prepareToken'):
+        with fs.resource_mutation_lock(uri, ctx):
+            raise ValueError('prepareToken required')
+    with pytest.raises(NodeNotFoundError):
+        fs.archive_node(uri, ctx)
+    with pytest.raises(AccessDeniedError):
+        fs.archive_node(uri.replace('acme', 'other'), ctx)
+    admission.store.enter('snapshot', mode='export', resources={})
+    admission.store.wait_drained('snapshot', 0)
+
+
+def test_native_atomic_resource_version_conflict_drains(native, tmp_path):
+    from commit.outbox_store import OutboxStore
+    from core.errors import ConcurrentModificationError
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from service.migration.admission import Admission
+    from service.migration.maintenance import MaintenanceStore
+    from tests.unit.fs.test_agfs_context_fs import _atomic_code_node, _atomic_code_context
+
+    client, mount, _ = native
+    a = Admission(MaintenanceStore(tmp_path / 'gate.db', 'native-conflict'))
+    fs = a.guard(AGFSContextFS(client=a.guard(client), mount_prefix=mount))
+    outbox = OutboxStore(client=client, fs=fs, mount_prefix=mount)
+    ctx = _atomic_code_context()
+    stale = _atomic_code_node(expected_version=2)
+    with pytest.raises(ConcurrentModificationError):
+        fs.write_node_with_outbox(stale, ctx, outbox.build_write_event(stale))
+    node = _atomic_code_node()
+    fs.write_node_with_outbox(node, ctx, outbox.build_write_event(node))
+    with pytest.raises(ConcurrentModificationError):
+        fs.write_node_with_outbox(stale, ctx, outbox.build_write_event(stale))
+    a.store.enter('snapshot', mode='export', resources={})
+    a.store.wait_drained('snapshot', 0)

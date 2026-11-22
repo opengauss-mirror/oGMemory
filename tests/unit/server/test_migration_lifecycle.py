@@ -76,7 +76,7 @@ def test_unmodified_target_keeps_original_session_cache(tmp_path, monkeypatch):
 
 def test_export_blocks_real_agfs_constructor_but_keeps_existing_reads(tmp_path, monkeypatch):
     from service.migration.admission import Admission
-    from tests.unit.service.migration.test_tree_backup import LocalClient
+    from tests.migration_fixtures import LocalClient
 
     client = LocalClient(tmp_path / 'files')
     client.path('/local').mkdir(parents=True)

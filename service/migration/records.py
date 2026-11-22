@@ -66,8 +66,7 @@ def identity(uri):
         raise PackageError("invalid node URI")
     from fs.agfs_adapter.agfs_context_fs import uri_to_path
 
-    if parts[0] != 'spaces':
-        uri_to_path(uri)
+    uri_to_path(uri)  # Require a URI representable by both adapters.
     return parsed.netloc, parts
 
 
@@ -207,7 +206,7 @@ def runtime_node(r):
 
 
 def validate_record(kind, r):
-    fields = {"nodes": NODE_FIELDS, "space_nodes": NODE_FIELDS, "archives": ARCHIVE_FIELDS, "relations": EDGE_FIELDS}[kind]
+    fields = {"nodes": NODE_FIELDS, "archives": ARCHIVE_FIELDS, "relations": EDGE_FIELDS}[kind]
     if set(r) != set(fields):
         raise PackageError(f"{kind}: unsupported or missing record fields")
     if kind == "relations":
@@ -255,10 +254,6 @@ def validate_record(kind, r):
     if account != r["account_id"] or runtime_node(r) or parts[0] == "sessions":
         raise PackageError("invalid or runtime-only node")
     expected = {"users": "user:", "agents": "agent:", "resources": "resource:"}.get(parts[0])
-    if kind == 'space_nodes':
-        if parts[0] != 'spaces' or len(parts) != 5 or parts[2] != 'memories':
-            raise PackageError('invalid shared-space content URI')
-        expected = 'space:'
     owner = account if parts[0] == "resources" else parts[1]
     if expected is None or r["owner_space"] != expected + owner:
         raise PackageError("node owner does not match URI")

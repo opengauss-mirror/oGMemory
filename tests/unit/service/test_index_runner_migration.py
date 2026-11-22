@@ -133,7 +133,7 @@ def test_official_factory_guards_concrete_storage_without_vector_provider(
     from fs.agfs_adapter.client import NativeAGFSHTTPError
     from providers.config import ProviderConfig
     from providers.unified_config import OgMemConfig
-    from tests.unit.service.migration.test_tree_backup import LocalClient
+    from tests.migration_fixtures import LocalClient
 
     class Client(LocalClient):
         def mkdir(self, path):

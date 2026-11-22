@@ -121,10 +121,8 @@ def create_migration_blueprint(get_service):
                     or preview['artifact_id'] != body.get('artifact_id')):
                 raise PackageError('请先对选中的迁移包完成预检。')
         headers = dict(request.headers)
-        selection = preview.get('result', {}).get('shared_spaces') if kind == 'import' else None
         job = queue.submit(kind, identity=body.get('request_id', ''), artifact=body.get('artifact_id'),
-                           recover_task=body.get('recover_task'), authorize=lambda: authorize(headers),
-                           shared_selection=selection)
+                           recover_task=body.get('recover_task'), authorize=lambda: authorize(headers))
         return jsonify(job_id=job['id']), 202
 
     @api.get('/jobs/<identity>')
