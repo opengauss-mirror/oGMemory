@@ -75,7 +75,7 @@ def test_full_service_control_reads_during_import(tmp_path, monkeypatch):
 def test_write_denial_returns_maintenance_response(tmp_path, monkeypatch, mode):
     import server.app as app_module
     import server.mcp_tools as tools
-    from service.migration.admission import business_wsgi
+    from server.maintenance_http import business_wsgi
 
     admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'instance'))
     service = SimpleNamespace(_admission=admission, _cfg=SimpleNamespace(
@@ -104,7 +104,7 @@ def test_write_denial_returns_maintenance_response(tmp_path, monkeypatch, mode):
 
 def test_memory_write_structured_maintenance_response(tmp_path, monkeypatch):
     import server.app as app_module
-    from service.migration.admission import business_wsgi
+    from server.maintenance_http import business_wsgi
 
     admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'instance'))
     def after_turn(params):

@@ -34,7 +34,7 @@ configure_third_party_loggers()
 logger = logging.getLogger("index-service")
 
 
-def _create_storage(cfg, *, invalidate_lexical_scopes=None, remember=None, guard=None):
+def _create_storage(cfg, *, invalidate_lexical_scopes=None, register_cleanup=None, guard=None):
     """Use the same storage backend as the API, not an unrelated AGFS outbox."""
     if cfg.storage_backend == "sql" or cfg.shared_spaces_enabled:
         from commit.sql_outbox_store import SQLOutboxStore
@@ -71,11 +71,11 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None, remember=None, guard
                 finally:
                     pool.close_all()
             raise
-        if remember is not None:
-            remember(pool)
+        if register_cleanup is not None:
+            register_cleanup(pool)
             if client is not None:
-                remember(client)
-                remember(fs)
+                register_cleanup(client)
+                register_cleanup(fs)
         if guard is not None and client is not None:
             guard(client)
         return fs, outbox, pool
@@ -94,8 +94,8 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None, remember=None, guard
         if callable(close):
             close()
         raise
-    if remember is not None:
-        remember(client)
+    if register_cleanup is not None:
+        register_cleanup(client)
     if guard is not None:
         guard(client)
     return fs, outbox, None
@@ -107,7 +107,7 @@ def _build_service(cfg, admission):
     from service.index_service import IndexService
 
     closers = []
-    def remember(obj, *, migration=False):
+    def register_cleanup(obj, *, migration=False):
         close = (getattr(obj, 'release_for_migration', None) if migration else None)
         close = close or getattr(obj, 'close_all', None) or getattr(obj, 'close', None)
         if callable(close):
@@ -124,30 +124,30 @@ def _build_service(cfg, admission):
         embedder = vector_index = None
         vector_cleanup = len(closers)
         if not cfg.agfs_retrieval_enabled:
-            embedder = remember(provider_cfg.create_embedder())
+            embedder = register_cleanup(provider_cfg.create_embedder())
             vector_cleanup = len(closers)
-            vector_index = admission.guard(remember(provider_cfg.create_vector_index(), migration=True))
+            vector_index = admission.guard(register_cleanup(provider_cfg.create_vector_index(), migration=True))
         from providers.composite_index import create_projection_writer
         projection = create_projection_writer(cfg, vector_index)
         if projection is not vector_index:
             if callable(getattr(projection, "release_for_migration", None)):
                 del closers[vector_cleanup:]  # The composite owns the vector client.
-            remember(projection, migration=True)
+            register_cleanup(projection, migration=True)
             admission.guard(projection.lexical_index)
             admission.guard(projection)
         lexical = getattr(projection, 'lexical_index', None)
         fs, outbox_store, storage_pool = _create_storage(
-            cfg, remember=remember, guard=admission.guard,
+            cfg, register_cleanup=register_cleanup, guard=admission.guard,
             invalidate_lexical_scopes=lexical.mark_scopes_dirty if lexical is not None else None)
         fs = admission.guard(fs)
         outbox_store = admission.guard(outbox_store)
-        llm = remember(provider_cfg.create_llm())
+        llm = register_cleanup(provider_cfg.create_llm())
         usage_pool = storage_pool
         if cfg.sql_connection_string:
             from fs.sql_adapter.model_usage_store import SQLModelUsageStore
             from fs.sql_adapter.pool import SharedConnectionPool
             if usage_pool is None:
-                usage_pool = remember(SharedConnectionPool(
+                usage_pool = register_cleanup(SharedConnectionPool(
                     cfg.sql_connection_string, pool_size=cfg.sql_pool_size, dialect=cfg.sql_dialect))
             usage_store = SQLModelUsageStore(usage_pool)
             for provider in (llm, embedder):
@@ -169,15 +169,12 @@ def _build_service(cfg, admission):
 class CoordinatedIndexRunner:
     """Register the official standalone producer in the instance migration gate."""
     def __init__(self, cfg, *, build_service=_build_service):
-        from pathlib import Path
-
         from service.migration.maintenance import MaintenanceStore
         from service.migration.participants import Participant
 
         self.cfg, self.build_service = cfg, build_service
         self.service = self.cleanup = None
-        workspace = Path(cfg.migration_workspace).expanduser().resolve()
-        self.store = MaintenanceStore(workspace / 'maintenance.sqlite', str(workspace))
+        self.store = MaintenanceStore.for_workspace(cfg.migration_workspace)
         self.participant = Participant(self.store, pause=self.pause, refresh=self.refresh, resume=self.resume)
         self.admission = self.participant.admission
         try:

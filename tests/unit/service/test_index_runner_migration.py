@@ -239,7 +239,7 @@ def test_coordinated_factory_preserves_lexical_projection_and_close_retry(tmp_pa
     monkeypatch.setattr(ProviderConfig, 'create_vector_index', lambda self: pytest.fail('no vector'))
     monkeypatch.setattr(ProviderConfig, 'create_llm', lambda self: SimpleNamespace())
     seen = []
-    def storage(cfg, *, invalidate_lexical_scopes=None, remember=None, guard=None):
+    def storage(cfg, *, invalidate_lexical_scopes=None, register_cleanup=None, guard=None):
         seen.append(invalidate_lexical_scopes)
         return Storage(), SimpleNamespace(), None
     monkeypatch.setattr(runner_module, '_create_storage', storage)

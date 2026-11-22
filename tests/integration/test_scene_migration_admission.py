@@ -8,7 +8,8 @@ import pytest
 from core.models import RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
-from service.migration.admission import Admission, business_wsgi
+from server.maintenance_http import business_wsgi
+from service.migration.admission import Admission
 from service.migration.maintenance import MaintenanceError, MaintenanceStore
 
 pytestmark = [pytest.mark.integration,

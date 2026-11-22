@@ -62,6 +62,15 @@ class Participant:
                     self.start()
                 raise
 
+    def wait_for_operations(self, deadline):
+        """Drain this process, excluding the current shutdown operation."""
+        token = self.admission.current_token()
+        while self.store.has_other_operations(self.id, token):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MaintenanceError('business operations have not stopped')
+            time.sleep(min(.05, remaining))
+
     def step(self):
         request = self.store.lifecycle_request(self.id)
         if request is None:

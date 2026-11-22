@@ -112,7 +112,8 @@ def test_admin_routes_unavailable_when_role_control_disabled(monkeypatch, tmp_pa
 
 
 def test_readonly_admin_keeps_authentication_during_migration(monkeypatch, tmp_path):
-    from service.migration.admission import Admission, business_wsgi
+    from server.maintenance_http import business_wsgi
+    from service.migration.admission import Admission
     from service.migration.maintenance import MaintenanceStore
     service, member_key = _make_service(tmp_path)
     service._admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'admin-test'))

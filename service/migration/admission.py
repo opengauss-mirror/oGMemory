@@ -25,10 +25,8 @@ def _content_path(path):
         tail = parts[i + 2:]
         if tail and tail[0] in {'_system', '.outbox', '.outbox-done', '.lexical-outbox', 'traces', 'tool-results'}:
             return False
-        if len(tail) >= 4 and tail[0] in {'users', 'agents'} and tail[2:4] == ('memories', '.write_operations'):
-            return False
-        if tail and tail[0] == 'sessions':
-            return len(tail) >= 3 and tail[2] == 'history'
+        from service.migration.records import runtime_path
+        return not runtime_path(tail)
     return True
 
 
@@ -41,6 +39,11 @@ def _content_arguments(*args, **kwargs):
         return any(not runtime_node({'uri': uri}) for uri in uris)
     value = args[0] if args else kwargs.get('path')
     return _content_path(value) if isinstance(value, str) else True
+
+
+def _transport_paths(signature, args, kwargs):
+    return [value for name, value in signature.bind(*args, **kwargs).arguments.items()
+            if name in {'path', 'src', 'dst', 'source', 'destination'}]
 
 
 def _content_storage(storage):
@@ -69,6 +72,21 @@ class Admission:
         self._runtime_backend = ContextVar(f'migration-runtime-{id(self)}', default=False)
         self._lock = threading.RLock()
         self._closing = False
+
+    @contextmanager
+    def request_scope(self):
+        marker = self._operation.set(None)
+        try:
+            with self.scope():
+                yield
+        finally:
+            self._operation.reset(marker)
+
+    def current_token(self):
+        operation = self._operation.get()
+        if operation is None or not operation.active or operation.owner != self._owner():
+            raise MaintenanceError('active operation required')
+        return operation.token
 
     def stop_accepting(self):
         with self._lock:
@@ -346,9 +364,7 @@ class Admission:
                 @wraps(function)
                 def transport(*args, _function=function, _write=write,
                               _signature=signature, _rejections=single_attempt, **kwargs):
-                    bound = _signature.bind(*args, **kwargs).arguments
-                    paths = [value for key, value in bound.items()
-                             if key in {'path', 'src', 'dst', 'source', 'destination'}]
+                    paths = _transport_paths(_signature, args, kwargs)
                     payload = any(_content_path(p) for p in paths) if paths else True
                     if self._runtime_backend.get():
                         payload = False  # Actual content adapters still acquire their own permit.
@@ -393,8 +409,7 @@ def control_client(client, admission, prefix):
         signature = inspect.signature(mutation)
         @wraps(mutation)
         def mutate(*args, _method=method, _mutation=mutation, _signature=signature, **kwargs):
-            paths = [value for key, value in _signature.bind(*args, **kwargs).arguments.items()
-                     if key in {'path', 'source', 'destination', 'src', 'dst'}]
+            paths = _transport_paths(_signature, args, kwargs)
             if not paths or not all(control_path(path, parents=_method == 'mkdir') for path in paths):
                 raise MaintenanceError('control client cannot mutate business storage')
             with admission.backend(write=True, content=False):
@@ -453,61 +468,3 @@ def install(service, admission):
         setattr(service, name, admission.wrap(getattr(service, name)))
     for name in ("_run_dispose_background", "_process_agent_memory", "_refresh_write_outcomes"):
         setattr(service, name, admission.wrap(getattr(service, name)))
-
-
-def business_wsgi(application, get_service):
-    """Keep HTTP operations admitted through the last streamed response chunk."""
-    from contextlib import ExitStack
-    from contextvars import copy_context
-    import json
-    from server.maintenance_http import MAINTENANCE_STATUS, MAINTENANCE_HEADERS, maintenance_payload
-
-    def serve(environ, start_response):
-        path = environ.get('PATH_INFO', '')
-        admin_read = (environ.get('REQUEST_METHOD') == 'GET'
-                      and path.startswith('/api/v1/admin/'))
-        control = (admin_read or path == '/api/v1/health' or path.startswith((
-            '/memory-viewer/', '/api/v1/auth/', '/api/v1/migration/')))
-        admission = None if control else getattr(get_service(), '_admission', None)
-        if admission is not None:
-            admission._operation.set(None)
-        with ExitStack() as lifetime:
-            try:
-                if admission is not None:
-                    lifetime.enter_context(admission.scope())
-            except MaintenanceError:
-                payload = json.dumps(maintenance_payload()).encode()
-                start_response(f'{MAINTENANCE_STATUS.value} {MAINTENANCE_STATUS.phrase}', [
-                    ('Content-Type', 'application/json'), ('Content-Length', str(len(payload))),
-                    *MAINTENANCE_HEADERS.items()])
-                yield payload
-                return
-            response = application(environ, start_response)
-            try:
-                yield from response
-            finally:
-                close = getattr(response, 'close', None)
-                if callable(close):
-                    close()
-    class Response:
-        def __init__(self, environ, start_response):
-            self.context = copy_context()
-            self.iterator = serve(environ, start_response)
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            return self.context.run(next, self.iterator)
-
-        def close(self):
-            self.context.run(self.iterator.close)
-
-        def __del__(self):
-            # Finalize in the Context that owns the request's admission token.
-            try:
-                self.close()
-            except Exception:
-                pass  # Uncertain backend operations stay durably registered.
-
-    return Response

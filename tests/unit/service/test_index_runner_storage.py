@@ -91,7 +91,7 @@ def test_shared_runner_registers_bridge_as_only_owner_of_stage_pool(monkeypatch)
     registered = []
     guard = Mock()
 
-    _create_storage(cfg, remember=registered.append, guard=guard)
+    _create_storage(cfg, register_cleanup=registered.append, guard=guard)
 
     assert registered == [pool, client, bridge]
     guard.assert_called_once_with(client)

@@ -174,7 +174,7 @@ def test_agfs_read_remains_available_during_snapshot(admission, tmp_path):
 def test_http_stream_is_drained_and_control_page_stays_available(admission):
     from types import SimpleNamespace
 
-    from service.migration.admission import business_wsgi
+    from server.maintenance_http import business_wsgi
 
     def application(environ, start):
         start('200 OK', [])
@@ -266,7 +266,7 @@ def test_wsgi_garbage_collection_closes_in_original_context(admission):
     import gc
     from types import SimpleNamespace
 
-    from service.migration.admission import business_wsgi
+    from server.maintenance_http import business_wsgi
 
     def app(environ, start_response):
         start_response('200 OK', [])
@@ -386,8 +386,34 @@ def test_sql_missing_node_settles_only_after_rollback(admission, method, rollbac
     with pytest.raises(ConnectionError if rollback_fails else NodeNotFoundError):
         call(*args)
     conn.rollback.assert_called_once()
+    assert conn.close.call_count == int(rollback_fails)
     with admission.store._transaction() as db:
         assert db.execute('SELECT count(*) FROM operations').fetchone()[0] == int(rollback_fails)
+
+
+def test_sql_commit_exception_does_not_settle_write(admission):
+    from unittest.mock import MagicMock
+
+    from core.errors import NodeNotFoundError
+    from core.models import RequestContext, Role
+    from fs.sql_adapter.sql_context_fs import SQLContextFS
+
+    fs = SQLContextFS.__new__(SQLContextFS)
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value.rowcount = 1
+    fs._get_connection = lambda: conn
+    fs._return_connection = lambda connection: None
+    uri = 'ctx://acme/users/alice/memories/preferences/editor'
+    conn.commit.side_effect = NodeNotFoundError(uri)
+    call = admission.wrap(fs.archive_node, write=True, backend=True)
+    ctx = RequestContext('acme', 'alice', '', 's', 'test', Role.ROOT)
+    with pytest.raises(NodeNotFoundError):
+        call(uri, ctx)
+    conn.commit.assert_called_once()
+    conn.rollback.assert_called_once()
+    admission.store.enter('restore', mode='import', resources={})
+    with pytest.raises(TimeoutError):
+        admission.store.wait_drained('restore', 0)
 
 
 def test_settled_sql_rejection_does_not_clear_prior_unknown_write(admission):

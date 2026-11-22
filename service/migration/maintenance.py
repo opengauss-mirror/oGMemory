@@ -15,6 +15,17 @@ from core.errors import MaintenanceError
 
 
 class MaintenanceStore:
+    @classmethod
+    def for_workspace(cls, directory):
+        workspace = Path(directory).expanduser().resolve()
+        workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return cls(workspace / 'maintenance.sqlite', str(workspace))
+
+    def has_other_operations(self, participant, token):
+        with self._transaction() as db:
+            return db.execute('SELECT 1 FROM operations WHERE participant=? AND token<>? LIMIT 1',
+                              (participant, token)).fetchone() is not None
+
     def __init__(self, path, instance_id):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)

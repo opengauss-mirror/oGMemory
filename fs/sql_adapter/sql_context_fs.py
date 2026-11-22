@@ -38,7 +38,7 @@ from core.resource_identity import (
 )
 from fs.access_control import check_uri_access
 from fs.sql_adapter.outbox_receipt import PROJECTION_RECEIPT_SQL
-from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
+from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool, rollback_write
 
 # ---------------------------------------------------------------------------
 # URI parsing (independent copy — no dependency on agfs_adapter)
@@ -879,6 +879,7 @@ class SQLContextFS(PoolAdapterMixin):
         relations_json, extra_meta, new_version, now = self._build_row_data(node)
 
         conn = self._get_connection()
+        committing = False
         try:
             self.bind_tenant(conn, ctx.account_id)
             with (
@@ -897,12 +898,12 @@ class SQLContextFS(PoolAdapterMixin):
                     new_version,
                     now,
                 )
+            committing = True
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
         except ConcurrentModificationError as exc:
-            conn.rollback()
-            exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         except Exception:
             conn.rollback()
@@ -942,6 +943,7 @@ class SQLContextFS(PoolAdapterMixin):
         relations_json, extra_meta, new_version, now = self._build_row_data(node)
 
         conn = self._get_connection()
+        committing = False
         try:
             self.bind_tenant(conn, ctx.account_id)
             with (
@@ -995,12 +997,12 @@ class SQLContextFS(PoolAdapterMixin):
                         ensure_ascii=False,
                     ),
                 )
+            committing = True
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
         except ConcurrentModificationError as exc:
-            conn.rollback()
-            exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         except Exception:
             conn.rollback()
@@ -1252,6 +1254,7 @@ class SQLContextFS(PoolAdapterMixin):
         self._validate_write_access((uri,), ctx)
 
         conn = self._get_connection()
+        committing = False
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
@@ -1287,10 +1290,10 @@ class SQLContextFS(PoolAdapterMixin):
                 )
                 if cur.rowcount == 0:
                     raise NodeNotFoundError(uri)
+            committing = True
             conn.commit()
         except NodeNotFoundError as exc:
-            conn.rollback()
-            exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         except Exception:
             conn.rollback()
@@ -1433,6 +1436,7 @@ class SQLContextFS(PoolAdapterMixin):
         self._validate_write_access((uri,), ctx)
 
         conn = self._get_connection()
+        committing = False
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
@@ -1448,10 +1452,10 @@ class SQLContextFS(PoolAdapterMixin):
                 )
                 if cur.rowcount == 0:
                     raise NodeNotFoundError(uri)
+            committing = True
             conn.commit()
         except NodeNotFoundError as exc:
-            conn.rollback()
-            exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         except Exception:
             conn.rollback()
@@ -1666,6 +1670,7 @@ class SQLContextFS(PoolAdapterMixin):
         to_prefix = to_uri.rstrip("/") + "/"
 
         conn = self._get_connection()
+        committing = False
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
@@ -1871,10 +1876,10 @@ class SQLContextFS(PoolAdapterMixin):
                                     Json({"records": records}),
                                 ),
                             )
+            committing = True
             conn.commit()
         except NodeNotFoundError as exc:
-            conn.rollback()
-            exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         except Exception:
             conn.rollback()

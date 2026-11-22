@@ -46,7 +46,7 @@ from server.memory_viewer import create_memory_viewer_blueprint
 from server.scene_api import create_scene_blueprint
 from server.space_management import create_shared_search_blueprint
 from server.maintenance_http import MAINTENANCE_HEADERS, MAINTENANCE_STATUS, maintenance_payload
-from service.migration.admission import business_wsgi
+from server.maintenance_http import business_wsgi
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(

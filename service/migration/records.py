@@ -194,15 +194,19 @@ def write_operation_path(parts):
     return (
         len(parts) >= 4
         and parts[0] in {"users", "agents"}
-        and parts[2:4] == ["memories", ".write_operations"]
+        and parts[2] == "memories" and parts[3] == ".write_operations"
+    )
+
+
+def runtime_path(parts):
+    return write_operation_path(parts) or (
+        bool(parts) and parts[0] == "sessions" and (len(parts) < 3 or parts[2] != "history")
     )
 
 
 def runtime_node(r):
     _, parts = identity(r["uri"])
-    return write_operation_path(parts) or (
-        parts[0] == "sessions" and (len(parts) < 3 or parts[2] != "history")
-    )
+    return runtime_path(parts)
 
 
 def validate_record(kind, r):
