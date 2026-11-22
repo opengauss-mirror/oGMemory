@@ -446,39 +446,21 @@ class ChromaVectorIndex(VectorIndex):
                     "collection": collection.name, "collection_id": str(collection.id),
                     "dimension": self._dimension}
 
-    def check_migration_target(self, *, empty=True, include_embedding=True) -> None:
+    def check_migration_target(self) -> None:
         with self._locked():
-            if empty and self._collection.count():
+            if self._collection.count():
                 raise ValueError("target vector index is not empty")
-            # Fetch the persisted collection constraint, not this client's cached
-            # model or HNSW reader (another process may have indexed new rows).
+            # A read-only query validates a retained collection dimension even
+            # after every row was deleted; it does not create probe records.
             try:
-                collection = self._client.get_collection(self._collection.name)
-                get_model = getattr(collection, "get_model", None)
-                if not callable(get_model):
-                    if not include_embedding:
-                        raise ValueError("Chroma SDK lacks metadata-only dimension validation; upgrade chromadb")
-                    # Older SDKs support the offline contract through a query.
-                    # Use the freshly fetched collection, not a stale handle.
-                    collection.query(query_embeddings=[[0.0] * self._dimension],
-                                     n_results=1, include=["distances"])
-                    return
-                dimension = get_model().dimension
+                self._collection.query(
+                    query_embeddings=[[0.0] * self._dimension], n_results=1,
+                    include=["distances"],
+                )
             except Exception as exc:
                 raise ValueError("target Chroma index dimension could not be validated") from exc
-            if ((dimension is None and self._collection.count()) or
-                    (dimension is not None and (type(dimension) is not int or dimension <= 0))):
-                raise ValueError("target Chroma index dimension could not be validated")
-            if dimension is not None and dimension != self._dimension:
-                raise ValueError("target Chroma index dimension differs from configuration")
-            if include_embedding:
-                try:
-                    self._collection.query(query_embeddings=[[0.0] * self._dimension],
-                                           n_results=1, include=["distances"])
-                except Exception as exc:
-                    raise ValueError("target Chroma index dimension could not be validated") from exc
 
-    def get_record(self, record_id: str, *, include_embedding: bool = True) -> IndexRecord | None:
+    def get_record(self, record_id: str) -> IndexRecord | None:
         """Fetch one :class:`IndexRecord` by id.
 
         Returns ``None`` when no row matches. Mirrors the
@@ -495,7 +477,7 @@ class ChromaVectorIndex(VectorIndex):
             return None
         result = self._collection.get(
             ids=[record_id],
-            include=["documents", "metadatas"] + (["embeddings"] if include_embedding else []),
+            include=["documents", "metadatas", "embeddings"],
         )
         ids = (result or {}).get("ids") or []
         if not ids:

@@ -106,14 +106,12 @@ def record():
     )
 
 
-@pytest.mark.parametrize("include_embedding", [False, True])
-def test_shared_record_and_empty_target_contract(vector_target, include_embedding):
+def test_shared_record_and_empty_target_contract(vector_target):
     index = vector_target()
     index.check_migration_target()
     original = record()
     index.upsert([original])
-    restored = index.get_record(original.id, include_embedding=include_embedding)
-    index.check_migration_target(empty=False, include_embedding=include_embedding)
+    restored = index.get_record(original.id)
     assert (restored.id, restored.uri, restored.level, restored.text) == (
         original.id,
         original.uri,
@@ -146,15 +144,14 @@ def test_space_projection_filters_round_trip_and_query(vector_target):
         assert not index.search_by_vector([1.0, 0.0, 0.0], {**original.filters, key: value}, 10)
 
 
-@pytest.mark.parametrize("include_embedding", [False, True])
-def test_shared_retained_schema_dimension_contract(vector_target, include_embedding):
+def test_shared_retained_schema_dimension_contract(vector_target):
     index = vector_target()
     index.upsert([record()])
     index.delete(["contract"])
     assert index.count() == 0
     with pytest.raises(ValueError, match="dimension|schema"):
         incompatible = vector_target(4)
-        incompatible.check_migration_target(include_embedding=include_embedding)
+        incompatible.check_migration_target()
 
 
 def test_shadow_scan_preserves_live_records_and_embeddings(vector_target):
@@ -184,60 +181,3 @@ def test_shadow_scan_preserves_live_records_and_embeddings(vector_target):
     assert shadow.search_by_vector([1.0, 0.0, 0.0], original.filters, 10)
     with pytest.raises(ValueError, match="batch_size"):
         list(index.iter_records(batch_size=0))
-
-
-def _chroma_metadata_writer(path, pipe):
-    from dataclasses import replace
-
-    from providers.vector_index.chroma_index import ChromaVectorIndex
-
-    index = ChromaVectorIndex(persist_directory=path, dimension=3)
-    original = record()
-    try:
-        index.upsert([original])
-        pipe.send('inserted')
-        pipe.recv()
-        index.upsert([replace(original, text='updated text', filters={**original.filters, 'category': 'updated'})])
-        pipe.send('updated')
-        pipe.recv()
-        index.delete([original.id])
-        pipe.send('deleted')
-        pipe.recv()
-    finally:
-        index.release_for_migration()
-
-
-def test_chroma_preflight_reads_other_process_metadata(tmp_path):
-    if 'chroma' not in os.environ.get('MIGRATION_CONTRACT_BACKENDS', 'chroma').split(','):
-        pytest.skip('Chroma-specific cross-process contract')
-    pytest.importorskip('chromadb')
-    import multiprocessing
-
-    from providers.vector_index.chroma_index import ChromaVectorIndex
-
-    path = str(tmp_path / 'process-chroma')
-    index = ChromaVectorIndex(persist_directory=path, dimension=3)
-    ctx = multiprocessing.get_context('spawn')
-    parent, child = ctx.Pipe()
-    process = ctx.Process(target=_chroma_metadata_writer, args=(path, child))
-    process.start()
-    child.close()
-    try:
-        for stage in ('inserted', 'updated', 'deleted'):
-            assert parent.poll(15) and parent.recv() == stage
-            index.check_migration_target(empty=False, include_embedding=False)
-            actual = index.get_record('contract', include_embedding=False)
-            if stage == 'deleted':
-                assert actual is None and index.count() == 0
-            else:
-                assert actual.text == (record().text if stage == 'inserted' else 'updated text')
-                assert actual.filters['category'] == ('document' if stage == 'inserted' else 'updated')
-                assert actual.metadata['grounding'] == record().metadata['grounding']
-            parent.send('next')
-        process.join(15)
-        assert process.exitcode == 0
-    finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(5)
-        index.release_for_migration()
