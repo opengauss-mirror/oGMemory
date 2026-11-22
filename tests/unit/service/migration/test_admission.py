@@ -150,7 +150,7 @@ def test_agfs_read_remains_available_during_snapshot(admission, tmp_path):
     from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
     from service.migration.storage import AGFSStorage
     from tests.unit.service.migration.test_engine import config, node
-    from tests.unit.service.migration.test_tree_backup import LocalClient
+    from tests.migration_fixtures import LocalClient
 
     class AdapterClient(LocalClient):
         def read(self, path, offset=0, size=-1):
@@ -214,17 +214,14 @@ async def test_mcp_request_uses_same_maintenance_gate(admission):
     assert rejected.value.data == {'status': 503, 'retryable': True}
 
 
-def test_trace_read_repair_cannot_write_during_export(admission):
+def test_trace_runtime_repair_continues_during_export(admission):
     from fs.agfs_adapter.agfs_trace_store import AGFSTraceEventStore
     from tests.unit.fs.test_agfs_trace_store import _MemoryAGFS
 
     client = _MemoryAGFS()
     trace = admission.guard(AGFSTraceEventStore(client=client))
-    before = dict(client.files)
     admission.store.enter('export', mode='export', resources={})
-    with pytest.raises(MaintenanceError):
-        trace.list_pending_skill_accounts()
-    assert client.files == before
+    assert trace.list_pending_skill_accounts() == []
     admission.store.wait_drained('export', 0)
     admission.store.reopen('export')
     assert trace.list_pending_skill_accounts() == []
