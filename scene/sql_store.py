@@ -16,7 +16,7 @@ from threading import Lock
 
 from psycopg2.extras import Json
 
-from fs.sql_adapter.pool import PoolAdapterMixin
+from fs.sql_adapter.pool import PoolAdapterMixin, rollback_write
 from fs.sql_adapter.sql_context_fs import SQLContextFS
 from retrieval.owner_scope import expand_owner_space_aliases
 from scene.config import ConfigRevisionConflict, SceneConfig, SceneConfigSnapshot
@@ -146,14 +146,16 @@ class _SQLStore:
         if not account_id:
             raise ValueError("account_id is required")
         connection = self.pool.get_connection()
+        committing = False
         try:
             PoolAdapterMixin.bind_tenant(connection, account_id)
             with connection.cursor() as cursor:
                 cursor.execute("SELECT set_config('statement_timeout', '30000', true)")
                 yield cursor
+            committing = True
             connection.commit()
-        except Exception:
-            connection.rollback()
+        except BaseException as exc:
+            rollback_write(connection, exc, committing=committing)
             raise
         finally:
             self.pool.return_connection(connection)

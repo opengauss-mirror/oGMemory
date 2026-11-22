@@ -426,6 +426,15 @@ class ChromaVectorIndex(VectorIndex):
             result = self._collection.get(where=self._build_where(filters), include=[])
             return len(result.get("ids") or [])
 
+    def release_for_migration(self) -> None:
+        """Release this client's SDK cache while all instance accesses are paused."""
+        close = getattr(self._client, "close", None)
+        if not callable(close):
+            raise ValueError("online migration requires a Chroma client with close() support")
+        with self._locked():
+            close()
+
+
     def check_migration_target(self) -> None:
         with self._locked():
             if self._collection.count():

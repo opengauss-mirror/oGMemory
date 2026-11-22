@@ -729,6 +729,14 @@ class AGFSContextFS:
         except ValueError:
             return False
 
+    def _validate_write_access(self, uri: str, ctx: RequestContext) -> None:
+        """Mark deterministic access rejection before starting a mutation."""
+        try:
+            self._ensure_accessible(uri, ctx)
+        except AccessDeniedError as exc:
+            exc.agfs_rejection_settled = True
+            raise
+
     def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
         """Raise AccessDeniedError if URI is not accessible.
 
@@ -1234,7 +1242,7 @@ class AGFSContextFS:
     ) -> Iterator[_ResourceMutationLease]:
         """Serialize code-resource writes and deletes across AGFS processes."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         node_path = self._uri_to_agfs_path(uri)
         final_path = PurePosixPath(node_path.rstrip("/"))
         parent_path = str(final_path.parent) + "/"
@@ -1245,6 +1253,7 @@ class AGFSContextFS:
         candidate_path = lock_path + "-" + owner_token
         deadline = time.monotonic() + timeout_seconds
         acquired = False
+        rejection = None
         lease_stop = Event()
         lease_lost = Event()
         lease_thread = None
@@ -1274,8 +1283,12 @@ class AGFSContextFS:
                         ) from exc
                     time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
 
+            renew = self._renew_resource_mutation_lease
+            admission = getattr(self, "_migration_guard", None)
+            if admission is not None:
+                renew = admission.bind_child(renew)
             lease_thread = Thread(
-                target=self._renew_resource_mutation_lease,
+                target=renew,
                 args=(lock_path, owner_token, lease_stop, lease_lost),
                 daemon=True,
             )
@@ -1289,22 +1302,31 @@ class AGFSContextFS:
                 lost=lease_lost,
             )
             lease.ensure_owned()
-            yield lease
+            try:
+                yield lease
+            except ConcurrentModificationError as exc:
+                if getattr(exc, 'agfs_write_not_started', False) is True:
+                    rejection = exc
+                raise
             lease.ensure_owned()
         finally:
             lease_stop.set()
             if lease_thread is not None:
                 lease_thread.join()
-            self._remove_tree_if_present(candidate_path)
+            cleaned = self._remove_tree_if_present(candidate_path)
+            released = False
             if acquired:
                 try:
                     if self._owns_resource_mutation_lock(lock_path, owner_token):
                         self._client.rm(lock_path, recursive=True)
+                        released = True
                 except Exception:
                     logger.warning(
                         "Failed to release AGFS code-resource mutation lock: %s",
                         lock_path,
                     )
+            if rejection is not None and cleaned and released:
+                rejection.agfs_rejection_settled = True
 
     @contextmanager
     def session_recovery_lock(self, uri: str, ctx: RequestContext, *, timeout_seconds=1.0):
@@ -1617,7 +1639,7 @@ class AGFSContextFS:
     ) -> None:
         """Atomically persist the durable-delete marker for a node."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         if mutation_lease is not None:
             if mutation_lease.uri != uri:
                 raise ValueError("mutation lease URI does not match tombstone URI")
@@ -1673,7 +1695,7 @@ class AGFSContextFS:
     ) -> None:
         """Remove a tombstone when deletion has not yet been durably accepted."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         if mutation_lease is not None:
             if mutation_lease.uri != uri:
                 raise ValueError("mutation lease URI does not match tombstone URI")
@@ -1696,7 +1718,7 @@ class AGFSContextFS:
     ) -> None:
         """Delete node payload files while preserving tombstone and Outbox."""
 
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
         if mutation_lease is not None:
             if mutation_lease.uri != uri:
                 raise ValueError("mutation lease URI does not match payload URI")
@@ -1875,7 +1897,7 @@ class AGFSContextFS:
     ) -> None:
         """Atomically publish a deterministic code node with its UPSERT event."""
 
-        self._ensure_accessible(node.uri, ctx)
+        self._validate_write_access(node.uri, ctx)
         expected_version = node.metadata.get("_expected_version")
         if (
             isinstance(expected_version, bool)
@@ -1897,11 +1919,9 @@ class AGFSContextFS:
             existing_meta_raw = self._read_optional_raw(meta_path)
             if existing_meta_raw is None:
                 if expected_version != 0:
-                    raise ConcurrentModificationError(
-                        node.uri,
-                        expected_version,
-                        0,
-                    )
+                    error = ConcurrentModificationError(node.uri, expected_version, 0)
+                    error.agfs_write_not_started = True
+                    raise error
                 self._remove_empty_code_resource_destination(
                     final_node_path,
                     lease,
@@ -1932,11 +1952,9 @@ class AGFSContextFS:
             ):
                 raise RuntimeError("invalid committed AGFS code-resource version")
             if expected_version != actual_version:
-                raise ConcurrentModificationError(
-                    node.uri,
-                    expected_version,
-                    actual_version,
-                )
+                error = ConcurrentModificationError(node.uri, expected_version, actual_version)
+                error.agfs_write_not_started = True
+                raise error
 
             existing = self.read_node(node.uri, ctx)
             if self._canonical_node_index_records(existing) != event_records:
@@ -2214,7 +2232,7 @@ class AGFSContextFS:
             AccessDeniedError: If account_id doesn't match URI prefix
         """
         # Step 0: Access control check
-        self._ensure_accessible(node.uri, ctx)
+        self._validate_write_access(node.uri, ctx)
         recovery = self.active_session_recovery()
         if recovery is not None:
             recovery[0].ensure_owned()
@@ -2233,6 +2251,7 @@ class AGFSContextFS:
             return
 
         staging_path = None
+        rejection = None
         if create_only:
             final_path = PurePosixPath(final_node_path.rstrip("/"))
             parent_path = str(final_path.parent) + "/"
@@ -2263,12 +2282,16 @@ class AGFSContextFS:
                         )
                     except (NodeNotFoundError, json.JSONDecodeError):
                         raise exc
-                    raise ConcurrentModificationError(
-                        node.uri, 0, existing.get("version", 1)
-                    ) from exc
+                    from fs.agfs_adapter.client import confirmed_rejection
+                    error = ConcurrentModificationError(node.uri, 0, existing.get("version", 1))
+                    if confirmed_rejection(exc):
+                        rejection = error
+                    raise error from exc
         finally:
             if staging_path:
-                self._remove_tree_if_present(staging_path)
+                cleaned = self._remove_tree_if_present(staging_path)
+                if rejection is not None and cleaned:
+                    rejection.agfs_rejection_settled = True
         if self._on_node_change is not None:
             self._on_node_change(node.uri)
 
@@ -2292,6 +2315,7 @@ class AGFSContextFS:
             "expected_version": expected_version,
             "temporary_meta_path": temporary_meta_path,
         }
+        rejection = None
         lock_acquired = False
         lease_stop = Event()
         lease_lost = Event()
@@ -2321,8 +2345,12 @@ class AGFSContextFS:
                     ) from retry_exc
                 lock_acquired = True
 
+            renew = self._renew_update_lease
+            admission = getattr(self, "_migration_guard", None)
+            if admission is not None:
+                renew = admission.bind_child(renew)
             lease_thread = Thread(
-                target=self._renew_update_lease,
+                target=renew,
                 args=(lock_path, token, lease_stop, lease_lost),
                 daemon=True,
             )
@@ -2330,9 +2358,8 @@ class AGFSContextFS:
 
             actual_version = self._read_node_version(final_node_path)
             if actual_version != expected_version:
-                raise ConcurrentModificationError(
-                    node.uri, expected_version, actual_version
-                )
+                rejection = ConcurrentModificationError(node.uri, expected_version, actual_version)
+                raise rejection
 
             self._write_node_files(
                 final_node_path,
@@ -2351,13 +2378,16 @@ class AGFSContextFS:
             lease_stop.set()
             if lease_thread is not None:
                 lease_thread.join()
-            self._remove_file_if_present(temporary_meta_path)
-            self._remove_tree_if_present(candidate_lock_path)
+            cleaned = self._remove_file_if_present(temporary_meta_path)
+            cleaned = self._remove_tree_if_present(candidate_lock_path) and cleaned
             if lock_acquired and self._owns_update_lock(lock_path, token):
                 try:
                     self._client.rm(lock_path, recursive=True)
                 except AGFSClientError:
+                    cleaned = False
                     logger.warning("Failed to release AGFS update lock: %s", lock_path)
+            if rejection is not None and cleaned:
+                rejection.agfs_rejection_settled = True
 
     def _write_update_marker(
         self,
@@ -2488,17 +2518,19 @@ class AGFSContextFS:
         self._remove_tree_if_present(lock_path)
         return True
 
-    def _remove_tree_if_present(self, path: str) -> None:
+    def _remove_tree_if_present(self, path: str) -> bool:
         try:
             self._client.rm(path.rstrip("/"), recursive=True)
-        except AGFSClientError:
-            pass
+        except AGFSClientError as exc:
+            return _is_not_found_error(exc)
+        return True
 
-    def _remove_file_if_present(self, path: str) -> None:
+    def _remove_file_if_present(self, path: str) -> bool:
         try:
             self._client.rm(path)
-        except AGFSClientError:
-            pass
+        except AGFSClientError as exc:
+            return _is_not_found_error(exc)
+        return True
 
     def _write_node_files(
         self,
@@ -3062,7 +3094,7 @@ class AGFSContextFS:
 
     def archive_node(self, uri: str, ctx: RequestContext) -> None:
         """Archive a node from AGFS by marking its metadata status ARCHIVED."""
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
 
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
@@ -3070,10 +3102,14 @@ class AGFSContextFS:
         try:
             meta = json.loads(self._read_file(meta_path))
         except NodeNotFoundError:
-            raise NodeNotFoundError(uri)
+            error = NodeNotFoundError(uri)
+            error.agfs_rejection_settled = True
+            raise error
 
         if meta.get("status") != NodeStatus.ACTIVE.value:
-            raise NodeNotFoundError(uri)
+            error = NodeNotFoundError(uri)
+            error.agfs_rejection_settled = True
+            raise error
 
         now = datetime.now(UTC).isoformat()
         meta["status"] = NodeStatus.ARCHIVED.value
@@ -3093,7 +3129,7 @@ class AGFSContextFS:
             NodeNotFoundError: If node doesn't exist
         """
         # Access control check
-        self._ensure_accessible(uri, ctx)
+        self._validate_write_access(uri, ctx)
 
         node_path = self._uri_to_agfs_path(uri)
 
@@ -3102,7 +3138,10 @@ class AGFSContextFS:
             self._client.rm(node_path, recursive=True)
         except AGFSClientError as e:
             if _is_not_found_error(e):
-                raise NodeNotFoundError(uri)
+                from fs.agfs_adapter.client import confirmed_rejection
+                error = NodeNotFoundError(uri)
+                error.agfs_rejection_settled = confirmed_rejection(e)
+                raise error from e
             raise
         if self._on_node_change is not None:
             self._on_node_change(uri, subtree=True)
@@ -3120,15 +3159,17 @@ class AGFSContextFS:
             NodeNotFoundError: If source node doesn't exist
         """
         # Access control check for both URIs
-        self._ensure_accessible(from_uri, ctx)
-        self._ensure_accessible(to_uri, ctx)
+        self._validate_write_access(from_uri, ctx)
+        self._validate_write_access(to_uri, ctx)
 
         from_path = self._uri_to_agfs_path(from_uri)
         to_path = self._uri_to_agfs_path(to_uri)
 
         # Ensure source exists
         if not self.exists(from_uri, ctx):
-            raise NodeNotFoundError(from_uri)
+            error = NodeNotFoundError(from_uri)
+            error.agfs_rejection_settled = True  # No mutation has started.
+            raise error
 
         # Move the directory
         self._client.mv(from_path, to_path)

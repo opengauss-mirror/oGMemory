@@ -17,6 +17,25 @@ _mount_lock = threading.Lock()
 _mounts = {}
 
 
+class NativeAGFSHTTPError(AGFSHTTPError):
+    """The synchronous C call has returned; no remote write remains in flight."""
+
+
+def confirmed_rejection(exc):
+    """A single request returned a filesystem rejection, not a transport failure."""
+    from requests.exceptions import HTTPError
+
+    if isinstance(exc, NativeAGFSHTTPError):
+        return True
+    cause = exc.__context__
+    if not isinstance(exc, AGFSClientError) or not isinstance(cause, HTTPError) or cause.response is None:
+        return False
+    response = cause.response
+    if response.status_code in {403, 404, 409}:
+        return True
+    return False
+
+
 class NativeAGFSClient:
 
     def __init__(self, library_path, config_path):
@@ -109,11 +128,11 @@ class NativeAGFSClient:
         message = self._string(self.lib.AGFS_GetLastError(error_id))
         lower = message.lower()
         if "not found" in lower or "no such file" in lower:
-            raise AGFSHTTPError(message, status_code=404)
+            raise NativeAGFSHTTPError(message, status_code=404)
         if "already exists" in lower or "file exists" in lower:
-            raise AGFSHTTPError(message, status_code=409)
+            raise NativeAGFSHTTPError(message, status_code=409)
         if "permission denied" in lower or "access denied" in lower:
-            raise AGFSHTTPError(message, status_code=403)
+            raise NativeAGFSHTTPError(message, status_code=403)
         raise AGFSClientError(message)
 
     def _json(self, method, *args):
@@ -141,6 +160,7 @@ class NativeAGFSClient:
 
     def write(self, path, data):
         return self._file_op("Write", path, data, len(data))["message"]
+
 
     def create(self, path):
         return self._json("Create", path.encode())
