@@ -445,7 +445,24 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                             (self._table_name, record_id))
             check()
 
+    @staticmethod
+    def _stored_metadata(record):
+        # Legacy SQL predicates read category/type from metadata as well.
+        metadata = {key: value for key, value in record.metadata.items() if key != "_embedding"}
+        return indexed_metadata({**metadata, **{
+            key: record.filters[key] for key in ("category", "context_type")
+            if key in record.filters
+        }})
 
+    def validate_records(self, records: list[IndexRecord]) -> None:
+        """Validate the actual SQL projection before migration writes content."""
+        from core.sql_payload import validate_sql_strings
+
+        for record in records:
+            validate_sql_strings([
+                record.id, record.uri, record.text, record.filters,
+                self._stored_metadata(record),
+            ])
 
     def upsert(self, records: list[IndexRecord]) -> None:
         """Add or update records in the index.
@@ -466,13 +483,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 embedding_str = _vec_literal(embedding)
                 filters_json = Json(record.filters)
-                # Legacy SQL predicates read these fields from metadata; keep
-                # that projection aligned with the canonical filter values.
-                metadata = dict(record.metadata)
-                metadata.pop("_embedding")
-                metadata.update({key: record.filters[key] for key in ("category", "context_type")
-                                 if key in record.filters})
-                metadata_json = Json(indexed_metadata(metadata))
+                metadata_json = Json(self._stored_metadata(record))
 
                 # Extract explicit security columns from filters
                 acct = record.filters.get("account_id")
@@ -627,8 +638,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         finally:
             self._return_connection(conn)
 
-    def check_migration_target(self) -> None:
-        if self.count():
+    def check_migration_target(self, *, empty=True, include_embedding=True) -> None:
+        if empty and self.count():
             raise ValueError("target vector index is not empty")
         conn = self._get_connection()
         try:
@@ -645,7 +656,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             conn.rollback()
             self._return_connection(conn)
 
-    def get_record(self, record_id: str) -> IndexRecord | None:
+    def get_record(self, record_id: str, *, include_embedding: bool = True) -> IndexRecord | None:
         """Fetch one :class:`IndexRecord` by id.
 
         Returns ``None`` when no row matches. Used by

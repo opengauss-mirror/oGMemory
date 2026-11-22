@@ -637,14 +637,14 @@ class MilvusVectorIndex(VectorIndex):
                 "database": self._migration_database, "collection": self._collection_name,
                 "collection_id": str(collection_id), "dimension": self._dimension}
 
-    def check_migration_target(self) -> None:
+    def check_migration_target(self, *, empty=True, include_embedding=True) -> None:
         from pymilvus import DataType
 
         self._validate_schema(DataType)
-        if self.count():
+        if empty and self.count():
             raise ValueError("target vector index is not empty")
 
-    def get_record(self, record_id: str) -> IndexRecord | None:
+    def get_record(self, record_id: str, *, include_embedding: bool = True) -> IndexRecord | None:
         if not record_id:
             return None
         deadline = time.monotonic() + self._timeout
