@@ -177,7 +177,7 @@ if [ "${OGMEM_MCP_ENABLED:-true}" = "true" ] || [ "${OGMEM_MCP_ENABLED:-true}" =
   OGMEM_MCP_BIND_PORT="${OGMEM_MCP_PORT:-8091}"
   OGMEM_MCP_BIND_PATH="${OGMEM_MCP_PATH:-/mcp}"
   echo "[entrypoint] Starting oGMemory MCP server on ${OGMEM_MCP_BIND_HOST}:${OGMEM_MCP_BIND_PORT}${OGMEM_MCP_BIND_PATH}..."
-  python3 -m cli.main mcp \
+  OGMEM_AGENT_TURN_SCHEDULER_OWNER=false python3 -m cli.main mcp \
     --transport streamable-http \
     --host "${OGMEM_MCP_BIND_HOST}" \
     --port "${OGMEM_MCP_BIND_PORT}" \

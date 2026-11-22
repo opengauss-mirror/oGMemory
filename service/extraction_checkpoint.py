@@ -18,6 +18,7 @@ from core.write_contract import OUTCOMES_KEY, store_outcome, merge_source_outcom
 from service.extraction_receipts import compact_plans
 
 EXTENSION_KEY = "memory_extraction_recovery"
+AGENT_TURN_PROJECTION_BARRIER = "agent_turn_projection_barrier"
 logger = logging.getLogger(__name__)
 
 
@@ -58,7 +59,8 @@ class ExtractionBatchJournal:
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
-                 request_messages=None, lifecycle=None, request_source_ids=None, agent_async=False):
+                 request_messages=None, lifecycle=None, request_source_ids=None, agent_async=False,
+                 ready_at_ms=None):
         self.manager, self.buffer, self.ctx = manager, buffer, ctx
         self._stage_owner = threading.get_ident()
         self._verified_stage_results = set()
@@ -94,6 +96,8 @@ class ExtractionBatchJournal:
                 batch["lifecycle"] = deepcopy(lifecycle)
             if agent_async:
                 batch["agent_async"] = True
+                if ready_at_ms is not None:
+                    batch["ready_at_ms"] = ready_at_ms
             self._replace(batch)
         self._archive_id = batch["archive_id"]
         restore_outbox_events(batch, ctx.account_id)
@@ -275,6 +279,7 @@ class ExtractionBatchJournal:
                 old_completed = list(self.buffer.completed_request_ids)
                 old_extension = self.buffer.runtime_extensions[EXTENSION_KEY]
                 old_outcomes = deepcopy(self.buffer.runtime_extensions.get(OUTCOMES_KEY))
+                old_barrier = self.buffer.runtime_extensions.get(AGENT_TURN_PROJECTION_BARRIER)
                 client_request_id = batch.get("client_request_id", "")
                 receipt = deepcopy(outcome or {})
                 receipt["plans"] = compact_plans(
@@ -288,6 +293,12 @@ class ExtractionBatchJournal:
                                source_sha256=stage_digest(batch["messages"]),
                                outbox_events=[list(item) for item in dict.fromkeys(references)],
                                outbox_tracking_complete=batch.get("outbox_tracking_version") == 1)
+                if batch.get("agent_async") and (receipt["outbox_events"] or not receipt["outbox_tracking_complete"]):
+                    self.buffer.runtime_extensions[AGENT_TURN_PROJECTION_BARRIER] = {
+                        "archive_id": batch["archive_id"],
+                        "event_refs": receipt["outbox_events"],
+                        "outbox_tracking_complete": receipt["outbox_tracking_complete"],
+                    }
                 receipt.setdefault("source_status", "ARCHIVED")
                 if batch.get("lifecycle", {}).get("source_digest"):
                     receipt["source_snapshot_sha256"] = batch["lifecycle"]["source_digest"]
@@ -335,6 +346,10 @@ class ExtractionBatchJournal:
                         self.buffer.runtime_extensions.pop(OUTCOMES_KEY, None)
                     else:
                         self.buffer.runtime_extensions[OUTCOMES_KEY] = old_outcomes
+                    if old_barrier is None:
+                        self.buffer.runtime_extensions.pop(AGENT_TURN_PROJECTION_BARRIER, None)
+                    else:
+                        self.buffer.runtime_extensions[AGENT_TURN_PROJECTION_BARRIER] = old_barrier
                 raise RecoveryPersistenceError("completed extraction checkpoint could not be saved")
             self._release_stage_results(stage_uris)
             return receipt

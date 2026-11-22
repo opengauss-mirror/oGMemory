@@ -1,0 +1,77 @@
+:root {
+  color-scheme: light;
+  --canvas: light-dark(#f5f5f5, #151515);
+  --surface: light-dark(rgba(255, 255, 255, 0.94), rgba(32, 32, 32, 0.96));
+  --surface-solid: light-dark(#fff, #202020);
+  --surface-soft: light-dark(#f3f3f3, #292929);
+  --surface-rail: light-dark(#efefef, #191919);
+  --ink: light-dark(#181818, #f4f4f4);
+  --muted: light-dark(#525252, #c4c4c4);
+  --quiet: light-dark(#646464, #a8a8a8);
+  --line: light-dark(#e0e0e0, #393939);
+  --line-strong: light-dark(#bdbdbd, #626262);
+  --violet: light-dark(#222, #efefef);
+  --violet-soft: light-dark(#e9e9e9, #373737);
+  --on-accent: light-dark(#fff, #181818);
+  --focus-ring: var(--violet);
+  --green: light-dark(#454545, #d0d0d0);
+  --green-soft: var(--surface-soft);
+  --cyan: light-dark(#383838, #dcdcdc);
+  --cyan-soft: var(--surface-soft);
+  --amber: light-dark(#505050, #c2c2c2);
+  --amber-soft: var(--violet-soft);
+  --red: var(--ink);
+  --red-soft: var(--violet-soft);
+  --scrollbar-thumb: light-dark(#797979, #777);
+  --scrollbar-track: light-dark(#eeeeee, #282828);
+  --scrollbar-thumb-hover: light-dark(#656565, #949494);
+  --scrollbar-thumb-active: light-dark(#505050, #b8b8b8);
+  --shadow: 0 12px 36px light-dark(rgba(0, 0, 0, 0.08), rgba(0, 0, 0, 0.24)), 0 2px 6px light-dark(rgba(0, 0, 0, 0.04), rgba(0, 0, 0, 0.10));
+  --font-body: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-display: "Bahnschrift", "Segoe UI Variable Display", "PingFang SC", "Microsoft YaHei UI", var(--font-body);
+  --font-mono: "Cascadia Code", ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  --radius-control: 8px;
+  --radius-panel: 12px;
+  --motion-fast: 140ms;
+  accent-color: var(--violet);
+  font-family: var(--font-body);
+}
+
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) { color-scheme: dark; }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+@supports not (scrollbar-color: auto) {
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track,
+  *::-webkit-scrollbar-corner { background: var(--scrollbar-track); }
+  *::-webkit-scrollbar-thumb {
+    border: 2px solid var(--scrollbar-track);
+    border-radius: var(--radius-control);
+    background: var(--scrollbar-thumb);
+  }
+  *::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+  *::-webkit-scrollbar-thumb:active { background: var(--scrollbar-thumb-active); }
+}
+
+@media (forced-colors: active) {
+  * { scrollbar-width: auto; scrollbar-color: auto; }
+  *::-webkit-scrollbar-track,
+  *::-webkit-scrollbar-corner { background: Canvas; }
+  *::-webkit-scrollbar-thumb { border-color: Canvas; background: ButtonText; }
+  *::-webkit-scrollbar-thumb:hover,
+  *::-webkit-scrollbar-thumb:active { background: Highlight; }
+  :root { --focus-ring: Highlight; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --motion-fast: 0ms; }
+}

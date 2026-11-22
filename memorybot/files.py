@@ -279,18 +279,34 @@ class AGFSFileStore:
     def fetch(self, url):
         return fetch_page(url, allowed_hosts=self.allowed_hosts)
 
+    @staticmethod
+    def _missing_object(exc):
+        message = str(exc).lower()
+        return any(marker in message for marker in ("not found", "404", "not exist"))
+
+    def _entries(self, directory):
+        try:
+            return self.client.ls(directory)
+        except Exception as exc:
+            if not self._missing_object(exc):
+                raise
+            return []
+
+    def delete_file_objects(self, account_id, file_id):
+        """Remove revisions published before their storage key was saved."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", file_id):
+            raise ValueError("文件标识无效")
+        prefix = f"files/{file_id}"
+        for row in self._entries(self._path(account_id, prefix)):
+            digest = row["name"]
+            if row["isDir"] and re.fullmatch(r"[a-f0-9]{64}", digest):
+                self.delete(account_id, f"{prefix}/{digest}/content")
+
     def delete(self, account_id, storage_key):
         directory = str(PurePosixPath(self._path(account_id, storage_key)).parent)
-        try:
-            entries = self.client.ls(directory)
-        except Exception as exc:
-            if (
-                "not found" in str(exc).lower()
-                or "404" in str(exc)
-                or "not exist" in str(exc).lower()
-            ):
-                return
-            raise
+        entries = self._entries(directory)
+        if not entries:
+            return
         if any(row["name"] == "backup.json" for row in entries):
             raise ValueError("文件仍受备份标记保护")
         for key in (
@@ -301,11 +317,7 @@ class AGFSFileStore:
             try:
                 self.client.rm(path)
             except Exception as exc:
-                if (
-                    "not found" not in str(exc).lower()
-                    and "404" not in str(exc)
-                    and "not exist" not in str(exc).lower()
-                ):
+                if not self._missing_object(exc):
                     raise
 
     @staticmethod

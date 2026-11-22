@@ -8,12 +8,13 @@ Used by both:
 from __future__ import annotations
 
 import importlib.metadata as _metadata
+import json
 import logging
 import os
 import re as _re
 import threading
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import copy_context
 from copy import deepcopy
@@ -21,6 +22,7 @@ from dataclasses import asdict, replace
 from datetime import UTC
 from datetime import datetime as _dt
 from functools import partial, wraps
+from time import time_ns
 from typing import Any
 from uuid import uuid4
 
@@ -106,6 +108,7 @@ from service.code_workspace_sync import (
     WorkspaceResolutionError,
 )
 from service.extraction_checkpoint import (
+    AGENT_TURN_PROJECTION_BARRIER,
     EXTENSION_KEY,
     ExtractionBatchJournal,
     RecoveryNeedsConfirmationError,
@@ -114,7 +117,6 @@ from service.extraction_checkpoint import (
     request_message_id,
 )
 from service.extraction_receipts import read as read_extraction_receipt
-from service.extraction_recovery_discovery import AGENT_TURN_PENDING, AGENT_TURN_TASK
 from service.extraction_retry import (
     MAX_ATTEMPTS,
     ExtractionRetryWorker,
@@ -122,6 +124,7 @@ from service.extraction_retry import (
     retry_failed_source,
     source_only_recovery,
 )
+from service.extraction_recovery_discovery import AGENT_TURN_PENDING, AGENT_TURN_READY_AT, AGENT_TURN_TASK
 from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
@@ -787,6 +790,7 @@ class MemoryService:
         self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
         self._outbox_stop = threading.Event()
+        self._outbox_wakeup = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._extraction_retry = ExtractionRetryWorker(self)
         self._extraction_discovery = None
@@ -1765,11 +1769,7 @@ class MemoryService:
         )
 
     @staticmethod
-    def _generate_summary_candidate(messages, session_time, session_id, llm):
-        """Generate the summary candidate from a frozen source snapshot."""
-        from extraction.summary_generator import SessionSummaryGenerator
-
-        check_deadline()
+    def _session_summary_source(messages):
         lines, participants = [], set()
         for msg in messages:
             role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
@@ -1780,12 +1780,19 @@ class MemoryService:
                 lines.append(f"{role}: {content}")
                 if role not in ("system", "assistant"):
                     participants.add(role)
-        messages_text = "\n".join(lines)
+        return "\n".join(lines), ", ".join(sorted(participants))
+
+    @staticmethod
+    def _generate_summary_candidate(messages, session_time, session_id, llm):
+        """Generate the summary candidate from a frozen source snapshot."""
+        from extraction.summary_generator import SessionSummaryGenerator
+
+        check_deadline()
+        messages_text, participants = MemoryService._session_summary_source(messages)
         if not messages_text.strip():
             return None
-        participants_str = ", ".join(sorted(participants))
         generator = SessionSummaryGenerator(llm=llm)
-        summary = generator.generate(messages_text, session_time, participants_str)
+        summary = generator.generate(messages_text, session_time, participants)
         check_deadline()
         if summary:
             formatted = generator.format_summary(summary)
@@ -1793,7 +1800,7 @@ class MemoryService:
                 logger.info("Skipping blank L0 summary: session=%s", session_id[:8])
                 return None
             return generator.build_candidate(
-                summary, formatted, session_time, participants_str, session_id,
+                summary, formatted, session_time, participants, session_id,
             )
         return None
 
@@ -1809,11 +1816,8 @@ class MemoryService:
 
     @contextmanager
     def _parallel_session_summary(self, messages, session_time, ctx, session_id, write_api,
-                                  candidate_checkpoint=None, publication_scope=None):
+                                  candidate_checkpoint=None, publication_scope=None, candidate_future=None):
         """Join summary generation at the owner-thread write boundary."""
-        from concurrent.futures import Future, ThreadPoolExecutor
-        from contextvars import copy_context
-
         from core.model_stage import stage_collector_scope, wait_model_result
 
         restored = candidate_checkpoint.load() if candidate_checkpoint is not None else None
@@ -1833,10 +1837,12 @@ class MemoryService:
             if cached is not None:
                 future = Future()
                 future.set_result(CandidateMemory(**cached["candidate"]) if cached["candidate"] else None)
+            elif candidate_future is not None:
+                future = candidate_future
             else:
                 future = pool.submit(copy_context().run, self._generate_summary_candidate,
                                      deepcopy(messages), session_time, session_id, llm)
-            written, saved = False, cached is not None
+            written, saved = False, cached is not None or candidate_future is not None
 
             def collect():
                 nonlocal saved
@@ -2122,7 +2128,8 @@ class MemoryService:
                 logger.warning("Lifecycle extraction recovery session=%s archive=%s attempt=%d error=%s",
                                session_id, journal.batch["archive_id"], failures, exc)
 
-    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal, *, publication_scope=None):
+    def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal, *, publication_scope=None,
+                                       summary_future=None):
         batch = journal.batch
         messages = batch["messages"]
         session_time = _parse_session_time(batch.get("session_time"))
@@ -2174,7 +2181,7 @@ class MemoryService:
         failures = []
         with self._parallel_session_summary(messages, session_time, ctx, session_id, write_api,
                                             journal.checkpoint("summary"),
-                                            publication_scope) as before_write:
+                                            publication_scope, candidate_future=summary_future) as before_write:
             for index, chunk in enumerate(chunks):
                 check_deadline()
                 try:
@@ -3145,22 +3152,20 @@ class MemoryService:
                 logger.info("OutboxWorker SQL listener thread launched")
                 return
 
-            # AGFS backend: polling loop with multi-account support
-            def _get_account_ids_to_scan():
-                if self._cfg.role_control_enabled:
-                    try:
-                        accounts = self.get_key_manager().get_accounts()
-                        return [a["account_id"] for a in accounts if a.get("account_id")]
-                    except Exception as exc:
-                        logger.warning("Failed to list accounts for outbox scan: %s", exc)
-                return [self._default_account_id]
-
             def _outbox_loop():
                 logger.info("OutboxWorker thread started (idle polling every 5s)")
+                refresh_accounts = True
+                account_ids = [self._default_account_id]
                 while not self._outbox_stop.is_set():
                     wait_seconds = 5
+                    if refresh_accounts or self._outbox_wakeup.is_set():
+                        self._outbox_wakeup.clear()
+                        refresh_accounts = False
+                        try:
+                            account_ids = list(dict.fromkeys(self._extraction_recovery_account_ids()))
+                        except Exception as exc:
+                            logger.warning("Failed to list accounts for outbox scan: %s", exc)
                     try:
-                        account_ids = _get_account_ids_to_scan()
                         stats = worker.run_once(
                             outbox_store=outbox_store,
                             account_ids=account_ids,
@@ -3181,7 +3186,9 @@ class MemoryService:
                                 wait_seconds = min(wait_seconds, delay)
                     except Exception as exc:
                         logger.warning("OutboxWorker poll error: %s", exc)
-                    self._outbox_stop.wait(wait_seconds)
+                    if not self._outbox_stop.is_set():
+                        self._outbox_wakeup.wait(wait_seconds)
+                    refresh_accounts = True
 
             self._outbox_thread = threading.Thread(
                 target=_outbox_loop, daemon=True, name="outbox-worker"
@@ -3190,6 +3197,12 @@ class MemoryService:
             logger.info("OutboxWorker background thread launched")
         except Exception as exc:
             logger.warning("Failed to start OutboxWorker: %s", exc, exc_info=True)
+
+    def _wake_agent_projection(self, account_id: str):
+        if self._cfg.index_workers <= 0:
+            self._async_drain(account_id=account_id)
+            return
+        self._outbox_wakeup.set()
 
     def _async_drain(self, account_id: str | None = None):
         """Background thread wrapper for outbox drain with logging."""
@@ -3259,6 +3272,7 @@ class MemoryService:
         with self._shutdown_lock:
             with self._init_lock:
                 self._outbox_stop.set()
+                self._outbox_wakeup.set()
             self._shutdown_resources(join_timeout)
 
     def _shutdown_resources(self, join_timeout: float) -> None:
@@ -3347,6 +3361,7 @@ class MemoryService:
             self._outbox_listener = None
             self._outbox_thread = None
             self._outbox_stop.clear()
+            self._outbox_wakeup.clear()
 
 
     @_serialize_lazy_initialization("_decision_client")
@@ -4578,7 +4593,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ctx = params.get("_ctx") or self.build_context(params)
         buf = self.get_session_manager().get_or_create(session_id, ctx)
         pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
-        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+        if (buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async")
+                or self._agent_turn_projection_blocks(buf)):
             self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
             return {"ok": False, "status": "processing", "retryable": True,
                     "reason": "agent_extraction_pending"}
@@ -5701,27 +5717,38 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(ctx.session_id, ctx)
-        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        extensions = buf.runtime_extensions
+        pending = extensions.get(EXTENSION_KEY, {}).get("batch")
         if pending:
             if pending.get("agent_async"):
                 return ExtractionBatchJournal.resume(mgr, buf, ctx), None
             return None, 1
-        request_id = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+        request_id = extensions.get(AGENT_TURN_PENDING)
         if not request_id:
             return None, None
         if buf.extraction_in_progress or buf.lifecycle_prepare_in_progress or buf.compaction_prepare_archive_id:
             return None, 1
-        receipts = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
-        for receipt in receipts.values():
-            if needs_projection_refresh(receipt):
-                resolved = self._resolve_write_outcome(receipt)
-                if resolved["projection_status"] in {"PENDING", "UNKNOWN"}:
-                    return None, 1
+        barrier = extensions.get(AGENT_TURN_PROJECTION_BARRIER)
+        receipts = extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+        if barrier is not None:
+            projection = self._agent_turn_projection_status(barrier)
+            if projection == "FAILED":
+                return None, 5
+            if projection not in {"DONE", "NOT_REQUIRED"}:
+                return None, 1
+        else:
+            for receipt in receipts.values():
+                if needs_projection_refresh(receipt):
+                    resolved = self._resolve_write_outcome(receipt)
+                    if resolved["projection_status"] in {"PENDING", "UNKNOWN"}:
+                        return None, 1
         source = list(buf.messages[buf.extraction_watermark:])
         if not source:
             raise RecoveryNeedsConfirmationError("accepted agent turn has no pending source")
         state = self._build_incremental_extraction_state(buf, incremental=source)
-        buf.runtime_extensions.pop(AGENT_TURN_PENDING)
+        extensions.pop(AGENT_TURN_PENDING)
+        ready_at_ms = extensions.pop(AGENT_TURN_READY_AT, None)
+        extensions.pop(AGENT_TURN_PROJECTION_BARRIER, None)
         try:
             journal = ExtractionBatchJournal(
                 mgr, buf, ctx, source, archive_id=generate_archive_id(),
@@ -5729,19 +5756,34 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_summary=buf.extraction_summary, tool_stats_text=state["tool_stats_text"],
                 client_request_id=request_id,
                 request_source_ids=receipts.get(request_id, {}).get("source_message_ids", ()),
-                agent_async=True,
+                agent_async=True, ready_at_ms=ready_at_ms,
             )
         except Exception:
-            buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+            extensions[AGENT_TURN_PENDING] = request_id
+            if ready_at_ms is not None:
+                extensions[AGENT_TURN_READY_AT] = ready_at_ms
+            if barrier is not None:
+                extensions[AGENT_TURN_PROJECTION_BARRIER] = barrier
             raise
         return journal, None
+
+    def _agent_turn_projection_status(self, barrier):
+        return self._resolve_write_outcome({
+            "outbox_tracking_complete": barrier["outbox_tracking_complete"],
+            "outbox_events": barrier["event_refs"],
+        })["projection_status"]
+
+    def _agent_turn_projection_blocks(self, buf):
+        barrier = buf.runtime_extensions.get(AGENT_TURN_PROJECTION_BARRIER)
+        return barrier is not None and self._agent_turn_projection_status(barrier) not in {"DONE", "NOT_REQUIRED"}
 
     def _dispose_agent_turn(self, mgr, buf, ctx):
         with buf.session_state_save_lock:
             with buf.extraction_lock:
                 pending = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
                 queued = buf.runtime_extensions.get(AGENT_TURN_PENDING)
-                if not queued and not pending.get("agent_async"):
+                if (not queued and not pending.get("agent_async") and
+                        not self._agent_turn_projection_blocks(buf)):
                     return None
                 if buf.ordinary_turns_in_progress:
                     return {"disposed": False, "flushed": False, "status": "processing",
@@ -5757,11 +5799,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         return {"disposed": False, "flushed": False, "status": "processing",
                                 "retryable": True, "reason": "agent_extraction_pending"}
                     buf.runtime_extensions[AGENT_TURN_PENDING] = request_id
+                    buf.runtime_extensions[AGENT_TURN_READY_AT] = time_ns() // 1_000_000
+                ready_at_ms = buf.runtime_extensions.get(AGENT_TURN_READY_AT)
             if waiting and not queued and not mgr.save_session_state(buf.session_id, ctx):
                 with buf.extraction_lock:
                     buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
+                    buf.runtime_extensions.pop(AGENT_TURN_READY_AT, None)
                 raise RecoveryPersistenceError("agent turn flush could not be saved")
-        self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+        self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued", "ready_at_ms": ready_at_ms})
         return {"disposed": True, "flushed": False, "status": "background_flush_dispatched"}
 
     @staticmethod
@@ -5781,15 +5826,136 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
         return outcome
 
+    def _agent_turn_summary_request(self, ctx, journal, snapshot):
+        from extraction.summary_generator import SUMMARY_PROMPT, SUMMARY_SCHEMA
+        from service.extraction_retry import source_only_reason
+        from session.compressor import SessionCompressor
+
+        batch = journal.batch
+        messages = batch["messages"]
+        if not messages or source_only_reason():
+            return None
+        archived = [{"role": m.role, "content": m.content, "id": m.id, "created_at": m.created_at}
+                    for m in snapshot]
+        summary_rows = [(m["id"], m["role"], m["content"]) for m in archived if m["role"] != "assistant"]
+        if (any(not isinstance(m["content"], str) for m in archived)
+                or summary_rows != [(m["id"], m["role"], m["content"]) for m in messages]):
+            return None
+        source, participants = self._session_summary_source(messages)
+        if not source or len(source) > 8000:
+            return None
+        summary_checkpoint = journal.checkpoint("summary")
+        if (not journal.has_stage("agent_turn_summaries")
+                and (journal.has_stage("history_archive") or summary_checkpoint.has_stage("session_summary")
+                     or "summary" in batch["slots"])):
+            return None
+        manager = journal.manager
+        llm = manager._archive_compression_llm()
+        if llm is None or llm is not self.get_llm():
+            return None
+        archive_inputs = manager._archive_compression_inputs(archived, ctx.session_id, ctx, llm, batch["archive_id"])
+        if archive_inputs["prev_overview"] or archive_inputs["prev_abstract"]:
+            return None
+        conversation = [{"role": m["role"], "content": m["content"]} for m in archived]
+        archive_prompt, archive_schema = SessionCompressor.compression_text_request(
+            json.dumps(conversation, ensure_ascii=False))
+        session_time = _parse_session_time(batch.get("session_time"))
+        l0_prompt = SUMMARY_PROMPT.format(
+            session_time=session_time.strftime("%Y-%m-%d") if session_time else "unknown",
+            participants=participants or "unknown",
+            conversation="Use the messages above whose role is not assistant.",
+        )
+        prompt = ("Produce one JSON object. Use all messages for the top-level overview and abstract. "
+                  "Put the second task's fields inside session_summary, based only on its specified messages.\n\n"
+                  + archive_prompt + "\n\n" + l0_prompt)
+        schema = {"type": "object", "properties": {**archive_schema["properties"], "session_summary": SUMMARY_SCHEMA},
+                  "required": [*archive_schema["required"], "session_summary"]}
+        inputs = {"archive": archive_inputs, "session_time": batch.get("session_time"),
+                  "prompt": prompt, "schema": schema}
+        return inputs, llm, session_time, participants
+
+    def _generate_agent_turn_summaries(self, ctx, manager, inputs, messages, llm, session_time, participants):
+        from extraction.summary_generator import SUMMARY_SCHEMA, SessionSummaryGenerator
+
+        check_deadline()
+        try:
+            response = llm.complete_json(inputs["prompt"], inputs["schema"])
+        except (OperationDeadlineExceededError, LLMTransientError):
+            raise
+        except Exception:
+            logger.info("Agent turn joint summary request failed; preparing the two summaries separately")
+            response = None
+        check_deadline()
+        response = response if isinstance(response, dict) else {}
+        overview, abstract = response.get("overview"), response.get("abstract")
+        summary = response.get("session_summary")
+        if (isinstance(overview, str) and overview.strip() and isinstance(abstract, str) and abstract.strip()
+                and isinstance(summary, dict)
+                and all(isinstance(summary.get(key), str) for key in SUMMARY_SCHEMA["required"])):
+            generator = SessionSummaryGenerator(llm)
+            formatted = generator.format_summary(summary)
+            candidate = (generator.build_candidate(summary, formatted, session_time, participants, ctx.session_id)
+                         if formatted.strip() else None)
+        else:
+            overview, abstract = manager._compute_archive_compression(inputs["archive"], llm)
+            candidate = self._generate_summary_candidate(messages, session_time, ctx.session_id, llm)
+        return {"archive": {"overview": overview, "abstract": abstract[:100]},
+                "candidate": asdict(candidate) if candidate is not None else None}
+
+    @contextmanager
+    def _parallel_agent_turn_summaries(self, ctx, journal, snapshot):
+        from core.model_stage import stage_collector_scope, wait_model_result
+
+        request = self._agent_turn_summary_request(ctx, journal, snapshot)
+        if request is None:
+            with journal.manager.parallel_archive_compression(snapshot, ctx.session_id, ctx, journal) as archive:
+                yield archive, None
+            return
+        inputs, llm, session_time, participants = request
+        cached = journal.load_stage("agent_turn_summaries", inputs)
+        archive = {"inputs": inputs["archive"], "llm": llm, "result": cached["archive"] if cached else None}
+        candidate_future = Future()
+        if cached is not None:
+            candidate_future.set_result(CandidateMemory(**cached["candidate"]) if cached["candidate"] else None)
+            yield archive, candidate_future
+            return
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-turn-summaries") as pool:
+            future = pool.submit(copy_context().run, self._generate_agent_turn_summaries,
+                                 ctx, journal.manager, inputs, deepcopy(journal.batch["messages"]),
+                                 llm, session_time, participants)
+
+            def collect():
+                if archive["result"] is None and future.done() and future.exception() is None:
+                    result = future.result()
+                    journal.save_stage("agent_turn_summaries", inputs, result)
+                    archive["result"] = result["archive"]
+                    candidate_future.set_result(
+                        CandidateMemory(**result["candidate"]) if result["candidate"] else None)
+                elif future.done() and future.exception() is not None and not candidate_future.done():
+                    candidate_future.set_exception(future.exception())
+
+            with stage_collector_scope(collect):
+                try:
+                    yield archive, candidate_future
+                finally:
+                    try:
+                        wait_model_result(future)
+                    except Exception:
+                        if not future.done() or future.exception() is None:
+                            raise
+                    else:
+                        collect()
+
     def _process_agent_turn(self, ctx, journal, publication_scope):
         mgr = journal.manager
         batch = journal.batch
         request_id, archive_id = batch["client_request_id"], batch["archive_id"]
         snapshot = [SessionMessage(**message) for message in batch["snapshot"]]
         write_api = self.get_write_api()
-        with mgr.parallel_archive_compression(snapshot, ctx.session_id, ctx, journal) as compression:
+        with self._parallel_agent_turn_summaries(ctx, journal, snapshot) as (compression, summary_future):
             write_result = (self._chunk_and_extract_recoverable(
                 write_api, ctx, ctx.session_id, journal, publication_scope=publication_scope,
+                summary_future=summary_future,
             ) if batch["messages"] else {})
         if self._write_result_has_failures(write_result):
             if not journal.has_retryable_write_failure():
@@ -5810,29 +5976,41 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             self._invalidate_identity_cache_if_profile_written(ctx.session_id, write_result)
             journal.finish(outcome=self._archived_extraction_outcome(write_result, request_id),
                            resolve_outcome=self._resolve_write_outcome)
+            return journal.buffer.runtime_extensions.get(AGENT_TURN_READY_AT)
 
     def _refresh_write_outcomes(self, ctx):
         """Persist completed projection receipts under the existing session fence."""
+        self._start_outbox_worker()
         try:
             with self._session_mutation_scope(ctx):
                 manager = self.get_session_manager()
                 buf = manager.get_or_create(ctx.session_id, ctx)
                 with buf.session_state_save_lock:
                     with buf.extraction_lock:
-                        entries = buf.runtime_extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+                        extensions = buf.runtime_extensions
+                        entries = extensions.get(OUTCOMES_KEY, {}).get("entries", {})
+                        barrier = extensions.get(AGENT_TURN_PROJECTION_BARRIER)
+                        cleared = barrier is not None and self._agent_turn_projection_status(barrier) in {
+                            "DONE", "NOT_REQUIRED",
+                        }
                         updates = {}
                         for request_id, outcome in entries.items():
-                            if needs_projection_refresh(outcome):
+                            if needs_projection_refresh(outcome) or (cleared and
+                                    barrier["archive_id"] in outcome.get("archive_receipts", {})):
                                 resolved = self._resolve_write_outcome(outcome)
                                 if resolved != outcome:
                                     updates[request_id] = resolved
-                        if not updates:
+                        if not updates and not cleared:
                             return
                         previous = {key: entries[key] for key in updates}
                         entries.update(updates)
+                        if cleared:
+                            extensions.pop(AGENT_TURN_PROJECTION_BARRIER)
                     if not manager.save_session_state(ctx.session_id, ctx):
                         with buf.extraction_lock:
                             entries.update(previous)
+                            if cleared:
+                                extensions[AGENT_TURN_PROJECTION_BARRIER] = barrier
                         raise RecoveryNeedsConfirmationError("projection receipt checkpoint was not acknowledged")
         except (SessionMutationBusyError, SessionOperationInProgress):
             return
@@ -6273,22 +6451,31 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             waiting = [message for message in buf.messages if message.id not in frozen_ids]
             ready = bool(waiting) and (force_extract or sum(m.estimated_tokens for m in waiting) >= threshold)
             previous = buf.runtime_extensions.get(AGENT_TURN_PENDING)
+            ready_at_ms = buf.runtime_extensions.get(AGENT_TURN_READY_AT)
+            previous_ready_at_ms = ready_at_ms
             if ready and self.get_write_api() is None:
                 return {"ok": False, "status": "failed", "retryable": True,
                         "error": "write API unavailable for asynchronous extraction"}
             if ready:
                 buf.runtime_extensions[AGENT_TURN_PENDING] = client_request_id
+                if ready_at_ms is None:
+                    ready_at_ms = time_ns() // 1_000_000
+                    buf.runtime_extensions[AGENT_TURN_READY_AT] = ready_at_ms
             receipt = _complete_request({"ok": True, "status": "accumulating", "pending_tokens": pending_tokens})
             if not receipt.get("ok"):
                 if previous is None:
                     buf.runtime_extensions.pop(AGENT_TURN_PENDING, None)
                 else:
                     buf.runtime_extensions[AGENT_TURN_PENDING] = previous
+                if previous_ready_at_ms is None:
+                    buf.runtime_extensions.pop(AGENT_TURN_READY_AT, None)
             elif ready:
-                self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
+                self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued",
+                                                 "ready_at_ms": ready_at_ms})
             return receipt
 
-        if pending.get("agent_async") or buf.runtime_extensions.get(AGENT_TURN_PENDING):
+        if (pending.get("agent_async") or buf.runtime_extensions.get(AGENT_TURN_PENDING)
+                or self._agent_turn_projection_blocks(buf)):
             return {"ok": False, "status": "processing", "retryable": True,
                     "error": "asynchronous extraction is processing this session"}
 
@@ -7104,7 +7291,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         buf = mgr.get_or_create(session_id, ctx=ctx)
         kind = lifecycle_kind(buf)
         pending_batch = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch", {})
-        if buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async"):
+        if (buf.runtime_extensions.get(AGENT_TURN_PENDING) or pending_batch.get("agent_async")
+                or self._agent_turn_projection_blocks(buf)):
             self._extraction_retry.wake(ctx, {"id": AGENT_TURN_TASK, "status": "queued"})
             return {"ok": False, "status": "processing", "retryable": True,
                     "session_id": session_id, "reason": "agent_extraction_pending"}
