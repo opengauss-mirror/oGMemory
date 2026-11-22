@@ -338,11 +338,11 @@ def _serialize_lazy_initialization(attribute: str):
     def _decorate(method):
         @wraps(method)
         def _wrapped(self, *args, **kwargs):
-            if getattr(self, attribute) is not None:
+            if getattr(self, attribute, None) is not None:
                 return method(self, *args, **kwargs)
             with self._init_lock:
                 admission = getattr(self, "_admission", None)
-                if (admission is not None and getattr(self, attribute) is None
+                if (admission is not None and getattr(self, attribute, None) is None
                         and attribute in {"_sql_pool", "_vector_index", "_trace_event_store", "_scene_manager"}):
                     with admission.scope(write=True):
                         return method(self, *args, **kwargs)
