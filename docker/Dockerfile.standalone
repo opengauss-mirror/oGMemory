@@ -36,6 +36,7 @@ COPY providers/  /opt/ogmem/providers/
 COPY service/    /opt/ogmem/service/
 COPY fs/         /opt/ogmem/fs/
 COPY server/     /opt/ogmem/server/
+COPY memorybot/  /opt/ogmem/memorybot/
 COPY session/    /opt/ogmem/session/
 COPY cli/        /opt/ogmem/cli/
 COPY scripts/    /opt/ogmem/scripts/

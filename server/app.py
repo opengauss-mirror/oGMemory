@@ -33,6 +33,7 @@ from features.tool_result_externalization.store_base import (
     ArtifactStoreUnavailableError,
     ToolResultExternalizationDisabledError,
 )
+from memorybot.http import create_blueprint as create_memorybot_blueprint
 from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
@@ -65,6 +66,8 @@ _SKILL_UPLOAD_MIMETYPES = _SKILL_ZIP_MIMETYPES | {"multipart/form-data"}
 app.config["MAX_CONTENT_LENGTH"] = _MAX_HTTP_BODY_BYTES
 _service: MemoryService | None = None
 _service_lock = threading.Lock()
+_bot_service = None
+_bot_service_lock = threading.Lock()
 _operator_service = None
 _operator_service_lock = threading.Lock()
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
@@ -82,6 +85,33 @@ _CODE_MEMORY_CANONICAL_FACADES = frozenset(
         "edit_code_file",
     }
 )
+
+
+def _get_bot_service():
+    global _bot_service
+    if _bot_service is None:
+        with _bot_service_lock:
+            if _bot_service is None:
+                from memorybot.config import BotConfig
+                from memorybot.models import BotError
+                from memorybot.worker import create_service
+
+                cfg = BotConfig.load(ogmem=get_config())
+                if not cfg.enabled:
+                    raise BotError("DEPENDENCY_UNAVAILABLE", "请配置 bot.enabled=true", 503)
+                _bot_service = create_service(_get_service(), cfg)
+    return _bot_service
+
+
+def _shutdown_bot_service():
+    global _bot_service
+    bot, _bot_service = _bot_service, None
+    if bot is not None:
+        bot.store.close()
+
+
+app.register_blueprint(create_memorybot_blueprint(_get_bot_service, inherit_upload_limit=False))
+atexit.register(_shutdown_bot_service)
 
 
 def _query_bool(value, *, default: bool = False) -> bool:

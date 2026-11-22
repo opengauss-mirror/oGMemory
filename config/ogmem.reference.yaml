@@ -390,3 +390,31 @@ m3:
     backend: opengauss            # [all] openGauss is still the recommended production target; ``pgvector`` is the convenience alias for PostgreSQL+pgvector deployments that want to share one DB
     table_name: m3_episodic_vectors  # [all] partition by run if you share a DB
     pool_size: 5                  # [all]
+
+# ---- memoryBot ----
+bot:
+  enabled: false
+  pool_size: 10
+  worker_concurrency: 4
+  cluster_concurrency: 16
+  tenant_concurrency: 8
+  max_pending: 10000
+  max_user_pending: 200
+  lease_seconds: 30
+  renew_seconds: 10
+  poll_seconds: 1
+  max_model_calls: 8
+  handbook_max_model_calls_per_file: 8
+  max_tool_calls: 12
+  max_input_tokens: 60000
+  max_output_tokens: 8000
+  task_timeout_seconds: 120
+  file_timeout_seconds: 900
+  max_file_bytes: 52428800
+  event_retention_days: 7
+  retention_days: 90
+  allowed_web_hosts: []            # Optional public website hostname allowlist
+  files:
+    backend: agfs
+    base_url: "http://127.0.0.1:1833"
+    mount_prefix: /memorybot
