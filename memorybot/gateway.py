@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from core.errors import NodeNotFoundError
 from core.models import ContextNode, OutboxEvent, Role
 from memorybot.models import BotError
+from retrieval.owner_scope import expand_owner_space_aliases
 
 
 class OutcomeUnknownError(RuntimeError):
@@ -152,22 +153,56 @@ class MemoryGateway:
             uris = list(dict.fromkeys(_node_uri(hit.uri) for hit in hits))
         else:
             fs = self.service._get_context_fs()
-            roots = [f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/"]
-            if scope.get("memory_scope") == "authorized":
-                roots += [
-                    f"ctx://{ctx.account_id}/agents/{space[6:]}/memories/"
-                    for space in ctx.visible_owner_spaces
-                    if space.startswith("agent:")
-                ]
-            directories = fs.count_memory_children(ctx)
+            directories, _ = self._memory_directories(fs, ctx, scope)
             uris = []
-            root_prefixes = tuple(roots)
             for directory in directories:
-                if not directory.startswith(root_prefixes):
-                    continue
                 if directory.endswith("/profile"):
                     uris.append(directory)
                 uris.extend(fs.list_children(directory, ctx))
+        return self._read_memory_values(ctx, scope, uris)
+
+    @staticmethod
+    def _memory_directories(fs, ctx, scope):
+        roots = [f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/"]
+        owners = [ctx.user_space_name()]
+        if scope.get("memory_scope") == "authorized":
+            for space in ctx.visible_owner_spaces:
+                if space.startswith("agent:"):
+                    roots.append(f"ctx://{ctx.account_id}/agents/{space[6:]}/memories/")
+                    owners.append(space)
+        prefixes = tuple(roots)
+        directories = [uri for uri in fs.count_memory_children(ctx) if uri.startswith(prefixes)]
+        return directories, owners
+
+    def list_memory_page(self, ctx, q, scope, hidden, *, limit, offset):
+        if q:
+            values = [row for row in self.list_memories(ctx, q, scope) if row["uri"] not in hidden]
+            return values[offset : offset + limit], len(values) > offset + limit
+
+        fs = self.service._get_context_fs()
+        directories, owners = self._memory_directories(fs, ctx, scope)
+        if not directories:
+            return [], False
+        profiles = [directory for directory in directories if directory.endswith("/profile")]
+        owner_aliases = expand_owner_space_aliases(owners)
+        conn = fs._get_connection()
+        try:
+            fs.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT uri FROM context_nodes WHERE account_id=%s AND status='ACTIVE' "
+                    "AND context_type='MEMORY' AND owner_space=ANY(%s) AND uri<>ALL(%s) "
+                    "AND (uri=ANY(%s) OR regexp_replace(uri, '/[^/]+$', '')=ANY(%s)) "
+                    "ORDER BY uri LIMIT %s OFFSET %s",
+                    (ctx.account_id, owner_aliases, list(hidden), profiles, directories, limit + 1, offset),
+                )
+                uris = [row[0] for row in cur.fetchall()]
+        finally:
+            conn.rollback()
+            fs._return_connection(conn)
+        return self._read_memory_values(ctx, scope, uris[:limit]), len(uris) > limit
+
+    def _read_memory_values(self, ctx, scope, uris):
         values = []
         for uri in uris:
             try:
