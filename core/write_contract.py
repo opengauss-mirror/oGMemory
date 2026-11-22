@@ -5,7 +5,7 @@ from functools import wraps
 
 from core.errors import (
     ConcurrentModificationError, EmbeddingError, ExtractionBudgetError,
-    ExtractionIncompleteError, ExtractionOutputError, LLMTransientError, OperationDeadlineExceededError,
+    ExtractionIncompleteError, ExtractionOutputError, LLMTransientError, MaintenanceError, OperationDeadlineExceededError,
     ValidationError, VectorIndexError,
 )
 
@@ -24,7 +24,9 @@ def error_fields(exc, request_id=""):
     """Preserve the originating failure independently from recovery policy."""
     name = type(exc).__name__
     code, component, status, action = "WRITE_INTERNAL_ERROR", "memory", 500, "manual_review"
-    if isinstance(exc, ExtractionBudgetError):
+    if isinstance(exc, MaintenanceError):
+        code, component, status, action = "MIGRATION_MAINTENANCE", "migration", 503, "retry_same_request"
+    elif isinstance(exc, ExtractionBudgetError):
         code, component, status = "EXTRACTION_CONTEXT_BUDGET", "extraction", 500
     elif isinstance(exc, LLMTransientError):
         code, component, status, action = "MODEL_TEMPORARILY_UNAVAILABLE", "model", 503, "retry_same_request"

@@ -228,3 +228,7 @@ class LLMCallError(ContextEngineError):
         super().__init__(message)
         self.status_code = status_code
         self.cause = cause
+
+
+class MaintenanceError(RuntimeError):
+    """Business access is temporarily unavailable during instance maintenance."""
