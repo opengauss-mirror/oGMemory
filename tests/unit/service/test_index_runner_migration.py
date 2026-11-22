@@ -47,7 +47,7 @@ def eventually(predicate):
 
 
 @pytest.mark.parametrize("mode", ["export", "import"])
-def test_real_scheduler_worker_is_blocked_and_clients_reopen(tmp_path, mode):
+def test_scheduler_keeps_source_projections_and_reopens_import_clients(tmp_path, mode):
     events = []
     runner = CoordinatedIndexRunner(config(tmp_path), build_service=factory(events))
     old = runner.service
@@ -55,8 +55,13 @@ def test_real_scheduler_worker_is_blocked_and_clients_reopen(tmp_path, mode):
     assert old._get_account_ids() == ["only-account"]
     runner.store.enter("task", mode=mode, resources={})
     try:
-        with pytest.raises(MaintenanceError):
-            old._worker.run_once(Mock(), ["only-account"])
+        if mode == "import":
+            with pytest.raises(MaintenanceError):
+                old._worker.run_once(Mock(), ["only-account"], pending_events=[])
+        else:
+            result = old._worker.run_once(Mock(), ["only-account"], pending_events=[])
+            assert result['processed'] == 0
+            runner.store.wait_drained("task", 0)
         if mode == "import":
             wait_participants(runner.store, "task", "drain", timeout=3)
             assert runner.service is None and events.count("closed") == 1
