@@ -6,7 +6,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial, wraps
 
 from service.migration.maintenance import MaintenanceError
@@ -170,18 +170,45 @@ class Admission:
                 # pyagfs wraps HTTP rejections but preserves their exception context.
                 # Only definite filesystem rejections are complete; timeouts and
                 # gateway/server errors can still leave remote writes in flight.
-                rejected = (isinstance(exc, NativeAGFSHTTPError) or
+                rejected = (getattr(exc, 'agfs_request_rejected', False) is True or
+                            isinstance(exc, NativeAGFSHTTPError) or
                             (isinstance(exc, AccessDeniedError)
                              and getattr(exc, 'sql_write_not_started', False) is True) or
                             (getattr(exc, 'sql_rollback_confirmed', False) is True) or
                             (isinstance(exc, (AccessDeniedError, ConcurrentModificationError, NodeNotFoundError))
                              and getattr(exc, 'agfs_rejection_settled', False) is True) or
                             (http_rejections and confirmed_rejection(exc)))
+                if http_rejections and rejected:
+                    exc.agfs_request_rejected = True
                 if write and not rejected:
                     self._operation.get().uncertain = True
                 raise
             finally:
                 self._runtime_backend.reset(runtime)
+
+    def bind_child(self, target):
+        """Bind a joined lease worker to its already admitted parent operation."""
+        parent = self._operation.get()
+        if parent is None or parent.owner != self._owner() or not parent.active:
+            raise MaintenanceError('lease worker requires an active parent operation')
+        runtime = self._runtime_backend.get()
+
+        @wraps(target)
+        def run(*args, **kwargs):
+            if not parent.active:
+                raise MaintenanceError('parent operation has ended')
+            child = replace(parent, owner=self._owner())
+            marker = self._operation.set(child)
+            mode = self._runtime_backend.set(runtime)
+            try:
+                return target(*args, **kwargs)
+            finally:
+                with self._lock:
+                    parent.uncertain = parent.uncertain or child.uncertain
+                child.active = False
+                self._runtime_backend.reset(mode)
+                self._operation.reset(marker)
+        return run
 
     def launch(self, target, *, args=(), kwargs=None, name=None, daemon=True):
         """Reserve the child's write permit before it can be delayed by scheduling."""
@@ -299,7 +326,7 @@ class Admission:
             # mkdir and rm issue one HTTP request. In particular write()
             # retries internally: a final rejection cannot settle earlier timeouts.
             from pyagfs.client import AGFSClient
-            single_attempt = isinstance(storage, AGFSClient) and name in {'mkdir', 'rm', 'mv'}
+            single_attempt = isinstance(storage, AGFSClient) and name in {'mkdir', 'rm', 'mv', 'write'}
             if isinstance(storage, AGFSClient) and name == 'write':
                 original_write = function
                 @wraps(original_write)

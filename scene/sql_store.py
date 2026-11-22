@@ -16,7 +16,7 @@ from threading import Lock
 
 from psycopg2.extras import Json
 
-from fs.sql_adapter.pool import PoolAdapterMixin
+from fs.sql_adapter.pool import PoolAdapterMixin, rollback_write
 from fs.sql_adapter.sql_context_fs import SQLContextFS
 from retrieval.owner_scope import expand_owner_space_aliases
 from scene.config import ConfigRevisionConflict, SceneConfig, SceneConfigSnapshot
@@ -155,9 +155,7 @@ class _SQLStore:
             committing = True
             connection.commit()
         except BaseException as exc:
-            connection.rollback()
-            if not committing:
-                exc.sql_rollback_confirmed = True
+            rollback_write(connection, exc, committing=committing)
             raise
         finally:
             self.pool.return_connection(connection)

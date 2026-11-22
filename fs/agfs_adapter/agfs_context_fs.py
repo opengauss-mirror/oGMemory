@@ -1283,8 +1283,12 @@ class AGFSContextFS:
                         ) from exc
                     time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
 
+            renew = self._renew_resource_mutation_lease
+            admission = getattr(self, "_migration_guard", None)
+            if admission is not None:
+                renew = admission.bind_child(renew)
             lease_thread = Thread(
-                target=self._renew_resource_mutation_lease,
+                target=renew,
                 args=(lock_path, owner_token, lease_stop, lease_lost),
                 daemon=True,
             )
@@ -2341,8 +2345,12 @@ class AGFSContextFS:
                     ) from retry_exc
                 lock_acquired = True
 
+            renew = self._renew_update_lease
+            admission = getattr(self, "_migration_guard", None)
+            if admission is not None:
+                renew = admission.bind_child(renew)
             lease_thread = Thread(
-                target=self._renew_update_lease,
+                target=renew,
                 args=(lock_path, token, lease_stop, lease_lost),
                 daemon=True,
             )

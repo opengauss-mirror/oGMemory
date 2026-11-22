@@ -128,6 +128,14 @@ cache:
 
 下表列出每个 YAML 字段对应的环境变量和默认值。
 
+### 迁移协调配置
+
+| YAML 路径 | 环境变量 | 默认值 | 说明 |
+|-----------|---------|-------|------|
+| `storage.migration_workspace` | `OGMEM_MIGRATION_WORKSPACE` | `.ogmemory/migration` | 维护协调状态目录；相对路径按进程工作目录解析。 |
+
+同一实例的 HTTP、MCP 和独立索引进程必须使用同一个可写目录，建议配置绝对路径。
+
 ### LLM 配置
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |

@@ -2328,8 +2328,15 @@ class MemoryService:
             if self._use_sql_metadata:
                 from server.sql_control_plane_store import SQLControlPlaneStore
                 admission = getattr(self, '_admission', None)
-                with admission.backend(write=True, content=False) if admission is not None else nullcontext():
-                    store = SQLControlPlaneStore(pool=self._get_shared_sql_pool())
+                from service.migration.maintenance import MaintenanceError
+                try:
+                    with admission.backend(write=True, content=False) if admission is not None else nullcontext():
+                        store = SQLControlPlaneStore(pool=self._get_shared_sql_pool())
+                except MaintenanceError:
+                    active = admission.store.status() if admission is not None else None
+                    if not active or active['mode'] != 'import':
+                        raise
+                    store = SQLControlPlaneStore(pool=self._get_shared_sql_pool(), initialize_schema=False)
                 if admission is not None:
                     # Control reads remain available; only durable mutations
                     # participate in business write admission.

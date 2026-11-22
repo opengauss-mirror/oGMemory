@@ -536,3 +536,14 @@ class PoolAdapterMixin:
             guard.check_active()
         with conn.cursor() as cur:
             cur.execute("SET LOCAL app.account_id = %s", (account_id,))
+
+
+def rollback_write(connection, error, *, committing):
+    """Confirm rejected writes; retire a session whose rollback cannot be confirmed."""
+    try:
+        connection.rollback()
+    except BaseException:
+        connection.close()
+        raise
+    if not committing:
+        error.sql_rollback_confirmed = True

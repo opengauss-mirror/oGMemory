@@ -243,3 +243,99 @@ def test_sql_control_failure_completion(tmp_path, method, failure, prior_unknown
         with pytest.raises((ValueError, TimeoutError)):
             a.wrap(getattr(store, method), write=True, backend=True)(*arguments[method])
     assert_drain(a, blocked=prior_unknown or failure != 'statement')
+
+
+@pytest.mark.parametrize('lock_kind', ['resource', 'update'])
+def test_joined_lease_renews_during_import(tmp_path, monkeypatch, lock_kind):
+    import threading
+    from core.models import ContextNode
+    import fs.agfs_adapter.agfs_context_fs as module
+
+    a = admission(tmp_path)
+    from fs.agfs_adapter.client import NativeAGFSHTTPError
+    from pyagfs.exceptions import AGFSClientError
+
+    class Client(_AtomicMemoryAGFSClient):
+        def rm(self, path, recursive=False):
+            try:
+                super().rm(path, recursive=recursive)
+            except AGFSClientError as exc:
+                # The synchronous test transport confirms the cleanup target is absent.
+                raise NativeAGFSHTTPError(str(exc), status_code=404) from exc
+
+    client = a.guard(Client())
+    fs = a.guard(AGFSContextFS(client=client, mount_prefix='/local'))
+    ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.MEMBER)
+    uri = 'ctx://acme/users/alice/memories/preferences/x'
+    node = ContextNode(uri=uri, context_type='MEMORY', category='preferences',
+                       owner_space='user:alice', level=2, abstract='memory',
+                       overview='memory', content='before', metadata={'version': 1})
+    if lock_kind == 'update':
+        fs.write_node(node, ctx)
+    renew = '_write_resource_mutation_lease' if lock_kind == 'resource' else '_write_update_lease'
+    monkeypatch.setattr(module, '_RESOURCE_MUTATION_LOCK_RENEW_INTERVAL_SECONDS', .01)
+    monkeypatch.setattr(module, '_UPDATE_LOCK_RENEW_INTERVAL_SECONDS', .01)
+    entered, renewed = threading.Event(), threading.Event()
+    write_lease = getattr(fs, renew)
+
+    def track_renewal(*args):
+        write_lease(*args)
+        if entered.is_set() and threading.current_thread() is not threading.main_thread():
+            renewed.set()
+
+    monkeypatch.setattr(fs, renew, track_renewal)
+
+    def during_mutation():
+        a.store.enter('import', mode='import', resources={})
+        entered.set()
+        assert renewed.wait(2)
+        with pytest.raises(TimeoutError):
+            a.store.wait_drained('import', 0)
+
+    if lock_kind == 'resource':
+        with fs.resource_mutation_lock(uri, ctx) as lease:
+            during_mutation()
+            lease.ensure_owned()
+    else:
+        write_files = fs._write_node_files
+
+        def write_during_maintenance(*args, **kwargs):
+            during_mutation()
+            return write_files(*args, **kwargs)
+
+        monkeypatch.setattr(fs, '_write_node_files', write_during_maintenance)
+        node.content = 'after'
+        node.metadata = {'_expected_version': 1}
+        fs.write_node(node, ctx)
+    a.store.wait_drained('import', 0)
+    a.store.reopen('import')
+    if lock_kind == 'update':
+        assert fs.read_node(uri, ctx).content == 'after'
+
+
+@pytest.mark.parametrize('committing', [False, True])
+@pytest.mark.parametrize('rollback_fails', [False, True])
+def test_sql_rollback_settlement_and_connection_retirement(committing, rollback_fails):
+    from fs.sql_adapter.pool import rollback_write
+    conn = Mock()
+    error = ValueError('write rejected')
+    if rollback_fails:
+        conn.rollback.side_effect = RuntimeError('connection lost')
+        with pytest.raises(RuntimeError, match='connection lost'):
+            rollback_write(conn, error, committing=committing)
+        conn.close.assert_called_once()
+        assert not getattr(error, 'sql_rollback_confirmed', False)
+    else:
+        rollback_write(conn, error, committing=committing)
+        conn.close.assert_not_called()
+        assert getattr(error, 'sql_rollback_confirmed', False) is (not committing)
+
+
+def test_maintenance_error_classification_uses_type():
+    from core.errors import MaintenanceError
+    from core.write_contract import error_fields
+    class DerivedMaintenance(MaintenanceError):
+        pass
+    assert error_fields(DerivedMaintenance())['http_status'] == 503
+    unrelated = type('MaintenanceError', (RuntimeError,), {})
+    assert error_fields(unrelated())['http_status'] == 500

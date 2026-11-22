@@ -608,7 +608,6 @@ class OgMemConfig:
     # -- Storage backend -------------------------------------------------------
     storage_backend: str = "agfs"  # "agfs" | "sql"
     migration_workspace: str = ".ogmemory/migration"
-    migration_asset_root: str | None = None
     sql_dialect: str | None = None  # Shared vector databases are identified at startup when omitted.
     sql_connection_string: str | None = None
     sql_pool_size: int = 5
@@ -2054,7 +2053,6 @@ class OgMemConfig:
             migration_workspace=_resolve(
                 storage.get("migration_workspace"), "OGMEM_MIGRATION_WORKSPACE", ".ogmemory/migration",
             ),
-            migration_asset_root=_resolve(storage.get('migration_asset_root'), 'OGMEM_MIGRATION_ASSET_ROOT', None),
             sql_dialect=_resolve(
                 storage.get("dialect"),
                 "SQL_DIALECT",

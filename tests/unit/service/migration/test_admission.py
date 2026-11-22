@@ -282,7 +282,7 @@ def test_wsgi_garbage_collection_closes_in_original_context(admission):
 
 
 @pytest.mark.parametrize('status', [403, 404, 409, 500, 502, 504])
-@pytest.mark.parametrize('method, verb', [('mkdir', 'post'), ('rm', 'delete')])
+@pytest.mark.parametrize('method, verb', [('mkdir', 'post'), ('rm', 'delete'), ('write', 'put')])
 def test_http_agfs_rejection_admission(admission, monkeypatch, status, method, verb):
     import requests
     from pyagfs import AGFSClient
@@ -294,7 +294,8 @@ def test_http_agfs_rejection_admission(admission, monkeypatch, status, method, v
     response._content = b'{"error":"filesystem rejection"}'
     monkeypatch.setattr(client.session, verb, lambda *args, **kwargs: response)
     with pytest.raises(AGFSClientError):
-        getattr(client, method)('/existing')
+        with admission.backend(write=True):
+            getattr(client, method)('/existing', b'data') if method == 'write' else getattr(client, method)('/existing')
     admission.store.enter('export', mode='export', resources={})
     if status in {403, 404, 409}:
         admission.store.wait_drained('export', 0)

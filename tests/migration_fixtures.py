@@ -1,5 +1,4 @@
 """Shared backend fixtures for migration component tests."""
-from core.models import IndexRecord
 
 class LocalClient:
     def __init__(self, root):
@@ -37,12 +36,3 @@ class LocalClient:
     def rm(self, path, recursive=False):
         import shutil
         shutil.rmtree(self._path(path))
-
-
-
-def record():
-    return IndexRecord(id="original", uri="ctx://a/users/u/memories/preferences/x", level=0,
-                       text="original", filters={"account_id": "a", "owner_space": "user:u"},
-                       metadata={"_embedding": [1., 0., 0.], "embedding_model": "test", "embedding_dimension": 3})
-
-

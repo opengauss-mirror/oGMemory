@@ -11,8 +11,9 @@ from server.memory_service import MemoryService
 from service.migration.admission import Admission, business_wsgi
 from service.migration.maintenance import MaintenanceError, MaintenanceStore
 
-pytestmark = pytest.mark.skipif(not os.environ.get('MIGRATION_TEST_ADMIN_DSN'),
-                                reason='isolated SQL administrator DSN required')
+pytestmark = [pytest.mark.integration,
+              pytest.mark.skipif(not os.environ.get('MIGRATION_TEST_ADMIN_DSN'),
+                                 reason='isolated SQL administrator DSN required')]
 
 
 def test_scene_runtime_configuration_worker_and_resume(tmp_path, monkeypatch):
@@ -137,6 +138,9 @@ def _check_sql_control_plane(service, gate, monkeypatch):
         with pytest.raises(ValueError, match='workspace conflict'):
             store.mutate_code_workspace_sync_state('acme', 'root', reject)
         gate.enter('control-import', mode='import', resources={})
+        service._control_store = service._key_manager = None
+        patch.setattr(SQLControlPlaneStore, '_ensure_table',
+                      lambda self: pytest.fail('maintenance must not initialize SQL schema'))
         assert client.get('/api/v1/admin/accounts', buffered=True).status_code == 200
         assert client.post('/api/v1/admin/accounts/acme/users',
                            json={'user_id': 'another'}, buffered=True).status_code == 503

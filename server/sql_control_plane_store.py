@@ -14,7 +14,7 @@ import threading
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from fs.sql_adapter.pool import PoolAdapterMixin
+from fs.sql_adapter.pool import PoolAdapterMixin, rollback_write
 from server.control_plane_store import CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID
 
 try:
@@ -44,6 +44,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         pool_size: int = 5,
         pool=None,
         dialect: str = "postgresql",
+        initialize_schema: bool = True,
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
@@ -52,7 +53,8 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             )
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._snapshots = threading.local()
-        self._ensure_table()
+        if initialize_schema:
+            self._ensure_table()
 
     # ------------------------------------------------------------------
     # Connection pool: provided by PoolAdapterMixin (bounded standalone
@@ -240,9 +242,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             conn.commit()
             return result
         except BaseException as exc:
-            conn.rollback()
-            if not committing:
-                exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         finally:
             self._return_connection(conn)
@@ -487,9 +487,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             committing = True
             conn.commit()
         except BaseException as exc:
-            conn.rollback()
-            if not committing:
-                exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         finally:
             self._return_connection(conn)
@@ -527,9 +525,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             committing = True
             conn.commit()
         except BaseException as exc:
-            conn.rollback()
-            if not committing:
-                exc.sql_rollback_confirmed = True
+            rollback_write(conn, exc, committing=committing)
             raise
         finally:
             self._return_connection(conn)

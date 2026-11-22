@@ -11,8 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-class MaintenanceError(RuntimeError):
-    pass
+from core.errors import MaintenanceError
 
 
 class MaintenanceStore:
