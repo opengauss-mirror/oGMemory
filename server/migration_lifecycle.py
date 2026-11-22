@@ -25,16 +25,17 @@ class ServiceLifecycle:
         if space_worker is not None:
             service._space_worker = None
         service._outbox_stop.set()
+        service._outbox_wakeup.set()
         if service._outbox_listener is not None:
             service._outbox_listener.stop()
         if not service.stop_skill_sedimentation(timeout=remaining()):
             return False
-        service._extraction_retry.close(remaining())
-        for thread in (service._outbox_thread, service._extraction_retry._thread):
-            if thread is not None:
-                thread.join(remaining())
-                if thread.is_alive():
-                    return False
+        if service._extraction_retry.close(remaining()) is False:
+            return False
+        if service._outbox_thread is not None:
+            service._outbox_thread.join(remaining())
+            if service._outbox_thread.is_alive():
+                return False
         if service._scene_manager is not None:
             self.restart_scene = self.restart_scene or service._scene_manager.running
             if not service._scene_manager.stop(timeout=remaining()):

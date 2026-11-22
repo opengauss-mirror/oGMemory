@@ -156,3 +156,71 @@ def test_fts_must_stop_before_refresh_and_is_discarded(tmp_path):
     assert service._agfs_fts is None
     assert service._read_api is None
     service.shutdown()
+
+
+@pytest.mark.parametrize('task_id', ['agent-turn', 'archive'])
+def test_import_waits_for_retry_execution_threads(tmp_path, monkeypatch, task_id):
+    import threading
+
+    store = MaintenanceStore(tmp_path / 'gate.db', 'retry-threads')
+    service = MemoryService(OgMemConfig(skill_sedimentation_enabled=False), defer_start=True)
+    from unittest.mock import Mock
+    scene = Mock(running=True)
+    service._scene_manager = scene
+    lifecycle = ServiceLifecycle(service, timeout=.05)
+    participant = Participant(store, pause=lifecycle.pause, refresh=lifecycle.refresh,
+                              resume=lambda: None)
+    entered, finish = threading.Event(), threading.Event()
+    def attempt(*args):
+        entered.set()
+        assert finish.wait(3)
+    monkeypatch.setattr(service._extraction_retry, 'run_once', attempt)
+    ctx = RequestContext('acme', 'alice', 'agent', 's', 'retry')
+    service._extraction_retry.wake(ctx, {
+        'id': task_id, 'status': 'queued', 'agent_async': task_id == 'agent-turn',
+    })
+    assert entered.wait(2)
+    with service._extraction_retry._condition:
+        if task_id == 'agent-turn':
+            assert any(thread.is_alive() for thread in service._extraction_retry._agent_threads)
+            assert service._extraction_retry._legacy_thread is None
+        else:
+            assert service._extraction_retry._legacy_thread.is_alive()
+            assert not service._extraction_retry._agent_threads
+    store.enter('restore', mode='import', resources={})
+    try:
+        with pytest.raises(MaintenanceError, match='workers'):
+            participant.step()
+        assert not store.participants_ready('restore', 'drain')
+        scene.stop.assert_not_called()
+        finish.set()
+        assert service._extraction_retry.close(1)
+        store.retry_participants('restore')
+        participant.step()
+        assert store.participants_ready('restore', 'drain')
+    finally:
+        finish.set()
+        service._extraction_retry.close(1)
+        participant.close()
+        service.shutdown()
+
+
+def test_pause_wakes_idle_outbox_worker():
+    import threading
+
+    service = MemoryService(OgMemConfig(skill_sedimentation_enabled=False), defer_start=True)
+    entered = threading.Event()
+    def idle_outbox():
+        entered.set()
+        service._outbox_wakeup.wait(3)
+    thread = threading.Thread(target=idle_outbox)
+    service._outbox_thread = thread
+    thread.start()
+    assert entered.wait(1)
+    try:
+        assert ServiceLifecycle(service, timeout=.2).pause()
+        assert not thread.is_alive()
+    finally:
+        service._outbox_wakeup.set()
+        thread.join(1)
+        service.shutdown()
