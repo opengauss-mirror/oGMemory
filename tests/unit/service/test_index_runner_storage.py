@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -58,18 +58,40 @@ def test_agfs_runner_keeps_configured_mount_and_outbox(transport, mode, provider
     assert result == (fs.return_value, outbox.return_value, None)
 
 
-@pytest.mark.parametrize("transport", ["http", "native"])
-def test_migration_uses_configured_transport(transport):
-    from service.migration.storage import AGFSStorage
-    cfg = SimpleNamespace(agfs_transport=transport, agfs_mount_prefix="/memory")
-    with patch("fs.agfs_adapter.client.create_agfs_client") as client:
-        storage = AGFSStorage(cfg)
-    client.assert_called_once_with(cfg)
-    assert storage.client is client.return_value
+@pytest.mark.parametrize("close_error", [False, True])
+def test_shared_runner_closes_client_if_bridge_initialization_fails(monkeypatch, close_error):
+    from scripts.run_index_service import _create_storage
+    pool, client = MagicMock(), MagicMock()
+    if close_error:
+        client.close.side_effect = RuntimeError("client close failed")
+    monkeypatch.setattr('fs.sql_adapter.pool.SharedConnectionPool', lambda *a, **kw: pool)
+    monkeypatch.setattr('fs.agfs_adapter.client.create_agfs_client', lambda cfg: client)
+    def fail(*a, **kw):
+        raise RuntimeError('bridge schema/init failed')
+    monkeypatch.setattr('fs.agfs_adapter.space_bridge.AGFSSpaceBridge', fail)
+    cfg = SimpleNamespace(storage_backend='agfs', shared_spaces_enabled=True,
+                          sql_connection_string='test', sql_pool_size=1,
+                          sql_dialect='opengauss', agfs_mount_prefix='/local')
+    with pytest.raises(RuntimeError):
+        _create_storage(cfg)
+    pool.close_all.assert_called_once()
+    client.close.assert_called_once()
 
 
-def test_migration_preserves_injected_client():
-    from service.migration.storage import AGFSStorage
-    client = SimpleNamespace()
-    storage = AGFSStorage(SimpleNamespace(agfs_mount_prefix="/memory"), client=client)
-    assert storage.client is client
+
+def test_shared_runner_registers_bridge_as_only_owner_of_stage_pool(monkeypatch):
+    pool, client, bridge = Mock(), Mock(), Mock()
+    monkeypatch.setattr('fs.sql_adapter.pool.SharedConnectionPool', lambda *a, **kw: pool)
+    monkeypatch.setattr('fs.agfs_adapter.client.create_agfs_client', lambda cfg: client)
+    monkeypatch.setattr('fs.agfs_adapter.space_bridge.AGFSSpaceBridge', lambda *a: bridge)
+    monkeypatch.setattr('commit.sql_outbox_store.SQLOutboxStore', lambda **kw: object())
+    cfg = SimpleNamespace(storage_backend='agfs', shared_spaces_enabled=True,
+                          sql_connection_string='test', sql_pool_size=1,
+                          sql_dialect='opengauss', agfs_mount_prefix='/local')
+    registered = []
+    guard = Mock()
+
+    _create_storage(cfg, remember=registered.append, guard=guard)
+
+    assert registered == [pool, client, bridge]
+    guard.assert_called_once_with(client)
