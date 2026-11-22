@@ -24,7 +24,8 @@ from core.vector_math import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
-_RECORD_FILTER_FIELDS = ("account_id", "owner_space", "category", "context_type", "resource_type")
+_RECORD_FILTER_FIELDS = ("account_id", "owner_space", "category", "context_type", "resource_type",
+                         "space_key", "authorization_resource_id", "content_rev", "state")
 
 DEFAULT_CHROMA_BATCH_SIZE = 5_000
 _CHROMA_LOCKS: dict[str, threading.RLock] = {}
@@ -385,7 +386,7 @@ class ChromaVectorIndex(VectorIndex):
                     conditions.append({key: {"$in": expected}})
                 else:
                     conditions.append({key: expected})
-            elif key in ("context_type", "category", "record_kind", "representation_version",
+            elif key in (*_RECORD_FILTER_FIELDS, "record_kind", "representation_version",
                          "embedding_model", "embedding_dimension", "memory_revision", "canonical_revision"):
                 if isinstance(expected, list):
                     conditions.append({key: {"$in": expected}})
@@ -434,6 +435,16 @@ class ChromaVectorIndex(VectorIndex):
         with self._locked():
             close()
 
+    def migration_identity(self) -> dict:
+        if not callable(getattr(self._client, "close", None)):
+            raise ValueError("online migration requires a Chroma client with close() support")
+        # Resolve by name again, rather than trusting the cached collection ID.
+        # Deleting/recreating the same named collection must invalidate recovery.
+        with self._locked():
+            collection = self._client.get_collection(self._collection.name)
+            return {"backend": "chroma", "directory": str(Path(self._persist_directory).resolve()),
+                    "collection": collection.name, "collection_id": str(collection.id),
+                    "dimension": self._dimension}
 
     def check_migration_target(self) -> None:
         with self._locked():
@@ -465,15 +476,42 @@ class ChromaVectorIndex(VectorIndex):
         if not record_id:
             return None
         result = self._collection.get(
-            ids=[record_id], include=["documents", "metadatas", "embeddings"]
+            ids=[record_id],
+            include=["documents", "metadatas", "embeddings"],
         )
         ids = (result or {}).get("ids") or []
         if not ids:
             return None
-        meta = ((result.get("metadatas") or [{}])[0]) or {}
-        doc = ((result.get("documents") or [""])[0]) or ""
+        return self._result_record(result, 0)
+
+    def iter_records(self, batch_size: int = 256):
+        """Read logical records for an internal shadow copy, including vectors.
+
+        The caller must hold a write barrier or discard the copy if the
+        instance revision changes. This iterator is not a snapshot boundary.
+        """
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        offset = 0
+        while True:
+            result = self._collection.get(
+                limit=batch_size, offset=offset,
+                include=["documents", "metadatas", "embeddings"],
+            )
+            ids = result.get("ids") or []
+            if not ids:
+                return
+            for position in range(len(ids)):
+                yield self._result_record(result, position)
+            offset += len(ids)
+
+    @staticmethod
+    def _result_record(result, position):
+        metadatas, documents = result.get("metadatas"), result.get("documents")
+        meta = (metadatas[position] if metadatas else None) or {}
+        doc = (documents[position] if documents else None) or ""
         embeddings = result.get("embeddings")
-        emb = embeddings[0] if embeddings is not None and len(embeddings) else []
+        emb = embeddings[position] if embeddings is not None and len(embeddings) else []
         # Restore the same filter contract used by record builders and migration
         # verification, including optional resource scope when present.
         filters = {
@@ -487,7 +525,7 @@ class ChromaVectorIndex(VectorIndex):
         if len(emb) and "_embedding" not in metadata:
             metadata["_embedding"] = [float(x) for x in emb]
         return IndexRecord(
-            id=str(ids[0]),
+            id=str(result["ids"][position]),
             uri=str(meta.get("uri", "")),
             level=int(meta.get("level", 2)),
             text=doc,

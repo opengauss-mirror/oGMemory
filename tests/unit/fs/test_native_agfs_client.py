@@ -65,6 +65,28 @@ def test_native_crud_binary_unicode_and_concurrency(native):
     assert client.stat(mount + "/empty")["isDir"]
 
 
+def test_native_stream_writes_binary_empty_and_truncates(native):
+    from io import BytesIO
+
+    client, mount, _ = native
+    root = mount + "/business"
+    client.mkdir(root)
+    payload = bytes(range(256)) * 9000
+
+    class BoundedStream(BytesIO):
+        def read(self, size=-1):
+            assert 0 < size <= 1024 * 1024
+            return super().read(size)
+
+    client.write_stream(root + "/binary", BoundedStream(payload))
+    assert client.read(root + "/binary") == payload
+    client.write_stream(root + "/empty", BytesIO(b""))
+    assert client.read(root + "/empty") == b""
+    client.write_stream(root + "/binary", BytesIO(b"short"))
+    assert client.read(root + "/binary") == b"short"
+    client.write_stream(root + "/binary", BytesIO(b""))
+    assert client.read(root + "/binary") == b""
+    assert {entry["name"] for entry in client.ls(root)} == {"binary", "empty"}
 
 
 def test_native_rejected_create_does_not_block_snapshot(native, tmp_path):
