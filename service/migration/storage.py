@@ -356,6 +356,11 @@ class AGFSStorage:
 
     def _walk(self, path, *, include_runtime=False):
         entries = self._ls(path)
+        if getattr(self, 'content_snapshot', False) and not include_runtime:
+            # A request may hold an identity lease while computing. Content
+            # writes have their own permits; lease files are outside the package.
+            entries = [e for e in entries if not (e.get('isDir') and re.fullmatch(
+                r'\..+\.resource-mutation-lock(?:-[0-9a-f]{32})?', str(e['name'])))]
         names = {e["name"] for e in entries}
         if any(not isinstance(n, str) or n in {".", ".."} or "/" in n or "\\" in n for n in names):
             raise PackageError("invalid AGFS directory entry")
@@ -398,6 +403,8 @@ class AGFSStorage:
                 yield from self._walk(path + "/" + name, include_runtime=include_runtime)
 
     def _check_outbox(self, path):
+        if getattr(self, 'content_snapshot', False):
+            return  # Queue state can change while a content-only snapshot is read.
         for e in self._ls(path):
             if e.get("isDir"):
                 raise PackageError("outbox contains recovery/dead-letter state")
