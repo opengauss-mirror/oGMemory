@@ -33,8 +33,7 @@ _SCOPE_FIELDS = (
     "video_id",
     "extractor_type",
 )
-_SHARED_FILTERS = {"space_key", "authorization_resource_id", "content_rev", "state"}
-_JSON_FILTERS = {"node_status", "extracted_node_id", "clip_id"} | _SHARED_FILTERS
+_JSON_FILTERS = {"node_status", "extracted_node_id", "clip_id"}
 _BATCH_SIZE = 32
 _URI_BATCH_SIZE = 128
 _QUERY_PAGE_SIZE = 256
@@ -63,8 +62,6 @@ class MilvusVectorIndex(VectorIndex):
         self._dimension = dimension
         self._timeout = timeout
         self._collection_name = collection_name
-        self._migration_database = db_name
-        self._migration_endpoint = uri
         self._client = MilvusClient(uri=uri, token=token or "", db_name=db_name, timeout=timeout)
         try:
             if not self._rpc("has_collection", collection_name=collection_name):
@@ -280,7 +277,6 @@ class MilvusVectorIndex(VectorIndex):
                 "abstract": record.text[:200],
                 **{key: value for key, value in record.metadata.items() if key != "_embedding"},
             }
-            metadata.update({key: record.filters[key] for key in _SHARED_FILTERS if key in record.filters})
             row: dict[str, Any] = {
                 key: str(record.filters.get(key, metadata.get(key, "")) or "")
                 for key in _SCOPE_FIELDS
@@ -622,29 +618,14 @@ class MilvusVectorIndex(VectorIndex):
             if heads.get(key) == row["id"]:
                 yield row
 
-    def migration_identity(self) -> dict:
-        from urllib.parse import urlsplit
-
-        endpoint = urlsplit(self._migration_endpoint)
-        if endpoint.scheme not in {"http", "https"} or not endpoint.hostname:
-            raise ValueError("migration requires an identified Milvus server")
-        description = self._rpc("describe_collection", collection_name=self._collection_name)
-        collection_id = description.get("collection_id")
-        if collection_id is None:
-            raise ValueError("Milvus did not report its collection identity")
-        return {"backend": "milvus", "scheme": endpoint.scheme, "server": endpoint.hostname,
-                "port": endpoint.port or (443 if endpoint.scheme == "https" else 80),
-                "database": self._migration_database, "collection": self._collection_name,
-                "collection_id": str(collection_id), "dimension": self._dimension}
-
-    def check_migration_target(self, *, empty=True, include_embedding=True) -> None:
+    def check_migration_target(self) -> None:
         from pymilvus import DataType
 
         self._validate_schema(DataType)
-        if empty and self.count():
+        if self.count():
             raise ValueError("target vector index is not empty")
 
-    def get_record(self, record_id: str, *, include_embedding: bool = True) -> IndexRecord | None:
+    def get_record(self, record_id: str) -> IndexRecord | None:
         if not record_id:
             return None
         deadline = time.monotonic() + self._timeout
@@ -663,18 +644,8 @@ class MilvusVectorIndex(VectorIndex):
                 break
             if time.monotonic() >= deadline:
                 raise TimeoutError("Milvus record changed throughout the lookup")
-        return self._row_to_record(rows[0], record_id)
-
-    def iter_records(self, batch_size: int = 256):
-        """Read only visible logical records; caller must validate the revision."""
-        if type(batch_size) is not int or not 1 <= batch_size <= 16384:
-            raise ValueError("batch_size must be between 1 and 16384")
-        for row in self._visible_rows({}, ["*"], page_size=batch_size):
-            yield self._row_to_record(row, row.get("logical_id") or row["id"])
-
-    def _row_to_record(self, row, record_id):
+        row = rows[0]
         scope = {key: row.get(key, "") for key in _SCOPE_FIELDS}
-        scope.update({key: row['metadata'][key] for key in _SHARED_FILTERS if key in row['metadata']})
         return IndexRecord(
             id=record_id,
             uri=row["uri"],

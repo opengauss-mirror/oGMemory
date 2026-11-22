@@ -1,12 +1,9 @@
-"""Fix a source inventory while registered business writers are paused."""
+"""Fix persisted content while readers, model work and index projections continue."""
 import time
 from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import UTC, datetime
 
 from service.migration.maintenance import MaintenanceError
-
-sql_snapshot_deadline = ContextVar('sql_snapshot_deadline', default=None)
 
 
 class SourceSnapshot:
@@ -29,17 +26,13 @@ class SourceSnapshot:
                     raise TimeoutError('source snapshot exceeded its write-pause budget')
 
             try:
-                self.gate.wait_drained(self.task, self.timeout)
+                self.gate.wait_drained(self.task, max(0, deadline - time.monotonic()))
                 self.timestamp = datetime.now(UTC).isoformat()
                 check()
                 from core.operation_deadline import operation_deadline
                 with operation_deadline(deadline - time.monotonic()):
-                    token = sql_snapshot_deadline.set(deadline)
-                    try:
-                        yield check
-                        check()
-                    finally:
-                        sql_snapshot_deadline.reset(token)
+                    yield check
+                    check()
             finally:
                 # Export performs no business writes. Even an unsuccessful drain
                 # can release this write barrier without clearing source data.

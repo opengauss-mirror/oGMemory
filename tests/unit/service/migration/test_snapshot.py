@@ -14,20 +14,142 @@ def test_snapshot_readers_continue_and_writes_resume(tmp_path):
         with other.scope():
             pass
         with pytest.raises(MaintenanceError):
-            with other.scope(write=True):
+            with other.content_scope():
                 pass
         assert snapshot.timestamp
-    with other.scope(write=True):
+    with other.content_scope():
         pass
 
 
 def test_snapshot_timeout_reopens_source_without_changing_writer(tmp_path):
     gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
     admission = Admission(gate)
-    with admission.scope(write=True):
+    with admission.content_scope():
         with pytest.raises(TimeoutError):
             with SourceSnapshot(gate, 'export', timeout=0).scope():
                 pytest.fail('unfinished writer cannot be snapshotted')
         assert gate.status() is None
-    with admission.scope(write=True):
+    with admission.content_scope():
         pass
+
+
+def test_snapshot_does_not_wait_for_request_after_persistence(tmp_path):
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
+    admission = Admission(gate)
+    with admission.scope(write=True):
+        with admission.backend(write=True):
+            pass
+        # The enclosing request can still calculate or stream its response.
+        with SourceSnapshot(gate, 'snapshot').scope():
+            with admission.backend(write=True, content=False):
+                pass  # Index projection can continue.
+            with pytest.raises(MaintenanceError), admission.backend(write=True):
+                pass
+        gate.enter('import', mode='import', resources={})
+        with pytest.raises(TimeoutError):
+            gate.wait_drained('import', 0)
+    gate.reopen('import')
+
+
+def test_snapshot_waits_for_whole_content_mutation_then_reopens(tmp_path):
+    import threading
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
+    admission = Admission(gate)
+    started, finish = threading.Event(), threading.Event()
+    def write():
+        with admission.content_scope():
+            with admission.backend(write=True):
+                started.set()
+                assert finish.wait(2)
+            with admission.backend(write=True):
+                pass  # Completing an admitted mutation remains permitted.
+    thread = threading.Thread(target=write)
+    thread.start()
+    assert started.wait(2)
+    try:
+        with pytest.raises(TimeoutError), SourceSnapshot(gate, 'slow', timeout=.02).scope():
+            pytest.fail('content mutation has not finished')
+        assert gate.status() is None
+    finally:
+        finish.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    with SourceSnapshot(gate, 'complete').scope():
+        pass
+
+
+def test_runtime_and_projection_writes_do_not_block_snapshot(tmp_path):
+    from fs.agfs_adapter.client import NativeAGFSClient
+    from service.migration.admission import _content_path
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
+    admission = Admission(gate)
+    client = object.__new__(NativeAGFSClient)
+    # Preserve concrete transport type, replace actual I/O in this policy test.
+    from types import MethodType
+    client.write = MethodType(lambda self, path, data: None, client)
+    admission.guard(client)
+    with SourceSnapshot(gate, 'runtime').scope():
+        with admission.backend(write=True, content=False):
+            client.write('/local/accounts/acme/users/u/memories/x/.outbox/e.json', b'{}')
+        client.write('/local/accounts/acme/sessions/s/state/content.md', b'{}')
+        with pytest.raises(MaintenanceError):
+            client.write('/local/accounts/acme/users/u/memories/x/content.md', b'changed')
+    assert not _content_path('/local/accounts/acme/sessions/s/state/content.md')
+    assert _content_path('/local/accounts/acme/sessions/s/history/a/content.md')
+
+
+@pytest.mark.parametrize('name', ['_system', '.outbox', '.foo-lock', 'traces', 'tool-results'])
+def test_business_names_do_not_bypass_content_barrier(tmp_path, name):
+    from service.migration.admission import _content_path
+    assert _content_path(f'/local/accounts/acme/users/alice/memories/preferences/{name}/content.md')
+
+
+def test_keyword_move_destination_is_checked(tmp_path):
+    from types import MethodType
+    from fs.agfs_adapter.client import NativeAGFSClient
+    client = object.__new__(NativeAGFSClient)
+    calls = []
+    client.mv = MethodType(lambda self, source, destination: calls.append(destination), client)
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'move')
+    Admission(gate).guard(client)
+    with SourceSnapshot(gate, 'snapshot').scope():
+        with pytest.raises(MaintenanceError):
+            client.mv('/local/accounts/acme/sessions/s/state/file',
+                      destination='/local/accounts/acme/users/alice/memories/preferences/x/content.md')
+    assert calls == []
+
+
+def test_runtime_to_content_move_requires_content_permit():
+    from service.migration.admission import _content_arguments
+    assert _content_arguments('ctx://acme/sessions/s/state',
+                              'ctx://acme/users/alice/memories/preferences/x')
+
+
+@pytest.mark.parametrize('failure', ['statement', 'commit'])
+def test_shared_transaction_preserves_unknown_commit(tmp_path, failure):
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+    from server.space_repository import SpaceRepository
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'space')
+    repo = object.__new__(SpaceRepository)
+    repo._migration_admission = Admission(gate)
+    conn = Mock()
+    conn.cursor.return_value = nullcontext(Mock())
+    repo.pool = Mock(get_connection=Mock(return_value=conn))
+    if failure == 'commit':
+        conn.commit.side_effect = TimeoutError('commit confirmation lost')
+    with pytest.raises((ValueError, TimeoutError)):
+        with repo.transaction('acme'):
+            if failure == 'statement':
+                raise ValueError('rejected')
+    gate.enter('snapshot', mode='export', resources={})
+    if failure == 'commit':
+        with pytest.raises(TimeoutError):
+            gate.wait_drained('snapshot', 0)
+    else:
+        gate.wait_drained('snapshot', 0)
+
+
+def test_normalized_transport_path_cannot_escape_runtime():
+    from service.migration.admission import _content_path
+    assert _content_path('/local/accounts/acme/_system/../users/alice/memories/preferences/x/content.md')

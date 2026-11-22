@@ -161,25 +161,6 @@ class NativeAGFSClient:
     def write(self, path, data):
         return self._file_op("Write", path, data, len(data))["message"]
 
-    def write_stream(self, path, stream):
-        """Restore a file through the C ABI with bounded transfer buffers."""
-        write = getattr(self.lib, "AGFS_WriteChunk", None)
-        if write is None:
-            raise AGFSClientError("native AGFS library requires WriteChunk for migration recovery")
-        write.argtypes = [c.c_int64, c.c_char_p, c.c_void_p, c.c_int64, c.c_int64, c.c_int]
-        write.restype = c.c_void_p
-        with self._volume_lock(path, shared=False):
-            offset = 0
-            while True:
-                chunk = stream.read(1024 * 1024)
-                value = json.loads(self._string(write(self.id, path.encode(), chunk, len(chunk), offset, int(offset == 0))))
-                if 'error_id' in value:
-                    self._error(value['error_id'])
-                if value.get('bytes_written') != len(chunk):
-                    raise AGFSClientError('incomplete AGFS recovery write')
-                offset += len(chunk)
-                if not chunk:
-                    break
 
     def create(self, path):
         return self._json("Create", path.encode())
