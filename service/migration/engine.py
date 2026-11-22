@@ -209,6 +209,7 @@ class MigrationService:
         with tempfile.TemporaryDirectory(dir=destination.parent) as tmp, ExitStack() as lifetime:
             assets = Assets(self.asset_root, tmp)
             with self.snapshot_scope() as check_snapshot, self.adapter_factory(self.cfg) as adapter:
+                adapter.content_snapshot = callable(check_snapshot)
                 adapter.check()
                 progress(phase="snapshotting")
                 source_backend = adapter.backend
@@ -220,9 +221,11 @@ class MigrationService:
                             check_snapshot()
                         yield assets.capture(record) if kind == "nodes" else record
 
-                inv = lifetime.enter_context(inventory(Path(tmp) / "source.sqlite", read))
+                inv = lifetime.enter_context(inventory(Path(tmp) / "source.sqlite", read,
+                                                       validate_references=False))
             # All records and attachment bytes are fixed. Release the source write
             # barrier before compression; later source changes are not included.
+            inv.finish()
             if environment["embedding"]["provider"] == "st":
                 environment["embedding"]["dimension"] = model_dimension(self.cfg, "st")
             progress(phase="exporting", counts=inv.summary())

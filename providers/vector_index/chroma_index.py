@@ -453,7 +453,17 @@ class ChromaVectorIndex(VectorIndex):
             # Fetch the persisted collection constraint, not this client's cached
             # model or HNSW reader (another process may have indexed new rows).
             try:
-                dimension = self._client.get_collection(self._collection.name).get_model().dimension
+                collection = self._client.get_collection(self._collection.name)
+                get_model = getattr(collection, "get_model", None)
+                if not callable(get_model):
+                    if not include_embedding:
+                        raise ValueError("Chroma SDK lacks metadata-only dimension validation; upgrade chromadb")
+                    # Older SDKs support the offline contract through a query.
+                    # Use the freshly fetched collection, not a stale handle.
+                    collection.query(query_embeddings=[[0.0] * self._dimension],
+                                     n_results=1, include=["distances"])
+                    return
+                dimension = get_model().dimension
             except Exception as exc:
                 raise ValueError("target Chroma index dimension could not be validated") from exc
             if ((dimension is None and self._collection.count()) or

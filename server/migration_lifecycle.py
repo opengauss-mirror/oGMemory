@@ -11,6 +11,7 @@ class ServiceLifecycle:
         self.timeout = timeout
         self.restart_outbox = False
         self.restart_code_sync = False
+        self.restart_scene = False
 
     def pause(self):
         service = self.service
@@ -34,7 +35,12 @@ class ServiceLifecycle:
                 thread.join(remaining())
                 if thread.is_alive():
                     return False
-        if service._scene_manager is not None and not service._scene_manager.stop(timeout=remaining()):
+        if service._scene_manager is not None:
+            self.restart_scene = self.restart_scene or service._scene_manager.running
+            if not service._scene_manager.stop(timeout=remaining()):
+                return False
+        scene_index = getattr(service._scene_source, 'candidate_index', None)
+        if scene_index is not None and not scene_index.close(timeout=remaining()):
             return False
         if service._code_workspace_sync_service is not None:
             sync = service._code_workspace_sync_service
@@ -146,6 +152,10 @@ class ServiceLifecycle:
         if self.restart_code_sync:
             service._get_code_workspace_sync_service().start()
             self.restart_code_sync = False
+        if self.restart_scene:
+            service._ensure_scene_runtime()
+            service._scene_manager.start()
+            self.restart_scene = False
         if self.restart_outbox:
             service._start_outbox_worker()
         self.restart_outbox = False
