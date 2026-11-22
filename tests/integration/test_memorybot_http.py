@@ -230,6 +230,9 @@ def test_http_schedule_template_and_web_result_flow(client):
     )
     assert resumed.json["data"]["state"] == "active"
     assert resumed.json["data"]["task_input"]["delivery"]["channel"] == "web"
+    deliveries = http.get("/api/v1/bot/deliveries?state=sent", headers=headers("deliveries"))
+    assert deliveries.status_code == 200
+    assert deliveries.json["data"] == {"items": [], "next_cursor": None}
 
 
 def test_http_completed_events_drain_all_batches_and_resume(client):

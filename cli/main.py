@@ -218,6 +218,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_migration.add_argument("--host", default="127.0.0.1")
     p_migration.add_argument("--port", type=int, default=8091)
 
+    from cli.bot import register_parser
+
+    register_parser(sub)
+
     return parser
 
 
@@ -278,6 +282,10 @@ def main(argv: list[str] | None = None) -> int:
         return run(args)
     elif cmd == "skill":
         from cli.commands.skill import run
+        return run(args)
+    elif cmd == "bot":
+        from cli.bot import run
+
         return run(args)
     else:
         parser.print_help()
