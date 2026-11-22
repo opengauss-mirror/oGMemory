@@ -71,7 +71,8 @@ def test_full_service_control_reads_during_import(tmp_path, monkeypatch):
         service.shutdown()
 
 
-def test_export_write_denial_returns_maintenance_response(tmp_path, monkeypatch):
+@pytest.mark.parametrize('mode', ['export', 'import'])
+def test_write_denial_returns_maintenance_response(tmp_path, monkeypatch, mode):
     import server.app as app_module
     import server.mcp_tools as tools
     from service.migration.admission import business_wsgi
@@ -86,12 +87,13 @@ def test_export_write_denial_returns_maintenance_response(tmp_path, monkeypatch)
             pytest.fail('write must not start')
     monkeypatch.setattr(tools, 'delete_memory', delete)
     monkeypatch.setattr(app_module.app, 'wsgi_app', business_wsgi(app_module.app.wsgi_app, lambda: service))
-    admission.store.enter('export', mode='export', resources={})
+    admission.store.enter('task', mode=mode, resources={})
     result = app_module.app.test_client().post('/api/v1/memories/delete', json={'uri': 'ogmemory://memories/preference/x'})
     assert result.status_code == 503
     assert result.json['error'] == 'migration_maintenance'
+    assert result.json['retryable'] is True
     assert result.headers['Retry-After'] == '5'
-    admission.store.wait_drained('export', 0)
+    admission.store.wait_drained('task', 0)
     with app_module.app.app_context():
         response, status = app_module._lifecycle_error_response(MaintenanceError('paused'), {})
         assert status == 503 and response.headers['Retry-After'] == '5'

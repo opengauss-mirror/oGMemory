@@ -34,7 +34,7 @@ configure_third_party_loggers()
 logger = logging.getLogger("index-service")
 
 
-def _create_storage(cfg, *, invalidate_lexical_scopes=None):
+def _create_storage(cfg, *, invalidate_lexical_scopes=None, remember=None, guard=None):
     """Use the same storage backend as the API, not an unrelated AGFS outbox."""
     if cfg.storage_backend == "sql" or cfg.shared_spaces_enabled:
         from commit.sql_outbox_store import SQLOutboxStore
@@ -57,7 +57,7 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None):
                 fs = AGFSSpaceBridge(pool, client, cfg.agfs_mount_prefix)
             else:
                 fs = SQLContextFS(pool=pool)
-            return fs, SQLOutboxStore(pool=pool, fs=fs), pool
+            outbox = SQLOutboxStore(pool=pool, fs=fs)
         except BaseException:
             try:
                 close = getattr(fs, 'close', None)
@@ -71,6 +71,14 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None):
                 finally:
                     pool.close_all()
             raise
+        if remember is not None:
+            remember(pool)
+            if client is not None:
+                remember(client)
+                remember(fs)
+        if guard is not None and client is not None:
+            guard(client)
+        return fs, outbox, pool
 
     from commit.outbox_store import OutboxStore
     from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
@@ -79,13 +87,18 @@ def _create_storage(cfg, *, invalidate_lexical_scopes=None):
     client = create_agfs_client(cfg)
     try:
         fs = AGFSContextFS(client=client, mount_prefix=cfg.agfs_mount_prefix)
-        return fs, OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix,
-                               invalidate_lexical_scopes=invalidate_lexical_scopes), None
+        outbox = OutboxStore(client=client, fs=fs, mount_prefix=cfg.agfs_mount_prefix,
+                             invalidate_lexical_scopes=invalidate_lexical_scopes)
     except BaseException:
         close = getattr(client, 'close', None)
         if callable(close):
             close()
         raise
+    if remember is not None:
+        remember(client)
+    if guard is not None:
+        guard(client)
+    return fs, outbox, None
 
 
 def _build_service(cfg, admission):
@@ -94,8 +107,8 @@ def _build_service(cfg, admission):
     from service.index_service import IndexService
 
     closers = []
-    def remember(obj, *, vector=False):
-        close = (getattr(obj, 'release_for_migration', None) if vector else None)
+    def remember(obj, *, migration=False):
+        close = (getattr(obj, 'release_for_migration', None) if migration else None)
         close = close or getattr(obj, 'close_all', None) or getattr(obj, 'close', None)
         if callable(close):
             closers.append(close)
@@ -109,26 +122,23 @@ def _build_service(cfg, admission):
     try:
         provider_cfg = ProviderConfig.from_ogmem_config(cfg)
         embedder = vector_index = None
+        vector_cleanup = len(closers)
         if not cfg.agfs_retrieval_enabled:
             embedder = remember(provider_cfg.create_embedder())
-            vector_index = admission.guard(remember(provider_cfg.create_vector_index(), vector=True))
+            vector_cleanup = len(closers)
+            vector_index = admission.guard(remember(provider_cfg.create_vector_index(), migration=True))
         from providers.composite_index import create_projection_writer
         projection = create_projection_writer(cfg, vector_index)
         if projection is not vector_index:
-            remember(projection)
+            if callable(getattr(projection, "release_for_migration", None)):
+                del closers[vector_cleanup:]  # The composite owns the vector client.
+            remember(projection, migration=True)
             admission.guard(projection.lexical_index)
             admission.guard(projection)
         lexical = getattr(projection, 'lexical_index', None)
         fs, outbox_store, storage_pool = _create_storage(
-            cfg, invalidate_lexical_scopes=lexical.mark_scopes_dirty if lexical is not None else None)
-        if storage_pool is not None:
-            remember(storage_pool)
-        else:
-            admission.guard(remember(fs._client))
-        if cfg.shared_spaces_enabled and cfg.storage_backend == 'agfs':
-            remember(fs._stage_pool)
-            admission.guard(remember(fs._agfs._client))
-            remember(fs)
+            cfg, remember=remember, guard=admission.guard,
+            invalidate_lexical_scopes=lexical.mark_scopes_dirty if lexical is not None else None)
         fs = admission.guard(fs)
         outbox_store = admission.guard(outbox_store)
         llm = remember(provider_cfg.create_llm())
@@ -161,7 +171,7 @@ class CoordinatedIndexRunner:
     def __init__(self, cfg, *, build_service=_build_service):
         from pathlib import Path
 
-        from service.migration.maintenance import MaintenanceError, MaintenanceStore
+        from service.migration.maintenance import MaintenanceStore
         from service.migration.participants import Participant
 
         self.cfg, self.build_service = cfg, build_service
@@ -171,15 +181,7 @@ class CoordinatedIndexRunner:
         self.participant = Participant(self.store, pause=self.pause, refresh=self.refresh, resume=self.resume)
         self.admission = self.participant.admission
         try:
-            try:
-                with self.admission.scope(write=True):
-                    self.resume()
-                self.participant._paused = False
-            except MaintenanceError:
-                if self.store.status() is None:
-                    raise
-                self.participant._paused = True
-            self.participant.start()
+            self.participant.start_service()
         except BaseException:
             self.participant.close()
             raise
@@ -213,25 +215,9 @@ class CoordinatedIndexRunner:
         return service.get_aggregated_stats() if service is not None else {}
 
     def close(self, timeout=30):
-        from service.migration.maintenance import MaintenanceError
-        p = self.participant
-        try:
-            with self.admission.scope(write=True, _shutdown=True):
-                p.stop.set()
-                if p._thread is not None:
-                    p._thread.join(timeout)
-                    if p._thread.is_alive():
-                        raise MaintenanceError('index lifecycle callback is still running')
-                with self.admission._lock:
-                    self.admission._closing = True
-                self.pause()
-        except BaseException:
-            p.stop.clear()
-            if p._thread is not None and not p._thread.is_alive():
-                p._thread = None
-                p.start()
-            raise
-        p.close()
+        with self.participant.shutdown_scope(timeout):
+            self.pause()
+        self.participant.close()
 
 
 def main():

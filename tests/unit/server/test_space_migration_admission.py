@@ -36,10 +36,11 @@ def test_import_blocks_space_reads_before_opening_connection(repository):
     repository.pool.get_connection.assert_not_called()
 
 
+@pytest.mark.parametrize('mode', ['export', 'import'])
 @pytest.mark.parametrize('failure_stage', ['statement', 'commit'])
 @pytest.mark.parametrize('rollback_fails', [False, True])
 @pytest.mark.parametrize('error_type', [RuntimeError, KeyboardInterrupt, SystemExit])
-def test_sql_completion_requires_confirmed_rollback(repository, rollback_fails, error_type, failure_stage):
+def test_sql_completion_requires_confirmed_rollback(repository, rollback_fails, error_type, failure_stage, mode):
     conn = repository.pool.get_connection.return_value
     if failure_stage == 'commit':
         conn.commit.side_effect = error_type('commit response lost')
@@ -56,7 +57,7 @@ def test_sql_completion_requires_confirmed_rollback(repository, rollback_fails, 
     else:
         repository.pool.discard_connection.assert_not_called()
     gate = repository._migration_admission.store
-    gate.enter('restore', mode='import', resources={})
+    gate.enter('restore', mode=mode, resources={})
     if rollback_fails or failure_stage == 'commit':
         with pytest.raises(TimeoutError):
             gate.wait_drained('restore', 0)

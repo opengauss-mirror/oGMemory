@@ -149,7 +149,14 @@ class CompositeProjectionWriter:
                 raise
             return lexical_count if count is None else count
 
+    def release_for_migration(self, timeout: float = 5.0) -> bool:
+        """Release the projections and any migration-specific vector SDK cache."""
+        return self._close(timeout, migration=True)
+
     def close(self, timeout: float = 5.0) -> bool:
+        return self._close(timeout)
+
+    def _close(self, timeout, *, migration=False):
         if self._closed:
             return True
         acquired = self._projection_lock.acquire(timeout=max(0.0, timeout))
@@ -157,7 +164,7 @@ class CompositeProjectionWriter:
             return False
         deadline = time.monotonic() + max(0.0, timeout)
         try:
-            self._start_vector_close()
+            self._start_vector_close(migration=migration)
             remaining = max(0.0, deadline - time.monotonic())
             if not self._vector_close_event.wait(remaining):
                 return False
@@ -174,13 +181,14 @@ class CompositeProjectionWriter:
         finally:
             self._projection_lock.release()
 
-    def _start_vector_close(self) -> None:
+    def _start_vector_close(self, *, migration=False) -> None:
         if self.vector_index is None or self._vector_close_thread is not None:
             return
 
         def close_vector() -> None:
             try:
-                close = getattr(self.vector_index, "close", None)
+                close = getattr(self.vector_index, "release_for_migration", None) if migration else None
+                close = close or getattr(self.vector_index, "close", None)
                 if callable(close):
                     self._vector_close_result = close()
             except Exception as exc:

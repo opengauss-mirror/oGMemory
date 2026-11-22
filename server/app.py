@@ -45,6 +45,7 @@ from server.memory_service import MemoryService
 from server.memory_viewer import create_memory_viewer_blueprint
 from server.scene_api import create_scene_blueprint
 from server.space_management import create_shared_search_blueprint
+from server.maintenance_http import MAINTENANCE_HEADERS, MAINTENANCE_STATUS, maintenance_payload
 from service.migration.admission import business_wsgi
 from session.session_manager import SessionOperationInProgress
 
@@ -235,9 +236,9 @@ def _error_response(exc: Exception):
     from service.operator_service import OperatorServiceBusyError
 
     if isinstance(exc, MaintenanceError):
-        response = jsonify({"error": "migration_maintenance", "message": str(exc), "retryable": True})
-        response.headers["Retry-After"] = "5"
-        return response, 503
+        response = jsonify(maintenance_payload(str(exc)))
+        response.headers.update(MAINTENANCE_HEADERS)
+        return response, MAINTENANCE_STATUS.value
 
     if isinstance(exc, OperatorServiceBusyError):
         return jsonify({"error": str(exc), "retryable": True}), 429
@@ -300,7 +301,7 @@ def _lifecycle_result_ok(result: dict) -> bool:
 def _lifecycle_result_response(result: dict):
     response = jsonify(result)
     if (result.get("error_detail") or {}).get("code") == "MIGRATION_MAINTENANCE":
-        response.headers["Retry-After"] = "5"
+        response.headers.update(MAINTENANCE_HEADERS)
     return response, _lifecycle_result_status(result)
 
 

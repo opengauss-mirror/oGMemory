@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 from service.migration.admission import Admission
 from service.migration.file_lock import exclusive_file
@@ -35,6 +36,31 @@ class Participant:
         if self._thread is None:
             self._thread = threading.Thread(target=self._watch, name='migration-participant', daemon=True)
             self._thread.start()
+
+    def start_service(self):
+        try:
+            with self.admission.scope(write=True):
+                self.resume()
+            self._paused = False
+        except MaintenanceError:
+            if self.store.status() is None:
+                raise
+            self._paused = True
+        self.start()
+
+    @contextmanager
+    def shutdown_scope(self, timeout):
+        with self.admission.scope(write=True, _shutdown=True):
+            try:
+                self._stop_watcher(timeout)
+                self.admission.stop_accepting()
+                yield
+            except BaseException:
+                self.stop.clear()
+                if self._thread is None or not self._thread.is_alive():
+                    self._thread = None
+                    self.start()
+                raise
 
     def step(self):
         request = self.store.lifecycle_request(self.id)
@@ -86,12 +112,14 @@ class Participant:
                 logger.error('Migration participant requires attention: %s', type(exc).__name__)
             self.stop.wait(self.interval)
 
-    def close(self, *, timeout=5):
+    def _stop_watcher(self, timeout):
         self.stop.set()
         if self._thread is not None:
             self._thread.join(timeout)
             if self._thread.is_alive():
                 raise MaintenanceError('maintenance callback is still running')
+    def close(self, *, timeout=5):
+        self._stop_watcher(timeout)
         # The caller must already have stopped its business workers. Never retire
         # a process with uncertain operations merely because its watcher stopped.
         self.store.remove_participant(self.id)

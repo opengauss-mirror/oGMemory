@@ -76,3 +76,22 @@ def test_shared_runner_closes_client_if_bridge_initialization_fails(monkeypatch,
         _create_storage(cfg)
     pool.close_all.assert_called_once()
     client.close.assert_called_once()
+
+
+
+def test_shared_runner_registers_bridge_as_only_owner_of_stage_pool(monkeypatch):
+    pool, client, bridge = Mock(), Mock(), Mock()
+    monkeypatch.setattr('fs.sql_adapter.pool.SharedConnectionPool', lambda *a, **kw: pool)
+    monkeypatch.setattr('fs.agfs_adapter.client.create_agfs_client', lambda cfg: client)
+    monkeypatch.setattr('fs.agfs_adapter.space_bridge.AGFSSpaceBridge', lambda *a: bridge)
+    monkeypatch.setattr('commit.sql_outbox_store.SQLOutboxStore', lambda **kw: object())
+    cfg = SimpleNamespace(storage_backend='agfs', shared_spaces_enabled=True,
+                          sql_connection_string='test', sql_pool_size=1,
+                          sql_dialect='opengauss', agfs_mount_prefix='/local')
+    registered = []
+    guard = Mock()
+
+    _create_storage(cfg, remember=registered.append, guard=guard)
+
+    assert registered == [pool, client, bridge]
+    guard.assert_called_once_with(client)

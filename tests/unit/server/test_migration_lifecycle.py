@@ -224,3 +224,41 @@ def test_pause_wakes_idle_outbox_worker():
         service._outbox_wakeup.set()
         thread.join(1)
         service.shutdown()
+
+
+
+@pytest.mark.parametrize('supports_release', [False, True])
+def test_pause_then_shutdown_closes_composite_vector_once(tmp_path, supports_release):
+    from unittest.mock import Mock
+
+    from providers.composite_index import CompositeProjectionWriter
+
+    closed = Mock()
+
+    class Vector:
+        def close(self):
+            closed('close')
+
+    class CachedVector(Vector):
+        def release_for_migration(self):
+            closed('release')
+
+    service = MemoryService(OgMemConfig(skill_sedimentation_enabled=False), defer_start=True)
+    lifecycle = ServiceLifecycle(service)
+    store = MaintenanceStore(tmp_path / 'gate.db', 'projection')
+    participant = Participant(store, pause=lifecycle.pause, refresh=lifecycle.refresh, resume=lifecycle.resume)
+    install(service, participant.admission)
+    vector = participant.admission.guard(CachedVector() if supports_release else Vector())
+    lexical = Mock()
+    service._vector_index = vector
+    service._lexical_index = lexical
+    service._projection_index = participant.admission.guard(CompositeProjectionWriter(vector, lexical))
+    store.enter('restore', mode='import', resources={})
+    try:
+        participant.step()
+        assert store.participants_ready('restore', 'drain')
+        service.shutdown()
+        closed.assert_called_once_with('release' if supports_release else 'close')
+        lexical.close.assert_called_once()
+    finally:
+        participant.close()

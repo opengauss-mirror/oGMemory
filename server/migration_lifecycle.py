@@ -60,16 +60,20 @@ class ServiceLifecycle:
         if fts is not None and not fts.close(remaining()):
             return False
         self._save_sessions()
+        service._space_content_store = service._agfs_fts = None
         # Close SDK clients before the independent migration reader is opened.
         # Reassigning a Python field alone does not invalidate native caches.
-        vector = service._vector_index
-        if service._projection_index is not None and service._lexical_index is not None:
-            if not service._projection_index.close(timeout=remaining()):
+        projection = service._projection_index
+        if projection is not None and service._lexical_index is not None:
+            close = getattr(projection, 'release_for_migration', None) or projection.close
+            if close(timeout=remaining()) is False:
                 return False
-        if vector is not None:
+        elif service._vector_index is not None:
+            vector = service._vector_index
             release = getattr(vector, 'release_for_migration', None) or getattr(vector, 'close', None)
-            if callable(release):
-                release()
+            if callable(release) and release() is False:
+                return False
+        service._projection_index = service._lexical_index = service._vector_index = None
         return time.monotonic() <= deadline
 
     def _save_sessions(self):

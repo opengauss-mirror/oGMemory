@@ -70,6 +70,10 @@ class Admission:
         self._lock = threading.RLock()
         self._closing = False
 
+    def stop_accepting(self):
+        with self._lock:
+            self._closing = True
+
     @staticmethod
     def _owner():
         try:
@@ -305,7 +309,7 @@ class Admission:
             return storage
         if getattr(storage, "_migration_guard", None) is not None:
             raise MaintenanceError("storage is already bound to another instance")
-        skip = {"close", "close_all", "shutdown", "stop"}
+        skip = {"close", "close_all", "release_for_migration", "shutdown", "stop"}
         reads = ("read", "get", "list", "exists", "search", "count", "scan", "iter", "has", "is_", "health", "probe", "check", "validate", "ls", "stat", "cat")
         content_storage = _content_storage(storage)
         for name in dir(type(storage)):
@@ -455,6 +459,8 @@ def business_wsgi(application, get_service):
     """Keep HTTP operations admitted through the last streamed response chunk."""
     from contextlib import ExitStack
     from contextvars import copy_context
+    import json
+    from server.maintenance_http import MAINTENANCE_STATUS, MAINTENANCE_HEADERS, maintenance_payload
 
     def serve(environ, start_response):
         path = environ.get('PATH_INFO', '')
@@ -470,10 +476,10 @@ def business_wsgi(application, get_service):
                 if admission is not None:
                     lifetime.enter_context(admission.scope())
             except MaintenanceError:
-                payload = b'{"error":"migration_maintenance","message":"Memory migration is in progress"}'
-                start_response('503 Service Unavailable', [
+                payload = json.dumps(maintenance_payload()).encode()
+                start_response(f'{MAINTENANCE_STATUS.value} {MAINTENANCE_STATUS.phrase}', [
                     ('Content-Type', 'application/json'), ('Content-Length', str(len(payload))),
-                    ('Retry-After', '5')])
+                    *MAINTENANCE_HEADERS.items()])
                 yield payload
                 return
             response = application(environ, start_response)

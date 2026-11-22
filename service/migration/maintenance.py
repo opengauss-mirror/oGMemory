@@ -133,8 +133,7 @@ class MaintenanceStore:
                 raise MaintenanceError("backup cannot replace an existing recovery point")
             if db.execute("SELECT 1 FROM operations LIMIT 1").fetchone():
                 raise MaintenanceError("operations have not drained")
-            if db.execute("SELECT 1 FROM participants WHERE task=? AND "
-                          "(stage IS NULL OR stage<>'drain' OR error IS NOT NULL)", (task_id,)).fetchone():
+            if not self._participants_ready(db, task_id, "drain"):
                 raise MaintenanceError('business processes have not quiesced')
             db.execute("UPDATE tasks SET backup=?,phase='backed_up' WHERE id=?", (encoded, task_id))
 
@@ -221,8 +220,7 @@ class MaintenanceStore:
                 raise MaintenanceError('cannot reopen with unfinished operations')
             if task['mode'] == 'import' and db.execute('SELECT 1 FROM participants LIMIT 1').fetchone():
                 if (db.execute('SELECT lifecycle FROM gate').fetchone()[0] != 'refresh'
-                        or db.execute("SELECT 1 FROM participants WHERE task=? AND "
-                                      "(stage IS NULL OR stage<>'refresh' OR error IS NOT NULL)", (task_id,)).fetchone()):
+                        or not self._participants_ready(db, task_id, "refresh")):
                     raise MaintenanceError('all participants must refresh before reopening')
             if not task["modified"]:
                 db.execute("UPDATE tasks SET phase='unchanged' WHERE id=?", (task_id,))
@@ -285,8 +283,7 @@ class MaintenanceStore:
                 raise MaintenanceError('unverified data cannot be exposed to refreshed clients')
             if db.execute('SELECT lifecycle FROM gate').fetchone()[0] != 'refresh':
                 if (db.execute('SELECT 1 FROM operations LIMIT 1').fetchone()
-                        or db.execute("SELECT 1 FROM participants WHERE task=? AND "
-                                      "(stage IS NULL OR stage<>'drain' OR error IS NOT NULL)", (task_id,)).fetchone()):
+                        or not self._participants_ready(db, task_id, "drain")):
                     raise MaintenanceError('participants have not drained')
                 db.execute("UPDATE gate SET lifecycle='refresh'")
                 db.execute('UPDATE participants SET stage=NULL,error=NULL WHERE task=?', (task_id,))
@@ -311,9 +308,13 @@ class MaintenanceStore:
             self._owned(db, task_id)
             if db.execute('SELECT lifecycle FROM gate').fetchone()[0] != stage:
                 return False
-            return not db.execute('SELECT 1 FROM participants WHERE task=? '
-                                  'AND (stage IS NULL OR stage<>? OR error IS NOT NULL) LIMIT 1',
-                                  (task_id, stage)).fetchone()
+            return self._participants_ready(db, task_id, stage)
+
+    @staticmethod
+    def _participants_ready(db, task_id, stage):
+        return not db.execute('SELECT 1 FROM participants WHERE task=? '
+                              'AND (stage IS NULL OR stage<>? OR error IS NOT NULL) LIMIT 1',
+                              (task_id, stage)).fetchone()
 
     def retire_stopped_participants(self):
         from service.migration.file_lock import exclusive_file
