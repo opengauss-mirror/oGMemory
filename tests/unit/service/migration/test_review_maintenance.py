@@ -163,3 +163,23 @@ def test_agfs_shared_hydration_is_read_admission(tmp_path):
     gate.enter('import', mode='import', resources={})
     with pytest.raises(MaintenanceError):
         bridge.load_content([])
+
+
+
+def test_agfs_archive_id_lookup_remains_readable_during_export(tmp_path):
+    from session.archive_store import SessionArchiveStore
+    from service.migration.snapshot import SourceSnapshot
+
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'archive')
+    admission = Admission(gate)
+    client = admission.guard(_AtomicMemoryAGFSClient())
+    archive = SessionArchiveStore(admission.guard(AGFSContextFS(client)))
+    ctx = RequestContext('acme', 'alice', 'agent', 'session', 'trace', Role.ROOT)
+    result = archive.write_archive('session', 'summary', 'summary', [], ctx, archive_id='archive')
+    assert result.success
+    with SourceSnapshot(gate, 'export').scope():
+        found = archive.read_archive_by_id('archive', ctx)
+        assert found is not None and found.session_id == 'session'
+    gate.enter('restore', mode='import', resources={})
+    with pytest.raises(MaintenanceError):
+        archive.read_archive_by_id('archive', ctx)

@@ -337,6 +337,8 @@ class Admission:
             if not inspect.ismethod(function):
                 continue
             write = not name.startswith(reads) or name.startswith(("get_or_create", "get_or_init"))
+            if name == 'find_archive_uri':
+                write = False
             if name == 'load_content':
                 from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
                 if isinstance(storage, AGFSSpaceBridge):

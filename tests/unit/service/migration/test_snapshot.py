@@ -1,3 +1,6 @@
+import multiprocessing
+import os
+
 import pytest
 
 from service.migration.admission import Admission
@@ -128,3 +131,76 @@ def test_runtime_to_content_move_requires_content_permit():
 def test_normalized_transport_path_cannot_escape_runtime():
     from service.migration.admission import _content_path
     assert _content_path('/local/accounts/acme/_system/../users/alice/memories/preferences/x/content.md')
+
+
+def _exit_during_snapshot(path, mode):
+    gate = MaintenanceStore(path, 'instance')
+    if mode == 'export':
+        with SourceSnapshot(gate, 'interrupted').scope():
+            os._exit(0)
+    with gate.execution():
+        gate.enter('interrupted', mode='import', resources={})
+        os._exit(0)
+
+
+def _exit_during_write(path, content):
+    from service.migration.participants import Participant
+
+    gate = MaintenanceStore(path, 'instance')
+    participant = Participant(gate, pause=lambda: True, refresh=lambda: None, resume=lambda: None)
+    with participant.admission.backend(write=True, content=content):
+        os._exit(0)
+
+
+def _run_abrupt_exit(target, *args):
+    process = multiprocessing.get_context('spawn').Process(target=target, args=args)
+    process.start()
+    process.join(10)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+    assert process.exitcode == 0
+
+
+@pytest.mark.parametrize('resume', ['write', 'upgrade', 'snapshot'])
+def test_abandoned_export_reopens_on_next_operation(tmp_path, resume):
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
+    reader = gate.admit() if resume == 'upgrade' else None
+    _run_abrupt_exit(_exit_during_snapshot, gate.path, 'export')
+    assert gate.status()['id'] == 'interrupted'
+    if resume == 'snapshot':
+        with SourceSnapshot(gate, 'next').scope():
+            assert gate.status()['id'] == 'next'
+    elif resume == 'upgrade':
+        gate.upgrade(reader)
+        gate.finish_operation(reader)
+    else:
+        gate.finish_operation(gate.admit(write=True))
+    assert gate.status() is None
+    assert gate.status('interrupted')['phase'] == 'unchanged'
+
+
+def test_abandoned_import_remains_closed(tmp_path):
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
+    _run_abrupt_exit(_exit_during_snapshot, gate.path, 'import')
+    with pytest.raises(MaintenanceError):
+        gate.admit(write=True)
+    with pytest.raises(MaintenanceError), SourceSnapshot(gate, 'next').scope():
+        pytest.fail('snapshot cannot replace an active import')
+    assert gate.status()['id'] == 'interrupted'
+
+
+@pytest.mark.parametrize('content', [True, False])
+def test_snapshot_only_waits_for_content_after_writer_exit(tmp_path, content):
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
+    _run_abrupt_exit(_exit_during_write, gate.path, content)
+    snapshot = SourceSnapshot(gate, 'next', timeout=.1)
+    if content:
+        with pytest.raises(TimeoutError), snapshot.scope():
+            pytest.fail('unknown content write must block snapshots')
+    else:
+        with snapshot.scope():
+            pass
+    gate.enter('restore', mode='import', resources={})
+    with pytest.raises(MaintenanceError, match='unfinished backend operations'):
+        gate.wait_drained('restore', 0)

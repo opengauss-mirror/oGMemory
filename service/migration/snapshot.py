@@ -18,7 +18,7 @@ class SourceSnapshot:
         with self.gate.execution():
             if self.gate.status(self.task) is not None:
                 raise MaintenanceError('snapshot task already exists; use its saved result or a new task')
-            self.gate.enter(self.task, mode='export', resources={'timeout': self.timeout})
+            self.gate.enter(self.task, mode='export', resources={'timeout': self.timeout, 'executor_lease': True})
             deadline = time.monotonic() + self.timeout
 
             def check():

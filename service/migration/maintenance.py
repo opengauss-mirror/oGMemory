@@ -69,10 +69,44 @@ class MaintenanceStore:
     def _active(db):
         return db.execute("SELECT tasks.* FROM gate JOIN tasks ON tasks.id=gate.task").fetchone()
 
+    @staticmethod
+    def _is_source_snapshot(task):
+        if task is None or task['mode'] != 'export' or task['modified']:
+            return False
+        resources = json.loads(task['resources'])
+        # Older SourceSnapshot tasks stored only the write-pause timeout.
+        return isinstance(resources, dict) and (
+            resources.get('executor_lease') is True or set(resources) == {'timeout'}
+        )
+
+    @staticmethod
+    def _discard_source_snapshot(db, task):
+        db.execute("UPDATE tasks SET phase='unchanged' WHERE id=?", (task['id'],))
+        db.execute('UPDATE gate SET task=NULL')
+
+    @property
+    def _executor_path(self):
+        return self.path.with_suffix('.executor.lock')
+
+    def _snapshot_still_active(self, db, task):
+        if not self._is_source_snapshot(task):
+            return True
+        from service.migration.file_lock import exclusive_file
+
+        # A nonblocking lease check is safe inside this transaction. A live
+        # executor holds the lease until it finishes and reopens the gate.
+        try:
+            with exclusive_file(self._executor_path):
+                self._discard_source_snapshot(db, task)
+        except OSError:
+            return True
+        return False
+
     def admit(self, *, write=False, participant=None, content=True):
         with self._transaction() as db:
             task = self._active(db)
-            if task and ((write and content) or task["mode"] == "import"):
+            if task and (task["mode"] == "import" or
+                         (write and content and self._snapshot_still_active(db, task))):
                 raise MaintenanceError("instance is in migration maintenance")
             if participant is not None and not db.execute('SELECT 1 FROM participants WHERE id=?', (participant,)).fetchone():
                 raise MaintenanceError('business process is not registered')
@@ -84,7 +118,8 @@ class MaintenanceStore:
     def upgrade(self, token, *, content=True):
         with self._transaction() as db:
             task = self._active(db)
-            if task and (content or task["mode"] == "import"):
+            if task and (task["mode"] == "import" or
+                         (content and self._snapshot_still_active(db, task))):
                 raise MaintenanceError("writes are paused for migration")
             if db.execute("UPDATE operations SET writing=1,content=MAX(content,?) WHERE token=?", (int(content), token)).rowcount != 1:
                 raise MaintenanceError("operation is no longer active")
@@ -125,11 +160,14 @@ class MaintenanceStore:
 
     def wait_drained(self, task_id, timeout):
         deadline = time.monotonic() + timeout
+        with self._transaction() as db:
+            exporting = self._owned(db, task_id)['mode'] == 'export'
+        predicate = ' WHERE writing=1 AND content=1' if exporting else ''
         while True:
-            self.retire_stopped_participants()
+            if not exporting:
+                self.retire_stopped_participants()
             with self._transaction() as db:
-                task = self._owned(db, task_id)
-                predicate = " WHERE writing=1 AND content=1" if task["mode"] == "export" else ""
+                self._owned(db, task_id)
                 if not db.execute("SELECT 1 FROM operations" + predicate + " LIMIT 1").fetchone():
                     return
             if time.monotonic() >= deadline:
@@ -352,7 +390,11 @@ class MaintenanceStore:
 
         with ExitStack() as stack:
             try:
-                stack.enter_context(exclusive_file(self.path.with_suffix('.executor.lock')))
+                stack.enter_context(exclusive_file(self._executor_path))
             except OSError as exc:
                 raise MaintenanceError('another migration executor is running') from exc
+            with self._transaction() as db:
+                task = self._active(db)
+                if self._is_source_snapshot(task):
+                    self._discard_source_snapshot(db, task)
             yield
