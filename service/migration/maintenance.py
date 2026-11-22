@@ -29,6 +29,8 @@ class MaintenanceStore:
             db.execute("CREATE TABLE IF NOT EXISTS receipts (digest TEXT PRIMARY KEY, target TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS gate (id INTEGER PRIMARY KEY CHECK(id=1), task TEXT)")
             db.execute("INSERT OR IGNORE INTO gate(id,task) VALUES(1,NULL)")
+            if 'content' not in {row[1] for row in db.execute('PRAGMA table_info(operations)')}:
+                db.execute('ALTER TABLE operations ADD COLUMN content INTEGER NOT NULL DEFAULT 1')
             if 'participant' not in {row[1] for row in db.execute('PRAGMA table_info(operations)')}:
                 db.execute('ALTER TABLE operations ADD COLUMN participant TEXT')
             if 'lifecycle' not in {row[1] for row in db.execute('PRAGMA table_info(gate)')}:
@@ -57,22 +59,24 @@ class MaintenanceStore:
     def _active(db):
         return db.execute("SELECT tasks.* FROM gate JOIN tasks ON tasks.id=gate.task").fetchone()
 
-    def admit(self, *, write=False, participant=None):
+    def admit(self, *, write=False, participant=None, content=True):
         with self._transaction() as db:
             task = self._active(db)
-            if task and (write or task["mode"] == "import"):
+            if task and ((write and content) or task["mode"] == "import"):
                 raise MaintenanceError("instance is in migration maintenance")
             if participant is not None and not db.execute('SELECT 1 FROM participants WHERE id=?', (participant,)).fetchone():
                 raise MaintenanceError('business process is not registered')
             token = uuid.uuid4().hex
-            db.execute("INSERT INTO operations(token,writing,participant) VALUES(?,?,?)", (token, int(write), participant))
+            db.execute("INSERT INTO operations(token,writing,participant,content) VALUES(?,?,?,?)",
+                       (token, int(write), participant, int(write and content)))
             return token
 
-    def upgrade(self, token):
+    def upgrade(self, token, *, content=True):
         with self._transaction() as db:
-            if self._active(db):
+            task = self._active(db)
+            if task and (content or task["mode"] == "import"):
                 raise MaintenanceError("writes are paused for migration")
-            if db.execute("UPDATE operations SET writing=1 WHERE token=?", (token,)).rowcount != 1:
+            if db.execute("UPDATE operations SET writing=1,content=MAX(content,?) WHERE token=?", (int(content), token)).rowcount != 1:
                 raise MaintenanceError("operation is no longer active")
 
     def finish_operation(self, token):
@@ -115,7 +119,7 @@ class MaintenanceStore:
             self.retire_stopped_participants()
             with self._transaction() as db:
                 task = self._owned(db, task_id)
-                predicate = " WHERE writing=1" if task["mode"] == "export" else ""
+                predicate = " WHERE writing=1 AND content=1" if task["mode"] == "export" else ""
                 if not db.execute("SELECT 1 FROM operations" + predicate + " LIMIT 1").fetchone():
                     return
             if time.monotonic() >= deadline:

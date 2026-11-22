@@ -216,6 +216,7 @@ class MigrationService:
             shared_description = None
             spaces = None
             with self.snapshot_scope() as check_snapshot, self.adapter_factory(self.cfg) as adapter:
+                adapter.content_snapshot = callable(check_snapshot)
                 adapter.check()
                 progress(phase="snapshotting")
                 source_backend = adapter.backend
@@ -228,7 +229,7 @@ class MigrationService:
                         yield assets.capture(record) if kind == "nodes" else record
 
                 inv = lifetime.enter_context(inventory(Path(tmp) / "source.sqlite", read,
-                    validate_references=not getattr(self.cfg, 'shared_spaces_enabled', False)))
+                    validate_references=False))
                 if getattr(self.cfg, 'shared_spaces_enabled', False):
                     from service.migration.space_catalog import SpaceCatalog
                     from service.migration.space_inventory import SpaceInventory
@@ -245,9 +246,9 @@ class MigrationService:
                     spaces.validate_dependencies(inv)
                     for record in spaces.records('space_nodes'):
                         inv.add('space_nodes', record)
-                    inv.finish()
             # All records and attachment bytes are fixed. Release the source write
             # barrier before compression; later source changes are not included.
+            inv.finish()
             if environment["embedding"]["provider"] == "st":
                 environment["embedding"]["dimension"] = model_dimension(self.cfg, "st")
             progress(phase="exporting", counts=inv.summary())

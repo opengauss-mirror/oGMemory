@@ -1,4 +1,4 @@
-"""Fix a source inventory while registered business writers are paused."""
+"""Fix persisted content while readers, model work and index projections continue."""
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -29,7 +29,7 @@ class SourceSnapshot:
                     raise TimeoutError('source snapshot exceeded its write-pause budget')
 
             try:
-                self.gate.wait_drained(self.task, self.timeout)
+                self.gate.wait_drained(self.task, max(0, deadline - time.monotonic()))
                 self.timestamp = datetime.now(UTC).isoformat()
                 check()
                 from core.operation_deadline import operation_deadline
