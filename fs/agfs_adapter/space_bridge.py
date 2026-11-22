@@ -112,7 +112,7 @@ class AGFSSpaceBridge(SQLContextFS):
         message = str(exc).lower()
         return "not found" in message or "no such file" in message
 
-    def _load_row(self, row):
+    def _load_row(self, row, *, read=None):
         uri = row["uri"]
         metadata = row.get("metadata") or {}
         pointer = metadata.get("agfs_content")
@@ -126,7 +126,7 @@ class AGFSSpaceBridge(SQLContextFS):
         if (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
                 or pointer.get("path") != path):
             raise NodeBrokenError(uri)
-        payload = self._agfs._client.read(path)
+        payload = (read or self._agfs._client.read)(path)
         if hashlib.sha256(payload).hexdigest() != digest or len(payload) != pointer.get("bytes"):
             raise NodeBrokenError(uri)
         value = json.loads(payload)
