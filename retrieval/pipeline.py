@@ -18,6 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextvars import copy_context
 
+from core.errors import AccessDeniedError, NodeNotFoundError
 from core.errors import RetrievalError
 from core.models import (
     LeafHit,
@@ -195,6 +196,28 @@ class RetrievalPipeline:
             final_top_k=final_top_k,
         )
 
+        # Deterministic hits can contain stale index abstracts during source cleanup.
+        # Hydrate only marked new cards; legacy result paths remain unchanged.
+        verified_blocks = []
+        for block in blocks:
+            if (block.metadata.get("extraction_method") == "deterministic" or block.metadata.get("deterministic")
+                    or block.metadata.get("evidence_derived")
+                    or "/memories/" in block.uri and (block.metadata.get("node_type") == "directory" or block.uri.endswith("/"))):
+                if self._context_reader is None:
+                    continue
+                try:
+                    current = self._context_reader.read_authorized(block.uri, ctx)
+                except (NodeNotFoundError, AccessDeniedError):
+                    continue
+                retrieval_metadata = {key: value for key, value in block.metadata.items()
+                                      if key == "retrieval_origin" or key.startswith("graph_")}
+                if not graph_snapshot_matches(current, retrieval_metadata, ctx, self._context_reader.read_authorized):
+                    continue
+                block.abstract, block.overview = current.abstract, current.overview
+                block.content_excerpt = current.content_excerpt
+                block.metadata = {**current.metadata, **retrieval_metadata}
+            verified_blocks.append(block)
+        blocks = verified_blocks
         trace.total_ms = (time.monotonic() - t0) * 1000
 
         # Track access hits

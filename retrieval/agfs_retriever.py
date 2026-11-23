@@ -39,6 +39,7 @@ from retrieval.owner_scope import canonical_owner_space, expand_owner_space_alia
 from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.result_ranker import is_temporal_query
 from retrieval.trace import RetrievalTrace, StageTrace, TraceTimer
+from service.evidence_lifecycle import ensure_sources_active
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,7 @@ class AGFSRetrieval:
         for uri in self._candidates(roots, ctx, set(), None):
             try:
                 node = self._fs.read_search_node(uri, ctx, _MAX_FIELD_BYTES)
+                ensure_sources_active(node, self._fs, ctx)
             except (NodeNotFoundError, NodeBrokenError):
                 continue
             if self._published_uri(node, uri) is None:
@@ -401,6 +403,7 @@ class AGFSRetrieval:
                         seen += 1
                         try:
                             node = self._fs.read_search_node(uri, ctx, min(_MAX_FIELD_BYTES, remaining // 3))
+                            ensure_sources_active(node, self._fs, ctx)
                         except (NodeNotFoundError, NodeBrokenError):
                             continue
                         except ConcurrentModificationError:

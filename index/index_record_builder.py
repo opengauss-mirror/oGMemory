@@ -80,7 +80,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
     CRITICAL: All records include account_id + owner_space in filters
     to prevent cross-tenant leakage at the vector index level.
     """
-    if node.metadata.get("indexing_disabled") is True:
+    if node.category == "evidence" or node.metadata.get("indexing_disabled") is True:
         return []
 
     # Extract account_id from URI for tenant isolation
@@ -111,6 +111,11 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         "has_overview": bool(node.overview),
         "has_content": bool(node.content),
     }
+    if node.metadata.get("deterministic"):
+        base_metadata["extraction_method"] = "deterministic"
+    if node.metadata.get("evidence_source_refs") or node.metadata.get("evidence_directory_invalidated"):
+        base_metadata["evidence_derived"] = True
+        base_metadata["node_type"] = "directory"
     base_metadata.update(code_metadata)
     if node.context_type != "RESOURCE":
         # Code resources have deterministic, revision-independent index payloads.
@@ -223,6 +228,9 @@ def build_directory_index_records(node: ContextNode, account_id: str) -> list[In
             node_type="directory", parent_uri=node.parent_uri,
             child_count=node.metadata.get("child_count", 0),
         )
+        if node.metadata.get("evidence_source_refs") or node.metadata.get("evidence_directory_invalidated"):
+            record.metadata["evidence_derived"] = True
+            record.metadata["canonical_revision"] = node.metadata.get("version", 0)
         if level == 0:
             record.metadata["categories"] = node.metadata.get("categories", [])
         records.append(record)

@@ -99,7 +99,8 @@ class ContextReader:
             logger.warning("[ContextReader] read_node failed for %s: %s", uri, exc, exc_info=True)
             return block
 
-        return self._project(uri, node, unit_key)
+        from service.evidence_lifecycle import ensure_sources_active
+        return self._project(uri, ensure_sources_active(node, self._fs, ctx), unit_key)
 
     def read_many(
         self, requests: list[tuple[str, str | None]], ctx: RequestContext,
@@ -131,7 +132,9 @@ class ContextReader:
                             logger.warning("[ContextReader] read_node failed for %s: %s", uri, node)
                             results[uri, unit_key] = RetrievedBlock(uri=uri, level_hit="L2")
                         else:
-                            results[uri, unit_key] = self._project(uri, node, unit_key)
+                            from service.evidence_lifecycle import ensure_sources_active
+                            results[uri, unit_key] = self._project(
+                                uri, ensure_sources_active(node, self._fs, ctx), unit_key)
                     except Exception as exc:
                         results[uri, unit_key] = exc
                 return results
@@ -172,7 +175,8 @@ class ContextReader:
         state = metadata.get("status") or metadata.get("lifecycle_status") or metadata.get("visibility") or ""
         if str(state).lower() in {"archived", "deleted", "broken", "retired", "inactive"}:
             raise NodeNotFoundError(uri)
-        return self._hydrate(uri, canonical_agent_node(node))
+        from service.evidence_lifecycle import ensure_sources_active
+        return self._hydrate(uri, canonical_agent_node(ensure_sources_active(node, self._fs, ctx)))
 
     def _check_acl(self, uri: str, ctx: RequestContext) -> None:
         # SECURITY: RequestContext is mandatory for all read operations

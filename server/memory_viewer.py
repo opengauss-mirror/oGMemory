@@ -9,6 +9,7 @@ from pathlib import Path
 
 from flask import Blueprint, jsonify, request, send_from_directory
 
+from core.errors import NodeNotFoundError
 from core.models import RequestContext, Role
 from fs.sql_adapter.sql_context_fs import parse_uri
 from server.auth import AuthorizationError, ControlPlaneDisabledError, build_admin_target_context
@@ -18,6 +19,7 @@ from server.mcp_resources import (
     external_to_internal_uri_candidates,
     internal_to_external_uri,
     parse_ogmemory_uri,
+    visible_memory_nodes,
 )
 from server.mcp_security import is_not_found_or_not_visible_error
 from server.mcp_tools import (
@@ -27,6 +29,7 @@ from server.mcp_tools import (
     _memory_node_summary,
     query_memory,
 )
+from service.evidence_lifecycle import ensure_sources_active
 from skills.artifact import canonical_skill_uri
 
 _TASK_STEPS = {
@@ -816,7 +819,10 @@ def _list_target_page(
         uri = f"ctx://{context.account_id}/users/{context.user_id}/memories/profile"
         if cursor or not context_fs.exists(uri, context):
             return [], False, None
-        node = context_fs.read_node(uri, context)
+        try:
+            node = ensure_sources_active(context_fs.read_node(uri, context), context_fs, context)
+        except NodeNotFoundError:
+            return [], False, None
         summary = _memory_node_summary(node)
         summary["context_uri"] = node.uri
         return [summary], False, None
@@ -842,19 +848,7 @@ def _list_target_page(
         if not cursor_key.startswith(external_prefix):
             raise ValueError("cursor must reference the requested memory directory")
         after_uri = f"{base_uri}/{cursor_key.removeprefix(external_prefix)}"
-    fetch_limit = limit + 1
-    if hasattr(context_fs, "list_node_summaries_page"):
-        nodes = context_fs.list_node_summaries_page(
-            base_uri,
-            context,
-            limit=fetch_limit,
-            after_uri=after_uri,
-        )
-    else:
-        child_uris = sorted(context_fs.list_children(base_uri, context))
-        if after_uri:
-            child_uris = [uri for uri in child_uris if uri > after_uri]
-        nodes = [context_fs.read_node(uri, context) for uri in child_uris[:fetch_limit]]
+    nodes = visible_memory_nodes(context_fs, base_uri, context, limit + 1, after_uri=after_uri)
     order_key = getattr(context_fs, "list_node_order_key", lambda uri: uri)
     entries = []
     for node in nodes[:limit]:
@@ -886,7 +880,7 @@ def _read_detail(service, context, uri: str) -> dict:
         last_error = None
         for internal_uri in external_to_internal_uri_candidates(uri, context):
             try:
-                node = context_fs.read_node(internal_uri, context)
+                node = ensure_sources_active(context_fs.read_node(internal_uri, context), context_fs, context)
                 break
             except Exception as exc:
                 if not is_not_found_or_not_visible_error(exc):

@@ -5,7 +5,7 @@ Generates L0 (abstract) and L1 (overview) summaries from children.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.interfaces import ContextFS, LLM
 from core.language import detect_language
@@ -67,6 +67,7 @@ class ChildSummary:
     category: str
     is_directory: bool
     has_abstract: bool
+    source_refs: list[dict] = field(default_factory=list)
 
 
 class DirectorySummarizer:

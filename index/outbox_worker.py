@@ -236,6 +236,19 @@ class OutboxWorker:
                     return self._process_upsert_directory(event, resolved_ctx)
             elif event_type == "DELETE_CONTEXT":
                 return self._process_delete_context(event, ctx)
+            elif event_type == "ARCHIVE_CONTEXT" and event.payload.get("evidence_directory_cleanup"):
+                from service.evidence_directory import directory_lock
+                if self._fs is None:
+                    raise RuntimeError("evidence directory cleanup requires canonical storage")
+                resolved_ctx = ctx or self._build_request_context(event)
+                with directory_lock(self._fs, event.uri, resolved_ctx):
+                    try:
+                        node = self._fs.read_node(event.uri, resolved_ctx)
+                    except NodeNotFoundError:
+                        node = None
+                    if node is not None and not node.metadata.get("evidence_directory_invalidated"):
+                        return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
+                    return self._process_archive_context(event)
             elif event_type == "ARCHIVE_CONTEXT":
                 return self._process_archive_context(event)
             elif event_type == "PROJECT_GRAPH":
@@ -321,8 +334,12 @@ class OutboxWorker:
             with distributed_usage_scope(embedding_scope_weights(inputs), inputs=inputs):
                 embeddings = self._projection.embed(records)
             projected_records = self._augment_with_embeddings(records, embeddings)
-        self._projection.upsert(projected_records)
-        self._upsert_code_bm25(records)
+        from index.evidence_projection import memory_projection_guard
+        with memory_projection_guard(self._fs, event, records) as current:
+            if not current:
+                return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
+            self._projection.upsert(projected_records)
+            self._upsert_code_bm25(records)
 
         logger.info(
             "Successfully processed UPSERT_CONTEXT %s, "
@@ -384,9 +401,12 @@ class OutboxWorker:
             if lexical_only:
                 self._confirm_node_publication(event, ctx)
             return []
+        if node.metadata.get("evidence_directory_invalidated"):
+            return []
         if lexical_only:
             current = build_agfs_lexical_records(node)
-        elif node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory":
+        elif (node.context_type != "MEMORY" or node.metadata.get("node_type") == "directory"
+                and not node.metadata.get("evidence_source_refs")):
             return records
         else:
             current = build_index_records(node)
@@ -1205,14 +1225,17 @@ class OutboxWorker:
                 augmented = self._augment_with_embeddings(records, embeddings)
                 try:
                     self._ensure_processing_owned(outbox_store, event, node_uri)
-                    with self._projection_owner(outbox_store, event, node_uri):
-                        projection.upsert(augmented)
-                        self._ensure_processing_owned(outbox_store, event, node_uri)
-                        self._upsert_code_bm25(records)
+                    from index.evidence_projection import memory_projection_guard
+                    with self._projection_owner(outbox_store, event, node_uri), memory_projection_guard(
+                            self._fs, event, records) as current:
+                        if current:
+                            self._projection.upsert(augmented)
+                            self._ensure_processing_owned(outbox_store, event, node_uri)
+                            self._upsert_code_bm25(records)
                     result = WorkerResult(
                         event_id=event.event_id,
                         success=True,
-                        records_upserted=len(records),
+                        records_upserted=len(records) if current else 0,
                     )
                     if self._supports_liveness_check(outbox_store):
                         current = self._event_is_current(
@@ -1444,7 +1467,10 @@ class OutboxWorker:
             ):
                 try:
                     records = self._current_projection_records(event, self._extract_records(event))
-                    if records:
+                    from index.evidence_projection import requires_source_guard
+                    if requires_source_guard(records):
+                        other_events.append((event, node_uri))
+                    elif records:
                         upsert_batch.append((event, node_uri, records))
                     else:
                         # Empty records — mark as succeeded immediately

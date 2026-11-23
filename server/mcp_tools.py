@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from typing import Any, Protocol
 from urllib.parse import quote, unquote
 
+from core.errors import NodeNotFoundError
 from core.models import RetrievedBlock
 from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 from providers.token_tracker import request_usage_scope
@@ -25,6 +26,7 @@ from server.mcp_resources import (
     parse_ogmemory_uri,
     public_type_from_internal,
     render_resource,
+    visible_memory_nodes,
 )
 from server.mcp_security import (
     CODE_EVIDENCE_UNTRUSTED_NOTICE,
@@ -35,6 +37,7 @@ from server.mcp_security import (
     with_untrusted_data_notice,
 )
 from server.mcp_trace import capture_write_trace
+from service.evidence_lifecycle import ensure_sources_active
 from skills.artifact import canonical_skill_uri
 
 logger = logging.getLogger(__name__)
@@ -224,21 +227,7 @@ def _list_memory_node_entries_page(
                 after_uri = f"{base_uri.rstrip('/')}/{cursor_key.removeprefix(external_prefix)}"
             elif cursor_key > external_prefix:
                 return
-        if hasattr(context_fs, "list_node_summaries_page"):
-            nodes = context_fs.list_node_summaries_page(
-                base_uri,
-                ctx,
-                limit=fetch_limit,
-                after_uri=after_uri,
-            )
-        else:
-            child_uris = sorted(context_fs.list_children(base_uri, ctx))
-            if after_uri:
-                child_uris = [uri for uri in child_uris if uri > after_uri]
-            nodes = [
-                context_fs.read_node(child_uri, ctx)
-                for child_uri in child_uris[:fetch_limit]
-            ]
+        nodes = visible_memory_nodes(context_fs, base_uri, ctx, fetch_limit, after_uri=after_uri)
         for node in nodes:
             sort_key = external_prefix + order_key(node.uri).rsplit("/", 1)[-1]
             if cursor_key is None or sort_key > cursor_key:
@@ -253,7 +242,10 @@ def _list_memory_node_entries_page(
             if (cursor_key is None or external_uri > cursor_key) and context_fs.exists(
                 internal_uri, ctx
             ):
-                node = context_fs.read_node(internal_uri, ctx)
+                try:
+                    node = ensure_sources_active(context_fs.read_node(internal_uri, ctx), context_fs, ctx)
+                except NodeNotFoundError:
+                    continue
                 candidates.append((external_uri, _memory_node_summary(node)))
             continue
         if memory_type == "pattern":
@@ -1392,8 +1384,10 @@ def read_memory(
                     node = context_fs.read_node_fields(internal_uri, ctx, level)
                 else:
                     node = context_fs.read_node(internal_uri, ctx)
+                node = ensure_sources_active(node, context_fs, ctx)
                 break
             except Exception as exc:
+                node = None
                 if not is_not_found_or_not_visible_error(exc):
                     raise
                 last_exc = exc
