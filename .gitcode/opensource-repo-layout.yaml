@@ -1,0 +1,20 @@
+project: opengauss/oGMemory
+version: "1.0"
+
+directories:
+  - path: "./agfs/"
+    type: upstream
+  - path: "./scripts/vendor/beam/"
+    type: third_party
+  - path: "./plugins/agent-plugins/tests/"
+    type: test
+  - path: "./plugins/deepseek-harness/tests/"
+    type: test
+  - path: "./plugins/opencode/tests/"
+    type: test
+  - path: "./tests/"
+    type: test
+
+files:
+  - path: "./LICENSE"
+    type: license
