@@ -343,7 +343,7 @@ class Admission:
             write = not name.startswith(reads) or name.startswith(("get_or_create", "get_or_init"))
             if name == 'find_archive_uri':
                 write = False
-            if name == 'load_content':
+            if name in {'load_content', 'hydrate_nodes'}:
                 from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
                 if isinstance(storage, AGFSSpaceBridge):
                     write = False  # Hydrates authorized immutable bodies only.

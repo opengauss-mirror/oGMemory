@@ -147,3 +147,23 @@ def test_server_can_close_chroma_without_migration_release(tmp_path, monkeypatch
         if service._migration_participant is not None:
             service._projection_index = service._vector_index = service._lexical_index = None
             close_service(service)
+
+
+def test_server_starting_during_export_starts_extraction_discovery(tmp_path, monkeypatch):
+    from service.extraction_retry import ExtractionRetryWorker
+    from service.migration.snapshot import SourceSnapshot
+
+    cfg = OgMemConfig(migration_workspace=str(tmp_path), skill_sedimentation_enabled=False)
+    gate = MaintenanceStore.for_workspace(tmp_path)
+    discoveries = []
+    monkeypatch.setattr(ExtractionRetryWorker, 'start_discovery',
+                        lambda worker, discovery: discoveries.append(discovery))
+    service = None
+    try:
+        with SourceSnapshot(gate, 'export').scope():
+            service = create_service(cfg)
+            assert discoveries and discoveries[0] is service._extraction_discovery
+        assert len(discoveries) == 1
+    finally:
+        if service is not None:
+            close_service(service)

@@ -2220,7 +2220,8 @@ class MemoryService:
 
     def start_extraction_recovery(self):
         admission = getattr(self, "_admission", None)
-        if admission is not None and admission.store.status() is not None:
+        active = admission.store.status() if admission is not None else None
+        if active is not None and active["mode"] == "import":
             return
         from service.extraction_recovery_discovery import ExtractionRecoveryDiscovery
         with self._init_lock:

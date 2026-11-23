@@ -242,3 +242,37 @@ def test_composite_projection_continues_without_delaying_source_snapshot(tmp_pat
     gate.enter('restore', mode='import', resources={})
     with pytest.raises(MaintenanceError):
         writer.delete(['during-import'])
+
+
+def test_shared_agfs_body_load_is_read_only_during_source_snapshot(tmp_path):
+    import hashlib
+    import json
+    from types import SimpleNamespace
+
+    from core.models import ContextNode
+    from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
+    from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
+
+    gate = MaintenanceStore.for_workspace(tmp_path)
+    admission = Admission(gate)
+    bridge = object.__new__(AGFSSpaceBridge)
+    transport = _AtomicMemoryAGFSClient()
+    bridge._agfs = SimpleNamespace(_mount_prefix='/local', _client=transport)
+    uri = 'ctx://acme/users/alice/memories/preferences/editor'
+    payload = json.dumps(dict(uri=uri, content='body', abstract='title', overview='overview')).encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    path = f'{bridge._content_directory(uri)}/{digest}.json'
+    transport.write(path, payload)
+    node = ContextNode(uri=uri, context_type='MEMORY', category='preferences', level=2,
+                       owner_space='user:alice', abstract='', overview='', content='',
+                       metadata={'agfs_content': {'path': path, 'sha256': digest, 'bytes': len(payload)}})
+    bridge._agfs._client = admission.guard(transport)
+    bridge = admission.guard(bridge)
+    with SourceSnapshot(gate, 'export').scope():
+        assert bridge.hydrate_nodes([node])[0].content == 'body'
+        assert bridge.load_content([{'uri': uri, 'metadata': node.metadata}])[0]['content'] == 'body'
+    gate.enter('import', mode='import', resources={})
+    with pytest.raises(MaintenanceError):
+        bridge.hydrate_nodes([node])
+    with pytest.raises(MaintenanceError):
+        bridge.load_content([{'uri': uri, 'metadata': node.metadata}])
