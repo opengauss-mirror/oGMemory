@@ -424,6 +424,8 @@ Use oGMemory as durable, cross-session context.
 
 单条返回 `uri`、`type`、`id` 以及 level 对应字段；集合 URI 返回集合内容。
 
+读取案例时，把查询结果的 `uri` 和来源字段一起原样传入。用户案例返回 `owner_scope: "user"`，只读取当前已认证用户的空间。Agent 案例返回 `owner_agent_id`，只读取该 Agent 的可见案例。`agent_id`（HTTP 的 `agentId`）仍表示调用者使用的 Agent。这套参数同时适用于 MCP 工具和 HTTP 的 `/api/v1/memories/query`、`/api/v1/memories/read`。省略来源时，多个可见位置匹配同一 URI 会报告歧义。MCP 的 `resources/read` 只接受 URI，遇到歧义时请改用 `ogm_read_memory` 并传入来源字段。
+
 ### 7.4 `ogm_write_memory`
 
 默认关闭。请求只能传原始文本或消息，不能直接传内部原子记忆字段。

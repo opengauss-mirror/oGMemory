@@ -213,22 +213,77 @@ def iter_internal_uri_candidates(
     for candidate in candidates:
         by_owner.setdefault(candidate.rsplit("/", 1)[0], []).append(candidate)
     for base_uri, owner_candidates in by_owner.items():
-        yield from owner_candidates
-        try:
-            children = context_fs.list_children(base_uri, ctx)
-        except Exception as exc:
-            if is_not_found_or_not_visible_error(exc):
+        yield from _owner_candidates(base_uri, owner_candidates, parsed.memory_id, ctx, context_fs)
+
+
+def _owner_candidates(base_uri, owner_candidates, memory_id, ctx, context_fs, *, list_physical=None):
+    yield from owner_candidates
+    if not hasattr(context_fs, "list_children"):
+        return
+    try:
+        children = (list_physical or context_fs.list_children)(base_uri, ctx)
+    except Exception as exc:
+        if is_not_found_or_not_visible_error(exc):
+            return
+        raise
+    matches = {
+        child for child in children
+        if child.rsplit("/", 1)[0] == base_uri
+        and child not in owner_candidates
+        and unquote(child.rsplit("/", 1)[1]) == memory_id
+        # A physical listing includes inactive entries. Check only matching names.
+        and (list_physical is None or context_fs.exists(child, ctx))
+    }
+    if len(matches) > 1:
+        raise ValueError("Ambiguous historical memory id")
+    yield from matches
+
+
+def read_case_node(uri, ctx, context_fs, read_node, *, owner_agent_id=None, owner_scope=None):
+    """Use the existing name lookup in each authorized case directory."""
+    from retrieval.owner_scope import visible_agent_ids
+
+    user_uris = external_to_internal_uri_candidates(uri, ctx)
+    user_dir, memory_id = user_uris[0].rsplit("/", 1)
+    names = [candidate.rsplit("/", 1)[1] for candidate in user_uris]
+    owner_dirs = [user_dir]
+    if owner_scope != "user":
+        agents = visible_agent_ids(ctx) if ctx.visible_owner_spaces else [ctx.agent_id]
+        if owner_agent_id is not None:
+            if owner_agent_id not in agents:
+                raise PermissionError("not_found_or_not_visible")
+            agents = [owner_agent_id]
+            owner_dirs = []
+        owner_dirs.extend(f"ctx://{ctx.account_id}/agents/{agent}/memories/cases" for agent in agents if agent)
+
+    found = None
+    list_physical = getattr(context_fs, "list_children_including_inactive", None)
+    for directory in owner_dirs:
+        exact = [f"{directory}/{name}" for name in names]
+        for candidate in _owner_candidates(directory, exact, memory_id, ctx, context_fs, list_physical=list_physical):
+            try:
+                node = ensure_sources_active(read_node(candidate, ctx), context_fs, ctx)
+            except Exception as exc:
+                if not is_not_found_or_not_visible_error(exc):
+                    raise
                 continue
-            raise
-        matches = {
-            child for child in children
-            if child.rsplit("/", 1)[0] == base_uri
-            and child not in owner_candidates
-            and unquote(child.rsplit("/", 1)[1]) == parsed.memory_id
-        }
-        if len(matches) > 1:
-            raise ValueError("Ambiguous historical memory id")
-        yield from matches
+            if found is not None:
+                raise ValueError("Ambiguous case URI: multiple visible owners match")
+            found = node
+            break
+    if found is None:
+        raise NodeNotFoundError(uri)
+    return found
+
+
+def case_owner_fields(node_uri: str) -> dict[str, str]:
+    parts = node_uri.removeprefix("ctx://").split("/")
+    if len(parts) >= 6 and parts[3:5] == ["memories", "cases"]:
+        if parts[1] == "users":
+            return {"owner_scope": "user"}
+        if parts[1] == "agents":
+            return {"owner_agent_id": parts[2]}
+    return {}
 
 
 def internal_to_external_uri(uri: str, *, category: str = "") -> str:
@@ -441,6 +496,9 @@ def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[st
     last_exc: Exception | None = None
     try:
         context_fs = service._get_context_fs()
+        if parsed.memory_type == "case":
+            node = read_case_node(uri, ctx, context_fs, context_fs.read_node)
+            return _truncate_payload(_node_detail(node), _configured_max_response_chars(service))
         for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
             try:
                 node = ensure_sources_active(context_fs.read_node(internal_uri, ctx), context_fs, ctx)
@@ -467,6 +525,7 @@ def _node_summary(node: ContextNode) -> dict[str, Any]:
         "uri": external_uri,
         "type": public_type_from_internal(node.category, node.uri),
         "id": external_id_from_uri(external_uri),
+        **case_owner_fields(node.uri),
         "abstract": node.abstract,
         "updated_at": node.metadata.get("updated_at", ""),
         "has_content": bool(node.content) or bool(node.metadata.get("has_content")),

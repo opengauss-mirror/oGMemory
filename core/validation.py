@@ -8,6 +8,7 @@ Provides validators for all external inputs to prevent:
 import hashlib
 import logging
 import re
+import unicodedata
 from dataclasses import replace
 
 from core.errors import ValidationError
@@ -80,6 +81,16 @@ def validate_utf8(text: str, field_name: str) -> str:
             field_name,
             f"Invalid UTF-8 encoding: {e}"
         )
+
+
+def validate_identity_segment(value: str, name: str, *, required: bool = True) -> None:
+    """Keep existing identities exact and safe to use as a single raw URI segment."""
+    if not isinstance(value, str) or (required and not value):
+        raise ValueError(f"{name} must be one safe URI path segment")
+    validate_utf8(value, name)
+    if (value == "." or ".." in value or any(char in value for char in "/\\%")
+            or any(unicodedata.category(char) in {"Cc", "Cs"} for char in value)):
+        raise ValueError(f"{name} must be one safe URI path segment")
 
 
 def validate_slug(slug: str, field_name: str = "slug") -> str:

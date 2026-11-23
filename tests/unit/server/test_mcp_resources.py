@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
 from urllib.parse import quote
 
 import pytest
 
 from core.errors import NodeNotFoundError
 from core.models import ContextNode, RequestContext
+from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from providers.unified_config import OgMemConfig
 from server.mcp_resources import render_resource
 from skills.artifact import is_governed_skill
@@ -125,6 +127,43 @@ def _node(uri, *, category="preference", content="content", metadata=None):
         content=content,
         metadata=node_metadata,
     )
+
+
+@pytest.mark.parametrize("alias_status", [None, "ACTIVE", "ARCHIVED"])
+def test_case_resource_checks_only_matching_agfs_children(monkeypatch, alias_status):
+    service = _FakeService(OgMemConfig(), [])
+    client = Mock()
+    fs = service.fs = AGFSContextFS(client, mount_prefix="")
+    ctx = _ctx()
+    user_uri = "ctx://acct-1/users/alice/memories/cases/example"
+    agent_dir = "ctx://acct-1/agents/bot/memories/cases"
+    alias = "%65xample"
+    entries = [{"name": f"other-{i}", "isDir": True} for i in range(1000)]
+    if alias_status:
+        entries.append({"name": alias, "isDir": True})
+    client.ls.return_value = entries
+    client.ls.reset_mock()
+    monkeypatch.setattr(fs, "is_tombstoned", lambda uri, ctx: False)
+    metadata = Mock(return_value='{"status":"' + (alias_status or "ACTIVE") + '"}')
+    monkeypatch.setattr(fs, "_read_file", metadata)
+
+    def read_node(uri, ctx):
+        if uri == user_uri or (uri == f"{agent_dir}/{alias}" and alias_status == "ACTIVE"):
+            return _node(uri, category="case", content=uri)
+        raise NodeNotFoundError(uri)
+
+    monkeypatch.setattr(fs, "read_node", read_node)
+    public_uri = "ogmemory://memories/case/example"
+    if alias_status == "ACTIVE":
+        with pytest.raises(ValueError, match="Ambiguous case URI"):
+            render_resource(service, public_uri, ctx)
+    else:
+        assert render_resource(service, public_uri, ctx)["content"] == user_uri
+    client.ls.assert_called_once_with(fs._uri_to_agfs_path(agent_dir))
+    if alias_status:
+        metadata.assert_called_once_with(fs._uri_to_agfs_path(f"{agent_dir}/{alias}") + fs.FILE_META)
+    else:
+        metadata.assert_not_called()
 
 
 def test_status_resource_reports_implemented_toolsets_only():

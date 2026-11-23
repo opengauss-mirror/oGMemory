@@ -13,18 +13,21 @@ from urllib.parse import quote, unquote
 from core.errors import NodeNotFoundError
 from core.models import RetrievedBlock
 from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
+from core.validation import validate_identity_segment
 from providers.token_tracker import request_usage_scope
 from retrieval.context_reader import project_memory_unit
 from retrieval.identity import memory_unit_key
 from retrieval.result_ranker import is_temporal_query
 from server.mcp_resources import (
     MEMORY_TYPES,
+    case_owner_fields,
     external_id_from_uri,
     external_to_internal_uri_candidates,
     internal_to_external_uri,
     iter_internal_uri_candidates,
     parse_ogmemory_uri,
     public_type_from_internal,
+    read_case_node,
     render_resource,
     visible_memory_nodes,
 )
@@ -314,6 +317,7 @@ def _memory_node_summary(node: Any) -> dict[str, Any]:
         "uri": external_uri,
         "type": public_type_from_internal(node.category, node.uri),
         "id": external_id_from_uri(external_uri),
+        **case_owner_fields(node.uri),
         "abstract": node.abstract,
         "updated_at": node.metadata.get("updated_at", ""),
         "has_content": bool(node.content) or bool(node.metadata.get("has_content")),
@@ -1250,6 +1254,8 @@ def read_memory(
     *,
     uri: str,
     unit_key: str | None = None,
+    owner_agent_id: str | None = None,
+    owner_scope: str | None = None,
     level: str = "all",
     max_chars: int = 12000,
     recover_original: bool = False,
@@ -1268,8 +1274,14 @@ def read_memory(
         raise ValueError("recover_original must be a boolean")
     if unit_key is not None and (not isinstance(unit_key, str) or not unit_key.strip()):
         raise ValueError("unit_key must be a non-empty string")
+    if owner_agent_id is not None:
+        validate_identity_segment(owner_agent_id, "owner_agent_id")
+    if owner_scope is not None and (owner_scope != "user" or owner_agent_id is not None):
+        raise ValueError("owner_scope must be 'user' and cannot be combined with owner_agent_id")
 
     if recover_original:
+        if owner_agent_id is not None or owner_scope is not None:
+            raise ValueError("Case owner selectors are not supported with recover_original")
         if unit_key is not None:
             raise ValueError("unit_key is not supported with recover_original")
         if level != "all":
@@ -1328,6 +1340,8 @@ def read_memory(
             "uri": uri,
             "level": level,
             "unit_key": unit_key,
+            "owner_agent_id": owner_agent_id,
+            "owner_scope": owner_scope,
             "max_chars": max_chars,
             "session_id": session_id,
             "agent_id": agent_id,
@@ -1344,6 +1358,8 @@ def read_memory(
         resolved_identity=resolved_identity,
     )
     parsed = parse_ogmemory_uri(uri)
+    if (owner_agent_id is not None or owner_scope is not None) and (parsed.kind != "item" or parsed.memory_type != "case"):
+        raise ValueError("Case owner selectors require a case memory URI")
 
     if unit_key is not None and (parsed.kind != "item" or parsed.memory_type not in {
         "tool_memory", "tool_evidence", "experience"
@@ -1376,21 +1392,16 @@ def read_memory(
         context_fs = service._get_context_fs()
         last_exc: Exception | None = None
         node = None
-        for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
-            try:
-                needs_full_node = unit_key is not None or (
-                    level == "overview" and parsed.memory_type in {"tool_memory", "tool_evidence", "experience"})
-                if hasattr(context_fs, "read_node_fields") and not needs_full_node:
-                    node = context_fs.read_node_fields(internal_uri, ctx, level)
-                else:
-                    node = context_fs.read_node(internal_uri, ctx)
-                node = ensure_sources_active(node, context_fs, ctx)
-                break
-            except Exception as exc:
-                node = None
-                if not is_not_found_or_not_visible_error(exc):
-                    raise
-                last_exc = exc
+        if parsed.memory_type == "case":
+            def read_fields(candidate, read_ctx):
+                if hasattr(context_fs, "read_node_fields"):
+                    return context_fs.read_node_fields(candidate, read_ctx, level)
+                return context_fs.read_node(candidate, read_ctx)
+
+            node = read_case_node(uri, ctx, context_fs, read_fields, owner_agent_id=owner_agent_id,
+                                  owner_scope=owner_scope)
+        else:
+            node, last_exc = _read_memory_node(uri, ctx, context_fs, parsed.memory_type, level, unit_key)
         if node is None:
             if last_exc is not None:
                 raise last_exc
@@ -1407,6 +1418,7 @@ def read_memory(
             "type": canonical_parsed.memory_type,
             "id": canonical_parsed.memory_id,
             "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
+            **case_owner_fields(node.uri),
         }
         if unit_key is not None:
             payload.update(unit_key=unit_key, unit_revision=node.metadata["unit_revision"])
@@ -1502,6 +1514,24 @@ def delete_memory(
     }
 
 
+def _read_memory_node(uri, ctx, context_fs, memory_type, level, unit_key):
+    last_exc = None
+    needs_full_node = unit_key is not None or (
+        level == "overview" and memory_type in {"tool_memory", "tool_evidence", "experience"})
+    for candidate in iter_internal_uri_candidates(uri, ctx, context_fs):
+        try:
+            if hasattr(context_fs, "read_node_fields") and not needs_full_node:
+                node = context_fs.read_node_fields(candidate, ctx, level)
+            else:
+                node = context_fs.read_node(candidate, ctx)
+            return ensure_sources_active(node, context_fs, ctx), None
+        except Exception as exc:
+            if not is_not_found_or_not_visible_error(exc):
+                raise
+            last_exc = exc
+    return None, last_exc
+
+
 def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
     external_uri = internal_to_external_uri(hit.uri, category=hit.category)
     parsed = parse_ogmemory_uri(external_uri)
@@ -1512,6 +1542,7 @@ def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
         "score": hit.score,
         "abstract": hit.abstract,
         "has_content": hit.has_content or bool(hit.content_excerpt),
+        **case_owner_fields(hit.uri),
     }
     if hit.overview:
         row["overview"] = hit.overview
