@@ -110,6 +110,7 @@ class Assertion:
     effect: str = ""
     retain: bool = False
     scope_ref: str = ""
+    durability: str = ""
 
     @classmethod
     def parse(cls, row):
@@ -117,7 +118,7 @@ class Assertion:
             return None
         fields = {key: row.get(key, "") for key in (
             "claim", "subject", "relation", "quote", "slot", "value",
-            "valid_from", "valid_to", "effect", "scope_ref",
+            "valid_from", "valid_to", "effect", "scope_ref", "durability",
         )}
         if any(not isinstance(value, str) for value in fields.values()):
             return None
@@ -126,6 +127,7 @@ class Assertion:
         assertion = cls(**fields, retain=row.get("retain") is True)
         start, end = timestamp(assertion.valid_from), timestamp(assertion.valid_to)
         if (assertion.relation not in ("supports", "refutes", "unknown")
+                or assertion.durability not in ("", "long_term", "transient")
                 or (assertion.valid_from and start is None)
                 or (assertion.valid_to and end is None)
                 or (start and end and start >= end)
@@ -184,8 +186,11 @@ def bind_archive_evidence(rows, source_ref, messages):
         matches = [msg_id for msg_id, content in users.items() if assertion.quote in content]
         if len(matches) == 1:
             msg_id = matches[0]
+            payload = asdict(assertion)
+            if not assertion.durability:
+                payload.pop("durability")
             bound.append({
-                **asdict(assertion), "source_ref": source_ref, "message_id": msg_id,
+                **payload, "source_ref": source_ref, "message_id": msg_id,
                 "source_revision": _revision(users[msg_id]),
             })
     return bound
