@@ -1,0 +1,167 @@
+"""Message-only retrieval, mixed memories, privacy and evidence/fact alignment."""
+
+from dataclasses import replace
+
+import pytest
+from pydantic import ValidationError
+
+from core.models import CandidateMemory
+from core.provenance_resolver import ProvenanceResolver
+from service.evidence_service import EvidenceService
+from tests.unit.evidence.test_sources import CTX, message
+from tests.unit.evidence.test_writer import write_candidates
+
+
+def test_message_only_and_no_vector_dependency(setup):
+    fs, _, store, _ = setup
+    store.register([message("Caroline visited Paris.")], CTX, batch_id="batch")
+    service = EvidenceService(fs)
+    result = service.search("Caroline Paris", CTX, use_memories=True)
+    assert len(result.evidence) == 1 and result.facts == []
+    assert service.search("son", CTX).evidence == []
+    assert service.search("Caroline", replace(CTX, user_id="other")).evidence == []
+
+
+def test_verified_facts_align_with_final_sources_and_roles(setup):
+    fs, _, store, _ = setup
+    messages = [message("I visited Paris."), message("I recommend visiting Paris.", role="assistant", id="two", sequence=4)]
+    write_candidates(setup, messages)
+    service = EvidenceService(fs)
+    result = service.search("Where did I visit Paris?", CTX, use_memories=True, top_k=1)
+    assert len(result.evidence) <= 1
+    assert result.facts and all(record["role"] == "user" for record in result.facts)
+    ids = {item["evidence_unit_id"] for item in result.evidence}
+    assert all(ref["evidence_unit_id"] in ids for record in result.facts for ref in record["source_refs"])
+    recommendations = service.search("What did you recommend in Paris?", CTX, use_memories=True)
+    assert recommendations.facts and all(record["role"] == "assistant" for record in recommendations.facts)
+    store.revoke_session(CTX)
+    assert service.search("Paris", CTX, use_memories=True).evidence == []
+
+
+@pytest.mark.parametrize("category", ["entity", "profile"])
+def test_legacy_llm_provenance_supplements_raw_source_without_inventing_facts(setup, category):
+    fs, api, store, _ = setup
+    store.register([message("I played it yesterday.")], CTX, batch_id="batch", archive_id="archive")
+    api.write_memory(CandidateMemory(category=category, owner_scope="user", routing_key="piano",
+        confidence=1.0, abstract="Piano practice", overview="Piano practice", content="Piano practice",
+        provenance_ids=[ProvenanceResolver.build_id("archive", "archive", ["message"])]), CTX)
+    service = EvidenceService(fs)
+    assert service.search("piano", CTX).evidence == []
+    result = service.search("piano", CTX, use_memories=True)
+    assert len(result.evidence) == 1 and result.facts == []
+
+
+@pytest.mark.parametrize("options", [{"top_k": True}, {"use_memories": "false"}, {"unknown": 1}, {"top_k": 51}])
+def test_shared_validation_rejects_coercion_and_unknown_fields(setup, options):
+    with pytest.raises(ValidationError):
+        EvidenceService(setup[0]).search("Paris", CTX, **options)
+
+
+def test_inflections_preserve_word_boundaries_and_places_are_not_subjects(setup):
+    fs, _, _, _ = setup
+    messages = [message("I visited Paris.")]
+    write_candidates(setup, messages)
+    service = EvidenceService(fs)
+    assert service.search("visit", CTX).evidence
+    assert service.search("Paris", CTX, use_memories=True).facts
+    assert not service.search("Did Caroline visit Paris?", CTX, use_memories=True).facts
+
+
+def test_question_and_pronoun_groups_respect_top_k_and_topic_boundaries(setup):
+    fs, _, store, _ = setup
+    store.register([message("Did you visit Paris?", sequence=0),
+                    message("Yes, I visited Paris.", id="two", sequence=1),
+                    message("It was my favorite visit.", id="three", sequence=2),
+                    message("She repaired a piano.", id="four", sequence=3)], CTX, batch_id="group")
+    service = EvidenceService(fs)
+    result = service.search("visit Paris", CTX, top_k=3)
+    assert {item["message_id"] for item in result.evidence} == {"message", "two", "three"}
+    assert len(service.search("Paris", CTX, top_k=1).evidence) <= 1
+
+
+def test_ordinary_pipeline_returns_both_engines_and_rejects_revoked_vector(setup):
+    from core.models import RetrievalConfig
+    from index.index_record_builder import build_index_records
+    from providers.embedder.mock_embedder import MockEmbedder
+    from providers.vector_index.in_memory_index import InMemoryVectorIndex
+    from retrieval.context_reader import ContextReader
+    from service.api import ReadAPI
+    from tests.unit.retrieval.test_pipeline import _build_pipeline
+
+    fs, writer, store, _ = setup
+    old = writer.write_memory(CandidateMemory(category="entity", owner_scope="user", routing_key="paris",
+        abstract="Paris visit", overview="Paris visit", content="I enjoy Paris visits.", confidence=1.0), CTX)
+    new, = write_candidates(setup, [message("I visited Paris.")], categories={"fact"})
+    cfg = RetrievalConfig(expand_hierarchy=False, hotness_alpha=0.0, default_top_k=10, global_search_topk=20)
+    embedder, index = MockEmbedder(dimension=8), InMemoryVectorIndex(dimension=8)
+    for uri in [old["target_uri"], new.target_uri]:
+        records = build_index_records(fs.read_node(uri, CTX))
+        for record in records:
+            record.vector = embedder.embed_texts([record.text])[0]
+        index.upsert(records)
+    pipeline = _build_pipeline(index, embedder, cfg, with_expand=False)
+    pipeline._context_reader = ContextReader(fs)
+    api = ReadAPI(pipeline, pipeline._context_reader, cfg)
+    result = api.search_memory("Paris", CTX, score_threshold=-1)
+    assert {hit.category for hit in result.hits} == {"entity", "fact"}
+    assert {hit.category for hit in api.search_memory("Paris", CTX, categories=["entity"], score_threshold=-1).hits} == {"entity"}
+    store.revoke_session(CTX)
+    assert {hit.category for hit in api.search_memory("Paris", CTX, score_threshold=-1).hits} == {"entity"}
+
+
+@pytest.mark.parametrize("memories,events", [(False, False), (False, True), (True, False), (True, True)])
+def test_event_and_memory_channels_are_independent_and_events_are_capped(setup, memories, events):
+    fs, _, _, _ = setup
+    messages = [message(f"I visited Paris on 2026-05-0{i + 1}.", id=str(i), sequence=i) for i in range(3)]
+    write_candidates(setup, messages)
+    result = EvidenceService(fs).search(
+        "Paris visit", CTX, use_memories=memories, use_events=events)
+    assert result.diagnostics["events_admitted"] == (2 if events else 0)
+    assert bool(result.facts) == (memories or events)
+    if not memories and events:
+        assert len(result.facts) == 2
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_shared_dependencies_are_removed_when_their_source_fails_final_check(setup, monkeypatch, batch):
+    import service.evidence_service as search
+    from core.evidence import message_source
+
+    fs, _, store, _ = setup
+    first = message("I opened a studio.", id="first", sequence=0)
+    following = message("That studio sounds wonderful.", id="following", sequence=1, role="assistant")
+    store.register([first, following], CTX, batch_id="dependency")
+    service = EvidenceService(fs)
+    if not batch:
+        monkeypatch.setattr(type(fs), "read_nodes", None)
+    root = message_source(first, CTX).source_key
+    original = service.store.read_source
+    select_groups = search.select_groups
+
+    def read_source(key, ctx):
+        if key == root:
+            return None
+        return original(key, ctx)
+
+    def invalidate_after_selection(*args, **kwargs):
+        selected = select_groups(*args, **kwargs)
+        monkeypatch.setattr(service.store, "read_source", read_source)
+        return selected
+
+    monkeypatch.setattr(search, "select_groups", invalidate_after_selection)
+    result = service.search("studio", CTX, top_k=10)
+    assert result.diagnostics["partial"]
+    assert result.evidence == [] and result.diagnostics["evidence_groups"] == []
+
+
+def test_reported_groups_only_reference_final_evidence_within_response_budget(setup):
+    import json
+
+    fs, _, store, _ = setup
+    store.register([message("I completed studio repairs. " * 80, id=str(i), sequence=i * 10)
+                    for i in range(50)], CTX, batch_id="budget")
+    result = EvidenceService(fs).search("studio repairs", CTX, top_k=50)
+    selected = {item["evidence_unit_id"] for item in result.evidence}
+    assert selected and result.diagnostics["truncated"]
+    assert {key for group in result.diagnostics["evidence_groups"] for key in group} == selected
+    assert len(json.dumps(result.to_dict(), ensure_ascii=False).encode()) < 64 * 1024
