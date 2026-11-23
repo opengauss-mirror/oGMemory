@@ -151,7 +151,9 @@ def test_feature_defaults_and_invalid_config():
 def test_changed_descriptor_is_not_skipped_as_duplicate_content():
     from dataclasses import replace
     from commit.context_writer import ContextWriter
+    from core.errors import NodeNotFoundError
     fs,policy = Mock(),Mock()
+    fs.read_node.side_effect = NodeNotFoundError("ctx://acct/users/alice/memories/entities/project")
     policy.plan.return_value = WritePlan("create","ctx://acct/users/alice/memories/entities/project")
     writer = ContextWriter(fs,llm=Mock(),policy_router=policy)
     original = CandidateMemory("entity","user","project","Project","Project overview","Project content",.9,
