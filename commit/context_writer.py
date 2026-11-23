@@ -23,6 +23,7 @@ from commit.write_receipts import (
     validate_receipt_target,
 )
 from core.errors import ConcurrentModificationError, NodeNotFoundError, OperationDeadlineExceededError, ValidationError
+from core.evidence import DETERMINISTIC_MEMORY_TYPES
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
@@ -342,7 +343,7 @@ class ContextWriter:
                         plan.merged_fields["expected_version"] = candidate.expected_version
 
                 # Existing nodes created by the other engine are never automatic update targets.
-                if candidate.category in {"fact", "entity", "event"}:
+                if candidate.category in DETERMINISTIC_MEMORY_TYPES:
                     from commit.deterministic import check_engine_target
                     check_engine_target(self._fs, candidate, plan.target_uri, ctx)
 

@@ -14,7 +14,10 @@ from service.evidence_store import EvidenceStore
 from tests.unit.evidence.test_sources import CTX, message
 from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
 
-pytestmark = pytest.mark.skipif(os.environ.get("OGMEM_REAL_NLP_TESTS") != "1", reason="opt-in real NLP suite")
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(os.environ.get("OGMEM_REAL_NLP_TESTS") != "1", reason="opt-in real NLP suite"),
+]
 
 
 @pytest.fixture(scope="module")

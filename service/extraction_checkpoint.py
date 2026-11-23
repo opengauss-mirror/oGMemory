@@ -103,7 +103,7 @@ class ExtractionBatchJournal:
             if extraction_config is not None:
                 batch["extraction_config"] = deepcopy(extraction_config)
                 if extraction_config.get("engine") == "deterministic":
-                    from service.deterministic_ingest import snapshot_messages
+                    from service.evidence_store import snapshot_messages
                     batch["messages"] = snapshot_messages(snapshot, ctx, manager._get_context_fs())
             if lifecycle is not None:
                 batch["lifecycle"] = deepcopy(lifecycle)

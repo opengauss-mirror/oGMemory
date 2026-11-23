@@ -20,6 +20,15 @@ from core.models import ContextNode, RequestContext
 from core.operation_deadline import check_deadline
 
 
+def snapshot_messages(snapshot, ctx, fs):
+    """Freeze source order across archive batches; reused message IDs retain order."""
+    messages = [{"id": message.id, "role": message.role, "content": message.content,
+                 "recorded_at": message.created_at} for message in snapshot
+                if message.role in {"user", "assistant"} and message.content.strip()]
+    result, _ = EvidenceStore(fs).reserve_messages(messages, ctx)
+    return result
+
+
 @contextmanager
 def leaf_publication_lock(store, outbox, uri, ctx, target_lock):
     """Acquire leaf locks in the same order for writes and revocation."""

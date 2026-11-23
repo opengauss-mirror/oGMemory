@@ -334,12 +334,8 @@ class OutboxWorker:
             with distributed_usage_scope(embedding_scope_weights(inputs), inputs=inputs):
                 embeddings = self._projection.embed(records)
             projected_records = self._augment_with_embeddings(records, embeddings)
-        from index.evidence_projection import memory_projection_guard
-        with memory_projection_guard(self._fs, event, records) as can_publish:
-            if not can_publish:
-                return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
-            self._projection.upsert(projected_records)
-            self._upsert_code_bm25(records)
+        if not self._publish_context_records(event, records, projected_records):
+            return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
 
         logger.info(
             "Successfully processed UPSERT_CONTEXT %s, "
@@ -352,6 +348,18 @@ class OutboxWorker:
             success=True,
             records_upserted=len(records),
         )
+
+    def _publish_context_records(self, event, records, projected_records, *, confirm_ownership=None):
+        from index.evidence_projection import memory_projection_guard
+
+        with memory_projection_guard(self._fs, event, records) as can_publish:
+            if not can_publish:
+                return False
+            self._projection.upsert(projected_records)
+            if confirm_ownership is not None:
+                confirm_ownership()
+            self._upsert_code_bm25(records)
+            return True
 
     def _confirm_node_publication(self, event: OutboxEvent, ctx: RequestContext | None) -> None:
         if self._fs is None or ctx is None:
@@ -1225,13 +1233,11 @@ class OutboxWorker:
                 augmented = self._augment_with_embeddings(records, embeddings)
                 try:
                     self._ensure_processing_owned(outbox_store, event, node_uri)
-                    from index.evidence_projection import memory_projection_guard
-                    with self._projection_owner(outbox_store, event, node_uri), memory_projection_guard(
-                            self._fs, event, records) as can_publish:
-                        if can_publish:
-                            self._projection.upsert(augmented)
-                            self._ensure_processing_owned(outbox_store, event, node_uri)
-                            self._upsert_code_bm25(records)
+                    with self._projection_owner(outbox_store, event, node_uri):
+                        can_publish = self._publish_context_records(
+                            event, records, augmented,
+                            confirm_ownership=lambda: self._ensure_processing_owned(outbox_store, event, node_uri),
+                        )
                     result = WorkerResult(
                         event_id=event.event_id,
                         success=True,

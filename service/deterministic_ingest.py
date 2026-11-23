@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 
 from commit.deterministic import deterministic_batch, validate_payload
-from core.evidence import digest
+from core.evidence import DETERMINISTIC_MEMORY_TYPES, digest
 from core.operation_deadline import check_deadline
 from core.validation import validate_candidate
 from extraction.deterministic.extractor import RULE_VERSION, DeterministicExtractor
@@ -21,7 +21,7 @@ def extraction_configuration(api):
     return {"engine": "deterministic", "rule_version": RULE_VERSION,
             "options": asdict(api._deterministic_config),
             "model_signature": extractor.parser.signature,
-            "enabled_types": [kind for kind in ("fact", "entity", "event")
+            "enabled_types": [kind for kind in DETERMINISTIC_MEMORY_TYPES
                               if api._schema_registry.get_compatible(kind) is not None
                               and api._schema_registry.get_compatible(kind).enabled]}
 
@@ -32,15 +32,6 @@ def get_extractor(api, options):
         api._deterministic_extractors[key] = DeterministicExtractor(
             api._schema_registry, DeterministicConfig(**options))
     return api._deterministic_extractors[key]
-
-
-def snapshot_messages(snapshot, ctx, fs):
-    """Freeze source order across archive batches; reused message IDs retain order."""
-    messages = [{"id": message.id, "role": message.role, "content": message.content,
-                 "recorded_at": message.created_at} for message in snapshot
-                if message.role in {"user", "assistant"} and message.content.strip()]
-    result, _ = EvidenceStore(fs).reserve_messages(messages, ctx)
-    return result
 
 
 def commit_deterministic(api, messages, ctx, config, *, checkpoint=None, before_write=None,
@@ -90,9 +81,4 @@ def commit_deterministic(api, messages, ctx, config, *, checkpoint=None, before_
         else:
             with publish():
                 plans = [api._writer.write_candidate(candidate, ctx) for candidate in candidates]
-    return {"candidates_extracted": extracted, "candidates_filtered": filtered,
-            "writes_completed": sum(plan.action != "skip" for plan in plans),
-            "writes_skipped": sum(plan.action == "skip" for plan in plans),
-            "writes_failed": len(candidates) - len(plans), "evidence": diagnostics,
-            "plans": [{"action": plan.action, "target_uri": plan.target_uri,
-                       "merged_fields": plan.merged_fields} for plan in plans]}
+    return extracted, filtered, len(candidates), plans, diagnostics

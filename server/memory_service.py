@@ -7556,8 +7556,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             messages=result["messages"],
             session_time=result["session_time"], session_summary=buf.extraction_summary,
             tool_stats_text=result["tool_stats_text"],
-            extraction_config=(frozen_extraction_config(pending)
-                if pending else self._new_extraction_config()))
+            extraction_config=self._new_extraction_config(buf))
 
     def bootstrap(self, params: dict) -> dict:
         return {"bootstrapped": True}
@@ -7673,8 +7672,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             archive_id=pending["archive_id"] if pending else generate_archive_id(), messages=state["messages"],
             session_time=state["session_time"], session_summary=buf.extraction_summary,
             tool_stats_text=state["tool_stats_text"],
-            extraction_config=(frozen_extraction_config(pending)
-                if pending else self._new_extraction_config()))
+            extraction_config=self._new_extraction_config(buf))
 
     def _prepare_dispose_source(self, mgr, buf, ctx, params):
         from service.api import MemoryWriteAPI as _CheckpointWriteAPI

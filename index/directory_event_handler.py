@@ -27,7 +27,6 @@ from index.directory_summarizer import (
 from index.index_record_builder import build_directory_index_records
 from index.vector_projection import VectorProjection
 from service.evidence_directory import publication_guard, source_refs, summary_source_refs
-from service.evidence_lifecycle import ensure_sources_active
 
 logger = logging.getLogger(__name__)
 
@@ -368,7 +367,6 @@ class DirectoryEventHandler:
         for file_uri in node.file_children:
             try:
                 file_node = self._fs.read_node(file_uri, ctx)
-                file_node = ensure_sources_active(file_node, self._fs, ctx)
                 if file_node and file_node.abstract:
                     summaries.append(ChildSummary(
                         uri=file_uri,

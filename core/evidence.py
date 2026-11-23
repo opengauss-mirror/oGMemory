@@ -13,6 +13,7 @@ from core.errors import ValidationError
 from core.models import RequestContext
 
 EVIDENCE_KINDS = frozenset({"sources", "windows", "sessions", "lifecycle"})
+DETERMINISTIC_MEMORY_TYPES = ("fact", "entity", "event")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _EVIDENCE_URI = re.compile(
     r"ctx://(?P<account>[^/]+)/users/(?P<owner_id>[^/]+)/evidence/"

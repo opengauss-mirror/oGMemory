@@ -30,6 +30,29 @@ from extraction.node_processing import NodeProcessor, NodeProcessingPartialError
 logger = get_logger(__name__)
 
 
+def _commit_result(archive_id, extracted_count, filtered_count, candidate_count, plans):
+    writes_completed = sum(1 for p in plans if p.action != "skip")
+    writes_skipped = sum(1 for p in plans if p.action == "skip")
+    writes_failed = candidate_count - writes_completed - writes_skipped
+
+    return {
+        "archive_id": archive_id,
+        "candidates_extracted": extracted_count,
+        "candidates_filtered": filtered_count,
+        "writes_completed": writes_completed,
+        "writes_skipped": writes_skipped,
+        "writes_failed": writes_failed,
+        "plans": [
+            {
+                "action": p.action,
+                "target_uri": p.target_uri,
+                "merged_fields": p.merged_fields,
+            }
+            for p in plans
+        ],
+    }
+
+
 class MemoryWriteAPI:
     """Public API for memory write operations.
 
@@ -256,11 +279,12 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             archive_id = generate_archive_id()
 
         if frozen["engine"] == "deterministic":
-            result = commit_deterministic(
+            extracted, filtered, candidate_count, plans, diagnostics = commit_deterministic(
                 self, messages, ctx, frozen, checkpoint=candidate_checkpoint,
                 before_write=before_write, confidence_threshold=confidence_threshold,
                 archive_id=archive_id, publication_scope=publication_scope)
-            result["archive_id"] = archive_id
+            result = _commit_result(archive_id, extracted, filtered, candidate_count, plans)
+            result["evidence"] = diagnostics
             return self._complete_commit_result(result, wait)
 
         def extract():
@@ -483,27 +507,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 graph_diagnostics = self.finish_partial_relations(
                     deduplicated, plans, ctx, proposals=extraction_proposals)
 
-        # Compile results
-        writes_completed = sum(1 for p in plans if p.action != "skip")
-        writes_skipped = sum(1 for p in plans if p.action == "skip")
-        writes_failed = len(deduplicated) - writes_completed - writes_skipped
-
-        result = {
-            "archive_id": archive_id,
-            "candidates_extracted": extracted_count,
-            "candidates_filtered": filtered_count,
-            "writes_completed": writes_completed,
-            "writes_skipped": writes_skipped,
-            "writes_failed": writes_failed,
-            "plans": [
-                {
-                    "action": p.action,
-                    "target_uri": p.target_uri,
-                    "merged_fields": p.merged_fields,
-                }
-                for p in plans
-            ],
-        }
+        result = _commit_result(archive_id, extracted_count, filtered_count, len(deduplicated), plans)
 
         if graph_diagnostics is not None:
             result["graph"] = graph_diagnostics

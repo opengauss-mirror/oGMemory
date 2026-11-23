@@ -6,8 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.errors import ValidationError
-from service.deterministic_ingest import snapshot_messages
-from service.evidence_store import EvidenceStore
+from service.evidence_store import EvidenceStore, snapshot_messages
 from tests.unit.evidence.test_sources import CTX, message
 
 def freeze(store, identity="live"):
