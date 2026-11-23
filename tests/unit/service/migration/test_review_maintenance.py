@@ -75,7 +75,6 @@ def test_full_service_control_reads_during_import(tmp_path, monkeypatch):
 def test_write_denial_returns_maintenance_response(tmp_path, monkeypatch, mode):
     import server.app as app_module
     import server.mcp_tools as tools
-    from server.maintenance_http import business_wsgi
 
     admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'instance'))
     service = SimpleNamespace(_admission=admission, _cfg=SimpleNamespace(
@@ -86,7 +85,6 @@ def test_write_denial_returns_maintenance_response(tmp_path, monkeypatch, mode):
         with admission.backend(write=True):
             pytest.fail('write must not start')
     monkeypatch.setattr(tools, 'delete_memory', delete)
-    monkeypatch.setattr(app_module.app, 'wsgi_app', business_wsgi(app_module.app.wsgi_app, lambda: service))
     admission.store.enter('task', mode=mode, resources={})
     result = app_module.app.test_client().post('/api/v1/memories/delete', json={'uri': 'ogmemory://memories/preference/x'})
     assert result.status_code == 503
@@ -104,7 +102,6 @@ def test_write_denial_returns_maintenance_response(tmp_path, monkeypatch, mode):
 
 def test_memory_write_structured_maintenance_response(tmp_path, monkeypatch):
     import server.app as app_module
-    from server.maintenance_http import business_wsgi
 
     admission = Admission(MaintenanceStore(tmp_path / 'gate.db', 'instance'))
     def after_turn(params):
@@ -115,7 +112,6 @@ def test_memory_write_structured_maintenance_response(tmp_path, monkeypatch):
         mcp_max_request_bytes=1048576))
     monkeypatch.setattr(app_module, '_service', service)
     monkeypatch.setattr(app_module, '_build_authenticated_context', lambda p: SimpleNamespace(agent_id='agent'))
-    monkeypatch.setattr(app_module.app, 'wsgi_app', business_wsgi(app_module.app.wsgi_app, lambda: service))
     admission.store.enter('export', mode='export', resources={})
     result = app_module.app.test_client().post('/api/v1/memories/write', json={
         'text': 'remember this', 'session_id': 'session'})
@@ -183,3 +179,78 @@ def test_agfs_archive_id_lookup_remains_readable_during_export(tmp_path):
     gate.enter('restore', mode='import', resources={})
     with pytest.raises(MaintenanceError):
         archive.read_archive_by_id('archive', ctx)
+
+
+@pytest.mark.parametrize('failure', ['contended', 'retry-conflict', 'retry-timeout', 'cleanup'])
+def test_agfs_update_lock_conflict_settles_only_confirmed_rejection(tmp_path, monkeypatch, failure):
+    import threading
+
+    from fs.agfs_adapter.client import NativeAGFSHTTPError
+    from pyagfs.exceptions import AGFSClientError
+
+    class Client(_AtomicMemoryAGFSClient):
+        def mv(self, source, destination):
+            try:
+                super().mv(source, destination)
+            except AGFSClientError as exc:
+                if 'already exists' in str(exc):
+                    raise NativeAGFSHTTPError(str(exc), status_code=409) from exc
+                raise
+
+        def rm(self, path, recursive=False):
+            try:
+                super().rm(path, recursive=recursive)
+            except AGFSClientError as exc:
+                if 'no such file' in str(exc).lower():
+                    raise NativeAGFSHTTPError(str(exc), status_code=404) from exc
+                raise
+
+    client = Client()
+    owner = AGFSContextFS(client)
+    ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.ROOT)
+    node = ContextNode(uri='ctx://acme/users/alice/memories/preferences/editor',
+                       context_type='MEMORY', category='preferences', owner_space='user:alice',
+                       level=2, abstract='original', overview='original', content='original')
+    owner.write_node(node, ctx)
+    stored = owner.read_node(node.uri, ctx)
+    node = replace(node, metadata={'_expected_version': stored.metadata['version']})
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'lock')
+    admission = Admission(gate)
+    contender = admission.guard(AGFSContextFS(admission.guard(client)))
+    held, finish = threading.Event(), threading.Event()
+    write = owner._write_node_files
+
+    def hold_lock(*args, **kwargs):
+        held.set()
+        assert finish.wait(5)
+        return write(*args, **kwargs)
+
+    monkeypatch.setattr(owner, '_write_node_files', hold_lock)
+    writer = threading.Thread(target=owner.write_node, args=(node, ctx))
+    writer.start()
+    try:
+        assert held.wait(3)
+        if failure.startswith('retry-'):
+            def retry(*args):
+                if failure == 'retry-timeout':
+                    def lose_response(source, target):
+                        if target.endswith('.update-lock'):
+                            raise AGFSClientError('transport timeout')
+                    client.before_mv = lose_response
+                return True
+            monkeypatch.setattr(contender, '_recover_update_lock', retry)
+        elif failure == 'cleanup':
+            monkeypatch.setattr(contender, '_remove_tree_if_present', lambda path: False)
+
+        with pytest.raises(ConcurrentModificationError):
+            contender.write_node(node, ctx)
+    finally:
+        finish.set()
+        writer.join(5)
+    assert not writer.is_alive()
+    gate.enter('export', mode='export', resources={})
+    if failure in {'contended', 'retry-conflict'}:
+        gate.wait_drained('export', 0)
+    else:
+        with pytest.raises(TimeoutError):
+            gate.wait_drained('export', 0)

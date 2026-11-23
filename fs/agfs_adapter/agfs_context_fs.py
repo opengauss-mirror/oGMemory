@@ -2303,6 +2303,8 @@ class AGFSContextFS:
     ) -> None:
         """Publish a version-checked replacement through an atomic metadata swap."""
 
+        from fs.agfs_adapter.client import confirmed_rejection
+
         final_path = PurePosixPath(final_node_path.rstrip("/"))
         parent_path = str(final_path.parent) + "/"
         token = uuid.uuid4().hex
@@ -2334,15 +2336,17 @@ class AGFSContextFS:
                 if not self._recover_update_lock(
                     final_node_path, lock_path, marker_path
                 ):
-                    raise ConcurrentModificationError(
-                        node.uri, expected_version, expected_version + 1
-                    ) from exc
+                    conflict = ConcurrentModificationError(node.uri, expected_version, expected_version + 1)
+                    if confirmed_rejection(exc):
+                        rejection = conflict
+                    raise conflict from exc
                 try:
                     self._client.mv(candidate_lock_path, lock_path)
                 except AGFSClientError as retry_exc:
-                    raise ConcurrentModificationError(
-                        node.uri, expected_version, expected_version + 1
-                    ) from retry_exc
+                    conflict = ConcurrentModificationError(node.uri, expected_version, expected_version + 1)
+                    if confirmed_rejection(exc) and confirmed_rejection(retry_exc):
+                        rejection = conflict
+                    raise conflict from retry_exc
                 lock_acquired = True
 
             lease_thread = Thread(

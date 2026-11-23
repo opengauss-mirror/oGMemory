@@ -102,11 +102,15 @@ class MaintenanceStore:
             return True
         return False
 
+    def _blocks_business_operation(self, db, *, content_write):
+        task = self._active(db)
+        return task is not None and (
+            task["mode"] == "import" or (content_write and self._snapshot_still_active(db, task))
+        )
+
     def admit(self, *, write=False, participant=None, content=True):
         with self._transaction() as db:
-            task = self._active(db)
-            if task and (task["mode"] == "import" or
-                         (write and content and self._snapshot_still_active(db, task))):
+            if self._blocks_business_operation(db, content_write=write and content):
                 raise MaintenanceError("instance is in migration maintenance")
             if participant is not None and not db.execute('SELECT 1 FROM participants WHERE id=?', (participant,)).fetchone():
                 raise MaintenanceError('business process is not registered')
@@ -117,9 +121,7 @@ class MaintenanceStore:
 
     def upgrade(self, token, *, content=True):
         with self._transaction() as db:
-            task = self._active(db)
-            if task and (task["mode"] == "import" or
-                         (content and self._snapshot_still_active(db, task))):
+            if self._blocks_business_operation(db, content_write=content):
                 raise MaintenanceError("writes are paused for migration")
             if db.execute("UPDATE operations SET writing=1,content=MAX(content,?) WHERE token=?", (int(content), token)).rowcount != 1:
                 raise MaintenanceError("operation is no longer active")

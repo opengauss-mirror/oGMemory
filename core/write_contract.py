@@ -9,6 +9,7 @@ from core.errors import (
     ValidationError, VectorIndexError,
 )
 
+MAINTENANCE_ERROR_CODE = "MIGRATION_MAINTENANCE"
 OUTCOMES_KEY = "memory_write_outcomes"
 IN_PROGRESS = {"ACCEPTED", "RUNNING", "RECOVERING", "PROJECTING"}
 PUBLIC_FIELDS = (
@@ -20,12 +21,16 @@ PUBLIC_FIELDS = (
 )
 
 
+def is_maintenance_result(result):
+    return (result.get("error_detail") or {}).get("code") == MAINTENANCE_ERROR_CODE
+
+
 def error_fields(exc, request_id=""):
     """Preserve the originating failure independently from recovery policy."""
     name = type(exc).__name__
     code, component, status, action = "WRITE_INTERNAL_ERROR", "memory", 500, "manual_review"
     if isinstance(exc, MaintenanceError):
-        code, component, status, action = "MIGRATION_MAINTENANCE", "migration", 503, "retry_same_request"
+        code, component, status, action = MAINTENANCE_ERROR_CODE, "migration", 503, "retry_same_request"
     elif isinstance(exc, ExtractionBudgetError):
         code, component, status = "EXTRACTION_CONTEXT_BUDGET", "extraction", 500
     elif isinstance(exc, LLMTransientError):

@@ -204,3 +204,41 @@ def test_snapshot_only_waits_for_content_after_writer_exit(tmp_path, content):
     gate.enter('restore', mode='import', resources={})
     with pytest.raises(MaintenanceError, match='unfinished backend operations'):
         gate.wait_drained('restore', 0)
+
+
+def test_composite_projection_continues_without_delaying_source_snapshot(tmp_path):
+    from threading import Event, Thread
+
+    from providers.composite_index import CompositeProjectionWriter
+
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'instance')
+    admission = Admission(gate)
+    entered, release, finished = Event(), Event(), Event()
+
+    class Lexical:
+        def delete(self, ids):
+            if ids == ['in-flight']:
+                entered.set()
+                assert release.wait(5)
+
+    writer = admission.guard(CompositeProjectionWriter(None, Lexical()))
+
+    def project():
+        writer.delete(['in-flight'])
+        finished.set()
+
+    thread = Thread(target=project)
+    thread.start()
+    try:
+        assert entered.wait(3)
+        with SourceSnapshot(gate, 'snapshot', timeout=.5).scope():
+            assert not finished.is_set()
+            release.set()
+            assert finished.wait(3)
+            writer.delete(['during-export'])
+    finally:
+        release.set()
+        thread.join(5)
+    gate.enter('restore', mode='import', resources={})
+    with pytest.raises(MaintenanceError):
+        writer.delete(['during-import'])

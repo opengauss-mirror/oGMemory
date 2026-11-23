@@ -47,6 +47,10 @@ def _transport_paths(signature, args, kwargs):
 
 
 def _content_storage(storage):
+    from providers.composite_index import CompositeProjectionWriter
+
+    if isinstance(storage, CompositeProjectionWriter):
+        return False
     return not type(storage).__module__.startswith((
         'providers.vector_index', 'providers.lexical_index', 'index.',
         'commit.outbox_store', 'commit.sql_outbox_store', 'scene.',

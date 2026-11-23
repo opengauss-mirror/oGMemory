@@ -27,7 +27,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
 from core.logging_config import configure_third_party_loggers
-from core.write_contract import error_fields, normalize_write_result, write_http_status
+from core.write_contract import error_fields, normalize_write_result, write_http_status, is_maintenance_result
 from features.tool_result_externalization.store_base import (
     ArtifactNotVisibleError,
     ArtifactStoreUnavailableError,
@@ -300,7 +300,7 @@ def _lifecycle_result_ok(result: dict) -> bool:
 
 def _lifecycle_result_response(result: dict):
     response = jsonify(result)
-    if (result.get("error_detail") or {}).get("code") == "MIGRATION_MAINTENANCE":
+    if is_maintenance_result(result):
         response.headers.update(MAINTENANCE_HEADERS)
     return response, _lifecycle_result_status(result)
 
@@ -717,7 +717,7 @@ def handle_write_memory():
             wait=_parse_boolean(params.get("wait"), "wait"),
             request_context=ctx,
         )
-        if (result.get("error_detail") or {}).get("code") == "MIGRATION_MAINTENANCE":
+        if is_maintenance_result(result):
             return _lifecycle_result_response(result)
         return jsonify(result)
     except Exception as exc:
