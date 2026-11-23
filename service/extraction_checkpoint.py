@@ -59,8 +59,8 @@ class ExtractionBatchJournal:
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
-                 request_messages=None, lifecycle=None, request_source_ids=None, agent_async=False,
-                 ready_at_ms=None):
+                 request_messages=None, lifecycle=None, request_source_ids=None, extraction_config=None,
+                 agent_async=False, ready_at_ms=None):
         self.manager, self.buffer, self.ctx = manager, buffer, ctx
         self._stage_owner = threading.get_ident()
         self._verified_stage_results = set()
@@ -92,6 +92,11 @@ class ExtractionBatchJournal:
                      "session_summary": session_summary, "tool_stats_text": tool_stats_text,
                      "chunks": None, "slots": {}, "outbox_tracking_version": 1,
                      "outbox_events": []}
+            if extraction_config is not None:
+                batch["extraction_config"] = deepcopy(extraction_config)
+                if extraction_config.get("engine") == "deterministic":
+                    from service.deterministic_ingest import snapshot_messages
+                    batch["messages"] = snapshot_messages(snapshot, ctx, manager._get_context_fs())
             if lifecycle is not None:
                 batch["lifecycle"] = deepcopy(lifecycle)
             if agent_async:

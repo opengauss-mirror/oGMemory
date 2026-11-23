@@ -63,6 +63,8 @@ internal_tool_usage_tracker=None,
         relation_candidate_service=None,
         decision_client=None,
         read_probability_threshold: float = 0.70,
+        extraction_engine: str = "llm",
+        deterministic_config=None,
     ):
         """Initialize the API with required dependencies.
 
@@ -86,6 +88,12 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._uri_resolver = uri_resolver
         self._internal_tool_usage_tracker = internal_tool_usage_tracker
         self._extraction_mode = extraction_mode
+        if extraction_engine not in {"llm", "deterministic"}:
+            raise ValueError("extraction_engine must be llm or deterministic")
+        from extraction.deterministic.nlp import DeterministicConfig
+        self._extraction_engine = extraction_engine
+        self._deterministic_config = deterministic_config or DeterministicConfig()
+        self._deterministic_extractors = {}
         self._decision_client = decision_client
         self._read_probability_threshold = read_probability_threshold
         if type(source_occurrence_reconciliation_enabled) is not bool:
@@ -232,6 +240,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 "status": "processing" (only if wait=False)
             }
         """
+        from service.deterministic_ingest import commit_deterministic, extraction_configuration
+        frozen = (candidate_checkpoint.journal.batch.get("extraction_config", {"engine": "llm"})
+                  if candidate_checkpoint is not None else extraction_configuration(self))
         if candidate_checkpoint is not None:
             from service.extraction_checkpoint import RecoveryNeedsConfirmationError
 
@@ -242,6 +253,14 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         if archive_id is None:
             from session.session_manager import generate_archive_id
             archive_id = generate_archive_id()
+
+        if frozen["engine"] == "deterministic":
+            result = commit_deterministic(
+                self, messages, ctx, frozen, checkpoint=candidate_checkpoint,
+                before_write=before_write, confidence_threshold=confidence_threshold,
+                archive_id=archive_id, publication_scope=publication_scope)
+            result["archive_id"] = archive_id
+            return self._complete_commit_result(result, wait)
 
         def extract():
             thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
@@ -492,7 +511,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                           failed_nodes=partial_error.failures,
                           reason=str(partial_error))
 
-        # For async mode, return task_id
+        return self._complete_commit_result(result, wait)
+
+    def _complete_commit_result(self, result, wait):
+        # Both engines preserve the existing completed-task contract.
         if not wait:
             task_id = str(uuid.uuid4())
             with self._tasks_lock:
@@ -591,7 +613,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                             candidate = checkpoint.revise_unwritten(index, refreshed)
                         logger.info("Refreshed concurrently updated profile: %s", candidate.target_uri)
                         continue
-                    if (self._node_processing_enabled and candidate.category in {"entity", "preference"}
+                    if (self._node_processing_enabled and not candidate.metadata.get("deterministic")
+                            and candidate.category in {"entity", "preference"}
                             and isinstance(exc.__cause__, ConcurrentModificationError)):
                         revised = self._node_processor().process(
                             checkpoint.reprocessing_drafts(candidate),

@@ -771,6 +771,22 @@ class OgMemConfig:
     decision: DecisionConfig | None = None
     shared_spaces_enabled: bool = False
 
+    # Appended to retain positional compatibility. Evidence has no independent switch.
+    extraction_engine: str = "llm"
+    deterministic_spacy_model_en: str = "en_core_web_sm"
+    deterministic_spacy_model_zh: str = "zh_core_web_sm"
+    deterministic_on_model_missing: str = "error"
+
+    @property
+    def evidence_enabled(self) -> bool:
+        return self.extraction_engine == "deterministic"
+
+    def deterministic_config(self):
+        from extraction.deterministic.nlp import DeterministicConfig
+        return DeterministicConfig(self.deterministic_spacy_model_en,
+                                   self.deterministic_spacy_model_zh,
+                                   self.deterministic_on_model_missing)
+
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
@@ -783,6 +799,9 @@ class OgMemConfig:
         return url.scheme == "http" and url.hostname in {"127.0.0.1", "localhost"} and url.port == 1833
 
     def __post_init__(self) -> None:
+        if self.extraction_engine not in {"llm", "deterministic"}:
+            raise ValueError("memory.extraction.engine must be llm or deterministic")
+        self.deterministic_config()
         if type(self.agent_turn_workers) is not int or self.agent_turn_workers < 1:
             raise ValueError("memory.extraction.agent_turn_workers must be a positive integer")
         if type(self.agent_turn_scheduler_owner) is not bool:
@@ -1266,6 +1285,8 @@ class OgMemConfig:
         auth = raw.get("auth") or {}
         sharing = raw.get("sharing") or {}
         memory = raw.get("memory") or {}
+        if "enabled" in (memory.get("evidence") or {}):
+            raise ValueError("memory.evidence.enabled is unsupported; select memory.extraction.engine")
         retrieval = raw.get("retrieval") or {}
         hybrid_enabled = _resolve_bool(retrieval.get("hybrid_enabled"), "OGMEM_RETRIEVAL_HYBRID_ENABLED", False)
         inverted_index = retrieval.get("inverted_index")
@@ -2209,6 +2230,14 @@ class OgMemConfig:
                 [],
             ),
             # Memory extraction
+            extraction_engine=_resolve(memory.get("extraction", {}).get("engine"),
+                                       "OGMEM_EXTRACTION_ENGINE", "llm"),
+            deterministic_spacy_model_en=_resolve(memory.get("extraction", {}).get("deterministic", {}).get("spacy_model_en"),
+                                                  "OGMEM_DETERMINISTIC_SPACY_MODEL_EN", "en_core_web_sm"),
+            deterministic_spacy_model_zh=_resolve(memory.get("extraction", {}).get("deterministic", {}).get("spacy_model_zh"),
+                                                  "OGMEM_DETERMINISTIC_SPACY_MODEL_ZH", "zh_core_web_sm"),
+            deterministic_on_model_missing=_resolve(memory.get("extraction", {}).get("deterministic", {}).get("on_model_missing"),
+                                                    "OGMEM_DETERMINISTIC_ON_MODEL_MISSING", "error"),
             card_format_enabled=_resolve_bool(
                 memory.get("extraction", {}).get("card_format_enabled"),
                 "OGMEM_CARD_FORMAT_ENABLED", False,

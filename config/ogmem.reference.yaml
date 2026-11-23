@@ -238,6 +238,11 @@ memory:
     read_probability_threshold: 0.70  # [all] Minimum JEV probability required for an old-memory read
     dual_pass_enabled: false      # [all] Set true to run two native extraction passes per span
     # agent_turn_workers: 10      # Active Agent extraction batches per scheduler process
+    # engine: llm                 # llm / deterministic.
+    # deterministic:              # Used only when engine is deterministic. Requires the deterministic extra for spaCy.
+    #   spacy_model_en: en_core_web_sm
+    #   spacy_model_zh: zh_core_web_sm
+    #   on_model_missing: error   # error / rules_only. Default requires both models to be installed.
   # after_turn_threshold: 400    # [all] tokens before auto-extraction
   # rolling_compress_enabled: true
   # compact_prepare_token_ttl: 300

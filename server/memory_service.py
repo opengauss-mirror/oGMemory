@@ -2075,6 +2075,16 @@ class MemoryService:
         )
         return aggregated
 
+    def _new_extraction_config(self, buffer=None):
+        if buffer is not None:
+            pending = buffer.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+            if pending is not None:
+                return pending.get("extraction_config", {"engine": "llm"})
+        from service.api import MemoryWriteAPI
+        from service.deterministic_ingest import extraction_configuration
+        api = self.get_write_api()
+        return extraction_configuration(api) if isinstance(api, MemoryWriteAPI) else {"engine": "llm"}
+
     def _extract_lifecycle_source(self, write_api, ctx, session_id, journal):
         while True:
             lifecycle = journal.batch["lifecycle"]
@@ -2103,6 +2113,8 @@ class MemoryService:
         session_time = _parse_session_time(batch.get("session_time"))
 
         def make_chunks():
+            if batch.get("extraction_config", {}).get("engine") == "deterministic":
+                return [messages]
             chunker = self._get_chunker()
             return chunker.chunk_messages(messages, flush=True).chunks if chunker else [messages]
 
@@ -3526,6 +3538,8 @@ class MemoryService:
                 uri_resolver=uri_resolver,
 internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_mode=self._cfg.extraction_mode,
+                extraction_engine=self._cfg.extraction_engine,
+                deterministic_config=self._cfg.deterministic_config(),
                 decision_client=(self.get_decision_client()
                                  if self._cfg.extraction_mode == "lazy" else None),
                 read_probability_threshold=self._cfg.read_probability_threshold,
@@ -4645,6 +4659,15 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         all_succeeded = True
         try:
             try:
+                from service.evidence_lifecycle import EvidenceLifecycle
+                fs = self._get_context_fs()
+                if fs is not None:
+                    steps["evidence"] = {"ok": True, **EvidenceLifecycle(fs, self._get_outbox_store(fs)).delete_session(ctx)}
+            except Exception as exc:
+                all_succeeded = False
+                return {"ok": False, "cleaned": False, "status": 503, "retryable": True,
+                        "session_id": session_id, "steps": {"evidence": {"ok": False, "error": str(exc)}}}
+            try:
                 deleted = mgr.delete_session_archives(session_id, ctx)
                 steps["archives"] = {"ok": True, "deleted": deleted}
             except Exception as exc:
@@ -5693,6 +5716,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_summary=buf.extraction_summary, tool_stats_text=state["tool_stats_text"],
                 client_request_id=request_id,
                 request_source_ids=receipts.get(request_id, {}).get("source_message_ids", ()),
+                extraction_config=self._new_extraction_config(buf),
                 agent_async=True, ready_at_ms=ready_at_ms,
             )
         except Exception:
@@ -6492,7 +6516,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     tool_stats_text=extraction_state["tool_stats_text"],
                     client_request_id=client_request_id or "extraction-retry-" + archive_id,
                     request_messages=new_messages,
-                    request_source_ids=sorted(request_source_ids))
+                    request_source_ids=sorted(request_source_ids),
+                    extraction_config=self._new_extraction_config(buf))
                 archive_id = extraction_journal.batch["archive_id"]
                 if not extraction_journal.batch.get("client_request_id"):
                     extraction_journal.mutate(lambda batch: batch.update(
@@ -6503,6 +6528,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     buf.end_extraction()
                 return {"ok": False, "status": "needs_confirmation" if isinstance(exc, RecoveryNeedsConfirmationError) else "failed",
                         "error": str(exc), "retryable": not isinstance(exc, RecoveryNeedsConfirmationError)}
+
+        if (extraction_journal is not None
+                and extraction_journal.batch.get("extraction_config", {}).get("engine") == "deterministic"):
+            # The frozen deterministic input includes assistant evidence even
+            # when the legacy LLM input has no extractable messages.
+            extraction_messages = extraction_journal.batch["messages"]
 
         def _finish_archived_batch(write_result=None):
             write_result = write_result or {}
@@ -7523,7 +7554,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 else buf.compaction_prepare_archive_id or generate_archive_id()),
             messages=result["messages"],
             session_time=result["session_time"], session_summary=buf.extraction_summary,
-            tool_stats_text=result["tool_stats_text"])
+            tool_stats_text=result["tool_stats_text"],
+            extraction_config=(pending.get("extraction_config", {"engine": "llm"})
+                if pending else self._new_extraction_config()))
 
     def bootstrap(self, params: dict) -> dict:
         return {"bootstrapped": True}
@@ -7638,7 +7671,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return LifecycleBatchJournal(mgr, buf, ctx, snapshot, kind="dispose",
             archive_id=pending["archive_id"] if pending else generate_archive_id(), messages=state["messages"],
             session_time=state["session_time"], session_summary=buf.extraction_summary,
-            tool_stats_text=state["tool_stats_text"])
+            tool_stats_text=state["tool_stats_text"],
+            extraction_config=(pending.get("extraction_config", {"engine": "llm"})
+                if pending else self._new_extraction_config()))
 
     def _prepare_dispose_source(self, mgr, buf, ctx, params):
         from service.api import MemoryWriteAPI as _CheckpointWriteAPI
