@@ -1,6 +1,12 @@
 """Generic channel competition and bounded conversational context."""
 
-from retrieval.evidence.ranking import lexical_scores, query_branches, rank_lexical, select_groups
+from retrieval.evidence.ranking import (
+    lexical_scores,
+    parse_evidence_query,
+    rank_lexical,
+    select_groups,
+    supplement_scores,
+)
 
 
 def test_ranked_lexical_channel_caps_candidates_with_stable_order():
@@ -9,6 +15,15 @@ def test_ranked_lexical_channel_caps_candidates_with_stable_order():
     ranked = rank_lexical("telescope", units, scores, 50)
     assert list(ranked) == [str(i) for i in range(50)]
     assert ranked["0"] == 1 / 61 and ranked["49"] == 1 / 110
+
+
+def test_primary_and_supplementary_ranks_share_tiebreak_and_keep_priority():
+    texts = {key: "telescope repair" for key in ("c", "b", "a")}
+    units = {key: {"text": text} for key, text in texts.items()}
+    primary = rank_lexical("telescope", units, lexical_scores("telescope", units), 2)
+    supplementary = supplement_scores("telescope", units, texts, 2)
+    assert list(primary.items()) == [("a", 1 / 61), ("b", 1 / 62)]
+    assert list(supplementary.items()) == [("a", 1 / 63), ("b", 1 / 64)]
 
 
 def test_common_terms_do_not_create_a_false_lexical_candidate():
@@ -26,9 +41,8 @@ def unit(text, sequence, *, session="session", speaker=""):
 
 
 def select(units, anchor, *, top_k=4, **kwargs):
-    query = "How long has Morgan kept a studio?"
-    return select_groups(query, {anchor: 1}, units, top_k, 50,
-                         branch_terms=[words for _, words in query_branches(query)], **kwargs)
+    query = parse_evidence_query("How long has Morgan kept a studio?")
+    return select_groups(query, {anchor: 1}, units, top_k, 50, **kwargs)
 
 
 def test_duration_answer_without_shared_topic_is_grouped_in_both_directions():
@@ -92,7 +106,7 @@ def test_whole_groups_respect_count_and_serialized_byte_limits():
 
 
 def test_functional_overlap_and_query_operators_cannot_establish_a_topic():
-    from retrieval.evidence.ranking import supplement_scores, terms
+    from retrieval.evidence.ranking import terms
 
     units = {"repair": {"text": "I've repaired different bicycles with my neighbour."},
              "other": {"text": "I’ve been cooking different soups with my sister."}}
@@ -106,8 +120,6 @@ def test_functional_overlap_and_query_operators_cannot_establish_a_topic():
 
 
 def test_supplements_have_distinct_bounded_ranks_and_keep_chinese_topics():
-    from retrieval.evidence.ranking import supplement_scores
-
     units = {"a": {"text": "我参加了摄影课程。"}, "b": {"text": "我参加了陶艺课程。"},
              "c": {"text": "我修理了自行车。"}}
     scores = supplement_scores("摄影课程", units, {key: u["text"] for key, u in units.items()}, 1)
@@ -121,9 +133,9 @@ def test_independent_facts_fit_before_optional_long_reply():
     units = {"first": unit("I completed four pottery courses. Any other course ideas?", 0),
              "reply": unit("That course progress is excellent. " * 100, 1),
              "second": unit("I completed two photography courses.", 0, session="other")}
-    selected, groups = select_groups("How many courses did I complete?",
+    selected, groups = select_groups(parse_evidence_query("How many courses did I complete?"),
         {"first": 1, "second": .9}, units, 2, 50,
-        branch_terms=[{"course", "complete"}], costs={"first": 80, "reply": 3000, "second": 80}, byte_limit=160)
+        costs={"first": 80, "reply": 3000, "second": 80}, byte_limit=160)
     assert selected == ["first", "second"]
     assert groups == [["first"], ["second"]]
 
@@ -147,7 +159,7 @@ def test_optional_context_is_available_after_seeds_and_retains_dependency_ids():
     units = {"first": unit("I opened a studio.", 0),
              "reply": unit("That studio sounds wonderful.", 1),
              "second": unit("I closed another studio.", 0, session="other")}
-    selected, groups = select_groups("studio", {"first": 1, "second": .9}, units, 3, 50, branch_terms=[{"studio"}])
+    selected, groups = select_groups(parse_evidence_query("studio"), {"first": 1, "second": .9}, units, 3, 50)
     assert selected == ["first", "second", "reply"]
     assert groups == [["first"], ["second"], ["first", "reply"]]
 
@@ -160,8 +172,6 @@ def test_topic_label_before_a_question_does_not_make_its_answer_optional():
 
 
 def test_ambiguous_function_words_remain_searchable_as_literal_names():
-    from retrieval.evidence.ranking import supplement_scores
-
     units = {"one": {"text": "May repaired a telescope.", "speaker": "May"},
              "two": {"text": "Will repaired a piano.", "speaker": "Will"}}
     for query, expected in [("May", "one"), ("Will", "two"), ("may", "one"), ("will", "two")]:

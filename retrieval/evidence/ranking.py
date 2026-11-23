@@ -3,6 +3,7 @@
 import math
 import re
 from collections import Counter
+from dataclasses import dataclass
 
 _LEMMA = {}
 for _root in "visit attend complete finish join adopt move graduate play repair start recommend suggest enjoy hide like love own mention".split():
@@ -57,9 +58,7 @@ def supplement_scores(query, units, texts, limit):
     topics = query_topics(query, units)
     documents = {key: {"text": text} for key, text in texts.items()
                  if key in units and topics & set(terms(text))}
-    scores = lexical_scores(query, documents)
-    return {key: 1 / (60 + limit + rank) for rank, key in enumerate(
-        sorted(scores, key=lambda key: (-scores[key], key))[:limit], 1)}
+    return _reciprocal_ranks(lexical_scores(query, documents), limit, offset=limit)
 
 
 def lexical_scores(query, units):
@@ -82,23 +81,39 @@ def lexical_scores(query, units):
     return scores
 
 
+def _reciprocal_ranks(scores, limit, *, offset=0):
+    ordered = sorted(scores, key=lambda key: (-scores[key], key))[:limit]
+    return {key: 1 / (60 + rank) for rank, key in enumerate(ordered, offset + 1)}
+
+
 def rank_lexical(query, units, lexical, limit):
     """Keep topical hits within the primary candidate limit."""
     topics = query_topics(query, units)
     candidates = {key: score for key, score in lexical.items()
                   if key in units and (not topics or topics & set(terms(units[key]["text"])))}
-    ordered = sorted(candidates, key=lambda key: (-candidates[key], key))[:limit]
-    return {key: 1 / (60 + rank) for rank, key in enumerate(ordered, 1)}
+    return _reciprocal_ranks(candidates, limit)
 
 
-def query_branches(query):
+@dataclass(frozen=True)
+class QueryBranch:
+    text: str
+    terms: frozenset[str]
+
+
+@dataclass(frozen=True)
+class ParsedEvidenceQuery:
+    text: str
+    branches: tuple[QueryBranch, ...]
+
+
+def parse_evidence_query(query: str) -> ParsedEvidenceQuery:
     """Share effective conjuncts between supplementary search and coverage."""
     branches = []
     for part in re.split(r"\band\b|和|与", query, flags=re.I):
-        words = set(terms(part))
+        words = frozenset(terms(part))
         if words:
-            branches.append((part.strip(), words))
-    return branches
+            branches.append(QueryBranch(part.strip(), words))
+    return ParsedEvidenceQuery(query, tuple(branches))
 
 
 def fact_matches(query, record):
@@ -167,7 +182,8 @@ def _adjacent(left, right):
                  and right["sequence"] - left["sequence"] == 1))
 
 
-def select_groups(query, scores, units, top_k, candidate_limit, *, branch_terms, costs=None, byte_limit=64 * 1024):
+def select_groups(query: ParsedEvidenceQuery, scores, units, top_k, candidate_limit, *,
+                  costs=None, byte_limit=64 * 1024):
     """Select independent seeds with only the context required to interpret them."""
     speaker_terms = {word for unit in units.values() for word in terms(unit.get("speaker", ""))}
     reference_terms = set("it that this they he she there him her them these those yes no hi hello hey thanks okay ok".split())
@@ -175,8 +191,8 @@ def select_groups(query, scores, units, top_k, candidate_limit, *, branch_terms,
     def topic_words(text):
         return topic_terms(text) - speaker_terms - reference_terms
 
-    query_topics = topic_words(query)
-    dates = set(re.findall(r"\d{4}-\d{2}-\d{2}", query))
+    query_topics = topic_words(query.text)
+    dates = set(re.findall(r"\d{4}-\d{2}-\d{2}", query.text))
     ordered = sorted(units, key=lambda key: (units[key]["session_id"], units[key]["sequence"],
                                              units[key]["parent_span"][0], key))
     positions = {key: i for i, key in enumerate(ordered)}
@@ -186,7 +202,7 @@ def select_groups(query, scores, units, top_k, candidate_limit, *, branch_terms,
     while pending and len(selected) < top_k:
         def priority(key):
             text_terms = set(terms(units[key]["text"]))
-            gain = sum(1 for i, branch in enumerate(branch_terms) if i not in covered and branch & text_terms)
+            gain = sum(1 for i, branch in enumerate(query.branches) if i not in covered and branch.terms & text_terms)
             exact_date = bool(dates & set(re.findall(r"\d{4}-\d{2}-\d{2}", units[key]["text"])))
             return (-int(exact_date), -scores[key] * (1 + .25 * gain), key)
         key = min(pending, key=priority)
@@ -233,7 +249,8 @@ def select_groups(query, scores, units, top_k, candidate_limit, *, branch_terms,
         pending.difference_update(group)
         used_bytes += size
         for item in group:
-            covered.update(i for i, branch in enumerate(branch_terms) if branch & set(terms(units[item]["text"])))
+            text_terms = set(terms(units[item]["text"]))
+            covered.update(i for i, branch in enumerate(query.branches) if branch.terms & text_terms)
     # Optional explanations/continuations compete only for the remaining
     # capacity, after every independent seed has had its admission attempt.
     for seed_group in list(groups):

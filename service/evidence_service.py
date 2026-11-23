@@ -9,13 +9,13 @@ import time
 from core.errors import NodeNotFoundError
 from core.evidence import evidence_uri
 from core.evidence_query import EvidenceQuery, MessageEvidenceResult, facts_supported_by
-from core.operation_deadline import remaining_seconds
 from core.evidence_timing import operation, request_id, stage, timed
+from core.operation_deadline import remaining_seconds
 from providers.token_tracker import request_usage_scope
 from retrieval.evidence.ranking import (
     fact_matches,
     lexical_scores,
-    query_branches,
+    parse_evidence_query,
     query_topics,
     rank_lexical,
     select_groups,
@@ -57,6 +57,7 @@ class EvidenceService:
         query = request.query
         started = time.monotonic()
         deadline = started + min(20, remaining_seconds() or 20)
+        parsed_query = parse_evidence_query(query)
         diagnostics = {"partial": False, "truncated": False, "scanned_sources": 0, "scanned_cards": 0,
                        "verified_facts": 0, "rejected_facts": 0, "unverifiable_cards": 0, "channels": {
                            name: {"enabled": getattr(request, "use_" + name), "available": True}
@@ -89,8 +90,8 @@ class EvidenceService:
         with stage("fusion"):
             scores = rank_lexical(query, units, lexical, request.candidate_limit)
             # Bounded subqueries add missing query branches by strongest support only.
-            branches = query_branches(query)
-            supplementary = [part for part, _ in branches[:request.max_supplementary_queries]] if len(branches) > 1 else []
+            branches = parsed_query.branches
+            supplementary = [branch.text for branch in branches[:request.max_supplementary_queries]] if len(branches) > 1 else []
             for branch in supplementary:
                 branch_scores = rank_lexical(branch, units, lexical_scores(branch, units), request.candidate_limit)
                 for key, score in branch_scores.items():
@@ -232,8 +233,7 @@ class EvidenceService:
                     if ref["evidence_unit_id"] in costs:
                         costs[ref["evidence_unit_id"]] += encoded_size(record) + 2
             selected, groups = select_groups(
-                query, scores, units, request.top_k, request.candidate_limit,
-                branch_terms=[words for _, words in branches], costs=costs,
+                parsed_query, scores, units, request.top_k, request.candidate_limit, costs=costs,
                 byte_limit=56 * 1024 - encoded_size(query),
             )
             if len(selected) < min(len(scores), request.top_k):
@@ -264,7 +264,7 @@ class EvidenceService:
             def refresh_coverage():
                 final_terms = set().union(*(set(terms(item["text"])) for item in result.evidence))
                 diagnostics["uncovered_branches"] = [index for index, branch in enumerate(branches)
-                                                      if not branch[1] & final_terms]
+                                                      if not branch.terms & final_terms]
             refresh_coverage()
             while groups and encoded_size(result.to_dict()) > 64 * 1024 - 64:
                 removed = set(groups.pop()) - {key for group in groups for key in group}
