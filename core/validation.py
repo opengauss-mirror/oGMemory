@@ -230,7 +230,7 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
     # Validate category (raises if invalid)
     valid_categories = {
         "profile", "preference", "entity", "event",
-        "case", "pattern", "skill", "tool"
+        "case", "pattern", "skill", "tool", "fact"
     }
     if candidate.category not in valid_categories:
         raise ValidationError(

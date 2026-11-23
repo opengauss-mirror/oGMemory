@@ -1,0 +1,21 @@
+memory_type: fact
+version: "1.0"
+description: "Source-grounded atomic fact produced by deterministic extraction."
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/facts"
+filename_template: "{{ routing_key }}.md"
+operation_mode: upsert
+owner_scope: user
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+  - name: abstract
+    type: string
+    required: true
+  - name: overview
+    type: string
+    required: true
+  - name: content
+    type: string
+    required: true
