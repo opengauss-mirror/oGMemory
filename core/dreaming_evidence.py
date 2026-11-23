@@ -1,5 +1,8 @@
 """Source-bound assertions consumed by Dreaming."""
 
+import json
+import os
+from bisect import bisect_left
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -8,6 +11,39 @@ from core.memory_names import canonical_object_name, canonical_scope
 from core.provenance_resolver import ProvenanceResolver
 
 EVIDENCE_KEY = "dreaming_evidence_v1"
+EVIDENCE_INPUT = "evidence_assertions"
+
+
+def enabled():
+    return os.environ.get("OGMEM_DREAMING_ENABLED", "").lower() in {"1", "true"}
+
+
+def merge_evidence(*groups, references=None):
+    rows = {}
+    for group in groups:
+        if isinstance(group, list):
+            for row in group:
+                if isinstance(row, dict) and (references is None or (
+                        isinstance(row.get("source_ref"), str) and row["source_ref"] in references)):
+                    rows.setdefault(json.dumps(row, sort_keys=True, ensure_ascii=False), row)
+    return list(rows.values())
+
+
+def evidence_metadata(candidate, *contributors):
+    merged = {}
+    for key in (EVIDENCE_KEY, EVIDENCE_INPUT):
+        rows = merge_evidence(candidate.metadata.get(key), *(source.metadata.get(key) for source in contributors))
+        if rows:
+            merged[key] = rows
+    return {**candidate.metadata, **merged} if merged else candidate.metadata
+
+
+def has_new_evidence(candidate, existing):
+    incoming = candidate.metadata.get(EVIDENCE_KEY)
+    if not incoming:
+        return False
+    previous = merge_evidence(existing.metadata.get(EVIDENCE_KEY))
+    return merge_evidence(previous, incoming) != previous
 
 
 def timestamp(value):
@@ -22,6 +58,43 @@ def timestamp(value):
 
 def claim_text(value):
     return " ".join(value.split())
+
+
+def fact_blocks(content, evidence_claims=()):
+    blocks = []
+    headings = {}
+    for line in content.splitlines():
+        if not line.strip():
+            continue
+        marker, _, title = line.partition(" ")
+        if title.strip() and marker in ("#", "##", "###", "####", "#####", "######"):
+            headings = {level: heading for level, heading in headings.items() if level < len(marker)}
+            headings[len(marker)] = line
+            continue
+        if blocks and blocks[-1][0] == list(headings.values()) and line.startswith(("  ", "\t")):
+            blocks[-1][1].append(line.rstrip())
+        else:
+            blocks.append((list(headings.values()), [line.rstrip()]))
+    sorted_claims = sorted(evidence_claims)
+    records = []
+    index = 0
+    while index < len(blocks):
+        headers, body = blocks[index]
+        claim = claim_text("\n".join(body).strip().removeprefix("- "))
+        text, end = claim, index + 1
+        for next_index in range(end, len(blocks)):
+            next_headers, continuation = blocks[next_index]
+            prefix = text + " "
+            position = bisect_left(sorted_claims, prefix)
+            if (next_headers != headers or position == len(sorted_claims)
+                    or not sorted_claims[position].startswith(prefix)):
+                break
+            text = prefix + claim_text("\n".join(continuation))
+            if text in evidence_claims:
+                claim, end = text, next_index + 1
+        records.append((claim, "\n".join([*headers, *(line for _, lines in blocks[index:end] for line in lines)])))
+        index = end
+    return records
 
 
 @dataclass(frozen=True)

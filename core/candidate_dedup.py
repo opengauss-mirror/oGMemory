@@ -10,9 +10,11 @@ from core.models import CandidateMemory
 def candidate_draft_fields(candidate: CandidateMemory) -> dict:
     """Preserve legacy serialization when optional internal partition identity is absent."""
     fields = asdict(candidate)
+    from core.dreaming_evidence import EVIDENCE_INPUT, EVIDENCE_KEY
     from extraction.relation_proposals import KEY
     metadata = dict(fields.get("metadata") or {})
-    metadata.pop(KEY, None)
+    for key in (KEY, EVIDENCE_INPUT, EVIDENCE_KEY):
+        metadata.pop(key, None)
     fields["metadata"] = metadata
     fields.pop("node_reconciliation_role", None)
     fields.pop("node_reconciliation_group", None)
@@ -57,9 +59,11 @@ def merge_duplicate_event_sources(
     existing: CandidateMemory, candidate: CandidateMemory,
 ) -> CandidateMemory:
     """Merge evidence IDs for equal drafts without mutating either input."""
+    from core.dreaming_evidence import evidence_metadata
     winner = candidate if candidate.confidence > existing.confidence else existing
-    return replace(winner, provenance_ids=list(dict.fromkeys(
-        [*existing.provenance_ids, *candidate.provenance_ids])))
+    other = existing if winner is candidate else candidate
+    return replace(winner, metadata=evidence_metadata(winner, other),
+                   provenance_ids=list(dict.fromkeys([*existing.provenance_ids, *candidate.provenance_ids])))
 
 
 def case_draft_signature(candidate: CandidateMemory) -> str:

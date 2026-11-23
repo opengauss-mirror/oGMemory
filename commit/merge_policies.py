@@ -8,6 +8,7 @@ import uuid as uuid_lib
 from datetime import UTC, datetime
 
 from commit.routing_key import normalize_routing_key
+from core.dreaming_evidence import EVIDENCE_KEY, has_new_evidence
 from core.errors import ConcurrentModificationError
 from core.interfaces import ContextFS, MergePolicy
 from core.models import CandidateMemory, RequestContext, WritePlan
@@ -83,6 +84,7 @@ class ProfilePolicy(MergePolicy):
                 if (all(getattr(candidate, name) == getattr(existing_node, name)
                         for name in ("abstract", "overview", "content"))
                         and set(candidate.provenance_ids) <= set(existing_node.metadata.get("provenance_ids", []))
+                        and not has_new_evidence(candidate, existing_node)
                         and all(not getattr(candidate, name)
                                 or getattr(candidate, name) == existing_node.metadata.get(name)
                                 for name in ("when", "who", "where"))):
@@ -175,6 +177,7 @@ class AggregateTopicPolicy(MergePolicy):
                     "existing_content": existing_node.content,
                     "content_append": candidate.content,
                     "expected_version": current_version,
+                    **({EVIDENCE_KEY: existing_node.metadata[EVIDENCE_KEY]} if EVIDENCE_KEY in existing_node.metadata else {}),
                     "provenance_ids": _merge_provenance_ids(
                         existing_node.metadata.get("provenance_ids"),
                         candidate.provenance_ids,
@@ -305,6 +308,7 @@ class SkillToolPolicy(MergePolicy):
                     "new_abstract": candidate.abstract,
                     "usage_count": existing_node.metadata.get("usage_count", 0) + 1,
                     "expected_version": current_version,
+                    **({EVIDENCE_KEY: existing_node.metadata[EVIDENCE_KEY]} if EVIDENCE_KEY in existing_node.metadata else {}),
                     "provenance_ids": _merge_provenance_ids(
                         existing_node.metadata.get("provenance_ids"),
                         candidate.provenance_ids,

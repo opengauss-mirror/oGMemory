@@ -39,11 +39,18 @@ from core.candidate_dedup import (
     normalize_same_span_case_runs,
     normalize_same_span_occurrence_runs,
 )
+from core.dreaming_evidence import (
+    EVIDENCE_INPUT,
+    EVIDENCE_KEY,
+    bind_archive_evidence,
+    evidence_metadata,
+    merge_evidence,
+)
 from core.errors import (
     ExtractionBudgetError,
     ExtractionIncompleteError,
-    LLMCallError,
     ExtractionOutputError,
+    LLMCallError,
     LLMOutputTruncatedError,
     LLMTransientError,
     OperationDeadlineExceededError,
@@ -63,6 +70,7 @@ from core.validation import (
 )
 from extraction.assembly_contract import UnsupportedAssemblyTemplateError
 from extraction.event_reconciliation import reconcile_event_drafts
+from extraction.evidence_layout import evidence_layout
 from extraction.incremental_edit import (
     INCREMENTAL_TOOLS,
     coalesce_incremental_edits,
@@ -1203,7 +1211,8 @@ class Extractor:
                 "Do not concatenate conflicting snapshots or invent facts. Keep the memory's "
                 "language. Keep abstract under 100 characters (hard maximum 200) and overview "
                 "under 2500 characters (hard maximum 5000); retain full details in content. "
-                "Return complete abstract, overview and content as nonempty strings.\n\n"
+                + evidence_layout(candidate for _, candidate in entries)
+                + "Return complete abstract, overview and content as nonempty strings.\n\n"
                 + json.dumps(payload, ensure_ascii=False)
             )
             schema = {
@@ -1240,6 +1249,7 @@ class Extractor:
                     target_uri=uri,
                     expected_version=existing.metadata.get("version", 0),
                     confidence=min(candidate.confidence for _, candidate in entries),
+                    metadata=evidence_metadata(entries[-1][1], *(candidate for _, candidate in entries[:-1])),
                     provenance_ids=list(
                         dict.fromkeys(
                             source
@@ -1628,6 +1638,7 @@ class Extractor:
                     existing.expected_version or 0, existing.confidence, len(existing.content),
                 ):
                     merged[key] = c
+                merged[key] = Extractor._keep_dreaming_evidence(merged[key], existing, c)
                 continue
             # Pick higher confidence; if equal, pick richer content
             if c.confidence > existing.confidence:
@@ -1650,9 +1661,19 @@ class Extractor:
                 if not c.where and existing.where:
                     c.where = existing.where
                 merged[key] = c
+            merged[key] = Extractor._keep_dreaming_evidence(merged[key], existing, c)
         result = list(merged.values())
         attach(result, proposals)
         return result
+
+    @staticmethod
+    def _keep_dreaming_evidence(winner, existing, incoming):
+        other = existing if winner is incoming else incoming
+        metadata = evidence_metadata(winner, other)
+        if metadata is winner.metadata:
+            return winner
+        references = list(dict.fromkeys([*winner.provenance_ids, *other.provenance_ids]))
+        return replace(winner, metadata=metadata, provenance_ids=references)
 
     def _storage_requires_owner_thread(self) -> bool:
         thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
@@ -2649,13 +2670,24 @@ class Extractor:
                     candidate.routing_key,
                 )
             candidates[:] = retained
+        prov_id = None
         if archive_id and span.message_ids:
             from core.provenance_resolver import ProvenanceResolver
             prov_id = ProvenanceResolver.build_id(
                 "archive", archive_id, span.message_ids
             )
-            for c in candidates:
-                c.provenance_ids.append(prov_id)
+        for candidate in candidates:
+            if prov_id:
+                candidate.provenance_ids.append(prov_id)
+            assertions = [row | {"scope_ref": step.scope_ref}
+                          for step in incremental_source_steps(candidate)
+                          for row in step.metadata.pop(EVIDENCE_INPUT, [])
+                          if isinstance(row, dict)]
+            candidate.metadata.pop(EVIDENCE_INPUT, None)
+            if prov_id and assertions:
+                bound = bind_archive_evidence(assertions, prov_id, span.focused_messages)
+                if bound:
+                    candidate.metadata[EVIDENCE_KEY] = merge_evidence(candidate.metadata.get(EVIDENCE_KEY), bound)
 
     def _parse_candidate_calls(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
         try:
