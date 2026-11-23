@@ -71,7 +71,7 @@ def test_source_only_tools_preserve_enabled_fact_and_identity_contracts(topic_dr
         registry, include_updates=False, topic_drafts=topic_drafts, activation_enabled=activation_enabled,
     )}
     assert set(source) == {schema.tool_name for schema in registry.list_compatible_enabled()
-                           if schema.memory_type not in {"session_archive", "session_summary"}
+                           if schema.memory_type not in {"session_archive", "session_summary", "fact"}
                            and (activation_enabled or schema.memory_type != "relation")}
     for name, tool in source.items():
         expected = {key: value for key, value in native[name]["input_schema"]["properties"].items()
