@@ -12,7 +12,6 @@ from core.errors import OperationDeadlineExceededError
 from core.evidence import message_source
 from extraction.deterministic.extractor import DeterministicExtractor
 from extraction.deterministic.nlp import (
-    DeterministicConfig,
     TextParser,
     reuse_documents,
     verified_document,
@@ -95,22 +94,6 @@ def test_reusing_a_document_never_reuses_source_validity_or_model_version(setup,
         store.revoke_session(CTX)
         assert not verify_record(record, store, CTX)
     assert model.call_count == 1
-
-
-def test_real_spacy_batch_candidates_and_documents_match_serial_execution():
-    pytest.importorskip("spacy")
-    try:
-        parser = TextParser(DeterministicConfig())
-    except RuntimeError as exc:
-        pytest.skip(str(exc))
-    texts = ["Caroline visited Paris yesterday.", "我完成了7篇文章。", "Caroline visited Paris yesterday."]
-    assert [doc.to_json() for doc in parser.parse_many(texts)] == [parser.parse(text).to_json() for text in texts]
-    serial = SimpleNamespace(parse=parser.parse, signature=parser.signature, degraded_languages=parser.degraded_languages)
-    messages = [message("[Alex]: I visited Paris. I completed 7 essays.\n[Morgan]: Alex repaired a telescope."),
-                message("我完成了7篇文章。", id="zh", sequence=10),
-                message("I recommend visiting Paris.", role="assistant", id="assistant", sequence=11)]
-    assert DeterministicExtractor(SchemaRegistry(), parser=parser).extract(messages, CTX) == (
-        DeterministicExtractor(SchemaRegistry(), parser=serial).extract(messages, CTX))
 
 
 # Quotation filtering stays linear and observes the caller's deadline.

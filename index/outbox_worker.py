@@ -335,8 +335,8 @@ class OutboxWorker:
                 embeddings = self._projection.embed(records)
             projected_records = self._augment_with_embeddings(records, embeddings)
         from index.evidence_projection import memory_projection_guard
-        with memory_projection_guard(self._fs, event, records) as current:
-            if not current:
+        with memory_projection_guard(self._fs, event, records) as can_publish:
+            if not can_publish:
                 return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
             self._projection.upsert(projected_records)
             self._upsert_code_bm25(records)
@@ -1227,15 +1227,15 @@ class OutboxWorker:
                     self._ensure_processing_owned(outbox_store, event, node_uri)
                     from index.evidence_projection import memory_projection_guard
                     with self._projection_owner(outbox_store, event, node_uri), memory_projection_guard(
-                            self._fs, event, records) as current:
-                        if current:
+                            self._fs, event, records) as can_publish:
+                        if can_publish:
                             self._projection.upsert(augmented)
                             self._ensure_processing_owned(outbox_store, event, node_uri)
                             self._upsert_code_bm25(records)
                     result = WorkerResult(
                         event_id=event.event_id,
                         success=True,
-                        records_upserted=len(records) if current else 0,
+                        records_upserted=len(records) if can_publish else 0,
                     )
                     if self._supports_liveness_check(outbox_store):
                         current = self._event_is_current(

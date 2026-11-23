@@ -1,11 +1,12 @@
 """Opt in with OGMEM_REAL_NLP_TESTS=1; selected runs REQUIRE both real models."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
-from core.evidence import digest
-from extraction.deterministic.extractor import DeterministicExtractor
+from extraction.deterministic.extractor import DeterministicExtractor, fact_id
+from extraction.deterministic.nlp import parser_language
 from extraction.deterministic.verification import verify_record
 from extraction.schemas.registry import SchemaRegistry
 from fs.agfs_adapter import AGFSContextFS
@@ -100,9 +101,8 @@ def test_real_models_preserve_recommendation_actor_in_extraction_and_verificatio
                "evidence_unit_id": source["units"][0]["evidence_unit_id"], "content_hash": source["content_hash"],
                "span": [0, len(text)], "quote": text}
         record.update(quote=text, object=text, source_refs=[ref], nlp_model=extractor.parser.signature[
-            "zh" if any("\u4e00" <= char <= "\u9fff" for char in text) else "en"])
-        record["fact_id"] = digest(ref["source_key"], ref["evidence_unit_id"], 0, text,
-                                   record["subject"], record["predicate"], record["object"])
+            parser_language(text)])
+        record["fact_id"] = fact_id(ref, record)
         assert not verify_record(record, store, CTX)
 
 
@@ -157,3 +157,15 @@ def test_real_models_preserve_quantity_value_and_clause(extractor, text, role, v
         assert quantity is None
     else:
         assert (quantity["value"], quantity["kind"]) == (value, kind)
+
+
+def test_real_spacy_batch_candidates_and_documents_match_serial_execution(extractor):
+    parser = extractor.parser
+    texts = ["Caroline visited Paris yesterday.", "我完成了7篇文章。", "Caroline visited Paris yesterday."]
+    assert [doc.to_json() for doc in parser.parse_many(texts)] == [parser.parse(text).to_json() for text in texts]
+    serial = SimpleNamespace(parse=parser.parse, signature=parser.signature, degraded_languages=parser.degraded_languages)
+    messages = [message("[Alex]: I visited Paris. I completed 7 essays.\n[Morgan]: Alex repaired a telescope."),
+                message("我完成了7篇文章。", id="zh", sequence=10),
+                message("I recommend visiting Paris.", role="assistant", id="assistant", sequence=11)]
+    assert DeterministicExtractor(SchemaRegistry(), parser=parser).extract(messages, CTX) == (
+        DeterministicExtractor(SchemaRegistry(), parser=serial).extract(messages, CTX))

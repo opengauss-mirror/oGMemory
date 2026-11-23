@@ -7,11 +7,7 @@ import pytest
 from core.errors import ValidationError
 from core.evidence import evidence_uri
 from service.evidence_lifecycle import EvidenceLifecycle
-from tests.unit.evidence.test_evidence_store import store as store_fixture
 from tests.unit.evidence.test_sources import CTX, message
-
-store = store_fixture
-
 
 @pytest.mark.parametrize("existing_manifest", [False, True])
 @pytest.mark.parametrize("failure", ["source", "window", "manifest"])

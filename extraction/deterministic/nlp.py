@@ -58,6 +58,10 @@ def load_model(name: str):
     return spacy.load(name)
 
 
+def parser_language(text: str) -> str:
+    return "zh" if any("\u4e00" <= c <= "\u9fff" for c in text) else "en"
+
+
 class TextParser:
     def __init__(self, config: DeterministicConfig):
         self.config = config
@@ -73,7 +77,7 @@ class TextParser:
 
     @timed("nlp")
     def parse(self, text: str):
-        language = "zh" if any("\u4e00" <= c <= "\u9fff" for c in text) else "en"
+        language = parser_language(text)
         model = self.models.get(language)
         # Execution/parse failures are not equivalent to a normally empty result.
         return model(text) if model is not None else None
@@ -83,7 +87,7 @@ class TextParser:
         """Parse one bounded extraction batch, retaining language and input order."""
         groups = {"en": [], "zh": []}
         for text in dict.fromkeys(texts):
-            language = "zh" if any("\u4e00" <= c <= "\u9fff" for c in text) else "en"
+            language = parser_language(text)
             groups[language].append(text)
         documents = {}
         for language, group in groups.items():

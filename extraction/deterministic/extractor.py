@@ -14,8 +14,8 @@ from core.evidence import deterministic_payload, digest, message_source, reassem
 from core.evidence_timing import operation
 from core.models import CandidateMemory
 from core.operation_deadline import check_deadline
-from core.validation import MAX_CONTENT_LEN
-from extraction.deterministic.nlp import DeterministicConfig, TextParser
+from core.validation import MAX_ABSTRACT_LEN, MAX_CONTENT_LEN, MAX_OVERVIEW_LEN
+from extraction.deterministic.nlp import DeterministicConfig, TextParser, parser_language
 
 RULE_VERSION = "1"
 _SENTENCE = re.compile(r"(?:[^.!?。！？\r\n]|(?<=\d)\.(?=\d))+(?:[.!?。！？]+|(?=[\r\n]|$))")
@@ -301,7 +301,7 @@ def render_records(title, records):
             break
         lines.append("- " + quote)
         length += len(quote) + 3
-    return (quotes[0][:200] if quotes else title[:200], overview[:5000],
+    return ((quotes[0] if quotes else title)[:MAX_ABSTRACT_LEN], overview[:MAX_OVERVIEW_LEN],
             header + "\n".join(lines) + "\n")
 
 
@@ -375,8 +375,7 @@ class DeterministicExtractor:
                       "role": unit.role, "speaker": unit.speaker, "quote": quote,
                       "source_refs": [ref], "recorded_at": source.recorded_at,
                       "rule_version": RULE_VERSION,
-                      "nlp_model": getattr(self.parser, "signature", {}).get(
-                          "zh" if any("\u4e00" <= char <= "\u9fff" for char in quote) else "en")}
+                      "nlp_model": getattr(self.parser, "signature", {}).get(parser_language(quote))}
             if fact_count < (6 if recommendation else 4):
                 facts.append(record)
                 fact_count += 1

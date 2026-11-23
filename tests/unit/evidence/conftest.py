@@ -17,3 +17,8 @@ def setup():
     llm.complete_json.side_effect = AssertionError("deterministic writes cannot call the LLM")
     api = MemoryWriteAPI(fs, llm, directory_summary_enabled=False)
     return fs, api, EvidenceStore(fs), llm
+
+
+@pytest.fixture
+def store():
+    return EvidenceStore(AGFSContextFS(_AtomicMemoryAGFSClient(), mount_prefix="/local"))

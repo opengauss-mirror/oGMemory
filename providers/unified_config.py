@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from extraction.deterministic.nlp import DeterministicConfig
 from providers.decision.config import DecisionConfig
 
 # Auto-load .env from config/ directory so API keys are available
@@ -773,16 +774,15 @@ class OgMemConfig:
 
     # Appended to retain positional compatibility. Evidence has no independent switch.
     extraction_engine: str = "llm"
-    deterministic_spacy_model_en: str = "en_core_web_sm"
-    deterministic_spacy_model_zh: str = "zh_core_web_sm"
-    deterministic_on_model_missing: str = "error"
+    deterministic_spacy_model_en: str = DeterministicConfig.spacy_model_en
+    deterministic_spacy_model_zh: str = DeterministicConfig.spacy_model_zh
+    deterministic_on_model_missing: str = DeterministicConfig.on_model_missing
 
     @property
     def evidence_enabled(self) -> bool:
         return self.extraction_engine == "deterministic"
 
     def deterministic_config(self):
-        from extraction.deterministic.nlp import DeterministicConfig
         return DeterministicConfig(self.deterministic_spacy_model_en,
                                    self.deterministic_spacy_model_zh,
                                    self.deterministic_on_model_missing)
@@ -2233,11 +2233,11 @@ class OgMemConfig:
             extraction_engine=_resolve(memory.get("extraction", {}).get("engine"),
                                        "OGMEM_EXTRACTION_ENGINE", "llm"),
             deterministic_spacy_model_en=_resolve(memory.get("extraction", {}).get("deterministic", {}).get("spacy_model_en"),
-                                                  "OGMEM_DETERMINISTIC_SPACY_MODEL_EN", "en_core_web_sm"),
+                                                  "OGMEM_DETERMINISTIC_SPACY_MODEL_EN", DeterministicConfig.spacy_model_en),
             deterministic_spacy_model_zh=_resolve(memory.get("extraction", {}).get("deterministic", {}).get("spacy_model_zh"),
-                                                  "OGMEM_DETERMINISTIC_SPACY_MODEL_ZH", "zh_core_web_sm"),
+                                                  "OGMEM_DETERMINISTIC_SPACY_MODEL_ZH", DeterministicConfig.spacy_model_zh),
             deterministic_on_model_missing=_resolve(memory.get("extraction", {}).get("deterministic", {}).get("on_model_missing"),
-                                                    "OGMEM_DETERMINISTIC_ON_MODEL_MISSING", "error"),
+                                                    "OGMEM_DETERMINISTIC_ON_MODEL_MISSING", DeterministicConfig.on_model_missing),
             card_format_enabled=_resolve_bool(
                 memory.get("extraction", {}).get("card_format_enabled"),
                 "OGMEM_CARD_FORMAT_ENABLED", False,

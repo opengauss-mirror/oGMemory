@@ -8,11 +8,7 @@ import pytest
 from core.errors import ValidationError
 from service.deterministic_ingest import snapshot_messages
 from service.evidence_store import EvidenceStore
-from tests.unit.evidence.test_evidence_store import store as store_fixture
 from tests.unit.evidence.test_sources import CTX, message
-
-store = store_fixture
-
 
 def freeze(store, identity="live"):
     return snapshot_messages([SimpleNamespace(id=identity, role="user", content="Did I visit Paris?",

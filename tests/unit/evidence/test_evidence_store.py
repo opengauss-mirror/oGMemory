@@ -10,12 +10,6 @@ from fs.agfs_adapter import AGFSContextFS
 from index.index_record_builder import build_index_records
 from service.evidence_store import EvidenceStore
 from tests.unit.evidence.test_sources import CTX, message
-from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
-
-
-@pytest.fixture
-def store():
-    return EvidenceStore(AGFSContextFS(_AtomicMemoryAGFSClient(), mount_prefix="/local"))
 
 
 def test_publish_replay_and_restart(store):
