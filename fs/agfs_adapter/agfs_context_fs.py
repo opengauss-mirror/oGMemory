@@ -202,6 +202,15 @@ def uri_to_path(uri: str) -> str:
     Raises:
         ValueError: If URI format is invalid
     """
+    from core.evidence import parse_evidence_uri
+
+    evidence = parse_evidence_uri(uri)
+    if evidence is not None:
+        path = (PurePosixPath('/accounts') / evidence['account'] / 'users'
+                / evidence['owner_id'] / evidence['category'])
+        if evidence['slug']:
+            path /= evidence['slug']
+        return str(path) + '/'
     # Try skill pattern first (different path structure)
     match = _SKILL_URI_PATTERN.match(uri)
     if match:
@@ -335,6 +344,11 @@ def parse_uri(uri: str) -> dict:
     Raises:
         ValueError: If URI format is invalid
     """
+    from core.evidence import parse_evidence_uri
+
+    evidence = parse_evidence_uri(uri)
+    if evidence is not None:
+        return evidence
     # Try skill pattern first
     match = _SKILL_URI_PATTERN.match(uri)
     if match:

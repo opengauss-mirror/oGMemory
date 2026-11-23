@@ -174,6 +174,8 @@ class MemoryIdentityResolver:
 
     @staticmethod
     def _in_scope(node, candidate, ctx):
+        if bool(node.metadata.get("deterministic")) != bool(candidate.metadata.get("deterministic")):
+            return False
         owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
         if node.category != candidate.category or node.owner_space != owner:
             return False

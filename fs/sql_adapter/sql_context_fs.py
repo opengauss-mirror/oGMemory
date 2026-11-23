@@ -95,6 +95,11 @@ _READ_NODE_SQL = (
 
 def parse_uri(uri: str) -> dict:
     """Parse a ContextEngine URI into its components."""
+    from core.evidence import parse_evidence_uri
+
+    evidence = parse_evidence_uri(uri)
+    if evidence is not None:
+        return evidence
     shared = re.fullmatch(r"ctx://([^/]+)/spaces/([^/]+)/(memories|skills)/(.+)", uri)
     if shared:
         return {"account": shared[1], "owner_type": "spaces", "owner_id": shared[2],
@@ -1504,7 +1509,7 @@ class SQLContextFS(PoolAdapterMixin):
                     """,
                     (
                         ctx.account_id,
-                        ["profile", "preference", "entity", "event", "case", "pattern",
+                        ["profile", "preference", "entity", "event", "case", "pattern", "fact",
                          "tool", "experience", "session_summary", "session_archive"],
                     ),
                 )
@@ -1516,7 +1521,7 @@ class SQLContextFS(PoolAdapterMixin):
         directories = {}
         allowed = {
             "profile": "profile", "preferences": "preference", "entities": "entity",
-            "events": "event", "cases": "case", "patterns": "pattern",
+            "events": "event", "cases": "case", "patterns": "pattern", "facts": "fact",
             "tools": "tool", "tool_units": "tool", "experiences": "experience", "session_summaries": "session_summary",
             "session_archives": "session_archive",
         }

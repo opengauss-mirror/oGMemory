@@ -203,6 +203,9 @@ class ContextWriter:
             return committed
 
         try:
+            if candidate.metadata.get("deterministic") is not None:
+                from commit.deterministic import write_deterministic
+                return write_deterministic(self, candidate, ctx, commit, recover_receipt)
             if candidate.write_operation_id:
                 if resolver is None:
                     raise WriteNotStartedError("durable operations require an authorized URI resolver")
@@ -311,6 +314,11 @@ class ContextWriter:
                         # Custom policies must retain the same hard CAS as
                         # managed memory identities, even after replanning.
                         plan.merged_fields["expected_version"] = candidate.expected_version
+
+                # Existing nodes created by the other engine are never automatic update targets.
+                if candidate.category in {"fact", "entity", "event"}:
+                    from commit.deterministic import check_engine_target
+                    check_engine_target(self._fs, candidate, plan.target_uri, ctx)
 
                 receipt_only = plan.action == "skip" and bool(candidate.write_operation_id)
                 if plan.action == "skip" and not receipt_only:
