@@ -237,6 +237,11 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     assert set(search_properties) == {"query", "scope", "budget"}
     assert search_schema.get("required") == ["query"]
     assert search_properties["query"]["type"] == "string"
+    from jsonschema import Draft202012Validator
+    query_validator = Draft202012Validator(search_properties["query"])
+    for query in ("\u001c", "\u001d", "\u001e", "\u001f", "\u0085", "\ufeff", "\u001cfoo"):
+        assert query_validator.is_valid(query) == bool(query.strip())
+    assert search_schema["additionalProperties"] is False
 
     scope_schema = search_schema["$defs"]["CodeSearchScopeInput"]
     assert scope_schema["additionalProperties"] is False
@@ -311,14 +316,25 @@ def test_search_code_tool_converts_narrow_inputs_to_existing_adapter_mappings():
 @pytest.mark.parametrize(
     "arguments",
     [
+        {},
+        {"query": ""},
+        {"query": " \t\n\u3000"},
+        {"query": "\u001c"},
+        {"query": "\u001d"},
+        {"query": "\u001e"},
+        {"query": "\u001f"},
+        {"query": 123},
+        {"query": "find service", "unexpected_parameter": True},
+        {"query": "find service", "ctx": {}},
         {"query": "find service", "scope": {"root_slugs": ["repo"]}},
         {"query": "find service", "budget": {"candidate_limit": 3}},
         {"query": "find service", "scope": {"paths": "src"}},
         {"query": "find service", "budget": {"result_limit": True}},
         {"query": "find service", "budget": {"result_limit": 0}},
+        {"query": "find service", "budget": {"result_limit": 1.5}},
     ],
 )
-def test_search_code_tool_rejects_invalid_nested_input_before_delegation(arguments):
+def test_search_code_tool_rejects_invalid_input_before_delegation(arguments):
     service = _RecordingCodeSearchService()
     mcp = create_mcp_server(service=service, config=OgMemConfig())
     tool = mcp._tool_manager.get_tool(SEARCH_CODE_TOOL_NAME)

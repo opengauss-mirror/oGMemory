@@ -73,6 +73,12 @@ SEARCH_SHARED_MEMORY_TOOL_NAME = "search_shared_memory"
 QUERY_MEMORY_TOOL_NAME = "ogm_query_memory"
 LIST_MEMORY_TOOL_NAME = "ogm_list_memories"
 SEARCH_CODE_TOOL_NAME = "ogm_search_code"
+# Match a character that Python str.strip() keeps. Explicit ranges give the
+# Pydantic and JSON Schema regex engines the same whitespace definition.
+_NON_BLANK_QUERY_PATTERN = (
+    r"[^\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a"
+    r"\u2028\u2029\u202f\u205f\u3000]"
+)
 READ_MEMORY_TOOL_NAME = "ogm_read_memory"
 WRITE_MEMORY_TOOL_NAME = "ogm_write_memory"
 DELETE_MEMORY_TOOL_NAME = "ogm_delete_memory"
@@ -474,7 +480,7 @@ def create_mcp_server(
 
     @mcp.tool(name=SEARCH_CODE_TOOL_NAME)
     def search_code(
-        query: StrictStr,
+        query: Annotated[StrictStr, Field(pattern=_NON_BLANK_QUERY_PATTERN, description="Search query containing non-whitespace text.")],
         scope: CodeSearchScopeInput | None = None,
         budget: CodeSearchBudgetInput | None = None,
         ctx: Context | None = None,
@@ -511,6 +517,13 @@ def create_mcp_server(
             from mcp.server.mcpserver.exceptions import ToolError
 
             raise ToolError(message) from exc
+
+    # The SDK ignores extra arguments by default; constrain only code search.
+    search_tool = mcp._tool_manager.get_tool(SEARCH_CODE_TOOL_NAME)
+    search_arguments = search_tool.fn_metadata.arg_model
+    search_arguments.model_config["extra"] = "forbid"
+    search_arguments.model_rebuild(force=True)
+    search_tool.parameters = search_arguments.model_json_schema(by_alias=True)
 
     def read_memory(
         uri: Annotated[
