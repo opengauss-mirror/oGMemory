@@ -2453,6 +2453,7 @@ class MemoryService:
                     query=query, ctx=ctx, top_k=15,
                     query_vector=query_vector,
                     fill_content_for_top_k=5 if self._graph_enabled() else 0, mode="QUICK",
+                    _include_message_evidence=False,
                     **graph_kwargs,
                     hints={"include_all_memories": True},
                 )
@@ -2573,6 +2574,7 @@ class MemoryService:
             top_k=search_top_k,
             fill_content_for_top_k=fill_content_for_top_k,
             mode="QUICK",
+            _include_message_evidence=False,
             **(dict(include_debug=True,collect_graph_supplement=True) if self._graph_enabled() else {}),
             hints={"include_all_memories": True},
             **({"query_vector": query_vector} if query_vector is not None else {}),
@@ -3639,6 +3641,22 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "outbox_event_id": outbox_event_id,
         }
 
+    def _retrieve_message_evidence(self, query, ctx, *, top_k=15):
+        if getattr(self._cfg, "evidence_enabled", False) is not True:
+            return None
+        from service.evidence_service import EvidenceService
+
+        query = sanitize_query(query)
+        if not query:
+            return None
+        try:
+            return EvidenceService(self._get_context_fs()).search(
+                query[:4000], ctx, top_k=min(50, top_k), use_memories=True, use_events=True, use_time=True,
+            )
+        except Exception as exc:
+            logger.warning("Message evidence retrieval failed (%s)", type(exc).__name__)
+            return None
+
     @_serialize_lazy_initialization("_read_api")
     def get_read_api(self, *, start_outbox_worker: bool = True):
         """Return the shared read API without forcing worker startup for code reads."""
@@ -3665,6 +3683,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 pipeline=pipeline,
                 read_service=ContextReader(fs=fs, storage_backend="agfs"),
                 config=cfg,
+                message_evidence=self._retrieve_message_evidence,
             )
             logger.info("ReadAPI ready: AGFS file retrieval")
         if self._read_api is None:
@@ -3767,6 +3786,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 pipeline=pipeline,
                 read_service=context_reader,
                 config=cfg,
+                message_evidence=self._retrieve_message_evidence,
             )
             logger.info(
                 "ReadAPI ready: embedder=%s, index=%s, backend=%s",
@@ -4308,6 +4328,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     top_k=top_k,
                     fill_content_for_top_k=0,
                     mode="QUICK",
+                    _include_message_evidence=False,
                     hints={"include_all_memories": True},
                 )
             ordinary_hits = list(getattr(result, "hits", []) or [])
@@ -5055,12 +5076,33 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 working_set,query,search_stats,ctx,budget_allocation,
                 lambda items, allocation: self._format_working_set(items, allocation, query=query))
         working_set_msg = ""
+        working_budget, message_context = budget_allocation, ""
+        available_tokens = budget_allocation.get("working_set", 0)
+        if available_tokens > 0:
+            try:
+                message_evidence = self._retrieve_message_evidence(query, ctx)
+                if message_evidence is not None and message_evidence.evidence:
+                    from retrieval.evidence.context import render_evidence_context
+
+                    heading = "## Message Evidence\n"
+                    tokens = max(1, available_tokens // 4) if working_set else available_tokens
+                    max_chars = min(30000, tokens * 4) - len(heading) - 2
+                    if max_chars > 0:
+                        context = render_evidence_context(message_evidence, max_chars=max_chars)
+                        if context.text:
+                            message_context = heading + context.text
+                            used_tokens = (len(message_context) + 5) // 4
+                            working_budget = {**budget_allocation, "working_set": available_tokens - used_tokens}
+            except Exception as exc:
+                logger.warning("assemble message evidence formatting failed (%s)", type(exc).__name__)
         try:
             working_set_msg = self._format_working_set(
-                working_set, budget_allocation, query=query, delivery_stats=delivery_stats,
+                working_set, working_budget, query=query, delivery_stats=delivery_stats,
             )
         except Exception as exc:
             logger.warning("assemble working_set_msg build failed: %s", exc)
+        if message_context and len(working_set_msg) + len(message_context) + 2 <= available_tokens * 4:
+            working_set_msg = "\n\n".join(filter(None, (working_set_msg, message_context)))
 
         # Step 4b: Get/compress session state → Layer 2 (updates every N turns)
         session_state_suffix = ""

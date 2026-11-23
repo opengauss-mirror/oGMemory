@@ -1004,10 +1004,13 @@ class ReadAPI:
         pipeline: RetrievalPipeline,
         read_service: ContextReader | None = None,
         config: RetrievalConfig | None = None,
+        *,
+        message_evidence=None,
     ) -> None:
         self._pipeline = pipeline
         self._read_service = read_service
         self._cfg = config or RetrievalConfig()
+        self._message_evidence = message_evidence
 
     def prepare_query_vector(self, query: str) -> list[float]:
         """Prepare one semantic vector for related searches in a request."""
@@ -1051,6 +1054,7 @@ class ReadAPI:
         final_top_k: int | None = None,
         hints: dict | None = None,
         query_vector: list[float] | None = None,
+        _include_message_evidence: bool | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -1083,6 +1087,14 @@ class ReadAPI:
 
         if not include_debug:
             result.trace = None
+
+        include_evidence = (_include_message_evidence if _include_message_evidence is not None
+                            else not categories and not memory_directories)
+        if (self._message_evidence is not None and include_evidence and result is not None
+                and not target_uri and not resource_type and context_type in (None, "MEMORY")):
+            evidence = self._message_evidence(query, ctx, top_k=final_top_k or top_k)
+            if evidence is not None:
+                result.message_evidence = evidence.to_dict()
 
         return result
 

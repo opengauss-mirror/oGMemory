@@ -383,6 +383,8 @@ for hit in result.hits:
 
 `SearchMemoryResult` 字段：`request_id`、`query`、`typed_queries`、`hits`、`trace`。
 
+服务配置为 `memory.extraction.engine: deterministic` 时，通过 `memory.get_read_api()` 执行的非定向记忆查询可从 `result.message_evidence` 读取原文证据和已核验事实。带类别、目录或目标 URI 限定的查询仍按原范围返回记忆。常规 `memory.compose(params)` 把同一证据检索路径的结果按预算并入 `retrievedEvidence`。
+
 每个 `RetrievedBlock` 包含：`uri`、`score`、`ranking_score`、`category`、`owner_space`、`abstract`、`overview`、`content_excerpt`、`relations`、`metadata`。
 
 ### 5.2 `read_memory`

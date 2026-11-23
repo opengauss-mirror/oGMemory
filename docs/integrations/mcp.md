@@ -322,6 +322,8 @@ Use oGMemory as durable, cross-session context.
 
 ### 7.1 `ogm_query_memory`
 
+服务配置为 `memory.extraction.engine: deterministic` 时，未指定 `types` 的查询可在 `message_evidence` 中返回相关原文、已核验事实及消息分组。常规记忆（包括此前由 LLM 抽取的记忆）仍从 `hits` 返回。HTTP `POST /api/v1/memories/query` 使用相同契约。
+
 ```json
 {
   "query": "用户偏好什么语言？",
