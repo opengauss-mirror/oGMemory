@@ -32,7 +32,7 @@ ssh -N -L 18090:127.0.0.1:8090 <用户名>@<服务器IP>
 
 ## 连接账户
 
-1. 点击左侧 **连接设置**。
+1. 点击左侧 **身份与 API Key**。
 2. 在 **API Key** 中填写 oGMemory 的访问密钥。
 3. 点击 **连接**。
 4. 查看右上角 **账户**，确认当前查看范围。
@@ -87,6 +87,61 @@ ctx://
 4. 点击 **检索**，再点击一条结果，在当前页面查看命中内容。
 
 例如，输入“用户偏好的沟通方式”，查找相关偏好记忆。结果按语义相关度排序；结果较少时，可以扩大范围或降低最低分数后再次检索。
+
+## 管理租户与用户
+
+启用配置 `auth.role_control_enabled` 后，通过左侧「身份与 API Key」连接。可用入口取决于 Key 对应的身份。
+
+| 身份 | 前台入口 | 管理范围 |
+| --- | --- | --- |
+| 部署管理员 | 部署管理 | 创建租户和首位管理员，进入租户管理其用户和 Agent |
+| 租户管理员 | 租户管理 | 管理本租户的用户、Agent 和用户 Key |
+| 普通用户 | 身份与 API Key | 连接并使用有权限访问的记忆 |
+
+### 创建租户与复制 API Key
+
+1. 使用部署管理员 Key 连接。打开「部署管理」，点击「创建租户」，填写租户标识和首位管理员用户名。
+2. 在成功弹窗点「复制 API Key」，或点「复制接入配置」获取服务地址和 Key 的 JSON。用新 Key 重新连接即可进入该租户的「租户管理」。部署管理员也可在租户目录点「进入租户」，直接管理其用户和 Agent。
+
+![部署管理的租户目录和创建入口](images/tenant-management/01-tenant-catalog.png)
+
+### 管理用户与 Agent
+
+在「租户管理 → 用户」点击「创建用户」选择租户角色。创建成功即可复制该用户的 API Key。重复标识会以红字提示，并定位到对应输入框。
+
+![租户管理员的用户列表](images/tenant-management/02-tenant-users.png)
+
+![创建用户后复制 API Key，截图中的 Key 已遮蔽](images/tenant-management/05-key-issued.png)
+
+![创建重复用户时的红色提示](images/tenant-management/04-duplicate-user.png)
+
+在「Agent」页点击「注册 Agent」。可按部分标识搜索已注册的归属用户，也可留空。注册后，可从 Agent 列表的「变更归属」绑定、转交或解除绑定，也可从用户列表使用「绑定 Agent」「查看 Agent」。在「团队空间 → 成员管理」可选择本租户已注册的用户或 Agent。团队角色在所属团队空间内生效。
+
+![注册 Agent 时选择归属用户](images/tenant-management/03-register-agent.png)
+
+普通用户的 Key 可通过「更多 → 查看 API Key」重新获取，查看会记录审计。本人可在「身份与 API Key」查看已连接的 Key。「轮换 Key」会立即使旧 Key 失效，需要更新使用旧 Key 的客户端。移除用户前须转交其 Agent，移除后历史记忆保留原用户标识。每个租户至少保留一位管理员。
+
+### 通过 HTTP 注册
+
+`BASE` 是 oGMemory HTTP 服务地址。部署管理员使用 `ROOT_KEY` 创建租户。从响应中取出 `user_key` 作为 `ADMIN_KEY`，用于注册该租户的用户与 Agent。
+
+```bash
+curl -X POST "$BASE/api/v1/admin/accounts" \
+  -H "X-API-Key: $ROOT_KEY" -H 'Content-Type: application/json' \
+  -d '{"account_id":"ops","admin_user_id":"alice"}'
+
+curl -X POST "$BASE/api/v1/admin/accounts/ops/users" \
+  -H "X-API-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"user_id":"bob","role":"MEMBER"}'
+
+curl -X POST "$BASE/api/v1/admin/accounts/ops/agents" \
+  -H "X-API-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"agent_id":"ops-agent","owner_user_id":"bob"}'
+```
+
+把创建用户响应中的 `user_key` 放入客户端的 `X-API-Key` 请求头即可接入。注册 Agent 时，省略 `owner_user_id` 或传 `null` 可保留未绑定状态。变更归属使用 `PATCH /api/v1/admin/accounts/ops/agents/ops-agent`，传 `{"owner_user_id":null}` 可解除绑定。
+
+用户和 Agent 列表支持 `limit`、`after`、`q`。有下一页时，用响应的 `next_after` 作为下一次请求的 `after`。Agent 列表可用 `owner_user_id` 筛选归属用户。角色变更使用 `PATCH /api/v1/admin/accounts/ops/users/bob/role`，报文为 `{"role":"ADMIN"}`。轮换和查看普通用户 Key 分别使用 `POST /api/v1/admin/accounts/ops/users/bob/key` 和 `POST /api/v1/admin/accounts/ops/users/bob/key/reveal`。使用配置文件中的旧式 Admin Key 时，身份固定为对应租户的 `admin`。
 
 ## 使用团队空间
 
@@ -146,7 +201,7 @@ curl -i http://127.0.0.1:8090/memory-viewer/
 
 ### 提示认证失败或没有权限
 
-打开 **连接设置**，确认填写的是当前 oGMemory 服务的 API Key，并确认密钥所属账户及权限。密钥变更后，重新保存连接设置。
+打开 **身份与 API Key**，确认填写的是当前 oGMemory 服务的 API Key，并确认密钥所属账户及权限。密钥变更后，用新 Key 重新连接。
 
 ### 看不到已经写入的记忆
 
