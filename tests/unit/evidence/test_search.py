@@ -22,6 +22,14 @@ def test_message_only_and_no_vector_dependency(setup):
     assert service.search("Caroline", replace(CTX, user_id="other")).evidence == []
 
 
+def test_punctuation_does_not_consume_a_supplementary_query_slot(setup):
+    fs, _, store, _ = setup
+    store.register([message("I visited Paris.")], CTX, batch_id="branches")
+    result = EvidenceService(fs).search("Paris and ? and Rome", CTX)
+    assert result.diagnostics["supplementary_queries"] == ["Paris", "Rome"]
+    assert result.diagnostics["uncovered_branches"] == [1]
+
+
 def test_verified_facts_align_with_final_sources_and_roles(setup):
     fs, _, store, _ = setup
     messages = [message("I visited Paris."), message("I recommend visiting Paris.", role="assistant", id="two", sequence=4)]

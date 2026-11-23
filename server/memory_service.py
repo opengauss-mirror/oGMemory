@@ -3683,7 +3683,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 pipeline=pipeline,
                 read_service=ContextReader(fs=fs, storage_backend="agfs"),
                 config=cfg,
-                message_evidence=self._retrieve_message_evidence,
+                message_evidence_provider=self._retrieve_message_evidence,
             )
             logger.info("ReadAPI ready: AGFS file retrieval")
         if self._read_api is None:
@@ -3786,7 +3786,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 pipeline=pipeline,
                 read_service=context_reader,
                 config=cfg,
-                message_evidence=self._retrieve_message_evidence,
+                message_evidence_provider=self._retrieve_message_evidence,
             )
             logger.info(
                 "ReadAPI ready: embedder=%s, index=%s, backend=%s",

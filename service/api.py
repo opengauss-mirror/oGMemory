@@ -14,12 +14,13 @@ from copy import deepcopy
 from dataclasses import replace
 from providers.llm_observation import correlate_extraction_calls
 
-from typing import Optional
+from typing import Optional, Protocol
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
 from commit.context_writer import ArchivePreparationRequired
 from commit.write_receipts import WriteDeadlineExceededError, WriteNotStartedError, receipt_plan
 from core.errors import ConcurrentModificationError, ExtractionIncompleteError, MemoryCardFormatError, OperationDeadlineExceededError
+from core.evidence_query import MessageEvidenceResult
 from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
@@ -991,6 +992,10 @@ from retrieval.context_reader import ContextReader
 from retrieval.pipeline import RetrievalPipeline
 
 
+class MessageEvidenceProvider(Protocol):
+    def __call__(self, query: str, ctx: RequestContext, *, top_k: int) -> MessageEvidenceResult | None: ...
+
+
 class ReadAPI:
     """Public API for memory search and read operations.
 
@@ -1005,12 +1010,12 @@ class ReadAPI:
         read_service: ContextReader | None = None,
         config: RetrievalConfig | None = None,
         *,
-        message_evidence=None,
+        message_evidence_provider: MessageEvidenceProvider | None = None,
     ) -> None:
         self._pipeline = pipeline
         self._read_service = read_service
         self._cfg = config or RetrievalConfig()
-        self._message_evidence = message_evidence
+        self._message_evidence_provider = message_evidence_provider
 
     def prepare_query_vector(self, query: str) -> list[float]:
         """Prepare one semantic vector for related searches in a request."""
@@ -1090,9 +1095,9 @@ class ReadAPI:
 
         include_evidence = (_include_message_evidence if _include_message_evidence is not None
                             else not categories and not memory_directories)
-        if (self._message_evidence is not None and include_evidence and result is not None
+        if (self._message_evidence_provider is not None and include_evidence and result is not None
                 and not target_uri and not resource_type and context_type in (None, "MEMORY")):
-            evidence = self._message_evidence(query, ctx, top_k=final_top_k or top_k)
+            evidence = self._message_evidence_provider(query, ctx, top_k=final_top_k or top_k)
             if evidence is not None:
                 result.message_evidence = evidence.to_dict()
 

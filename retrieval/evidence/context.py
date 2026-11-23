@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 
-from core.evidence_query import MessageEvidenceResult
+from core.evidence_query import MessageEvidenceResult, facts_supported_by
 from retrieval.evidence.ranking import fact_matches, query_topics, terms
 
 
@@ -32,7 +32,7 @@ def fit_evidence_payload(payload, remaining_chars):
         keys = selected | set(group)
         trial = {
             "evidence": [unit for unit in units if unit["evidence_unit_id"] in keys],
-            "facts": [fact for fact in facts if all(ref["evidence_unit_id"] in keys for ref in fact["source_refs"])],
+            "facts": facts_supported_by(facts, keys),
             "groups": [*selected_groups, group],
             "partial": payload["diagnostics"]["partial"],
             "truncated": payload["diagnostics"]["truncated"] or len(keys) < len(units),
@@ -69,15 +69,14 @@ def _context_spans(text, quotes, topics):
     return merged
 
 
-def _quote_spans(payload, units):
+def _quote_spans(query, facts, topics, units):
     """The service verifies facts; rendering also checks exact source alignment.
 
     This is not fresh ACL/version verification. A saved response can become stale when source authority changes.
     """
-    topics = query_topics(payload["query"], units)
     quotes = {key: [] for key in units}
-    for record in payload.get("facts", []):
-        if not (topics & set(terms(record["quote"])) and fact_matches(payload["query"], record)):
+    for record in facts:
+        if not (topics & set(terms(record["quote"])) and fact_matches(query, record)):
             continue
         refs = record.get("source_refs", [])
         aligned = []
@@ -100,21 +99,25 @@ def _quote_spans(payload, units):
     return quotes
 
 
-def render_evidence_context(result: MessageEvidenceResult | dict, *, max_chars=30000):
+def render_evidence_context(result: MessageEvidenceResult | dict, *, query: str | None = None, max_chars=30000):
     """Render bounded historical data without splitting required dependencies.
 
-    Accept the shared Python result or an HTTP/MCP payload. Independent units
-    may use relevant verified quotes with neighbouring sentences; multi-unit
-    dependencies keep full text. Older responses lacking group diagnostics are
-    conservatively treated as one atomic group. No model or storage calls occur.
+    Accept a Python evidence result, an HTTP/MCP query response, or its
+    message_evidence object. Pass the query separately with a standalone
+    message_evidence object to enable quote-based excerpts. Multi-unit
+    dependencies keep full text. Results without groups are kept together.
     """
     if type(max_chars) is not int or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")
     payload = result.to_dict() if isinstance(result, MessageEvidenceResult) else result
+    if query is None:
+        query = payload.get("query", "")
+    if "hits" in payload or "message_evidence" in payload:
+        payload = payload.get("message_evidence") or {}
     units = {unit["evidence_unit_id"]: unit for unit in payload.get("evidence", [])}
-    quotes = _quote_spans(payload, units)
-    topics = query_topics(payload["query"], units)
-    groups = payload.get("diagnostics", {}).get("evidence_groups")
+    topics = query_topics(query, units)
+    quotes = _quote_spans(query, payload.get("facts", []), topics, units)
+    groups = payload.get("groups", payload.get("diagnostics", {}).get("evidence_groups"))
     legacy = groups is None
     if legacy:
         groups = [list(units)] if units else []

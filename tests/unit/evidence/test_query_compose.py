@@ -8,6 +8,7 @@ import pytest
 import server.app as app_module
 from core.models import RetrievedBlock, SearchMemoryResult
 from providers.unified_config import OgMemConfig
+from retrieval.evidence.context import render_evidence_context
 from server.mcp_tools import query_memory
 from server.memory_service import MemoryService
 from service.api import ReadAPI
@@ -32,7 +33,7 @@ def service(setup):
     pipeline.run.side_effect = lambda query, *_args, **_kwargs: SearchMemoryResult(
         query=query, hits=[LEGACY],
     )
-    api = ReadAPI(pipeline, message_evidence=memory._retrieve_message_evidence)
+    api = ReadAPI(pipeline, message_evidence_provider=memory._retrieve_message_evidence)
     memory.get_read_api = Mock(return_value=api)
     return memory
 
@@ -47,18 +48,43 @@ def test_python_query_returns_both_paths_and_respects_scoped_searches(service):
         assert api.search_memory(QUERY, CTX, **scope).message_evidence is None
 
 
-def test_http_and_shared_mcp_query_use_existing_contract(service, monkeypatch):
+@pytest.mark.asyncio
+async def test_http_and_mcp_query_responses_round_trip_to_renderer(service, monkeypatch):
+    from mcp import Client
+
+    from server.mcp_server import create_mcp_server
+
     monkeypatch.setattr(app_module, "_service", service)
     monkeypatch.setattr(app_module, "_build_authenticated_context", lambda params: CTX)
     result = app_module.app.test_client().post("/api/v1/memories/query", json={"query": QUERY, "top_k": 1})
     assert result.status_code == 200
     payload = result.get_json()
-    mcp = query_memory(service, query=QUERY, request_context=CTX, top_k=1)
+    monkeypatch.setattr("server.mcp_tools.build_mcp_context", lambda *_args, **_kwargs: CTX)
+    async with Client(create_mcp_server(service=service, config=service._cfg)) as client:
+        response = await client.call_tool("ogm_query_memory", {"query": QUERY, "top_k": 1})
+    assert not response.is_error
+    mcp = response.structured_content
     assert payload["hits"] == mcp["hits"] and payload["hits"][0]["type"] == "entity"
     assert payload["message_evidence"] == mcp["message_evidence"]
     assert payload["message_evidence"]["evidence"][0]["text"] == QUOTE
+    rendered = render_evidence_context(payload)
+    assert QUOTE in rendered.text and not rendered.diagnostics["legacy_grouping"]
+    assert render_evidence_context(mcp) == rendered
+    assert render_evidence_context(mcp["message_evidence"], query=mcp["query"]) == rendered
+    assert QUOTE in render_evidence_context(mcp["message_evidence"]).text
     filtered = query_memory(service, query=QUERY, request_context=CTX, types=["entity"])
     assert filtered["hits"] == mcp["hits"] and "message_evidence" not in filtered
+    assert render_evidence_context(filtered).text == ""
+
+
+def test_public_query_rendering_keeps_independent_groups_when_budget_is_tight(service, setup):
+    setup[2].register([message("I visited Rome.", id="rome", sequence=12)], CTX, batch_id="rome")
+    payload = query_memory(service, query="Where did I visit Paris and Rome?", request_context=CTX)
+    evidence = payload["message_evidence"]
+    assert len(evidence["groups"]) == 2 and all(len(group) == 1 for group in evidence["groups"])
+    full = render_evidence_context(payload)
+    bounded = render_evidence_context(payload, max_chars=len(full.text) - 1)
+    assert len(full.blocks) == 2 and len(bounded.blocks) == 1
 
 
 def test_query_preserves_legacy_response_when_evidence_disabled_or_unavailable(service):

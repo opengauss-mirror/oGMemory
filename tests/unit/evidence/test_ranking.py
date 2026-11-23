@@ -1,41 +1,14 @@
 """Generic channel competition and bounded conversational context."""
 
-from retrieval.evidence.ranking import fuse_channels, lexical_scores
+from retrieval.evidence.ranking import lexical_scores, query_branches, rank_lexical, select_groups
 
 
-def test_name_only_consensus_does_not_displace_strong_lexical_hit():
-    units = {"topic": {"text": "I repaired a telescope.", "speaker": "Alex"},
-             "greeting": {"text": "Hello Alex!", "speaker": "Morgan"},
-             "synonym": {"text": "I fixed the optical instrument.", "speaker": "Alex"},
-             "other": {"text": "Tomorrow is sunny.", "speaker": "Morgan"}}
-    scores = fuse_channels("Alex repaired a telescope", units,
-                           lexical_scores("Alex repaired a telescope", units),
-                           {"greeting": .99, "synonym": .9}, 10)
-    assert scores["topic"] >= scores["greeting"]
-    assert "synonym" in scores  # Semantic-only paraphrases survive.
-    assert "other" not in scores
-
-
-def test_shared_tail_cannot_displace_independent_channel_heads():
-    units = {str(i): {"text": "A telescope observation.", "speaker": ""} for i in range(60)}
-    units.update({"lex": {"text": "Telescope repair", "speaker": ""},
-                  "sem": {"text": "Optical equipment", "speaker": ""}})
-    lexical = {"lex": 100, **{str(i): 60 - i for i in range(60)}}
-    semantic = {"sem": 100, **{str(i): 60 - i for i in range(60)}}
-    scores = fuse_channels("telescope", units, lexical, semantic, 50)
-    assert scores["lex"] > scores["48"]
-    assert scores["sem"] > scores["48"]
-    assert "49" not in scores  # Each channel is capped before fusion.
-    assert "sem" in scores and "lex" in scores
-
-
-def test_fusion_is_deduplicated_and_does_not_reject_name_only_queries():
-    units = {"one": {"text": "Alex arrived.", "speaker": "Alex"},
-             "two": {"text": "Alex left.", "speaker": "Morgan"}}
-    lexical = lexical_scores("Alex", units)
-    scores = fuse_channels("Alex", units, lexical, {"one": .9, "outside": 1}, 5)
-    assert set(scores) == {"one", "two"}
-    assert max(scores.values()) <= 1 / 61  # No topical double vote for the name.
+def test_ranked_lexical_channel_caps_candidates_with_stable_order():
+    units = {str(i): {"text": "A telescope observation."} for i in range(60)}
+    scores = {str(i): 60 - i for i in range(60)} | {"outside": 100}
+    ranked = rank_lexical("telescope", units, scores, 50)
+    assert list(ranked) == [str(i) for i in range(50)]
+    assert ranked["0"] == 1 / 61 and ranked["49"] == 1 / 110
 
 
 def test_common_terms_do_not_create_a_false_lexical_candidate():
@@ -43,7 +16,7 @@ def test_common_terms_do_not_create_a_false_lexical_candidate():
              "two": {"text": "Hello friend, telescope repair."},
              "three": {"text": "Hello friend, lunch time."}}
     query = "Hello friend telescope"
-    scores = fuse_channels(query, units, lexical_scores(query, units), {}, 5)
+    scores = rank_lexical(query, units, lexical_scores(query, units), 5)
     assert set(scores) == {"two"}
 
 
@@ -53,9 +26,9 @@ def unit(text, sequence, *, session="session", speaker=""):
 
 
 def select(units, anchor, *, top_k=4, **kwargs):
-    from retrieval.evidence.ranking import select_groups
-
-    return select_groups("How long has Morgan kept a studio?", {anchor: 1}, units, top_k, 50, **kwargs)
+    query = "How long has Morgan kept a studio?"
+    return select_groups(query, {anchor: 1}, units, top_k, 50,
+                         branch_terms=[words for _, words in query_branches(query)], **kwargs)
 
 
 def test_duration_answer_without_shared_topic_is_grouped_in_both_directions():
@@ -63,7 +36,7 @@ def test_duration_answer_without_shared_topic_is_grouped_in_both_directions():
              "a": unit("Seven years already!", 1),
              "other": unit("It is raining outside.", 2)}
     for anchor in ("q", "a"):
-        selected, _, groups = select(units, anchor)
+        selected, groups = select(units, anchor)
         assert selected == ["q", "a"]
         assert groups == [["q", "a"]]
 
@@ -122,11 +95,10 @@ def test_functional_overlap_and_query_operators_cannot_establish_a_topic():
     from retrieval.evidence.ranking import supplement_scores, terms
 
     units = {"repair": {"text": "I've repaired different bicycles with my neighbour."},
-             "other": {"text": "I’ve been cooking different soups with my sister."},
-             "semantic": {"text": "Restoring two-wheel transport."}}
+             "other": {"text": "I’ve been cooking different soups with my sister."}}
     query = "How many different bicycles have I been repairing with my neighbour?"
-    scores = fuse_channels(query, units, lexical_scores(query, units), {"semantic": .9}, 5)
-    assert set(scores) == {"repair", "semantic"}
+    scores = rank_lexical(query, units, lexical_scores(query, units), 5)
+    assert set(scores) == {"repair"}
     supplements = supplement_scores(query, units, {key: u["text"] for key, u in units.items()}, 5)
     assert set(supplements) == {"repair"}
     assert supplements["repair"] < 1 / 65
@@ -146,14 +118,12 @@ def test_supplements_have_distinct_bounded_ranks_and_keep_chinese_topics():
 
 
 def test_independent_facts_fit_before_optional_long_reply():
-    from retrieval.evidence.ranking import select_groups
-
     units = {"first": unit("I completed four pottery courses. Any other course ideas?", 0),
              "reply": unit("That course progress is excellent. " * 100, 1),
              "second": unit("I completed two photography courses.", 0, session="other")}
-    selected, _, groups = select_groups("How many courses did I complete?",
+    selected, groups = select_groups("How many courses did I complete?",
         {"first": 1, "second": .9}, units, 2, 50,
-        costs={"first": 80, "reply": 3000, "second": 80}, byte_limit=160)
+        branch_terms=[{"course", "complete"}], costs={"first": 80, "reply": 3000, "second": 80}, byte_limit=160)
     assert selected == ["first", "second"]
     assert groups == [["first"], ["second"]]
 
@@ -174,12 +144,10 @@ def test_referring_seed_keeps_antecedent_and_does_not_cross_a_gap():
 
 
 def test_optional_context_is_available_after_seeds_and_retains_dependency_ids():
-    from retrieval.evidence.ranking import select_groups
-
     units = {"first": unit("I opened a studio.", 0),
              "reply": unit("That studio sounds wonderful.", 1),
              "second": unit("I closed another studio.", 0, session="other")}
-    selected, _, groups = select_groups("studio", {"first": 1, "second": .9}, units, 3, 50)
+    selected, groups = select_groups("studio", {"first": 1, "second": .9}, units, 3, 50, branch_terms=[{"studio"}])
     assert selected == ["first", "second", "reply"]
     assert groups == [["first"], ["second"], ["first", "reply"]]
 
@@ -197,11 +165,11 @@ def test_ambiguous_function_words_remain_searchable_as_literal_names():
     units = {"one": {"text": "May repaired a telescope.", "speaker": "May"},
              "two": {"text": "Will repaired a piano.", "speaker": "Will"}}
     for query, expected in [("May", "one"), ("Will", "two"), ("may", "one"), ("will", "two")]:
-        scores = fuse_channels(query, units, lexical_scores(query, units), {}, 5)
+        scores = rank_lexical(query, units, lexical_scores(query, units), 5)
         assert set(scores) == {expected}
         assert set(supplement_scores(query, units, {key: u["text"] for key, u in units.items()}, 5)) == {expected}
-    assert set(fuse_channels("What piano may I repair?", units,
-                            lexical_scores("What piano may I repair?", units), {}, 5)) == {"two"}
+    assert set(rank_lexical("What piano may I repair?", units,
+                            lexical_scores("What piano may I repair?", units), 5)) == {"two"}
 
 
 def test_negative_contractions_and_demonstratives_are_not_independent_topics():
@@ -212,4 +180,4 @@ def test_negative_contractions_and_demonstratives_are_not_independent_topics():
     units = {"one": {"text": "I can't repair the bicycle."},
              "two": {"text": "I can’t attend the exhibition."}}
     query = "Which bicycle can't I repair?"
-    assert set(fuse_channels(query, units, lexical_scores(query, units), {}, 5)) == {"one"}
+    assert set(rank_lexical(query, units, lexical_scores(query, units), 5)) == {"one"}

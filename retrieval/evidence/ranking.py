@@ -82,32 +82,23 @@ def lexical_scores(query, units):
     return scores
 
 
-def reciprocal_ranks(scores):
-    return {key: 1 / (60 + rank) for rank, key in enumerate(
-        sorted(scores, key=lambda key: (-scores[key], key)), 1)}
-
-
-def fuse_channels(query, units, lexical, semantic, limit):
-    """Keep strong independent hits; bound corroboration to 25% of a rank vote.
-
-    Speaker names, greetings and terms in most documents cannot establish an
-    independent topic. Semantic-only hits remain eligible (including synonyms).
-    """
+def rank_lexical(query, units, lexical, limit):
+    """Keep topical hits within the primary candidate limit."""
     topics = query_topics(query, units)
-    matches = {key: topics & set(terms(unit["text"])) for key, unit in units.items()}
-    lexical = {key: score for key, score in lexical.items()
-               if key in units and (not topics or topics & matches[key])}
-    semantic = {key: score for key, score in semantic.items() if key in units}
-    channels = [reciprocal_ranks(dict(sorted(channel.items(), key=lambda item: (-item[1], item[0]))[:limit]))
-                for channel in (lexical, semantic)]
-    scores = {}
-    speakers = {word for unit in units.values() for word in terms(unit.get("speaker", ""))}
-    support_topics = topics - speakers
-    for key in channels[0].keys() | channels[1].keys():
-        left, right = channels[0].get(key, 0), channels[1].get(key, 0)
-        support = len(support_topics & matches[key]) / len(support_topics) if support_topics else 0
-        scores[key] = max(left, right) + .25 * min(left, right) * support
-    return scores
+    candidates = {key: score for key, score in lexical.items()
+                  if key in units and (not topics or topics & set(terms(units[key]["text"])))}
+    ordered = sorted(candidates, key=lambda key: (-candidates[key], key))[:limit]
+    return {key: 1 / (60 + rank) for rank, key in enumerate(ordered, 1)}
+
+
+def query_branches(query):
+    """Share effective conjuncts between supplementary search and coverage."""
+    branches = []
+    for part in re.split(r"\band\b|和|与", query, flags=re.I):
+        words = set(terms(part))
+        if words:
+            branches.append((part.strip(), words))
+    return branches
 
 
 def fact_matches(query, record):
@@ -176,7 +167,7 @@ def _adjacent(left, right):
                  and right["sequence"] - left["sequence"] == 1))
 
 
-def select_groups(query, scores, units, top_k, candidate_limit, *, costs=None, byte_limit=64 * 1024):
+def select_groups(query, scores, units, top_k, candidate_limit, *, branch_terms, costs=None, byte_limit=64 * 1024):
     """Select independent seeds with only the context required to interpret them."""
     speaker_terms = {word for unit in units.values() for word in terms(unit.get("speaker", ""))}
     reference_terms = set("it that this they he she there him her them these those yes no hi hello hey thanks okay ok".split())
@@ -185,8 +176,6 @@ def select_groups(query, scores, units, top_k, candidate_limit, *, costs=None, b
         return topic_terms(text) - speaker_terms - reference_terms
 
     query_topics = topic_words(query)
-    branches = [set(terms(part)) for part in re.split(r"\band\b|和|与", query, flags=re.I)]
-    branches = [branch for branch in branches if branch]
     dates = set(re.findall(r"\d{4}-\d{2}-\d{2}", query))
     ordered = sorted(units, key=lambda key: (units[key]["session_id"], units[key]["sequence"],
                                              units[key]["parent_span"][0], key))
@@ -197,7 +186,7 @@ def select_groups(query, scores, units, top_k, candidate_limit, *, costs=None, b
     while pending and len(selected) < top_k:
         def priority(key):
             text_terms = set(terms(units[key]["text"]))
-            gain = sum(1 for i, branch in enumerate(branches) if i not in covered and branch & text_terms)
+            gain = sum(1 for i, branch in enumerate(branch_terms) if i not in covered and branch & text_terms)
             exact_date = bool(dates & set(re.findall(r"\d{4}-\d{2}-\d{2}", units[key]["text"])))
             return (-int(exact_date), -scores[key] * (1 + .25 * gain), key)
         key = min(pending, key=priority)
@@ -244,7 +233,7 @@ def select_groups(query, scores, units, top_k, candidate_limit, *, costs=None, b
         pending.difference_update(group)
         used_bytes += size
         for item in group:
-            covered.update(i for i, branch in enumerate(branches) if branch & set(terms(units[item]["text"])))
+            covered.update(i for i, branch in enumerate(branch_terms) if branch & set(terms(units[item]["text"])))
     # Optional explanations/continuations compete only for the remaining
     # capacity, after every independent seed has had its admission attempt.
     for seed_group in list(groups):
@@ -270,5 +259,4 @@ def select_groups(query, scores, units, top_k, candidate_limit, *, costs=None, b
             selected.append(following_key)
             groups.append(group)
             used_bytes += size
-            covered.update(i for i, branch in enumerate(branches) if branch & set(terms(following["text"])))
-    return selected, [i for i in range(len(branches)) if i not in covered], groups
+    return selected, groups

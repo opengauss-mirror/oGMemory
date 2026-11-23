@@ -124,7 +124,7 @@ def test_no_fact_semantic_evidence_and_assistant_sources_remain_usable():
     assert context.text.startswith(response.untrusted_data_notice)
 
 
-def test_python_http_mcp_payloads_render_identically_and_legacy_groups_are_atomic():
+def test_internal_result_and_legacy_dictionary_keep_groups_atomic():
     items = [unit("q", "What course?", role="assistant"), unit("a", "Pottery.")]
     response = result(items)
     context = render_evidence_context(response)

@@ -5,6 +5,8 @@ import re
 import time
 from datetime import UTC, datetime
 
+from core.evidence import resolve_event_time
+
 
 def date_prefixes(query):
     prefixes = re.findall(r"\b\d{4}-\d{2}(?:-\d{2})?\b", query)
@@ -31,11 +33,8 @@ def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
         if request.use_time:
             now = datetime.now(UTC)
             for key, unit in units.items():
-                from types import SimpleNamespace
-
-                from extraction.deterministic.extractor import _event_time
                 source = sources[unit["source_key"]]
-                event_time, _ = _event_time(unit["text"], SimpleNamespace(**source))
+                event_time, _ = resolve_event_time(unit["text"], source["recorded_at"], source.get("timezone"))
                 value = event_time or unit["recorded_at"]
                 if not value:
                     continue

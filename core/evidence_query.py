@@ -5,6 +5,11 @@ from dataclasses import asdict, dataclass, field
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+def facts_supported_by(facts, evidence_ids):
+    return [fact for fact in facts
+            if all(ref["evidence_unit_id"] in evidence_ids for ref in fact["source_refs"])]
+
+
 class EvidenceQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     query: str = Field(min_length=1, max_length=4000)

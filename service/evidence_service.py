@@ -8,21 +8,38 @@ import time
 
 from core.errors import NodeNotFoundError
 from core.evidence import evidence_uri
-from core.evidence_query import EvidenceQuery, MessageEvidenceResult
+from core.evidence_query import EvidenceQuery, MessageEvidenceResult, facts_supported_by
 from core.operation_deadline import remaining_seconds
 from core.evidence_timing import operation, request_id, stage, timed
 from providers.token_tracker import request_usage_scope
 from retrieval.evidence.ranking import (
     fact_matches,
-    fuse_channels,
     lexical_scores,
+    query_branches,
     query_topics,
+    rank_lexical,
     select_groups,
     supplement_scores,
     terms,
     topic_terms,
 )
 from service.evidence_store import EvidenceStore
+
+
+def _add_archive_hints(node, sources, memory_texts):
+    from core.provenance_resolver import ProvenanceResolver
+
+    for provenance in node.metadata.get("provenance_ids", []):
+        try:
+            parsed = ProvenanceResolver.parse_id(provenance)
+        except ValueError:
+            continue
+        if parsed["source_type"] != "archive":
+            continue
+        for source in sources.values():
+            if parsed["source_id"] in source["archive_ids"] and source["message_id"] in parsed["detail"]:
+                for unit in source["units"]:
+                    memory_texts.setdefault(unit["evidence_unit_id"], node.content)
 
 
 class EvidenceService:
@@ -70,12 +87,12 @@ class EvidenceService:
         with stage("lexical_fusion"):
             lexical = lexical_scores(query, units)
         with stage("fusion"):
-            scores = fuse_channels(query, units, lexical, {}, request.candidate_limit)
+            scores = rank_lexical(query, units, lexical, request.candidate_limit)
             # Bounded subqueries add missing query branches by strongest support only.
-            branches = [part.strip() for part in re.split(r"\band\b|和|与", query, flags=re.I) if part.strip()]
-            supplementary = branches[:request.max_supplementary_queries] if len(branches) > 1 else []
+            branches = query_branches(query)
+            supplementary = [part for part, _ in branches[:request.max_supplementary_queries]] if len(branches) > 1 else []
             for branch in supplementary:
-                branch_scores = fuse_channels(branch, units, lexical_scores(branch, units), {}, request.candidate_limit)
+                branch_scores = rank_lexical(branch, units, lexical_scores(branch, units), request.candidate_limit)
                 for key, score in branch_scores.items():
                     scores[key] = max(scores.get(key, 0), score)
             diagnostics["supplementary_queries"] = supplementary
@@ -116,24 +133,12 @@ class EvidenceService:
                                 stop_cards = True
                                 break
                             data = node.metadata.get("deterministic", {})
-                            if not data and not topics & set(terms(node.content)):
+                            if not data:
+                                if request.use_memories and topics & set(terms(node.content)):
+                                    if not node.metadata.get("provenance_ids"):
+                                        diagnostics["unverifiable_cards"] += 1
+                                    _add_archive_hints(node, sources, memory_texts)
                                 continue
-                            if request.use_memories and not data:
-                                if not node.metadata.get("provenance_ids"):
-                                    diagnostics["unverifiable_cards"] += 1
-                                from core.provenance_resolver import ProvenanceResolver
-                                for provenance in node.metadata.get("provenance_ids", []):
-                                    try:
-                                        parsed = ProvenanceResolver.parse_id(provenance)
-                                    except ValueError:
-                                        continue
-                                    if parsed["source_type"] != "archive":
-                                        continue
-                                    for source in sources.values():
-                                        if (parsed["source_id"] in source["archive_ids"]
-                                                and source["message_id"] in parsed["detail"]):
-                                            for unit in source["units"]:
-                                                memory_texts.setdefault(unit["evidence_unit_id"], node.content)
                             candidates = data.get("fact_records", [])
                             for record in candidates:
                                 if time.monotonic() >= deadline:
@@ -226,8 +231,11 @@ class EvidenceService:
                 for ref in record["source_refs"]:
                     if ref["evidence_unit_id"] in costs:
                         costs[ref["evidence_unit_id"]] += encoded_size(record) + 2
-            selected, uncovered, groups = select_groups(query, scores, units, request.top_k, request.candidate_limit,
-                                                costs=costs, byte_limit=56 * 1024 - encoded_size(query))
+            selected, groups = select_groups(
+                query, scores, units, request.top_k, request.candidate_limit,
+                branch_terms=[words for _, words in branches], costs=costs,
+                byte_limit=56 * 1024 - encoded_size(query),
+            )
             if len(selected) < min(len(scores), request.top_k):
                 diagnostics["truncated"] = True
         with stage("final_source_check"):
@@ -245,9 +253,8 @@ class EvidenceService:
             retained = {key for group in groups for key in group}
             evidence = [item for item in evidence if item["evidence_unit_id"] in retained]
             selected_ids = {item["evidence_unit_id"] for item in evidence}
-            facts = [record for record in unique.values()
-                     if all(ref["evidence_unit_id"] in selected_ids for ref in record["source_refs"])]
-            diagnostics.update(verified_facts=len(facts), uncovered_branches=uncovered,
+            facts = facts_supported_by(unique.values(), selected_ids)
+            diagnostics.update(verified_facts=len(facts),
                                selected_evidence_unit_ids=sorted(selected_ids),
                                source_bytes=source_bytes, card_bytes=card_bytes,
                                index_ready=bool(sources), elapsed_ms=round((time.monotonic() - started) * 1000))
@@ -257,14 +264,13 @@ class EvidenceService:
             def refresh_coverage():
                 final_terms = set().union(*(set(terms(item["text"])) for item in result.evidence))
                 diagnostics["uncovered_branches"] = [index for index, branch in enumerate(branches)
-                                                      if not set(terms(branch)) & final_terms]
+                                                      if not branch[1] & final_terms]
             refresh_coverage()
             while groups and encoded_size(result.to_dict()) > 64 * 1024 - 64:
                 removed = set(groups.pop()) - {key for group in groups for key in group}
                 result.evidence = [item for item in result.evidence if item["evidence_unit_id"] not in removed]
-                result.facts = [record for record in result.facts
-                                if not any(ref["evidence_unit_id"] in removed for ref in record["source_refs"])]
                 selected_ids -= removed
+                result.facts = facts_supported_by(result.facts, selected_ids)
                 diagnostics.update(truncated=True, verified_facts=len(result.facts),
                                    selected_evidence_unit_ids=sorted(selected_ids))
                 refresh_coverage()
