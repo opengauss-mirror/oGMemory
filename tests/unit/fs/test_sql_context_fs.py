@@ -301,6 +301,14 @@ def test_inventory_counts_agent_tools_and_experiences(mock_sql_fs):
     assert {"tool", "experience"} <= set(query.args[1][1])
 
 
+def test_inventory_counts_facts_in_the_user_memory_directory(mock_sql_fs):
+    fs, _, cur = mock_sql_fs
+    facts = "ctx://acct-1/users/u1/memories/facts"
+    cur.fetchall.return_value = [(facts, "fact", 3), (facts, "entity", 2)]
+    assert fs.count_memory_children(_ctx()) == {facts: 3}
+    assert "fact" in cur.execute.call_args.args[1][1]
+
+
 class TestSQLContextFSWriteNode:
     def test_write_new_node(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs

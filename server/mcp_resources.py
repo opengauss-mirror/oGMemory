@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+from core.errors import NodeNotFoundError
 from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, RequestContext
 from server.mcp_security import (
@@ -15,6 +16,7 @@ from server.mcp_security import (
     is_not_found_or_not_visible_error,
     raise_not_found_or_not_visible,
 )
+from service.evidence_lifecycle import ensure_sources_active
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,7 @@ class MemoryTypeSpec:
 
 
 MEMORY_TYPES: dict[str, MemoryTypeSpec] = {
+    "fact": MemoryTypeSpec("fact", "fact", "facts", "user"),
     "profile": MemoryTypeSpec("profile", "profile", "profile", "user"),
     "preference": MemoryTypeSpec("preference", "preference", "preferences", "user"),
     "entity": MemoryTypeSpec("entity", "entity", "entities", "user"),
@@ -384,7 +387,12 @@ def render_collection_resource(
             if memory_type == "profile":
                 internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
                 if context_fs.exists(internal_uri, ctx):
-                    memories.append(_node_summary(context_fs.read_node(internal_uri, ctx)))
+                    try:
+                        node = ensure_sources_active(context_fs.read_node(internal_uri, ctx), context_fs, ctx)
+                    except NodeNotFoundError:
+                        pass
+                    else:
+                        memories.append(_node_summary(node))
             elif memory_type == "pattern":
                 user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
                 memories.extend(_list_node_summaries(context_fs, user_base, ctx, fetch_limit))
@@ -435,7 +443,7 @@ def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[st
         context_fs = service._get_context_fs()
         for internal_uri in iter_internal_uri_candidates(uri, ctx, context_fs):
             try:
-                node = context_fs.read_node(internal_uri, ctx)
+                node = ensure_sources_active(context_fs.read_node(internal_uri, ctx), context_fs, ctx)
                 return _truncate_payload(
                     _node_detail(node),
                     _configured_max_response_chars(service),
@@ -465,16 +473,39 @@ def _node_summary(node: ContextNode) -> dict[str, Any]:
     }
 
 
+def visible_memory_nodes(context_fs, base_uri, ctx, limit, *, after_uri=None):
+    """Fill a public page after excluding revoked deterministic memories."""
+    order_key = getattr(context_fs, "list_node_order_key", lambda uri: uri)
+    cursor = order_key(after_uri) if after_uri else None
+    visible = []
+    scanned = 0
+    while len(visible) < limit:
+        remaining = limit - len(visible)
+        if hasattr(context_fs, "list_node_summaries_page"):
+            nodes = context_fs.list_node_summaries_page(base_uri, ctx, limit=remaining, after_uri=cursor)
+        elif hasattr(context_fs, "list_node_summaries"):
+            nodes = context_fs.list_node_summaries(base_uri, ctx, scanned + remaining)
+            nodes = nodes[scanned:]
+        else:
+            uris = [uri for uri in sorted(context_fs.list_children(base_uri, ctx), key=order_key)
+                    if cursor is None or order_key(uri) > cursor][:remaining]
+            nodes = [context_fs.read_node(uri, ctx) for uri in uris]
+        for node in nodes:
+            if cursor is not None and order_key(node.uri) <= cursor:
+                continue
+            try:
+                visible.append(ensure_sources_active(node, context_fs, ctx))
+            except NodeNotFoundError:
+                pass
+        if len(nodes) < remaining:
+            break
+        scanned += len(nodes)
+        cursor = max(cursor or "", order_key(nodes[-1].uri))
+    return visible
+
+
 def _list_node_summaries(context_fs: Any, base_uri: str, ctx: RequestContext, limit: int) -> list[dict[str, Any]]:
-    if hasattr(context_fs, "list_node_summaries"):
-        return [
-            _node_summary(node)
-            for node in context_fs.list_node_summaries(base_uri, ctx, limit)
-        ]
-    return [
-        _node_summary(context_fs.read_node(child_uri, ctx))
-        for child_uri in context_fs.list_children(base_uri, ctx)[:limit]
-    ]
+    return [_node_summary(node) for node in visible_memory_nodes(context_fs, base_uri, ctx, limit)]
 
 
 def _node_detail(node: ContextNode) -> dict[str, Any]:

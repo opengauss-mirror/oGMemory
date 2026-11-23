@@ -22,7 +22,8 @@ from commit.write_receipts import (
     receipt_plan,
     validate_receipt_target,
 )
-from core.errors import ConcurrentModificationError, OperationDeadlineExceededError
+from core.errors import ConcurrentModificationError, NodeNotFoundError, OperationDeadlineExceededError, ValidationError
+from core.evidence import DETERMINISTIC_MEMORY_TYPES
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
@@ -203,6 +204,8 @@ class ContextWriter:
             return committed
 
         try:
+            if candidate.metadata.get("deterministic") is not None:
+                return self._write_deterministic(candidate, ctx, commit, recover_receipt)
             if candidate.write_operation_id:
                 if resolver is None:
                     raise WriteNotStartedError("durable operations require an authorized URI resolver")
@@ -250,6 +253,33 @@ class ContextWriter:
                 if committed is not None:
                     return committed
             raise error_type(str(exc)) from exc
+
+    def _write_deterministic(self, candidate, ctx, commit, recover_receipt):
+        from commit.deterministic import plan_deterministic_write, require_deterministic_batch, validate_payload
+        from core.validation import validate_candidate
+        from service.evidence_store import EvidenceStore, leaf_publication_lock
+
+        require_deterministic_batch()
+        candidate = validate_candidate(candidate)
+        store = EvidenceStore(self._fs)
+        data = validate_payload(candidate, store, ctx)
+        resolver = self._identity_resolver
+        uri = resolver.uris.resolve(candidate.category, {"routing_key": candidate.routing_key}, ctx)
+        if candidate.target_uri and candidate.target_uri != uri:
+            raise ValidationError("deterministic", "candidate changed its deterministic target")
+        store.add_support(uri, data["source_refs"], ctx)
+        with leaf_publication_lock(store, self._outbox_store, uri, ctx, resolver.lock_directory):
+            # Recheck under the publication lock after any intervening revocation.
+            validate_payload(candidate, store, ctx, verify_structure=False)
+            if candidate.write_operation_id:
+                committed = recover_receipt()
+                if committed is not None:
+                    return committed
+            try:
+                current = self._fs.read_node(uri, ctx)
+            except NodeNotFoundError:
+                current = None
+            return commit(candidate, ctx, plan_deterministic_write(candidate, uri, data, current))
 
     def _write_candidate(
         self,
@@ -311,6 +341,11 @@ class ContextWriter:
                         # Custom policies must retain the same hard CAS as
                         # managed memory identities, even after replanning.
                         plan.merged_fields["expected_version"] = candidate.expected_version
+
+                # Existing nodes created by the other engine are never automatic update targets.
+                if candidate.category in DETERMINISTIC_MEMORY_TYPES:
+                    from commit.deterministic import check_engine_target
+                    check_engine_target(self._fs, candidate, plan.target_uri, ctx)
 
                 receipt_only = plan.action == "skip" and bool(candidate.write_operation_id)
                 if plan.action == "skip" and not receipt_only:

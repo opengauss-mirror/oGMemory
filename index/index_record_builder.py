@@ -66,6 +66,10 @@ def agent_memory_index_ids(node: ContextNode) -> list[str]:
     ]
 
 
+def _is_evidence_derived(node: ContextNode) -> bool:
+    return bool(node.metadata.get("evidence_source_refs") or node.metadata.get("evidence_directory_invalidated"))
+
+
 def build_index_records(node: ContextNode) -> list[IndexRecord]:
     """Expand ContextNode into an L0 record and optional L2 record.
 
@@ -80,7 +84,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
     CRITICAL: All records include account_id + owner_space in filters
     to prevent cross-tenant leakage at the vector index level.
     """
-    if node.metadata.get("indexing_disabled") is True:
+    if node.category == "evidence" or node.metadata.get("indexing_disabled") is True:
         return []
 
     # Extract account_id from URI for tenant isolation
@@ -111,6 +115,11 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         "has_overview": bool(node.overview),
         "has_content": bool(node.content),
     }
+    if node.metadata.get("deterministic"):
+        base_metadata["extraction_method"] = "deterministic"
+    if _is_evidence_derived(node):
+        base_metadata["evidence_derived"] = True
+        base_metadata["node_type"] = "directory"
     base_metadata.update(code_metadata)
     if node.context_type != "RESOURCE":
         # Code resources have deterministic, revision-independent index payloads.
@@ -213,6 +222,7 @@ def build_agfs_lexical_records(node: ContextNode) -> list[IndexRecord]:
 
 def build_directory_index_records(node: ContextNode, account_id: str) -> list[IndexRecord]:
     records = []
+    evidence_derived = _is_evidence_derived(node)
     for level, text in ((0, node.abstract), (1, node.overview)):
         if level == 1 and not text:
             continue
@@ -223,6 +233,9 @@ def build_directory_index_records(node: ContextNode, account_id: str) -> list[In
             node_type="directory", parent_uri=node.parent_uri,
             child_count=node.metadata.get("child_count", 0),
         )
+        if evidence_derived:
+            record.metadata["evidence_derived"] = True
+            record.metadata["canonical_revision"] = node.metadata.get("version", 0)
         if level == 0:
             record.metadata["categories"] = node.metadata.get("categories", [])
         records.append(record)

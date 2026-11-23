@@ -138,6 +138,10 @@ class MemoryIdentityResolver:
                 stack.enter_context(self._lock(directory, ctx))
             yield
 
+    def lock_directory(self, directory, ctx):
+        """Hold one directory identity lock using the resolver's reentrancy rules."""
+        return self._lock(directory, ctx)
+
     @contextmanager
     def _lock(self, directory, ctx):
         key = (ctx.account_id, directory)
@@ -186,6 +190,8 @@ class MemoryIdentityResolver:
 
     @staticmethod
     def _in_scope(node, candidate, ctx):
+        if bool(node.metadata.get("deterministic")) != bool(candidate.metadata.get("deterministic")):
+            return False
         owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
         if node.category != candidate.category or node.owner_space != owner:
             return False

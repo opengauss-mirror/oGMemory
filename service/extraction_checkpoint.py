@@ -40,6 +40,14 @@ def request_message_id(ctx, request_id, index):
     return "msg_request_" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def frozen_extraction_config(batch):
+    return batch.get("extraction_config", {"engine": "llm"})
+
+
+def checkpoint_extraction_config(checkpoint):
+    return frozen_extraction_config(checkpoint.journal.batch)
+
+
 class ExtractionBatchJournal:
     @classmethod
     def resume(cls, manager, buffer, ctx):
@@ -59,8 +67,8 @@ class ExtractionBatchJournal:
 
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
-                 request_messages=None, lifecycle=None, request_source_ids=None, agent_async=False,
-                 ready_at_ms=None):
+                 request_messages=None, lifecycle=None, request_source_ids=None, extraction_config=None,
+                 agent_async=False, ready_at_ms=None):
         self.manager, self.buffer, self.ctx = manager, buffer, ctx
         self._stage_owner = threading.get_ident()
         self._verified_stage_results = set()
@@ -92,6 +100,11 @@ class ExtractionBatchJournal:
                      "session_summary": session_summary, "tool_stats_text": tool_stats_text,
                      "chunks": None, "slots": {}, "outbox_tracking_version": 1,
                      "outbox_events": []}
+            if extraction_config is not None:
+                batch["extraction_config"] = deepcopy(extraction_config)
+                if extraction_config.get("engine") == "deterministic":
+                    from service.evidence_store import snapshot_messages
+                    batch["messages"] = snapshot_messages(snapshot, ctx, manager._get_context_fs())
             if lifecycle is not None:
                 batch["lifecycle"] = deepcopy(lifecycle)
             if agent_async:
@@ -101,6 +114,10 @@ class ExtractionBatchJournal:
             self._replace(batch)
         self._archive_id = batch["archive_id"]
         restore_outbox_events(batch, ctx.account_id)
+
+    @property
+    def extraction_engine(self):
+        return frozen_extraction_config(self.batch).get("engine", "llm")
 
     @property
     def batch(self):

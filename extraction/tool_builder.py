@@ -46,7 +46,7 @@ _FIELD_TYPE_JSON_SCHEMA = {
 _EXCLUDED_TOOL_FIELDS = {"provenance_ids"}
 
 # Schemas used by storage/internal flows, not by LLM extraction.
-_INTERNAL_MEMORY_TYPES = {"session_archive", "session_summary"}
+_INTERNAL_MEMORY_TYPES = {"session_archive", "session_summary", "fact"}
 _UPDATE_MEMORY_TYPES = {"profile", "entity", "preference", "pattern"}
 _TEXT_LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
                 "content": MAX_CONTENT_LEN}

@@ -95,6 +95,11 @@ _READ_NODE_SQL = (
 
 def parse_uri(uri: str) -> dict:
     """Parse a ContextEngine URI into its components."""
+    from core.evidence import parse_evidence_uri
+
+    evidence = parse_evidence_uri(uri)
+    if evidence is not None:
+        return evidence
     shared = re.fullmatch(r"ctx://([^/]+)/spaces/([^/]+)/(memories|skills)/(.+)", uri)
     if shared:
         return {"account": shared[1], "owner_type": "spaces", "owner_id": shared[2],
@@ -1489,6 +1494,12 @@ class SQLContextFS(PoolAdapterMixin):
 
     def count_memory_children(self, ctx: RequestContext) -> dict[str, int]:
         """Count active memory items by parent directory in one scoped query."""
+        allowed = {
+            "profile": "profile", "preferences": "preference", "entities": "entity",
+            "events": "event", "cases": "case", "patterns": "pattern", "facts": "fact",
+            "tools": "tool", "tool_units": "tool", "experiences": "experience", "session_summaries": "session_summary",
+            "session_archives": "session_archive",
+        }
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -1502,11 +1513,7 @@ class SQLContextFS(PoolAdapterMixin):
                       AND (position('/memories/' in uri) > 0)
                     GROUP BY parent, category
                     """,
-                    (
-                        ctx.account_id,
-                        ["profile", "preference", "entity", "event", "case", "pattern",
-                         "tool", "experience", "session_summary", "session_archive"],
-                    ),
+                    (ctx.account_id, list(dict.fromkeys(allowed.values()))),
                 )
                 rows = cur.fetchall()
         finally:
@@ -1514,12 +1521,6 @@ class SQLContextFS(PoolAdapterMixin):
             self._return_connection(conn)
 
         directories = {}
-        allowed = {
-            "profile": "profile", "preferences": "preference", "entities": "entity",
-            "events": "event", "cases": "case", "patterns": "pattern",
-            "tools": "tool", "tool_units": "tool", "experiences": "experience", "session_summaries": "session_summary",
-            "session_archives": "session_archive",
-        }
         for parent, category, count in rows:
             parts = parent.split("/")
             if len(parts) == 7 and parts[3] in {"users", "agents"} and parts[5] == "memories":

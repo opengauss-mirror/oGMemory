@@ -13,8 +13,9 @@ This ensures summaries are generated bottom-up:
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
+from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
 from core.models import ContextNode, IndexRecord, OutboxEvent, RequestContext
 from index.directory_summarizer import (
@@ -25,6 +26,7 @@ from index.directory_summarizer import (
 )
 from index.index_record_builder import build_directory_index_records
 from index.vector_projection import VectorProjection
+from service.evidence_directory import publication_guard, source_refs, summary_source_refs
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +144,7 @@ class DirectoryEventHandler:
             )
 
         try:
-            result = asyncio.run(self._run_dag(root_uri, ctx))
+            result = asyncio.run(self._run_dag(root_uri, ctx, event.payload.get("evidence_rebuild_directories", ())))
             return result
         except Exception as e:
             logger.error("Failed to process directory event %s: %s", root_uri, e, exc_info=True)
@@ -157,9 +159,11 @@ class DirectoryEventHandler:
         self,
         root_uri: str,
         ctx: RequestContext,
+        rebuild_directories=(),
     ) -> DirectoryEventResult:
         """Run DAG execution asynchronously."""
         self._nodes: dict[str, DirNode] = {}
+        self._rebuild_directories = rebuild_directories
         self._parent_map: dict[str, str | None] = {}
         self._root_done: asyncio.Event | None = None
         self._stats = DagStats()
@@ -225,6 +229,12 @@ class DirectoryEventHandler:
                 for child_uri in self._fs.list_children(dir_uri, ctx)
                 if not self._same_uri(child_uri, dir_uri)
             ]
+            # Cleanup knows affected ancestors even when a storage adapter lists
+            # category nodes without a trailing slash (or omits directory rows).
+            rebuilt_children = {uri for uri in self._rebuild_directories
+                                if uri.rstrip("/").rsplit("/", 1)[0] == dir_uri.rstrip("/")}
+            children = [uri for uri in children if uri.rstrip("/") + "/" not in rebuilt_children]
+            children.extend(sorted(rebuilt_children))
 
             if len(children) > self._max_children:
                 logger.warning(
@@ -365,6 +375,7 @@ class DirectoryEventHandler:
                         category=file_node.category or "unknown",
                         is_directory=False,
                         has_abstract=True,
+                        source_refs=summary_source_refs(self._fs, file_node, ctx),
                     ))
             except Exception as e:
                 logger.warning("Failed to read file %s: %s", file_uri, e)
@@ -429,10 +440,11 @@ class DirectoryEventHandler:
                     "node_type": "directory",
                     "child_count": summary.child_count,
                     "categories": summary.categories,
+                    "evidence_source_refs": [ref for child in valid_summaries for ref in child.source_refs],
                 },
             )
 
-            await asyncio.to_thread(self._fs.write_node, dir_node, ctx)
+            dir_node = await asyncio.to_thread(self._publish_directory, dir_node, ctx)
             self._stats.written_dir_uris.append(dir_uri)
             logger.info("Generated summary for directory %s", dir_uri)
 
@@ -449,6 +461,7 @@ class DirectoryEventHandler:
                 category="directory",
                 is_directory=True,
                 has_abstract=True,
+                source_refs=source_refs(dir_node),
             )
 
         except Exception as e:
@@ -464,6 +477,22 @@ class DirectoryEventHandler:
             return
 
         await self._on_child_done(parent_uri, dir_uri, child_summary, ctx)
+
+    def _publish_directory(self, node, ctx):
+        with publication_guard(self._fs, node, ctx):
+            if callable(getattr(type(self._fs), "memory_identity_lock", None)):
+                try:
+                    current = self._fs.read_node(node.uri, ctx)
+                except NodeNotFoundError:
+                    current = None
+                if current is not None:
+                    node = replace(node, metadata={**node.metadata, "_expected_version": current.metadata.get("version", 0)})
+            self._fs.write_node(node, ctx)
+            return self._fs.read_node(node.uri, ctx) if source_refs(node) else node
+
+    def _publish_vectors(self, node, records, ctx):
+        with publication_guard(self._fs, node, ctx, revision=node.metadata.get("version") if source_refs(node) else None):
+            self._projection.upsert(records)
 
     def _extract_owner_space_from_uri(self, uri: str, ctx: RequestContext) -> str:
         """Extract owner_space from URI.
@@ -552,6 +581,6 @@ class DirectoryEventHandler:
                             {**record.metadata, "_embedding": embedding})
                 for record, embedding in zip(records, embeddings)
             ]
-        await asyncio.to_thread(projection.upsert, records)
+        await asyncio.to_thread(self._publish_vectors, dir_node, records, ctx)
         self._stats.record_ids.extend(record.id for record in records)
         logger.info("Indexed directory %s with %d records", dir_node.uri, len(records))

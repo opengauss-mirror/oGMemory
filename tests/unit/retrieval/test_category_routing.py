@@ -59,7 +59,7 @@ def test_public_category_recall(unit_memory, enabled, expand, query, types, expe
         HierarchicalSearcher(index, cfg), ResultRanker(cfg), cfg, context_reader=reader,
     )
     api = ReadAPI(pipeline, reader, cfg)
-    service = SimpleNamespace(_cfg=SimpleNamespace(), get_read_api=lambda: api,
+    service = SimpleNamespace(_cfg=SimpleNamespace(retrieval_default_top_k=10, retrieval_max_top_k=50), get_read_api=lambda: api,
                               _get_context_fs=lambda: fs)
 
     response = query_memory(service, query=query, types=types, request_context=ctx)
