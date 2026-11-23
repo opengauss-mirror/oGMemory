@@ -315,6 +315,24 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             snapshots[path] = copy.deepcopy(result)
         return result
 
+    def list_accounts_page(self, limit: int, after: str, query: str) -> list[dict]:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT a.account_id,a.status,a.created_at, "
+                    "(SELECT COUNT(*) FROM cp_users u WHERE u.account_id=a.account_id AND u.status='active') "
+                    "FROM (SELECT account_id,status,created_at FROM cp_accounts WHERE account_id>%s "
+                    "AND POSITION(LOWER(%s) IN LOWER(account_id))>0 ORDER BY account_id LIMIT %s) a "
+                    "ORDER BY a.account_id",
+                    (after, query, limit + 1),
+                )
+                fields = ("account_id", "status", "created_at", "user_count")
+                return [dict(zip(fields, row, strict=True)) for row in cur.fetchall()]
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
     def list_identity_page(
         self, kind: str, account_id: str, limit: int, after: str, query: str, *, owner_user_id: str | None = None,
     ) -> list[dict]:

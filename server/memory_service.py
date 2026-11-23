@@ -2234,6 +2234,8 @@ class MemoryService:
         self,
         params: dict,
         identity: ResolvedIdentity | None = None,
+        *,
+        include_agent_visibility: bool = True,
     ) -> RequestContext:
         """Build RequestContext, allowing per-request overrides.
 
@@ -2261,7 +2263,7 @@ class MemoryService:
                 agent_id=requested_agent_id or "",
                 session_id=session_id,
             )
-            if ctx.role == Role.ROOT:
+            if ctx.role == Role.ROOT or (not include_agent_visibility and not requested_agent_id):
                 visible = [ctx.user_space_name()]
                 if requested_agent_id:
                     visible.append(f"agent:{requested_agent_id}")

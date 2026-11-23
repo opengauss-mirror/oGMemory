@@ -113,7 +113,12 @@ const elements = {
 function requestHeaders() { return state.apiKey ? { 'X-API-Key': state.apiKey } : {}; }
 function setApiKey(value) {
   const changed = value.trim() !== state.apiKey;
-  if (changed) window.sharedSpaces?.reset();
+  if (changed) {
+    window.sharedSpaces?.reset();
+    window.tenantAdmin?.reset();
+    state.tenantScope = null;
+    $('[data-view="tenants"]').hidden = true;
+  }
   state.apiKey = value.trim();
   if (state.apiKey) sessionStorage.setItem(API_KEY_STORAGE_KEY, state.apiKey);
   else sessionStorage.removeItem(API_KEY_STORAGE_KEY);
@@ -160,6 +165,10 @@ async function fetchJson(url, options = {}) {
   return body;
 }
 
+function viewerScopeUrl() {
+  return apiUrl('/api/v1/memory-viewer/scope', { includeAgents: state.view === 'tenants' ? 'false' : '' });
+}
+
 async function loadTree(verifiedScope = null) {
   const requestId = ++state.treeRequestId;
   const accountRequestId = ++state.accountRequestId;
@@ -169,35 +178,49 @@ async function loadTree(verifiedScope = null) {
   setLoading(true);
   if (state.view === 'spaces') window.sharedSpaces?.notify('正在连接并读取团队空间…');
   try {
-    const scope = verifiedScope || await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), requestOptions);
+    const scope = verifiedScope || await fetchJson(viewerScopeUrl(), requestOptions);
     const adminMode = Boolean(scope.admin_mode);
-    const body = adminMode
-      ? await fetchJson(apiUrl('/api/v1/memory-viewer/admin/tree', { accountId: state.accountId }), requestOptions)
-      : publicTree(scope);
+    const tenantOnly = adminMode && state.view === 'tenants';
+    const body = tenantOnly
+      ? { account_id: scope.role === 'ROOT' ? state.accountId : scope.account_id, accounts: [], users: [], agents: [] }
+      : adminMode
+        ? await fetchJson(apiUrl('/api/v1/memory-viewer/admin/tree', { accountId: state.accountId }), requestOptions)
+        : publicTree(scope);
     if (requestId !== state.treeRequestId || accountRequestId !== state.accountRequestId) return;
     state.adminMode = adminMode;
+    if (tenantOnly) state.tenantDirectoryChanged = true;
+    state.tenantScope = scope;
+    const tenantNav = $('[data-view="tenants"]');
+    tenantNav.hidden = !adminMode;
+    tenantNav.querySelector('.nav-label').textContent = scope.role === 'ROOT' ? '部署管理' : '租户管理';
     state.tree = body;
     state.accountId = body.account_id || '';
     state.accountTrees.clear();
     state.inventories.clear();
-    if (state.accountId) state.accountTrees.set(state.accountId, body);
+    if (state.accountId && !tenantOnly) state.accountTrees.set(state.accountId, body);
     state.directories.clear();
     clearDetail();
     localStorage.setItem('ogmemory-viewer-account-id', state.accountId);
     renderAccounts(body.accounts || []);
-    renderSearchScopes();
+    if (!tenantOnly) renderSearchScopes();
     openRootDirectories();
     renderContextTree();
     renderDashboard();
     loadInventories(body.accounts || []);
     setConnection(true);
     if (state.view === 'spaces') await window.sharedSpaces?.initialize();
+    if (state.view === 'tenants') {
+      elements.account.closest('.scope-switcher').hidden = true;
+      elements.pageTitle.textContent = tenantNav.textContent;
+      document.title = elements.pageTitle.textContent + ' · oGMemory';
+      await window.tenantAdmin?.load();
+    }
     if (state.view === 'dashboard') loadDashboardMetrics();
     if (state.view === 'monitoring') loadMonitoring();
     if (state.view === 'tasks') loadTasks();
   } catch (error) {
     if (requestId !== state.treeRequestId || accountRequestId !== state.accountRequestId) return;
-    const message = error.name === 'TimeoutError' ? '连接超时，请检查服务或连接设置后刷新。' : error.message;
+    const message = error.name === 'TimeoutError' ? '连接超时，请检查服务状态后刷新。' : error.message;
     showTreeError(message);
     if (state.view === 'spaces') window.sharedSpaces?.notify(message, true);
     setConnection(false);
@@ -280,6 +303,7 @@ async function selectAccount(accountId, toggle = false) {
   if (state.view === 'dashboard') loadDashboardMetrics();
   if (state.view === 'monitoring') loadMonitoring();
   if (state.view === 'tasks') loadTasks();
+  if (state.view === 'tenants') window.tenantAdmin?.load();
 }
 
 function publicTree(scope) {
@@ -443,6 +467,13 @@ async function retrySelectedTask() {
     button.textContent = '重新触发';
   }
 }
+function clearSearchScopes() {
+  state.searchTargets.clear();
+  elements.retrievalScope.replaceChildren(new Option('加载检索范围…', ''));
+  elements.retrievalScope.disabled = true;
+  resetRetrieval();
+}
+
 function renderSearchScopes() {
   const previous = elements.retrievalScope.value;
   state.searchTargets.clear();
@@ -462,6 +493,8 @@ function renderSearchScopes() {
   });
   elements.retrievalScope.innerHTML = options.join('') || '<option value="">无可检索范围</option>';
   elements.retrievalScope.value = state.searchTargets.has(previous) ? previous : 'all';
+  elements.retrievalScope.disabled = false;
+  setRetrievalBusy(Boolean(state.retrievalController));
   renderSceneScopes();
 }
 
@@ -1211,7 +1244,7 @@ async function runRetrieval() {
     showFieldProblem(threshold, $('#retrieval-status'), '请输入 0 到 1 之间的分数。');
     return;
   }
-  if (!target) {
+  if (!target || target.accountId !== state.accountId) {
     $('#retrieval-status').textContent = '连接账户后才能选择检索范围。';
     return;
   }
@@ -1301,7 +1334,7 @@ function clearRetrievalDetail() {
   $('#retrieval-detail-placeholder').hidden = false;
 }
 function setRetrievalBusy(busy) {
-  $('#retrieval-submit').disabled = busy;
+  $('#retrieval-submit').disabled = busy || !state.searchTargets.size;
   $('#retrieval-submit').textContent = busy ? '检索中' : '检索';
   elements.retrievalResults.setAttribute('aria-busy', String(busy));
 }
@@ -1330,20 +1363,23 @@ function switchView(view, loadContent = true) {
   const tasks = view === 'tasks';
   const scenes = view === 'scenes';
   const spaces = view === 'spaces';
+  const tenants = view === 'tenants';
   const bot = view === 'bot';
   elements.botView.hidden = !bot;
   elements.shell.classList.toggle('bot-active', bot);
   elements.dashboardView.hidden = !dashboard;
-  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes || spaces || bot;
+  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes || spaces || tenants || bot;
   $('#spaces-view').hidden = !spaces;
-  elements.account.closest('.scope-switcher').hidden = spaces || bot;
+  $('#tenant-view').hidden = !tenants;
+  elements.account.closest('.scope-switcher').hidden = spaces || bot || tenants;
   elements.retrievalView.hidden = !retrieval;
   elements.monitoringView.hidden = !monitoring;
   elements.tasksView.hidden = !tasks;
   elements.scenesView.hidden = !scenes;
-  elements.pageTitle.textContent = bot ? 'memoryBot' : spaces ? '团队空间' : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : '记忆';
+  elements.pageTitle.textContent = bot ? 'memoryBot' : spaces ? '团队空间' : tenants ? (state.tenantScope?.role === 'ROOT' ? '部署管理' : '租户管理') : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : '记忆';
   document.title = `${elements.pageTitle.textContent} · oGMemory`;
   if (spaces) { if (loadContent) window.sharedSpaces?.load(); return; }
+  if (tenants) { if (loadContent) window.tenantAdmin?.load(); return; }
   if (bot) { showBot(); return; }
   const skill = view === 'skill';
   $('#tree-label').textContent = skill ? 'Agent Skill' : 'ContextFS';
@@ -1374,6 +1410,11 @@ function switchView(view, loadContent = true) {
 }
 
 function navigateToView(view, trigger) {
+  if (state.view === 'tenants' && view !== 'tenants' && state.tenantDirectoryChanged) {
+    state.tenantDirectoryChanged = false;
+    switchView(view, false);
+    return loadTree();
+  }
   if (state.view === 'spaces') return window.sharedSpaces.guardNavigation(() => switchView(view), trigger);
   return switchView(view);
 }
@@ -1653,7 +1694,7 @@ window.addEventListener('message', (event) => {
 });
 function showHashView({ initial = false } = {}) {
   const view = location.hash.slice(1);
-  if (!['bot', 'memory', 'dashboard', 'scenes', 'retrieval', 'skill', 'monitoring', 'tasks', 'spaces'].includes(view)) return;
+  if (!['bot', 'memory', 'dashboard', 'scenes', 'retrieval', 'skill', 'monitoring', 'tasks', 'spaces', 'tenants'].includes(view)) return;
   if (initial) { switchView(view, view !== 'spaces'); return; }
   if (view === state.view) return;
   if (state.view === 'spaces') history.replaceState(null, '', '#spaces');
@@ -1688,7 +1729,7 @@ $('#settings-form').addEventListener('submit', async (event) => {
   saveSettings.textContent = '连接中';
   settingsFeedback.textContent = '';
   try {
-    const scope = await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), {
+    const scope = await fetchJson(viewerScopeUrl(), {
       signal: AbortSignal.any([controller.signal, timeout]),
       headers: { 'X-API-Key': candidate },
     });

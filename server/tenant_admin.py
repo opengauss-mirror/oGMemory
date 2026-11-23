@@ -18,12 +18,15 @@ class TenantAdminService:
         self._store = store
         self._audit = audit
 
-    def list_accounts(self, ctx: RequestContext) -> dict:
+    def list_accounts(self, ctx: RequestContext, *, limit=None, after="", q="") -> dict:
         self._require_root(ctx)
-        rows = self._key_manager.get_accounts()
-        for row in rows:
+        read_page = getattr(self._store, "list_accounts_page", None)
+        if limit is not None and read_page is not None:
+            return self._page("accounts", "account_id", read_page(limit, after, q), limit)
+        page = self._filter_page("accounts", "account_id", self._key_manager.get_accounts(), limit, after, q)
+        for row in page["accounts"]:
             row["user_count"] = len(self._key_manager.get_users(row["account_id"]))
-        return {"accounts": rows}
+        return page
 
     def create_account(self, ctx: RequestContext, account_id: str, admin_user_id: str) -> dict:
         self._require_root(ctx)
