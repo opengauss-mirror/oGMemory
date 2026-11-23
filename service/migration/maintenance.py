@@ -154,6 +154,10 @@ class MaintenanceStore:
                    if task_id else self._active(db))
             return dict(row) if row else None
 
+    def active_import(self):
+        task = self.status()
+        return task if task and task["mode"] == "import" else None
+
     def _owned(self, db, task_id):
         task = self._active(db)
         if not task or task["id"] != task_id:

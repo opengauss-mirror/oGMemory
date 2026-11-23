@@ -9,6 +9,7 @@ from core.models import RequestContext, Role
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from service.migration.admission import Admission
 from service.migration.maintenance import MaintenanceStore
+from tests.migration_fixtures import ConfirmedMemoryAGFSClient
 from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
 
 
@@ -252,18 +253,7 @@ def test_joined_lease_renews_during_import(tmp_path, monkeypatch, lock_kind):
     import fs.agfs_adapter.agfs_context_fs as module
 
     a = admission(tmp_path)
-    from fs.agfs_adapter.client import NativeAGFSHTTPError
-    from pyagfs.exceptions import AGFSClientError
-
-    class Client(_AtomicMemoryAGFSClient):
-        def rm(self, path, recursive=False):
-            try:
-                super().rm(path, recursive=recursive)
-            except AGFSClientError as exc:
-                # The synchronous test transport confirms the cleanup target is absent.
-                raise NativeAGFSHTTPError(str(exc), status_code=404) from exc
-
-    client = a.guard(Client())
+    client = a.guard(ConfirmedMemoryAGFSClient())
     fs = a.guard(AGFSContextFS(client=client, mount_prefix='/local'))
     ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.MEMBER)
     uri = 'ctx://acme/users/alice/memories/preferences/x'

@@ -1241,6 +1241,7 @@ class AGFSContextFS:
         timeout_seconds: float = _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS,
     ) -> Iterator[_ResourceMutationLease]:
         """Serialize code-resource writes and deletes across AGFS processes."""
+        from fs.agfs_adapter.client import confirmed_rejection
 
         self._validate_write_access(uri, ctx)
         node_path = self._uri_to_agfs_path(uri)
@@ -1253,6 +1254,7 @@ class AGFSContextFS:
         candidate_path = lock_path + "-" + owner_token
         deadline = time.monotonic() + timeout_seconds
         acquired = False
+        only_conflicts = True
         rejection = None
         lease_stop = Event()
         lease_lost = Event()
@@ -1272,15 +1274,19 @@ class AGFSContextFS:
                     self._client.mv(candidate_path, lock_path)
                     acquired = True
                 except Exception as exc:
+                    only_conflicts &= confirmed_rejection(exc, status_code=409)
                     if self._owns_resource_mutation_lock(lock_path, owner_token):
                         acquired = True
                         break
                     if self._recover_resource_mutation_lock(node_path, lock_path):
                         continue
                     if time.monotonic() >= deadline:
-                        raise TimeoutError(
+                        timeout = TimeoutError(
                             f"timed out acquiring AGFS code-resource mutation lock: {uri}"
-                        ) from exc
+                        )
+                        if only_conflicts:
+                            rejection = timeout
+                        raise timeout from exc
                     time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
 
             lease_thread = Thread(
@@ -1321,7 +1327,7 @@ class AGFSContextFS:
                         "Failed to release AGFS code-resource mutation lock: %s",
                         lock_path,
                     )
-            if rejection is not None and cleaned and released:
+            if rejection is not None and cleaned and (not acquired or released):
                 rejection.agfs_rejection_settled = True
 
     @contextmanager
@@ -1342,7 +1348,10 @@ class AGFSContextFS:
             try:
                 lease = stack.enter_context(self.resource_mutation_lock(uri, ctx, timeout_seconds=timeout_seconds))
             except TimeoutError as exc:
-                raise SessionMutationBusyError("AGFS session recovery is busy") from exc
+                busy = SessionMutationBusyError("AGFS session recovery is busy")
+                if getattr(exc, "agfs_rejection_settled", False) is True:
+                    busy.agfs_rejection_settled = True
+                raise busy from exc
             token = _SESSION_RECOVERY.set((lease, (ctx.account_id, ctx.user_id, ctx.agent_id, ctx.session_id)))
             try:
                 yield lease

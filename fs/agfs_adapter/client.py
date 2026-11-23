@@ -21,19 +21,17 @@ class NativeAGFSHTTPError(AGFSHTTPError):
     """The synchronous C call has returned; no remote write remains in flight."""
 
 
-def confirmed_rejection(exc):
+def confirmed_rejection(exc, *, status_code=None):
     """A single request returned a filesystem rejection, not a transport failure."""
     from requests.exceptions import HTTPError
 
     if isinstance(exc, NativeAGFSHTTPError):
-        return True
+        return status_code is None or exc.status_code == status_code
     cause = exc.__context__
     if not isinstance(exc, AGFSClientError) or not isinstance(cause, HTTPError) or cause.response is None:
         return False
-    response = cause.response
-    if response.status_code in {403, 404, 409}:
-        return True
-    return False
+    status = cause.response.status_code
+    return status in {403, 404, 409} and (status_code is None or status == status_code)
 
 
 class NativeAGFSClient:

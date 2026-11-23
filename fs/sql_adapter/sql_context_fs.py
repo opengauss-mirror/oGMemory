@@ -902,11 +902,8 @@ class SQLContextFS(PoolAdapterMixin):
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
-        except ConcurrentModificationError as exc:
+        except BaseException as exc:
             rollback_write(conn, exc, committing=committing)
-            raise
-        except Exception:
-            conn.rollback()
             raise
         finally:
             self._return_connection(conn)
@@ -1001,11 +998,8 @@ class SQLContextFS(PoolAdapterMixin):
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
-        except ConcurrentModificationError as exc:
+        except BaseException as exc:
             rollback_write(conn, exc, committing=committing)
-            raise
-        except Exception:
-            conn.rollback()
             raise
         finally:
             self._return_connection(conn)

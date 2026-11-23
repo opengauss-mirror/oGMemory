@@ -9,6 +9,7 @@ from core.models import ContextNode, RequestContext, Role
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from service.migration.admission import Admission, install
 from service.migration.maintenance import MaintenanceError, MaintenanceStore
+from tests.migration_fixtures import ConfirmedMemoryAGFSClient
 from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
 
 
@@ -185,27 +186,9 @@ def test_agfs_archive_id_lookup_remains_readable_during_export(tmp_path):
 def test_agfs_update_lock_conflict_settles_only_confirmed_rejection(tmp_path, monkeypatch, failure):
     import threading
 
-    from fs.agfs_adapter.client import NativeAGFSHTTPError
     from pyagfs.exceptions import AGFSClientError
 
-    class Client(_AtomicMemoryAGFSClient):
-        def mv(self, source, destination):
-            try:
-                super().mv(source, destination)
-            except AGFSClientError as exc:
-                if 'already exists' in str(exc):
-                    raise NativeAGFSHTTPError(str(exc), status_code=409) from exc
-                raise
-
-        def rm(self, path, recursive=False):
-            try:
-                super().rm(path, recursive=recursive)
-            except AGFSClientError as exc:
-                if 'no such file' in str(exc).lower():
-                    raise NativeAGFSHTTPError(str(exc), status_code=404) from exc
-                raise
-
-    client = Client()
+    client = ConfirmedMemoryAGFSClient()
     owner = AGFSContextFS(client)
     ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.ROOT)
     node = ContextNode(uri='ctx://acme/users/alice/memories/preferences/editor',
@@ -254,3 +237,34 @@ def test_agfs_update_lock_conflict_settles_only_confirmed_rejection(tmp_path, mo
     else:
         with pytest.raises(TimeoutError):
             gate.wait_drained('export', 0)
+
+
+@pytest.mark.parametrize('failure', ['conflict', 'transport', 'cleanup'])
+def test_contended_session_recovery_lock_settles_only_confirmed_timeout(tmp_path, monkeypatch, failure):
+    from fs.sql_adapter.session_mutation import SessionMutationBusyError
+    from pyagfs.exceptions import AGFSClientError
+
+    gate = MaintenanceStore(tmp_path / 'gate.db', 'session-lock')
+    admission = Admission(gate)
+    client = ConfirmedMemoryAGFSClient()
+    owner = AGFSContextFS(client)
+    contender = admission.guard(AGFSContextFS(admission.guard(client)))
+    ctx = RequestContext('acme', 'alice', 'agent', 's', 't', Role.ROOT)
+    uri = 'ctx://acme/sessions/s/state'
+    with owner.resource_mutation_lock(uri, ctx):
+        if failure == 'transport':
+            def lose_response(source, target):
+                if target.endswith('.resource-mutation-lock'):
+                    raise AGFSClientError('transport timeout')
+            contender._client.before_mv = lose_response
+        elif failure == 'cleanup':
+            monkeypatch.setattr(contender, '_remove_tree_if_present', lambda path: False)
+        with pytest.raises(SessionMutationBusyError, match='recovery is busy'):
+            with contender.session_recovery_lock(uri, ctx, timeout_seconds=0):
+                pytest.fail('contender must not acquire the held lock')
+    gate.enter('restore', mode='import', resources={})
+    if failure == 'conflict':
+        gate.wait_drained('restore', 0)
+    else:
+        with pytest.raises(TimeoutError):
+            gate.wait_drained('restore', 0)

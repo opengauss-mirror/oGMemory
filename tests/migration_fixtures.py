@@ -1,5 +1,11 @@
 """Shared backend fixtures for migration component tests."""
 
+from pyagfs.exceptions import AGFSClientError
+
+from fs.agfs_adapter.client import NativeAGFSHTTPError
+from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
+
+
 class LocalClient:
     def __init__(self, root):
         self.root = root
@@ -36,3 +42,31 @@ class LocalClient:
     def rm(self, path, recursive=False):
         import shutil
         shutil.rmtree(self._path(path))
+
+
+class ConfirmedMemoryAGFSClient(_AtomicMemoryAGFSClient):
+    """Simulate the deterministic filesystem rejections of the native transport."""
+
+    def mkdir(self, path):
+        try:
+            super().mkdir(path)
+        except AGFSClientError as exc:
+            if 'already exists' in str(exc).lower():
+                raise NativeAGFSHTTPError(str(exc), status_code=409) from exc
+            raise
+
+    def mv(self, source, destination):
+        try:
+            super().mv(source, destination)
+        except AGFSClientError as exc:
+            if 'already exists' in str(exc).lower():
+                raise NativeAGFSHTTPError(str(exc), status_code=409) from exc
+            raise
+
+    def rm(self, path, recursive=False):
+        try:
+            super().rm(path, recursive=recursive)
+        except AGFSClientError as exc:
+            if 'no such file' in str(exc).lower():
+                raise NativeAGFSHTTPError(str(exc), status_code=404) from exc
+            raise

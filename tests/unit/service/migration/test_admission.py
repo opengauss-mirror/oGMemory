@@ -451,3 +451,58 @@ def test_sql_access_rejection_precedes_connection(admission, method, prior_unkno
             call(*args)
     with admission.store._transaction() as db:
         assert db.execute('SELECT count(*) FROM operations').fetchone()[0] == int(prior_unknown)
+
+
+@pytest.mark.parametrize('failure', ['node-write', 'pending-delete', 'rollback', 'commit'])
+def test_sql_node_write_settles_only_confirmed_precommit_rollback(admission, failure):
+    from contextlib import nullcontext
+    from unittest.mock import MagicMock
+
+    from core.models import ContextNode, OutboxEvent, RequestContext, Role
+    from fs.sql_adapter.sql_context_fs import SQLContextFS
+
+    fs = SQLContextFS.__new__(SQLContextFS)
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchone.return_value = None if failure == 'commit' else (1,)
+    fs._get_connection = lambda: conn
+    fs._return_connection = lambda connection: None
+    fs._acquire_resource_mutation_lock = lambda *args: None
+    fs._execute_write = MagicMock()
+    fs._capture_node_trigger_events = lambda *args: nullcontext([])
+    fs._sql_dialect = "postgresql"
+    if failure == 'node-write':
+        fs._execute_write.side_effect = RuntimeError('node write failed')
+    elif failure == 'rollback':
+        conn.rollback.side_effect = RuntimeError('rollback response lost')
+    elif failure == 'commit':
+        conn.commit.side_effect = RuntimeError('commit response lost')
+    ctx = RequestContext('acme', 'alice', '', 's', 'test', Role.ROOT)
+    uri = 'ctx://acme/resources/workspace-file'
+    node = ContextNode(uri=uri, context_type='RESOURCE', category='code', level=2,
+                       owner_space='resource:acme', abstract='', overview='', content='text',
+                       metadata={'resource_type': 'code'})
+    event = OutboxEvent(event_id='event', event_type='UPSERT_CONTEXT', uri=uri, payload={}, status='PENDING')
+    if failure == 'node-write':
+        node.metadata.clear()
+        call = admission.wrap(fs.write_node, write=True, backend=True)
+        args = (node, ctx)
+    else:
+        call = admission.wrap(fs.write_node_with_outbox, write=True, backend=True)
+        args = (node, ctx, event)
+    expected_error = {
+        'node-write': 'node write failed',
+        'pending-delete': 'pending durable deletion',
+        'rollback': 'rollback response lost',
+        'commit': 'commit response lost',
+    }[failure]
+    with pytest.raises(RuntimeError, match=expected_error):
+        call(*args)
+    conn.rollback.assert_called_once()
+    admission.store.enter('export', mode='export', resources={})
+    if failure in {'node-write', 'pending-delete'}:
+        conn.commit.assert_not_called()
+        admission.store.wait_drained('export', 0)
+    else:
+        with pytest.raises(TimeoutError):
+            admission.store.wait_drained('export', 0)

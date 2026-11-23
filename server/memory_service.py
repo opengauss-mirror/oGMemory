@@ -2220,8 +2220,8 @@ class MemoryService:
 
     def start_extraction_recovery(self):
         admission = getattr(self, "_admission", None)
-        active = admission.store.status() if admission is not None else None
-        if active is not None and active["mode"] == "import":
+        active = admission.store.active_import() if admission is not None else None
+        if active is not None:
             return
         from service.extraction_recovery_discovery import ExtractionRecoveryDiscovery
         with self._init_lock:
@@ -8896,8 +8896,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     def health(self) -> dict:
         admission = getattr(self, "_admission", None)
-        active = admission.store.status() if admission is not None else None
-        if active and active['mode'] == 'import':
+        active = admission.store.active_import() if admission is not None else None
+        if active is not None:
             return {"backend": "og-memory", "storage_backend": self._cfg.storage_backend,
                     "status": "maintenance", "migration_phase": active['phase']}
         agfs_required = self._cfg.storage_backend == "agfs"

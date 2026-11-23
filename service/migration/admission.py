@@ -201,7 +201,7 @@ class Admission:
                             (isinstance(exc, AccessDeniedError)
                              and getattr(exc, 'sql_write_not_started', False) is True) or
                             (getattr(exc, 'sql_rollback_confirmed', False) is True) or
-                            (isinstance(exc, (AccessDeniedError, ConcurrentModificationError, NodeNotFoundError))
+                            (isinstance(exc, (AccessDeniedError, ConcurrentModificationError, NodeNotFoundError, TimeoutError))
                              and getattr(exc, 'agfs_rejection_settled', False) is True) or
                             (http_rejections and confirmed_rejection(exc)))
                 if http_rejections and rejected:

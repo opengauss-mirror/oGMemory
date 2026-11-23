@@ -245,11 +245,8 @@ def test_composite_projection_continues_without_delaying_source_snapshot(tmp_pat
 
 
 def test_shared_agfs_body_load_is_read_only_during_source_snapshot(tmp_path):
-    import hashlib
-    import json
-    from types import SimpleNamespace
-
     from core.models import ContextNode
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
     from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
     from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
 
@@ -257,15 +254,12 @@ def test_shared_agfs_body_load_is_read_only_during_source_snapshot(tmp_path):
     admission = Admission(gate)
     bridge = object.__new__(AGFSSpaceBridge)
     transport = _AtomicMemoryAGFSClient()
-    bridge._agfs = SimpleNamespace(_mount_prefix='/local', _client=transport)
+    bridge._agfs = AGFSContextFS(transport)
     uri = 'ctx://acme/users/alice/memories/preferences/editor'
-    payload = json.dumps(dict(uri=uri, content='body', abstract='title', overview='overview')).encode()
-    digest = hashlib.sha256(payload).hexdigest()
-    path = f'{bridge._content_directory(uri)}/{digest}.json'
-    transport.write(path, payload)
+    metadata = bridge.store_shared(uri, 'body', 'title', 'overview')
     node = ContextNode(uri=uri, context_type='MEMORY', category='preferences', level=2,
                        owner_space='user:alice', abstract='', overview='', content='',
-                       metadata={'agfs_content': {'path': path, 'sha256': digest, 'bytes': len(payload)}})
+                       metadata=metadata)
     bridge._agfs._client = admission.guard(transport)
     bridge = admission.guard(bridge)
     with SourceSnapshot(gate, 'export').scope():
