@@ -8,6 +8,8 @@ SchemaRegistry is the single source of truth for extraction tools.
 
 from logging import getLogger
 
+from core.dreaming_evidence import EVIDENCE_INPUT
+from core.dreaming_evidence import enabled as dreaming_enabled
 from core.errors import ToolCallProtocolError
 from core.models import CandidateMemory, ContextNode, RequestContext
 from core.validation import (
@@ -114,6 +116,35 @@ def build_update_instruction(registry: SchemaRegistry, categories=None, *, inclu
     if any(schema.memory_type == "profile" and schema.is_single_file for schema in schemas):
         parts.append(_profile_snapshot_instruction(include_updates))
     return "\n\n".join(parts)
+
+
+_EVIDENCE_SCHEMA = {
+    "type": "array",
+    "description": (
+        "Record assertions grounded in verbatim user messages. Use the exact fact text in content "
+        "(without Markdown bullet syntax), or the full content for an indivisible memory. "
+        "Identify the actual subject and the source's relation to the claim. "
+        "Quote one user message verbatim. Omit assertions when a source or subject cannot be established."
+    ),
+    "items": {
+        "type": "object",
+        "properties": {
+            "claim": {"type": "string"},
+            "subject": {"type": "string"},
+            "quote": {"type": "string"},
+            "relation": {"type": "string", "enum": ["supports", "refutes", "unknown"]},
+            "slot": {"type": "string", "description": "Stable attribute identifier when supplied with a value."},
+            "value": {"type": "string", "description": "Value of the identified attribute."},
+            "valid_from": {"type": "string", "description": "Explicit ISO-8601 inclusive start, if stated."},
+            "valid_to": {"type": "string", "description": "Explicit ISO-8601 exclusive end, if stated."},
+            "effect": {"type": "string", "enum": ["correction", "revocation"],
+                       "description": "Use only for an explicit dated replacement or withdrawal."},
+            "retain": {"type": "boolean", "description": "The source explicitly asks to retain this fact."},
+        },
+        "required": ["claim", "subject", "quote", "relation"],
+        "additionalProperties": False,
+    },
+}
 
 
 def build_extraction_tools(registry: SchemaRegistry, *, include_updates: bool = True,
@@ -265,6 +296,10 @@ def build_extraction_tools(registry: SchemaRegistry, *, include_updates: bool = 
                 tool["input_schema"]["properties"]["update_activation"] = dict(descriptor)
                 tool["input_schema"]["required"].append("update_activation")
         tools.extend(incremental_tools)
+    if dreaming_enabled():
+        for tool in tools:
+            if tool["name"] != "extract_relation":
+                tool["input_schema"]["properties"][EVIDENCE_INPUT] = _EVIDENCE_SCHEMA
     return tools
 
 
@@ -310,11 +345,14 @@ def parse_tool_call(
         # is validated by the complete snapshot parser, not as an edit command.
         incremental_input = dict(tool_input)
         activation = incremental_input.pop("update_activation", None) if activation_enabled else None
+        assertions = incremental_input.pop(EVIDENCE_INPUT, None) if dreaming_enabled() else None
         name, full_input = materialize_incremental_input(
             tool_name, incremental_input, registry, read_nodes, ctx, current_content,
         )
         if activation_enabled:
             full_input["update_activation"] = activation
+        if assertions is not None:
+            full_input[EVIDENCE_INPUT] = assertions
         parsed = (parse_tool_call(name, full_input, registry, activation_enabled=True)
                   if activation_enabled else parse_tool_call(name, full_input, registry))
         if parsed is None:
@@ -512,6 +550,11 @@ def parse_tool_call(
         if tool_stats:
             logger.debug(f"Included tool_stats for {tool_name}: {list(tool_stats.keys())}")
 
+    metadata = {}
+    if activation is not None:
+        metadata.update(update_activation=activation, update_activation_version="c1-integrated-activation-v1")
+    if dreaming_enabled() and isinstance(assertions := tool_input.get(EVIDENCE_INPUT), list):
+        metadata[EVIDENCE_INPUT] = assertions
     return (
         schema.memory_type,
         schema.owner_scope,
@@ -534,9 +577,7 @@ def parse_tool_call(
             target_uri=target_uri,
             expected_version=expected_version,
             **identity_fields,
-            metadata={"update_activation": activation,
-                      "update_activation_version": "c1-integrated-activation-v1"}
-            if activation is not None else {},
+            metadata=metadata,
         ),
     )
 

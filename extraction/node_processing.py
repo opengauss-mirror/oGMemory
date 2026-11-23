@@ -14,6 +14,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from jsonschema import Draft202012Validator
 
+from core.dreaming_evidence import EVIDENCE_KEY, evidence_metadata
 from core.errors import (
     ExtractionIncompleteError,
     LLMOutputTruncatedError,
@@ -517,6 +518,10 @@ class NodeProcessor:
                                "target_uri": target_ids.get(c.target_uri, c.target_uri)}
                               for i, c in enumerate(drafts)]}
         rules = _RULES
+        if any(EVIDENCE_KEY in draft.metadata for draft in drafts):
+            rules += "\nKeep the exact text of each retained draft fact when organizing it into the card.\n"
+            for draft in payload["drafts"]:
+                draft["metadata"].pop(EVIDENCE_KEY, None)
         if related_target:
             rules += ("This request only reconciles the supplied related_target. "
                       "Return operations=[] and answer its related question. "
@@ -747,7 +752,8 @@ class NodeProcessor:
                 fields = {name: list(dict.fromkeys([*getattr(previous, name), *getattr(candidate, name)]))
                           for name in ("provenance_ids", "verified_routing_aliases", "verified_object_aliases",
                                        "source_contexts", "node_draft_indices")}
-                result[index] = replace((preferred or {}).get(target, candidate), **fields)
+                selected = (preferred or {}).get(target, candidate)
+                result[index] = replace(selected, metadata=evidence_metadata(selected, previous, candidate), **fields)
             else:
                 if target:
                     positions[target] = len(result)
@@ -1044,6 +1050,7 @@ class NodeProcessor:
                        verified_object_aliases=list(node.metadata.get("object_name_aliases", [])))
         candidate = self._materialize({**op, "action": "update"}, [seed], reads, ctx)
         return replace(candidate, node_reconciliation_role="related",
+                       metadata=evidence_metadata(candidate, *sources),
                        provenance_ids=list(dict.fromkeys(s for c in sources for s in c.provenance_ids)),
                        source_contexts=list(dict.fromkeys(s for c in sources for s in c.source_contexts)),
                        node_draft_indices=list(dict.fromkeys(i for c in sources for i in c.node_draft_indices)))
@@ -1122,6 +1129,7 @@ class NodeProcessor:
                                 scope_ref=node.metadata.get("scope_ref", "") if candidate.category == "entity" else candidate.scope_ref,
                                 content=content, abstract=abstract, overview=overview)
         candidate = replace(candidate, provenance_ids=sources,
+                            metadata=evidence_metadata(candidate, *drafts),
                             source_contexts=list(dict.fromkeys(source for c in drafts for source in c.source_contexts)),
                             node_draft_indices=_draft_indices(drafts),
                             verified_routing_aliases=list(dict.fromkeys(

@@ -16,6 +16,7 @@ from commit.policy_router import PolicyRouter
 from commit.routing_key import normalize_routing_key
 from commit.write_receipts import receipt_plan
 from core.candidate_dedup import occurrence_replay_fields
+from core.dreaming_evidence import EVIDENCE_KEY, has_new_evidence
 from core.errors import (
     ConcurrentModificationError,
     ExtractionIncompleteError,
@@ -113,10 +114,21 @@ class MemoryIdentityResolver:
 
     @staticmethod
     def _normalize_subject(candidate, ctx):
-        if (candidate.category == "preference" and candidate.who
-                and MemoryIdentityResolver._self_holder(candidate.who, ctx) == canonical_scope(ctx.user_id)):
-            return replace(candidate, who=ctx.user_id)
-        return candidate
+        if candidate.category != "preference" or not candidate.who:
+            return candidate
+        owner = canonical_scope(ctx.user_id)
+        if MemoryIdentityResolver._self_holder(candidate.who, ctx) != owner:
+            return candidate
+        metadata = candidate.metadata
+        if isinstance(evidence := metadata.get(EVIDENCE_KEY), list):
+            claims = []
+            for row in evidence:
+                if (isinstance(row, dict) and isinstance(subject := row.get("subject"), str)
+                        and subject.strip() and MemoryIdentityResolver._self_holder(subject, ctx) == owner):
+                    row = {**row, "subject": ctx.user_id}
+                claims.append(row)
+            metadata = {**metadata, EVIDENCE_KEY: claims}
+        return replace(candidate, who=ctx.user_id, metadata=metadata)
 
     @contextmanager
     def lock_directories(self, directories, ctx):
@@ -556,7 +568,8 @@ class MemoryIdentityResolver:
         if len(matches) > 1:
             raise ValueError("occurrence replay has ambiguous targets; select a read target explicitly")
         if matches:
-            if candidate.write_operation_id or self._descriptor_changed(candidate, matches[0]):
+            if (candidate.write_operation_id or self._descriptor_changed(candidate, matches[0])
+                    or has_new_evidence(candidate, matches[0])):
                 existing = self.fs.read_node(matches[0].uri, ctx)
                 return commit(candidate, ctx, self._plan(candidate, existing, nodes, directory, ctx, duplicate=True))
             return WritePlan(action="skip", target_uri=matches[0].uri,
@@ -599,7 +612,7 @@ class MemoryIdentityResolver:
             # Content replay identity stays unchanged. A valid descriptor-only
             # refresh still needs a real versioned write and index event, while
             # preserving the existing content rather than appending it twice.
-            if self._descriptor_changed(candidate, existing):
+            if self._descriptor_changed(candidate, existing) or has_new_evidence(candidate, existing):
                 return commit(candidate, ctx, plan)
             metadata = plan.merged_fields["identity_metadata"]
             changed = any(metadata.get(name) != existing.metadata.get(name) for name in

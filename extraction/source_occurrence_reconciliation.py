@@ -9,7 +9,9 @@ from collections import Counter
 from dataclasses import replace
 
 from core.candidate_dedup import candidate_draft_fields, occurrence_replay_fields
+from core.dreaming_evidence import evidence_metadata
 from core.errors import ExtractionIncompleteError, ValidationError
+from core.model_stage import model_signature, run_model_call, stage_digest
 from core.models import CandidateMemory
 from core.validation import validate_candidate, validate_utf8
 from extraction.event_reconciliation import (
@@ -25,9 +27,9 @@ from extraction.event_reconciliation import (
     _verified_partition,
     _verify_occurrence_groups,
 )
+from extraction.evidence_layout import evidence_layout
 from extraction.occurrence_qualification import prompt_fits
 from providers.llm_observation import observe_call
-from core.model_stage import model_signature, run_model_call, stage_digest
 
 _EVIDENCE_SCHEMA = {
     "type": "object", "properties": {
@@ -235,7 +237,7 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm, *, checkpoint=No
         drafts = [{"source_index": used_sources.index(candidate_sources[index]),
                    "draft": candidate_draft_fields(candidates[index])} for index in indices]
         payload = {"sources": local_sources, "drafts": drafts}
-        prompt = _prompt(_PARTITION, payload)
+        prompt = _prompt(_PARTITION + evidence_layout(candidates[index] for index in indices), payload)
         if not prompt_fits(prompt, _SCHEMA):
             raise ExtractionIncompleteError("Source occurrence partition exceeds the complete context budget")
         inputs = ({"prompt": prompt, "schema": _SCHEMA, "model": model_signature(llm)}
@@ -285,6 +287,7 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm, *, checkpoint=No
                 merged = replace(
                     candidates[first], **{name: group[name] for name in (*_LAYERS, *_CONTEXT, "scope_ref")},
                     confidence=min(candidates[index].confidence for index in members),
+                    metadata=evidence_metadata(candidates[first], *(candidates[index] for index in members[1:])),
                     provenance_ids=list(dict.fromkeys(pid for index in members
                                                      for pid in candidates[index].provenance_ids)),
                     evidence_quote=("\n".join(dict.fromkeys(

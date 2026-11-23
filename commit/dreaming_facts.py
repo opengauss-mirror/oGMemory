@@ -6,7 +6,7 @@ from hashlib import sha256
 from itertools import takewhile
 
 from commit.dreaming_policy import Evidence, eligible_for_promotion, evidence_score, valid_at
-from core.dreaming_evidence import claim_text, timestamp, verified_assertions
+from core.dreaming_evidence import claim_text, fact_blocks, timestamp, verified_assertions
 from core.errors import MemoryCardFormatError
 from core.models import CandidateMemory
 from extraction.card_format import validate_memory_card
@@ -26,7 +26,7 @@ def _assessment(proofs):
     }
 
 
-def _facts(node):
+def _facts(node, evidence_claims=frozenset()):
     lines = [line.rstrip() for line in node.content.splitlines() if line.strip()]
     parts = []
     if node.category in {"entity", "preference"}:
@@ -50,10 +50,15 @@ def _facts(node):
                     intro.append(line)
     elif node.category == "profile" and lines and all(line.startswith("- ") for line in lines):
         parts = [([], [line]) for line in lines]
-    return [(" ".join(line.strip()[2:] if index == 0 else line.strip()
-                      for index, line in enumerate(body)),
-             "\n".join(line for line in [*header, *body] if line))
-            for header, body in parts] or [(node.content.strip(), node.content)]
+    if parts:
+        return [(" ".join(line.strip()[2:] if index == 0 else line.strip() for index, line in enumerate(body)),
+                 "\n".join(line for line in [*header, *body] if line))
+                for header, body in parts]
+    if evidence_claims and claim_text(node.content) not in evidence_claims:
+        records = fact_blocks(node.content, evidence_claims)
+        if any(claim in evidence_claims for claim, _ in records):
+            return records
+    return [(node.content.strip(), node.content)]
 
 
 @dataclass(frozen=True)
@@ -115,7 +120,7 @@ def _assess_claim(node, claim, content, observations, window=(None, None)):
         refs.append(expiry.proof["source_ref"])
     return {
         "abstract": (next((line[2:] for line in content.splitlines() if line.startswith("- ")), claim)
-                     if claim != content else node.abstract or claim),
+                     if claim != content or content != node.content else node.abstract or claim),
         "content": content,
         "provenance_ids": refs or list(node.metadata.get("provenance_ids") or []),
         "slot": slot, "value": value,
@@ -268,10 +273,10 @@ def _effective_bounds(fact, node_start, node_end):
 
 def assess_facts(node, *, read_source=None):
     """Build auditable fact and value metadata for the current node version."""
-    records = list(dict.fromkeys(_facts(node)))
+    assertions = list(verified_assertions(node, read_source))
+    records = list(dict.fromkeys(_facts(node, {claim_text(assertion.claim) for assertion, _ in assertions})))
     prior = node.metadata.get("dreaming_review", {}).get("facts", {})
     retained = _retain_history(node, records, prior)
-    assertions = verified_assertions(node, read_source)
     facts = _assess_node_claims(node, [record for record in records if record[0]], assertions)
     facts.update(_close_facts(facts, prior))
     for fact in facts.values():

@@ -6,8 +6,15 @@ import json
 from dataclasses import replace
 
 from core.candidate_dedup import candidate_draft_fields
-from core.errors import ExtractionIncompleteError, ExtractionBudgetError, ExtractionSemanticError, ValidationError
+from core.dreaming_evidence import evidence_metadata
+from core.errors import (
+    ExtractionBudgetError,
+    ExtractionIncompleteError,
+    ExtractionSemanticError,
+    ValidationError,
+)
 from core.memory_names import canonical_scope
+from core.model_stage import model_signature, run_model_call
 from core.models import CandidateMemory
 from core.validation import (
     MAX_ABSTRACT_LEN,
@@ -16,9 +23,9 @@ from core.validation import (
     validate_candidate,
     validate_utf8,
 )
+from extraction.evidence_layout import evidence_layout
 from extraction.prefetch import _CONTEXT_CHARS, _OUTPUT_CHARS, _PREFETCH_NODES
 from providers.llm_observation import observe_call
-from core.model_stage import model_signature, run_model_call
 
 _LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
            "content": MAX_CONTENT_LEN, "title": MAX_ABSTRACT_LEN}
@@ -276,7 +283,7 @@ def reconcile_occurrence_updates(entries, existing, ctx, uris, llm, checkpoint=N
         "Use current source evidence to resolve contradictions and preserve all case steps "
         "and outcomes. Return faithful abstract, overview, content, title and complete "
         "when/who/where; carry context corrections across spans. Keep category, ownership "
-        "and scope fixed. " + _SOURCE_RULES
+        "and scope fixed. " + evidence_layout(candidate for _, candidate in entries) + _SOURCE_RULES
     )
     prompt = _prompt(instruction, payload)
     if not prompt_fits(prompt, SNAPSHOT_SCHEMA):
@@ -300,6 +307,7 @@ def reconcile_occurrence_updates(entries, existing, ctx, uris, llm, checkpoint=N
     try:
         result = validate_candidate(replace(
             latest, **snapshot, confidence=min(candidate.confidence for _, candidate in entries),
+            metadata=evidence_metadata(latest, *(candidate for _, candidate in entries[:-1])),
             provenance_ids=list(dict.fromkeys(source for _, candidate in entries
                                              for source in candidate.provenance_ids)),
         ))
