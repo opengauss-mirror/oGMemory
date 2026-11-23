@@ -12,6 +12,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 
 from pyagfs import AGFSClient
+from pyagfs.exceptions import AGFSClientError
 
 from commit.code_resource_events import (
     build_code_resource_delete_event,
@@ -235,7 +236,9 @@ class OutboxStore:
             event._outbox_processing_lease = lease
             yield self.try_acquire(event, node_uri, worker_id)
 
-    def _write_processing_file(self, path: str, data: bytes, event: OutboxEvent, node_uri: str) -> None:
+    def _write_processing_file(
+        self, path: str, data: bytes, event: OutboxEvent, node_uri: str, *, replace_existing: bool = False,
+    ) -> None:
         self.ensure_processing_owned(event, node_uri)
         lease = getattr(event, "_outbox_processing_lease", None)
         if lease is None:
@@ -245,7 +248,14 @@ class OutboxStore:
         try:
             self._client.write(temporary, data)
             self.ensure_processing_owned(event, node_uri)
-            self._client.mv(temporary, path)
+            try:
+                self._client.mv(temporary, path)
+            except AGFSClientError as exc:
+                if not replace_existing or not str(exc).lower().startswith("file already exists:"):
+                    raise
+                # SQLFS atomically replaces file data on write, but rejects rename over an existing path.
+                self.ensure_processing_owned(event, node_uri)
+                self._client.write(path, data)
             self.ensure_processing_owned(event, node_uri)
         finally:
             self._rm_if_present(temporary)
@@ -347,6 +357,14 @@ class OutboxStore:
                 self.persist_event(event)
 
     def save_payload(self, event: OutboxEvent) -> None:
+        if event.event_type == EventType.DREAM_MEMORY.value and getattr(event, "_outbox_processing_lease", None):
+            path = self._uri_to_agfs_path(event.uri) + ".outbox/" + event.event_id + ".json"
+            self._write_processing_file(path, serialize_outbox_event(event), event, event.uri, replace_existing=True)
+            return
+        if event.event_type != EventType.EXTRACT_AGENT_MEMORY.value:
+            self.ensure_processing_owned(event, event.uri)
+            self.persist_event(event)
+            return
         with self._agent_event_lock(event):
             self._check_agent_lease(event)
             if not self._cleanup_completed_agent_event(event):
@@ -1414,24 +1432,21 @@ class OutboxStore:
             node_uri: URI of the associated node
             next_retry_at: Optional datetime for scheduled retry (exponential backoff)
         """
+        self._reschedule(event, node_uri, next_retry_at, retry_increment=1)
+
+    def defer(self, event: OutboxEvent, node_uri: str, next_retry_at: datetime) -> None:
+        self._reschedule(event, node_uri, next_retry_at, retry_increment=0)
+        self.release(event, node_uri)
+
+    def _reschedule(self, event, node_uri, next_retry_at, *, retry_increment):
         self.ensure_processing_owned(event, node_uri)
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
-        event.retry_count += 1
+        event.retry_count += retry_increment
         event.status = "PENDING"
         if next_retry_at:
             event.next_retry_at = next_retry_at.isoformat()
-        data = json.dumps({
-            "event_id": event.event_id,
-            "event_type": event.event_type,
-            "uri": event.uri,
-            "payload": event.payload,
-            "status": event.status,
-            "retry_count": event.retry_count,
-            "created_at": event.created_at,
-            "next_retry_at": event.next_retry_at,
-        }, ensure_ascii=False, indent=2)
-        self._write_processing_file(event_path, data.encode("utf-8"), event, node_uri)
+        self._write_processing_file(event_path, serialize_outbox_event(event), event, node_uri, replace_existing=True)
 
     def try_acquire(
         self,

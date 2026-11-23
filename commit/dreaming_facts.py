@@ -7,7 +7,14 @@ from itertools import takewhile
 
 from commit.dreaming_agent_evidence import agent_units
 from commit.dreaming_policy import Evidence, eligible_for_promotion, evidence_score, valid_at
-from core.dreaming_evidence import claim_text, fact_blocks, timestamp, verified_assertions
+from core.dreaming_evidence import (
+    claim_text,
+    fact_blocks,
+    matches_node_version,
+    node_created_at,
+    timestamp,
+    verified_assertions,
+)
 from core.errors import MemoryCardFormatError
 from core.models import CandidateMemory
 from extraction.card_format import validate_memory_card
@@ -319,14 +326,25 @@ def _with_external_closures(fact, sources):
     }
 
 
-def _restore_external_closures(facts, prior):
+def _restore_external_closures(facts, prior, active_correction_created_at):
     supported = {_episode(fact) for fact in facts.values()
                  if fact["grade"] == "high" and fact["support"] != "disputed"}
     by_episode = {}
+    active_sources = {}
     for previous in prior.values():
         identity = (_episode(previous), previous["slot"], previous["value"])
+        if identity[0] not in supported:
+            continue
         sources = by_episode.setdefault(identity, {})
         for uri, bound in previous.get("external_corrections", {}).items():
+            if active_correction_created_at is not None:
+                expected = bound.get("source_created_at")
+                if not expected:
+                    continue
+                if uri not in active_sources:
+                    active_sources[uri] = active_correction_created_at(uri)
+                if expected != active_sources[uri]:
+                    continue
             if uri not in sources or bound["valid_to"] < sources[uri]["valid_to"]:
                 sources[uri] = bound
     for key, fact in facts.items():
@@ -349,17 +367,19 @@ def _summarize(node, items):
     }
 
 
-def assess_facts(node, *, read_source=None):
+def assess_facts(node, *, read_source=None, active_correction_created_at=None):
     """Build auditable fact and value metadata for the current node version."""
     if (units := agent_units(node, read_source)) is not None:
         return _assess_agent_units(node, units)
     assertions = list(verified_assertions(node, read_source))
     records = list(dict.fromkeys(_facts(node, {claim_text(assertion.claim) for assertion, _ in assertions})))
-    prior = node.metadata.get("dreaming_review", {}).get("facts", {})
+    previous_review = node.metadata.get("dreaming_review", {})
+    created_at = previous_review.get("node_created_at")
+    prior = previous_review.get("facts", {}) if not created_at or created_at == node_created_at(node.metadata) else {}
     retained = _retain_history(node, records, prior)
     facts = _assess_node_claims(node, [record for record in records if record[0]], assertions)
     facts.update(_close_facts(facts, prior))
-    _restore_external_closures(facts, prior)
+    _restore_external_closures(facts, prior, active_correction_created_at)
     for fact in facts.values():
         if fact["content"] in retained:
             fact["retained_history"] = True
@@ -397,10 +417,17 @@ def visible_facts(node, when):
     """Return the independently eligible facts for the requested point in time."""
     review = node.metadata.get("dreaming_review", {})
     start, end = timestamp(review.get("valid_from")), timestamp(review.get("valid_to"))
-    if review.get("version") != node.metadata.get("version") or not valid_at(when, valid_from=start, valid_to=end):
+    if (not matches_node_version(node.metadata, review.get("version"), review.get("node_created_at"))
+            or not valid_at(when, valid_from=start, valid_to=end)):
         return {}
     return {key: fact | _effective_bounds(fact, start, end)
             for key, fact in review.get("facts", {}).items() if _fact_applies(fact, when)}
+
+
+def same_correction_scope(current, prior):
+    return (current.owner_space == prior.owner_space and current.category == prior.category
+            and all(current.metadata.get(field) == prior.metadata.get(field)
+                    for field in ("scope_ref", "routing_key", "who")))
 
 
 def correction_plan(current, prior):
@@ -410,13 +437,13 @@ def correction_plan(current, prior):
     new_review = current.metadata.get("dreaming_review", {})
     old_review = prior.metadata.get("dreaming_review", {})
     for node, review in ((current, new_review), (prior, old_review)):
-        version = node.metadata.get("version")
-        if version is None or review.get("version") != version:
+        if review.get("version") is None or not matches_node_version(
+            node.metadata, review["version"], review.get("node_created_at"),
+        ):
             return None
 
     corrections = {}
-    if (current.owner_space == prior.owner_space and current.category == prior.category
-            and all(current.metadata.get(field) == prior.metadata.get(field) for field in ("scope_ref", "routing_key", "who"))):
+    if same_correction_scope(current, prior):
         current_start = timestamp(current.metadata.get("valid_from"))
         current_end = timestamp(current.metadata.get("valid_to"))
         for key, fact in new_review.get("facts", {}).items():
@@ -438,6 +465,7 @@ def correction_plan(current, prior):
             sources[current.uri] = {
                 "valid_to": bound["valid_to"], "superseded_by": successor,
                 "supersession_evidence": bound["supersession_evidence"], "value": corrections[successor]["value"],
+                "source_created_at": node_created_at(current.metadata),
             }
         facts[key] = _with_external_closures(originals[key], sources)
     if facts == old_facts:

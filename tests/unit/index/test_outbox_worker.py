@@ -9,7 +9,8 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 import pytest
 
 from core.errors import NodeNotFoundError
-from core.models import IndexRecord, OutboxEvent, RequestContext
+from core.models import ContextNode, IndexRecord, OutboxEvent, RequestContext
+from index.index_record_builder import build_agfs_lexical_records
 from index.outbox_worker import (
     OutboxWorker,
     WorkerConfig,
@@ -233,6 +234,36 @@ class TestOutboxWorkerProcessEvent:
         assert stored_record.uri == "ctx://test/users/u1/memories/profile"
         # Embedding should be added to metadata
         assert "_embedding" in stored_record.metadata
+
+
+def test_dreaming_retirement_and_restore_reconcile_lexical_projection():
+    uri = "ctx://test/users/u1/memories/patterns/deploy"
+    node = ContextNode(uri, "MEMORY", "pattern", 0, "user:u1", "Release process",
+                       "Deployment checks", "Confirm the release dashboard.", {"version": 1})
+    records = build_agfs_lexical_records(node)
+    vector_index = MockVectorIndex()
+    fs = Mock()
+    fs.read_node.return_value = node
+    worker = OutboxWorker(vector_index, None, fs=fs, dreaming=Mock())
+    assert worker.process_event(create_upsert_event(uri, records)).records_upserted == len(records)
+
+    node.metadata["dreaming_review"] = {"version": 1, "lifecycle": {"eligibility": "retired"}}
+    visibility = {"dreaming_visibility": True, "expected_version": 1}
+    retire = OutboxEvent("retire", "ARCHIVE_CONTEXT", uri, {
+        **visibility, "ids_to_delete": [record.id for record in records],
+    }, "PENDING")
+    assert worker.process_event(retire).success
+    assert set(vector_index.deleted_ids) >= {record.id for record in records}
+    assert worker.process_event(create_upsert_event(uri, records)).records_upserted == 0
+    assert vector_index.records == {}
+
+    node.metadata["dreaming_review"]["lifecycle"]["eligibility"] = "active"
+    node.overview = "Restored deployment checks"
+    restore = OutboxEvent("restore", "UPSERT_CONTEXT", uri, {
+        **visibility, "records": [],
+    }, "PENDING")
+    assert worker.process_event(restore).records_upserted == len(records)
+    assert vector_index.records[records[0].id].text == f"{node.abstract}\n{node.overview}"
 
 
 class TestOutboxWorkerFailureCases:
