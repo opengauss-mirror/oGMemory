@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from itertools import takewhile
 
+from commit.dreaming_agent_evidence import agent_units
 from commit.dreaming_policy import Evidence, eligible_for_promotion, evidence_score, valid_at
 from core.dreaming_evidence import claim_text, fact_blocks, timestamp, verified_assertions
 from core.errors import MemoryCardFormatError
@@ -284,8 +285,24 @@ def _effective_bounds(fact, node_start, node_end):
     return {"valid_from": start.isoformat() if start else None, "valid_to": end.isoformat() if end else None}
 
 
+def _summarize(node, items):
+    value_band, value_reason = _value(node, items)
+    scores = [item["confidence"] for item in items if item["confidence"] is not None]
+    confidence = min(scores) if scores and len(scores) == len(items) else None
+    recommendation = "pending"
+    if confidence is not None:
+        recommendation = "recommended" if all(item["support"] == "corroborated" for item in items) else "observation"
+    return {
+        "evidence_state": "verified" if confidence is not None else "pending",
+        "confidence": confidence, "value_band": value_band,
+        "value_reason": value_reason, "recommendation": recommendation,
+    }
+
+
 def assess_facts(node, *, read_source=None):
     """Build auditable fact and value metadata for the current node version."""
+    if (units := agent_units(node, read_source)) is not None:
+        return _assess_agent_units(node, units)
     assertions = list(verified_assertions(node, read_source))
     records = list(dict.fromkeys(_facts(node, {claim_text(assertion.claim) for assertion, _ in assertions})))
     prior = node.metadata.get("dreaming_review", {}).get("facts", {})
@@ -296,21 +313,32 @@ def assess_facts(node, *, read_source=None):
         if fact["content"] in retained:
             fact["retained_history"] = True
     current = [fact for fact in facts.values() if not fact.get("superseded_by")]
-    value_band, value_reason = _value(node, current)
     single = next(iter(facts.values())) if len(facts) == 1 else {}
     valid_from, valid_to = timestamp(node.metadata.get("valid_from")), timestamp(node.metadata.get("valid_to"))
-    scores = [item["confidence"] for item in current if item["confidence"] is not None]
-    confidence = min(scores) if scores and len(scores) == len(current) else None
-    recommendation = "pending"
-    if confidence is not None:
-        recommendation = "recommended" if all(item["support"] == "corroborated" for item in current) else "observation"
     return {
         "facts": facts,
-        "evidence_state": "verified" if confidence is not None else "pending",
-        "confidence": confidence,
-        "value_band": value_band, "value_reason": value_reason,
-        "recommendation": recommendation,
+        "units": {},
+        "unit_confidence": {},
+        **_summarize(node, current),
         **_effective_bounds(single, valid_from, valid_to),
+    }
+
+
+def _assess_agent_units(node, grounded):
+    units = {}
+    for key, (unit, proofs, reusable) in grounded.items():
+        units[key] = {
+            "content": unit["content"], "abstract": unit["title"],
+            "provenance_ids": list(dict.fromkeys(proof["source_ref"] for proof in proofs)),
+            "value_reason": "reusable_agent_unit" if proofs and reusable else "",
+            "evidence_state": "verified" if proofs else "pending",
+            **_assessment(proofs),
+        }
+    scores = {key: unit["confidence"] for key, unit in units.items()}
+    return {
+        "facts": {}, "units": units, "unit_confidence": scores,
+        **_summarize(node, list(units.values())),
+        **_effective_bounds({}, timestamp(node.metadata.get("valid_from")), timestamp(node.metadata.get("valid_to"))),
     }
 
 
