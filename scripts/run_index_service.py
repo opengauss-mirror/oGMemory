@@ -108,15 +108,17 @@ def _build_service(cfg, admission):
 
     closers = []
     def register_cleanup(obj, *, migration=False):
-        close = (getattr(obj, 'release_for_migration', None) if migration else None)
-        close = close or getattr(obj, 'close_all', None) or getattr(obj, 'close', None)
-        if callable(close):
-            closers.append(close)
+        release = getattr(obj, 'release_for_migration', None) if migration else None
+        close = getattr(obj, 'close_all', None) or getattr(obj, 'close', None)
+        if callable(close) or callable(release):
+            closers.append((close, release))
         return obj
-    def cleanup():
+    def cleanup(*, migration=False):
         # Preserve a failed close for explicit lifecycle retry.
         while closers:
-            if closers[-1]() is False:
+            close, release = closers[-1]
+            callback = release if migration and callable(release) else close
+            if callable(callback) and callback() is False:
                 raise RuntimeError("index resource has not finished closing")
             closers.pop()
     try:
@@ -191,14 +193,14 @@ class CoordinatedIndexRunner:
             try:
                 self.service.start()
             except BaseException:
-                self.pause()
+                self.pause(migration=False)
                 raise
 
-    def pause(self):
+    def pause(self, *, migration=True):
         if self.service is not None:
             self.service.stop(wait=True)
         if self.cleanup is not None:
-            self.cleanup()
+            self.cleanup(migration=migration)
         self.service = self.cleanup = None
         return True
 
@@ -213,7 +215,7 @@ class CoordinatedIndexRunner:
 
     def close(self, timeout=30):
         with self.participant.shutdown_scope(timeout):
-            self.pause()
+            self.pause(migration=False)
         self.participant.close()
 
 

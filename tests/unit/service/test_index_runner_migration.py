@@ -33,7 +33,7 @@ def factory(events):
             admission=admission,
         )
         events.append(service)
-        return service, lambda: events.append("closed")
+        return service, lambda *, migration: events.append("closed")
 
     return build
 
@@ -253,3 +253,34 @@ def test_coordinated_factory_preserves_lexical_projection_and_close_retry(tmp_pa
         cleanup()
     projection.finished = True
     cleanup()
+
+
+@pytest.mark.parametrize('migration', [False, True])
+def test_index_runner_selects_chroma_cleanup_for_lifecycle(tmp_path, monkeypatch, migration):
+    from providers.config import ProviderConfig
+    from providers.unified_config import OgMemConfig
+    from providers.vector_index.chroma_index import ChromaVectorIndex
+    from scripts import run_index_service as runner_module
+
+    vector = object.__new__(ChromaVectorIndex)
+    vector._client = object()  # SDK versions without close().
+    monkeypatch.setattr(ProviderConfig, 'create_vector_index', lambda self: vector)
+    monkeypatch.setattr(ProviderConfig, 'create_embedder', lambda self: None)
+    monkeypatch.setattr(ProviderConfig, 'create_llm', lambda self: None)
+    monkeypatch.setattr(runner_module, '_create_storage', lambda *a, **kw: (None, SimpleNamespace(), None))
+    monkeypatch.setattr(IndexService, 'start', lambda self: None)
+    cfg = OgMemConfig(migration_workspace=str(tmp_path), skill_sedimentation_enabled=False)
+    runner = CoordinatedIndexRunner(cfg)
+    try:
+        if migration:
+            runner.store.enter('restore', mode='import', resources={})
+            with pytest.raises(MaintenanceError):
+                wait_participants(runner.store, 'restore', 'drain', timeout=.5)
+            assert runner.store.status()['id'] == 'restore'
+            assert not runner.store.participants_ready('restore', 'drain')
+        else:
+            runner.close()
+            with runner.store._transaction() as db:
+                assert db.execute('SELECT 1 FROM participants').fetchone() is None
+    finally:
+        runner.participant.close()

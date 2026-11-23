@@ -13,7 +13,7 @@ class ServiceLifecycle:
         self.restart_code_sync = False
         self.restart_scene = False
 
-    def pause(self):
+    def pause(self, *, migration=True):
         service = self.service
         deadline = time.monotonic() + self.timeout
         def remaining():
@@ -65,12 +65,14 @@ class ServiceLifecycle:
         # Reassigning a Python field alone does not invalidate native caches.
         projection = service._projection_index
         if projection is not None and service._lexical_index is not None:
-            close = getattr(projection, 'release_for_migration', None) or projection.close
+            release = getattr(projection, 'release_for_migration', None) if migration else None
+            close = release or projection.close
             if close(timeout=remaining()) is False:
                 return False
         elif service._vector_index is not None:
             vector = service._vector_index
-            release = getattr(vector, 'release_for_migration', None) or getattr(vector, 'close', None)
+            release = getattr(vector, 'release_for_migration', None) if migration else None
+            release = release or getattr(vector, 'close', None)
             if callable(release) and release() is False:
                 return False
         service._projection_index = service._lexical_index = service._vector_index = None

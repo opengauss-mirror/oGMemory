@@ -48,7 +48,8 @@ def close_service(service, *, timeout=30):
     with participant.shutdown_scope(timeout):
         deadline = time.monotonic() + timeout
         participant.wait_for_operations(deadline)
-        if ServiceLifecycle(service, timeout=max(0, deadline - time.monotonic())).pause() is not True:
+        lifecycle = ServiceLifecycle(service, timeout=max(0, deadline - time.monotonic()))
+        if lifecycle.pause(migration=False) is not True:
             raise MaintenanceError('business workers have not stopped')
         service.shutdown(join_timeout=max(0, deadline - time.monotonic()))
     participant.close()

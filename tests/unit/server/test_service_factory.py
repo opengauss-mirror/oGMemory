@@ -116,3 +116,34 @@ def test_shared_worker_start_and_shutdown_follow_registered_lifecycle(tmp_path, 
     assert seen == ['started']
     close_service(service)
     assert seen == ['started', 'stopped']
+
+
+@pytest.mark.parametrize('composite', [False, True])
+def test_server_can_close_chroma_without_migration_release(tmp_path, monkeypatch, composite):
+    from unittest.mock import Mock
+
+    from providers.composite_index import CompositeProjectionWriter
+    from providers.vector_index.chroma_index import ChromaVectorIndex
+
+    monkeypatch.setattr(MemoryService, 'start_extraction_recovery', lambda service: None)
+    service = create_service(OgMemConfig(migration_workspace=str(tmp_path), skill_sedimentation_enabled=False))
+    participant = service._migration_participant
+    try:
+        vector = object.__new__(ChromaVectorIndex)
+        vector._client = object()  # SDK versions without close().
+        service._vector_index = vector
+        if composite:
+            service._lexical_index = Mock()
+            service._projection_index = CompositeProjectionWriter(vector, service._lexical_index)
+        pool = service._sql_pool = Mock()
+
+        close_service(service)
+
+        pool.close_all.assert_called_once()
+        assert service._migration_participant is None
+        with participant.store._transaction() as db:
+            assert db.execute('SELECT 1 FROM participants').fetchone() is None
+    finally:
+        if service._migration_participant is not None:
+            service._projection_index = service._vector_index = service._lexical_index = None
+            close_service(service)
