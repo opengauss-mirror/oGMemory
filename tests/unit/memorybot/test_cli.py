@@ -73,7 +73,7 @@ def bot_http(monkeypatch, request):
                 self.end_headers()
                 self.wfile.write(artifact)
             elif path.endswith("/events"):
-                stream_connections.append(dict(self.headers))
+                stream_connections.append(self.headers)
                 if len(stream_connections) == 1:
                     events = [(1, "progress", {"message": "已读取资料", "phase": "context"})]
                 else:
@@ -390,3 +390,48 @@ def test_agent_templates_and_background_task_stop(bot_http, capsys):
     assert bot_http[1][-1]["body"] == {"operation_id": "op_memory", "decision": "cancel"}
     assert invoke(bot_http, "memory", "remember", "偏好简洁回复", "--agent-id", "analyst") == 0
     assert bot_http[1][-1]["query"] == {"agent_id": ["analyst"]}
+
+
+def test_backup_export_verify_release_arguments(monkeypatch, capsys, tmp_path):
+    calls = []
+
+    def run_backup(action, **kwargs):
+        calls.append({"action": action, **kwargs})
+        return {"action": action, "file_count": 2}
+
+    monkeypatch.setattr("memorybot.backup.run_backup", run_backup)
+    manifest = str(tmp_path / "manifest.json")
+    assert (
+        main(
+            [
+                "bot",
+                "backup",
+                "export",
+                "--account-id",
+                "team",
+                "--backup-id",
+                "daily",
+                "--manifest",
+                manifest,
+                "--retain-days",
+                "180",
+                "-c",
+                "ogmem.yaml",
+            ]
+        )
+        == 0
+    )
+    assert calls[-1] == {
+        "action": "export",
+        "config_path": "ogmem.yaml",
+        "account_id": "team",
+        "backup_id": "daily",
+        "manifest_path": manifest,
+        "retain_days": 180,
+    }
+    assert json.loads(capsys.readouterr().out)["action"] == "export"
+    for action in ("verify", "release"):
+        assert main(["bot", "backup", action, "--manifest", manifest, "-c", "ogmem.yaml"]) == 0
+        assert calls[-1]["action"] == action
+        assert calls[-1]["manifest_path"] == manifest
+        assert json.loads(capsys.readouterr().out)["action"] == action
