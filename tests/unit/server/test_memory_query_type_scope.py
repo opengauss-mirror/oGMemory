@@ -84,7 +84,7 @@ def test_all_memory_hint_preserves_custom_types_and_legacy_patterns(memory_query
     assert {hit.category for hit in result.hits} == {
         spec.internal_category for spec in MEMORY_TYPES.values()
     } | {"custom"}
-    assert len(result.hits) == 15
+    assert len(result.hits) == len(h.nodes)
     assert {hit.owner_space for hit in result.hits if hit.category == "pattern"} == {
         "user:u1", "agent:a1", "agent:a2",
     }
@@ -118,7 +118,7 @@ def test_compose_and_prefetch_keep_current_facts_with_historical_sources(memory_
     params = {"_ctx": h.ctx, "sessionId": h.ctx.session_id, "query": QUERY, "prefetchTopK": 20}
 
     staged = service.prefetch(params)
-    assert staged["prefetched"] == 14
+    assert staged["prefetched"] == len(h.nodes)
     response = service.compose(params)
 
     assert response["sessionContext"] == "## Recent Session Summary\n" + current_session
@@ -136,7 +136,7 @@ def test_default_query_recalls_all_public_types_with_one_embedding(memory_query,
     result = query_memory(h.service, query=QUERY, top_k=20, request_context=h.ctx, **options)
 
     assert {hit["type"] for hit in result["hits"]} == set(MEMORY_TYPES)
-    assert len(result["hits"]) == 14
+    assert len(result["hits"]) == len(h.nodes)
     h.embedder.embed_texts.assert_called_once_with([QUERY])
     assert {call.kwargs["filters"]["account_id"] for call in h.index.search_by_vector.call_args_list} == {"acct-1"}
     assert [call.kwargs["filters"]["context_type"] for call in h.index.search_by_vector.call_args_list] == [
@@ -214,6 +214,6 @@ def test_lexical_query_covers_public_types_with_zero_embedding_calls(memory_quer
     result = query_memory(h.service, query=QUERY, top_k=20, request_context=h.ctx)
 
     assert {hit["type"] for hit in result["hits"]} == set(MEMORY_TYPES)
-    assert len(result["hits"]) == 14
+    assert len(result["hits"]) == len(h.nodes)
     assert seed.bm25_index.search.call_count == 3
     assert h.embedder.embed_texts.call_count == h.index.search_by_vector.call_count == 0
