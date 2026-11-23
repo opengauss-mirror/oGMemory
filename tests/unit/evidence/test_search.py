@@ -162,6 +162,54 @@ def test_shared_dependencies_are_removed_when_their_source_fails_final_check(set
     assert result.evidence == [] and result.diagnostics["evidence_groups"] == []
 
 
+@pytest.mark.parametrize("available_reads", [0, 2])
+def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(setup, monkeypatch, available_reads):
+    from time import monotonic
+    from types import SimpleNamespace
+
+    import service.evidence_service as search
+
+    fs, _, _, _ = setup
+    write_candidates(setup, [
+        message("I visited Paris.", id="paris", sequence=0),
+        message("I visited Rome.", id="rome", sequence=2),
+        message("It was unforgettable.", id="followup", sequence=3, role="assistant"),
+    ])
+    service = EvidenceService(fs)
+    now = monotonic()
+    deadline = now + 20
+    checks = []
+    read_source = service.store.read_source
+    monkeypatch.setattr(search, "time", SimpleNamespace(monotonic=lambda: now))
+
+    def check_source(key, ctx):
+        nonlocal now
+        checks.append(key)
+        source = read_source(key, ctx)
+        if len(checks) == available_reads:
+            now = deadline
+        return source
+
+    def select_then_expire(_query, _scores, units, *_args, **_kwargs):
+        nonlocal now
+        keys = {unit["message_id"]: key for key, unit in units.items()}
+        monkeypatch.setattr(service.store, "read_source", check_source)
+        if available_reads == 0:
+            now = deadline
+        paris, rome, followup = (keys[name] for name in ("paris", "rome", "followup"))
+        return [paris, rome, followup], [[paris], [rome, followup]]
+
+    monkeypatch.setattr(search, "select_groups", select_then_expire)
+    result = service.search("Where did I travel to Paris and Rome?", CTX, use_memories=True)
+
+    assert len(checks) == available_reads
+    assert result.diagnostics["partial"]
+    assert [item["message_id"] for item in result.evidence] == (["paris"] if available_reads else [])
+    assert [fact["quote"] for fact in result.facts] == (["I visited Paris."] if available_reads else [])
+    assert len(result.diagnostics["evidence_groups"]) == bool(available_reads)
+    assert result.diagnostics["uncovered_branches"] == ([1] if available_reads else [0, 1])
+
+
 def test_reported_groups_only_reference_final_evidence_within_response_budget(setup):
     import json
 

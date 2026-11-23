@@ -105,6 +105,9 @@ class ParsedEvidenceQuery:
     text: str
     branches: tuple[QueryBranch, ...]
 
+    def covered_branch_indices(self, evidence_terms: set[str]) -> set[int]:
+        return {i for i, branch in enumerate(self.branches) if branch.terms & evidence_terms}
+
 
 def parse_evidence_query(query: str) -> ParsedEvidenceQuery:
     """Share effective conjuncts between supplementary search and coverage."""
@@ -202,7 +205,7 @@ def select_groups(query: ParsedEvidenceQuery, scores, units, top_k, candidate_li
     while pending and len(selected) < top_k:
         def priority(key):
             text_terms = set(terms(units[key]["text"]))
-            gain = sum(1 for i, branch in enumerate(query.branches) if i not in covered and branch.terms & text_terms)
+            gain = len(query.covered_branch_indices(text_terms) - covered)
             exact_date = bool(dates & set(re.findall(r"\d{4}-\d{2}-\d{2}", units[key]["text"])))
             return (-int(exact_date), -scores[key] * (1 + .25 * gain), key)
         key = min(pending, key=priority)
@@ -250,7 +253,7 @@ def select_groups(query: ParsedEvidenceQuery, scores, units, top_k, candidate_li
         used_bytes += size
         for item in group:
             text_terms = set(terms(units[item]["text"]))
-            covered.update(i for i, branch in enumerate(query.branches) if branch.terms & text_terms)
+            covered.update(query.covered_branch_indices(text_terms))
     # Optional explanations/continuations compete only for the remaining
     # capacity, after every independent seed has had its admission attempt.
     for seed_group in list(groups):

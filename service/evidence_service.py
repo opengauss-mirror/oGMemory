@@ -241,6 +241,9 @@ class EvidenceService:
         with stage("final_source_check"):
             evidence = []
             for key in selected:
+                if time.monotonic() >= deadline:
+                    diagnostics["partial"] = True
+                    break
                 item = units[key]
                 current = self.store.read_source(item["source_key"], ctx)
                 if current is not None and current["source_node_version"] == item["source_node_version"]:
@@ -263,8 +266,8 @@ class EvidenceService:
                                         sorted(facts, key=lambda record: record["fact_id"]), diagnostics)
             def refresh_coverage():
                 final_terms = set().union(*(set(terms(item["text"])) for item in result.evidence))
-                diagnostics["uncovered_branches"] = [index for index, branch in enumerate(branches)
-                                                      if not branch.terms & final_terms]
+                covered = parsed_query.covered_branch_indices(final_terms)
+                diagnostics["uncovered_branches"] = [index for index in range(len(branches)) if index not in covered]
             refresh_coverage()
             while groups and encoded_size(result.to_dict()) > 64 * 1024 - 64:
                 removed = set(groups.pop()) - {key for group in groups for key in group}
