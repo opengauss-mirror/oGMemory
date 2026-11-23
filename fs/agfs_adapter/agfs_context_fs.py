@@ -41,6 +41,7 @@ from core.errors import (
 from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
 from core.operation_deadline import check_deadline
+from core.persistence_outcome import WriteCompletion, record_write_completion, write_completion
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
     RootBindingError,
@@ -543,6 +544,16 @@ class AGFSContextFS:
         fs.write_node(node, context)
     """
 
+    _migration_internal_writes = ("_mkdir_p", "_recover_acknowledging_delete")
+    _migration_reads = (
+        "exists", "find_archive_uri", "is_tombstoned", "list_children",
+        "list_children_including_inactive", "list_identity_node_summaries_page",
+        "list_node_summaries", "list_node_summaries_page", "read_code_workspace_root_binding",
+        "read_node", "read_node_fields", "read_node_metadata_including_inactive", "read_nodes",
+        "read_search_node", "scan_session_recovery",
+    )
+    _migration_runtime_writes = ("resource_mutation_lock", "session_recovery_lock", "memory_identity_lock",)
+
     # File names within a node directory
     FILE_CONTENT = "content.md"
     FILE_RELATIONS = ".relations.json"
@@ -734,7 +745,7 @@ class AGFSContextFS:
         try:
             self._ensure_accessible(uri, ctx)
         except AccessDeniedError as exc:
-            exc.agfs_rejection_settled = True
+            record_write_completion(exc, WriteCompletion.SETTLED)
             raise
 
     def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
@@ -1307,7 +1318,7 @@ class AGFSContextFS:
             try:
                 yield lease
             except ConcurrentModificationError as exc:
-                if getattr(exc, 'agfs_write_not_started', False) is True:
+                if write_completion(exc) is WriteCompletion.CLEANUP_REQUIRED:
                     rejection = exc
                 raise
             lease.ensure_owned()
@@ -1328,7 +1339,7 @@ class AGFSContextFS:
                         lock_path,
                     )
             if rejection is not None and cleaned and (not acquired or released):
-                rejection.agfs_rejection_settled = True
+                record_write_completion(rejection, WriteCompletion.SETTLED)
 
     @contextmanager
     def session_recovery_lock(self, uri: str, ctx: RequestContext, *, timeout_seconds=1.0):
@@ -1349,8 +1360,8 @@ class AGFSContextFS:
                 lease = stack.enter_context(self.resource_mutation_lock(uri, ctx, timeout_seconds=timeout_seconds))
             except TimeoutError as exc:
                 busy = SessionMutationBusyError("AGFS session recovery is busy")
-                if getattr(exc, "agfs_rejection_settled", False) is True:
-                    busy.agfs_rejection_settled = True
+                if write_completion(exc) is WriteCompletion.SETTLED:
+                    record_write_completion(busy, WriteCompletion.SETTLED)
                 raise busy from exc
             token = _SESSION_RECOVERY.set((lease, (ctx.account_id, ctx.user_id, ctx.agent_id, ctx.session_id)))
             try:
@@ -1929,7 +1940,7 @@ class AGFSContextFS:
             if existing_meta_raw is None:
                 if expected_version != 0:
                     error = ConcurrentModificationError(node.uri, expected_version, 0)
-                    error.agfs_write_not_started = True
+                    record_write_completion(error, WriteCompletion.CLEANUP_REQUIRED)
                     raise error
                 self._remove_empty_code_resource_destination(
                     final_node_path,
@@ -1962,7 +1973,7 @@ class AGFSContextFS:
                 raise RuntimeError("invalid committed AGFS code-resource version")
             if expected_version != actual_version:
                 error = ConcurrentModificationError(node.uri, expected_version, actual_version)
-                error.agfs_write_not_started = True
+                record_write_completion(error, WriteCompletion.CLEANUP_REQUIRED)
                 raise error
 
             existing = self.read_node(node.uri, ctx)
@@ -2300,7 +2311,7 @@ class AGFSContextFS:
             if staging_path:
                 cleaned = self._remove_tree_if_present(staging_path)
                 if rejection is not None and cleaned:
-                    rejection.agfs_rejection_settled = True
+                    record_write_completion(rejection, WriteCompletion.SETTLED)
         if self._on_node_change is not None:
             self._on_node_change(node.uri)
 
@@ -2396,7 +2407,7 @@ class AGFSContextFS:
                     cleaned = False
                     logger.warning("Failed to release AGFS update lock: %s", lock_path)
             if rejection is not None and cleaned:
-                rejection.agfs_rejection_settled = True
+                record_write_completion(rejection, WriteCompletion.SETTLED)
 
     def _write_update_marker(
         self,
@@ -3112,12 +3123,12 @@ class AGFSContextFS:
             meta = json.loads(self._read_file(meta_path))
         except NodeNotFoundError:
             error = NodeNotFoundError(uri)
-            error.agfs_rejection_settled = True
+            record_write_completion(error, WriteCompletion.SETTLED)
             raise error
 
         if meta.get("status") != NodeStatus.ACTIVE.value:
             error = NodeNotFoundError(uri)
-            error.agfs_rejection_settled = True
+            record_write_completion(error, WriteCompletion.SETTLED)
             raise error
 
         now = datetime.now(UTC).isoformat()
@@ -3149,7 +3160,8 @@ class AGFSContextFS:
             if _is_not_found_error(e):
                 from fs.agfs_adapter.client import confirmed_rejection
                 error = NodeNotFoundError(uri)
-                error.agfs_rejection_settled = confirmed_rejection(e)
+                if confirmed_rejection(e):
+                    record_write_completion(error, WriteCompletion.SETTLED)
                 raise error from e
             raise
         if self._on_node_change is not None:
@@ -3177,7 +3189,7 @@ class AGFSContextFS:
         # Ensure source exists
         if not self.exists(from_uri, ctx):
             error = NodeNotFoundError(from_uri)
-            error.agfs_rejection_settled = True  # No mutation has started.
+            record_write_completion(error, WriteCompletion.SETTLED)  # No mutation has started.
             raise error
 
         # Move the directory

@@ -20,6 +20,8 @@ from index.edge_projection import (
 class SQLEdgeProjectionStore(PoolAdapterMixin):
     """Persists projections on canonical relation rows and owns retry jobs."""
 
+    _migration_reads = ("has_due_work",)
+
     @staticmethod
     def _claimable_sql() -> str:
         """Shared eligibility for bounded mutation coalescing and durable retries."""

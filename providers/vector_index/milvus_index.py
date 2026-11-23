@@ -46,6 +46,12 @@ _VARCHAR_LIMITS = {"id": 512, "text": 65535, **dict.fromkeys(_SCOPE_FIELDS, 8192
 class MilvusVectorIndex(VectorIndex):
     """Persistent COSINE/HNSW index using the synchronous MilvusClient API."""
 
+    _migration_runtime_only = True
+    _migration_reads = (
+        "check_migration_target", "count", "get_embeddings", "get_record", "probe",
+        "search_by_vector", "search_children", "validate_records",
+    )
+
     def __init__(
         self,
         uri: str = "http://localhost:19530",

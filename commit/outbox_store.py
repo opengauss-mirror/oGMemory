@@ -63,6 +63,12 @@ class OutboxStore:
     changes to the vector index.
     """
 
+    _migration_runtime_only = True
+    _migration_reads = (
+        "count_unfinished", "get_event_status", "is_event_current", "list_pending",
+        "list_pending_events",
+    )
+
     _DELETE_TOMBSTONE_NAME = ".delete_tombstone.json"
     _DELETE_TOMBSTONE_PENDING = "PENDING"
     _DELETE_TOMBSTONE_ACKNOWLEDGING = "ACKNOWLEDGING"

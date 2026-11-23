@@ -57,6 +57,14 @@ def _turn_id(
 class AGFSTraceEventStore:
     """Single-instance AGFS implementation of the lifecycle trace repository."""
 
+    _migration_runtime_only = True
+    _migration_internal_writes = ("_mkdir_p", "_remove_if_present", "_replace_file")
+    _migration_reads = (
+        "count_skill_distinct_sessions", "count_skill_example_distinct_sessions",
+        "count_skill_work_accounts", "list_pending_skill_accounts", "list_ready_skill_capabilities",
+        "list_skill_candidates", "read_skill_trace_event_page",
+    )
+
     def __init__(self, *, client, mount_prefix: str = "/local", max_turn_events: int = 128) -> None:
         if max_turn_events < 2 or max_turn_events > 1024:
             raise ValueError("max_turn_events must be between 2 and 1024")

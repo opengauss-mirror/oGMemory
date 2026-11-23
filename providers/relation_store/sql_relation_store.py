@@ -33,6 +33,10 @@ class SQLRelationStore(PoolAdapterMixin):
     upsert.
     """
 
+    _migration_reads = (
+        "get_edges", "get_one_hop", "get_relation_neighbors", "get_traversal_neighbors",
+    )
+
     def __init__(
         self,
         connection_string: str | None = None,

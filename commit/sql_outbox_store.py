@@ -66,6 +66,12 @@ class SQLOutboxStore(PoolAdapterMixin):
     Locking uses ``UPDATE … RETURNING`` for atomic batch claims.
     """
 
+    _migration_runtime_only = True
+    _migration_reads = (
+        "count_unfinished", "get_event", "get_event_status", "is_event_current", "list_pending",
+        "list_pending_events", "list_recent",
+    )
+
     supports_batch_claim = True
     notify_channel = "ogmem_outbox"
 

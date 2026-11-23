@@ -16,6 +16,7 @@ from uuid import uuid4
 from psycopg2.errors import UniqueViolation
 from psycopg2.extras import Json, RealDictCursor, execute_values
 
+from fs.sql_adapter.pool import rollback_write
 from server.space_job_repository import SpaceJobRepository
 from server.space_privacy import redact_item
 from server.space_rules import (
@@ -80,33 +81,34 @@ class SpaceRepository(SpaceJobRepository):
         admission = getattr(self, '_migration_admission', None)
         with (admission.content_scope() if write else admission.scope()) if admission is not None else nullcontext():
             conn = self.pool.get_connection()
-            discard = False
+            retired = False
+
+            def retire(connection):
+                nonlocal retired
+                retired = True
+                self.pool.discard_connection(connection)
+
             committing = False
             try:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("SELECT set_config('app.account_id', %s, true)", (account_id,))
-                    if write:
-                        cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id),))
-                        if space_id:
-                            cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id, space_id),))
-                    yield cur
-                committing = True
-                conn.commit()
-            except BaseException as error:
-                if committing and admission is not None and write:
-                    admission._operation.get().uncertain = True
-                try:
-                    conn.rollback()
-                except BaseException as rollback_error:
-                    discard = True
-                    if admission is not None and write:
-                        admission._operation.get().uncertain = True
-                    raise error from rollback_error
-                raise
+                with admission.backend(write=write) if admission is not None else nullcontext():
+                    try:
+                        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                            cur.execute("SELECT set_config('app.account_id', %s, true)", (account_id,))
+                            if write:
+                                cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id),))
+                                if space_id:
+                                    cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key(account_id, space_id),))
+                            yield cur
+                        committing = True
+                        conn.commit()
+                    except BaseException as error:
+                        try:
+                            rollback_write(conn, error, committing=committing, retire=retire)
+                        except BaseException as rollback_error:
+                            raise error from rollback_error
+                        raise
             finally:
-                if discard:
-                    self.pool.discard_connection(conn)
-                else:
+                if not retired:
                     self.pool.return_connection(conn)
 
     @staticmethod

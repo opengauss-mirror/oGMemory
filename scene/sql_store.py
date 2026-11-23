@@ -121,6 +121,9 @@ def snapshot_from_dict(account_id: str, owner_space: str, revision: int, payload
 
 
 class _SQLStore:
+
+    _migration_runtime_only = True
+
     _schema_lock = Lock()
 
     def __init__(self, pool) -> None:
@@ -201,6 +204,10 @@ class _SQLStore:
 
 class SQLSceneRepository(_SQLStore):
     """Versioned scene snapshots with tenant isolation and optimistic publication."""
+
+    _migration_reads = (
+        "contributions", "list_scopes", "load_active", "load_snapshot", "pending_projections",
+    )
 
     def pending_projections(self, limit: int = 20):
         emitted = 0
@@ -354,6 +361,8 @@ class SQLSceneRepository(_SQLStore):
 class SQLSceneJobStore(_SQLStore):
     """Persist the shared queue state machine under one short scope transaction."""
 
+    _migration_reads = ("get",)
+
     @staticmethod
     def _load(cursor, account_id, owner_space) -> InMemorySceneJobStore:
         cursor.execute("SELECT queue, clock_timestamp() FROM scene_scopes WHERE account_id=%s AND owner_space=%s",
@@ -488,6 +497,8 @@ class SQLSceneJobStore(_SQLStore):
 
 class SQLSceneConfigProvider(_SQLStore):
     """Append-only configuration revisions, merged and published with scope CAS."""
+
+    _migration_reads = ("export", "get_effective",)
 
     def __init__(self, pool, default: SceneConfig | None = None):
         self.default = default or SceneConfig()

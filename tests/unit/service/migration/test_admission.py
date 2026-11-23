@@ -3,6 +3,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from core.persistence_outcome import WriteCompletion, record_write_completion
 from service.migration.admission import Admission
 from service.migration.maintenance import MaintenanceError, MaintenanceStore
 
@@ -125,21 +126,32 @@ async def test_delayed_child_cannot_bypass_gate(admission):
 
 def test_actual_adapter_remains_guarded_after_service_returns(admission):
     class Storage:
-        def read_node(self):
+        _migration_reads = ("fetch_node",)
+        _migration_runtime_writes = ("publish_runtime",)
+
+        def publish_runtime(self):
+            return 'projected'
+
+        def fetch_node(self):
             return 'data'
-        def write_node(self):
+
+        def read_and_modify(self):
             return 'written'
+
     storage = admission.guard(Storage())
     assert isinstance(storage, Storage)
-    assert storage.read_node() == 'data'
+    assert storage.fetch_node() == 'data'
     admission.store.enter('export', mode='export', resources={})
-    assert storage.read_node() == 'data'
+    assert storage.fetch_node() == 'data'
+    assert storage.publish_runtime() == 'projected'
     with pytest.raises(MaintenanceError):
-        storage.write_node()
+        storage.read_and_modify()
     admission.store.reopen('export')
     admission.store.enter('import', mode='import', resources={})
     with pytest.raises(MaintenanceError):
-        storage.read_node()
+        storage.fetch_node()
+    with pytest.raises(MaintenanceError):
+        storage.publish_runtime()
     admission.store.wait_drained('import', 0)
 
 
@@ -349,7 +361,7 @@ def test_sql_conflict_releases_only_confirmed_rollback(admission, confirmed):
     from core.errors import ConcurrentModificationError
     exc = ConcurrentModificationError('ctx://a/node', 1, 2)
     if confirmed:
-        exc.sql_rollback_confirmed = True
+        record_write_completion(exc, WriteCompletion.SETTLED)
     with pytest.raises(ConcurrentModificationError):
         with admission.backend(write=True):
             raise exc
@@ -422,7 +434,7 @@ def test_settled_sql_rejection_does_not_clear_prior_unknown_write(admission):
         with pytest.raises(TimeoutError), admission.backend(write=True):
             raise TimeoutError('write completion unknown')
         exc = NodeNotFoundError('ctx://acme/missing')
-        exc.sql_rollback_confirmed = True
+        record_write_completion(exc, WriteCompletion.SETTLED)
         with pytest.raises(NodeNotFoundError), admission.backend(write=True):
             raise exc
     admission.store.enter('export', mode='export', resources={})

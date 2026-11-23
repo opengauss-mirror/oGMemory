@@ -48,6 +48,11 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
     ``session_archives`` table.
     """
 
+    _migration_reads = (
+        "get_session_owner", "list_archives", "list_archives_since", "read_archive",
+        "read_archive_abstract", "read_archive_by_id",
+    )
+
     def __init__(
         self,
         connection_string: str | None = None,

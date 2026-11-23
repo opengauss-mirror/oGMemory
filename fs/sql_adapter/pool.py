@@ -22,6 +22,7 @@ import time
 from concurrent.futures import Future
 from contextlib import contextmanager
 
+from core.persistence_outcome import WriteCompletion, record_write_completion
 from fs.sql_adapter.dialect import SQLDialect, normalize_sql_dialect, resolve_sql_dialect
 
 try:
@@ -538,12 +539,16 @@ class PoolAdapterMixin:
             cur.execute("SET LOCAL app.account_id = %s", (account_id,))
 
 
-def rollback_write(connection, error, *, committing):
+def rollback_write(connection, error, *, committing, retire=None):
     """Confirm rejected writes; retire a session whose rollback cannot be confirmed."""
+    record_write_completion(error, WriteCompletion.UNKNOWN)
     try:
         connection.rollback()
     except BaseException:
-        connection.close()
+        if retire is None:
+            connection.close()
+        else:
+            retire(connection)
         raise
     if not committing:
-        error.sql_rollback_confirmed = True
+        record_write_completion(error, WriteCompletion.SETTLED)

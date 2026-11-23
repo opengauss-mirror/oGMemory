@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Callable, Optional
 
-from core.errors import NodeNotFoundError
+from core.errors import MaintenanceError, NodeNotFoundError
 from core.models import ContextNode, RequestContext
 from providers.token_tracker import UsageTracker
 from session.models import ArchiveEntry, SessionMessage, SessionMeta, SessionWindowState
@@ -794,6 +794,31 @@ class SessionManager:
         guard.check_database(store._connection_string, store._sql_dialect)
         guard.ensure_owned()
         return True
+
+    def checkpoint_sessions(self, fallback: RequestContext, mutation_scope) -> None:
+        """Persist quiescent session buffers while retaining newer durable state."""
+        with self._lock:
+            sessions = list(self._sessions.items())
+        for session_id, buffer in sessions:
+            if (buffer.active_operation_count or buffer.extraction_active_count or buffer.commit_in_progress
+                    or buffer.dispose_in_progress or buffer.cleaning):
+                raise MaintenanceError('session still has an active business operation')
+            ctx = self._session_state_context(session_id, buffer.meta, fallback)
+            with mutation_scope(ctx):
+                fs = self._get_context_fs() if callable(self._get_context_fs) else None
+                if fs is None:
+                    raise MaintenanceError('session checkpoint storage is unavailable')
+                with buffer.session_state_save_lock:
+                    if buffer.durable_state_token is not None:
+                        if not self._durable_state_matches(buffer, fs, ctx):
+                            continue  # Another process already persisted a newer state.
+                    else:
+                        if any(fs.exists(uri, ctx) for uri in (
+                                SessionState.state_uri(ctx.account_id, session_id),
+                                SessionState.legacy_state_uri(ctx.account_id, session_id))):
+                            continue  # An unversioned cache cannot replace durable state.
+                    if not self.save_session_state(session_id, ctx):
+                        raise MaintenanceError('session checkpoint could not be persisted')
 
     def save_session_state(self, session_id: str, ctx: RequestContext) -> bool:
         from service.extraction_recovery_discovery import DISCOVERY_KEY, recovery_discovery_hint
@@ -2425,7 +2450,7 @@ class SessionManager:
                         if any(owner):
                             raise PermissionError("invalid durable session owner metadata")
             except Exception as exc:
-                from core.errors import NodeNotFoundError
+                from core.errors import MaintenanceError, NodeNotFoundError
 
                 if isinstance(exc, PermissionError):
                     raise
@@ -2493,7 +2518,7 @@ class SessionManager:
                 fs.delete_node(uri, ctx)
                 deleted += 1
             except Exception as exc:
-                from core.errors import NodeNotFoundError
+                from core.errors import MaintenanceError, NodeNotFoundError
 
                 if isinstance(exc, (NodeNotFoundError, FileNotFoundError)):
                     continue

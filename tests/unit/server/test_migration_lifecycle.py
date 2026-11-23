@@ -121,7 +121,7 @@ def test_refresh_discards_shared_space_worker_repository_and_content(tmp_path):
 def test_resume_restarts_previously_running_workspace_scheduler(tmp_path, monkeypatch):
     from unittest.mock import Mock
     service = MemoryService(OgMemConfig(skill_sedimentation_enabled=False), defer_start=True)
-    sync = Mock(_scheduler=object())
+    sync = Mock(running=True)
     service._code_workspace_sync_service = sync
     lifecycle = ServiceLifecycle(service)
     monkeypatch.setattr(service, '_get_code_workspace_sync_service', lambda: sync)
@@ -161,12 +161,14 @@ def test_fts_must_stop_before_refresh_and_is_discarded(tmp_path):
 @pytest.mark.parametrize('task_id', ['agent-turn', 'archive'])
 def test_import_waits_for_retry_execution_threads(tmp_path, monkeypatch, task_id):
     import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock
 
     store = MaintenanceStore(tmp_path / 'gate.db', 'retry-threads')
     service = MemoryService(OgMemConfig(skill_sedimentation_enabled=False), defer_start=True)
-    from unittest.mock import Mock
-    scene = Mock(running=True)
-    service._scene_manager = scene
+    scene_index = Mock()
+    service._scene_manager = Mock(running=True)
+    service._scene_source = SimpleNamespace(candidate_index=scene_index)
     lifecycle = ServiceLifecycle(service, timeout=.05)
     participant = Participant(store, pause=lifecycle.pause, refresh=lifecycle.refresh,
                               resume=lambda: None)
@@ -192,7 +194,7 @@ def test_import_waits_for_retry_execution_threads(tmp_path, monkeypatch, task_id
         with pytest.raises(MaintenanceError, match='workers'):
             participant.step()
         assert not store.participants_ready('restore', 'drain')
-        scene.stop.assert_not_called()
+        scene_index.close.assert_not_called()
         finish.set()
         assert service._extraction_retry.close(1)
         store.retry_participants('restore')

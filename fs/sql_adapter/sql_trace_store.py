@@ -109,6 +109,12 @@ def _event_preview(content: dict, limit: int) -> str:
 class SQLTraceEventStore(PoolAdapterMixin):
     """Store individual hook events and finalized per-turn aggregates."""
 
+    _migration_reads = (
+        "count_skill_distinct_sessions", "count_skill_example_distinct_sessions",
+        "count_skill_work_accounts", "list_pending_skill_accounts", "list_ready_skill_capabilities",
+        "list_skill_candidates", "read_skill_trace_event_page",
+    )
+
     def __init__(
         self,
         connection_string: str | None = None,

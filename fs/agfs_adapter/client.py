@@ -12,13 +12,25 @@ import yaml
 from pyagfs import AGFSClient
 from pyagfs.exceptions import AGFSClientError, AGFSHTTPError
 
+from core.persistence_outcome import WriteCompletion, record_write_completion
+
 # The C library shares one mount table among all clients in a process.
 _mount_lock = threading.Lock()
 _mounts = {}
 
 
+# The external SDK has no place to declare its admission policy.
+HTTP_AGFS_READS = ("cat", "get_handle_info", "get_plugins_info", "health",
+                   "list_handles", "list_plugins", "ls", "read", "stat")
+HTTP_AGFS_SINGLE_MUTATIONS = ("mkdir", "mv", "rm", "write")
+
+
 class NativeAGFSHTTPError(AGFSHTTPError):
     """The synchronous C call has returned; no remote write remains in flight."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        record_write_completion(self, WriteCompletion.SETTLED)
 
 
 def confirmed_rejection(exc, *, status_code=None):
@@ -35,6 +47,7 @@ def confirmed_rejection(exc, *, status_code=None):
 
 
 class NativeAGFSClient:
+    _migration_reads = ("ls", "read", "stat")
 
     def __init__(self, library_path, config_path):
         library_path = str(Path(library_path).resolve())

@@ -76,6 +76,8 @@ def _is_explicit_already_exists(exc: Exception) -> bool:
 
 
 class AGFSToolResultArtifactStore(ToolResultArtifactStore):
+    _migration_internal_writes = ("_mkdir_p",)
+
     def __init__(self, client, mount_prefix: str = "/local"):
         self._client = client
         self._mount_prefix = mount_prefix.rstrip("/")

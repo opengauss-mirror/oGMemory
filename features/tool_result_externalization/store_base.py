@@ -107,6 +107,8 @@ def decode_utf8_range(data: bytes, offset_bytes: int, length_bytes: int) -> dict
 
 
 class ToolResultArtifactStore(ABC):
+    _migration_reads = ("list", "read_all", "read_metadata", "read_range")
+
     @abstractmethod
     def write(self, metadata: ArtifactMetadata, output_text: str, ctx: RequestContext) -> bool:
         """Commit output and metadata; return True when an identical artifact was reused."""

@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import partial, wraps
 
+from core.persistence_outcome import WriteCompletion, record_write_completion, write_completion
 from service.migration.maintenance import MaintenanceError
 
 
@@ -44,18 +45,6 @@ def _content_arguments(*args, **kwargs):
 def _transport_paths(signature, args, kwargs):
     return [value for name, value in signature.bind(*args, **kwargs).arguments.items()
             if name in {'path', 'src', 'dst', 'source', 'destination'}]
-
-
-def _content_storage(storage):
-    from providers.composite_index import CompositeProjectionWriter
-
-    if isinstance(storage, CompositeProjectionWriter):
-        return False
-    return not type(storage).__module__.startswith((
-        'providers.vector_index', 'providers.lexical_index', 'index.',
-        'commit.outbox_store', 'commit.sql_outbox_store', 'scene.',
-        'session.trace', 'providers.trace', 'fs.agfs_adapter.agfs_trace_store',
-    ))
 
 
 @dataclass
@@ -177,36 +166,14 @@ class Admission:
             self._operation.reset(marker)
 
     @contextmanager
-    def backend(self, *, write, http_rejections=False, content=True):
+    def backend(self, *, write, content=True):
         lifetime = self.content_scope() if write and content else self.scope(write=write)
         with lifetime:
             runtime = self._runtime_backend.set(not content)
             try:
                 yield
             except BaseException as exc:
-                # Only backend mutations can be uncertain, not rejected parameters
-                # or business result dictionaries. Never release on a guessed timeout.
-                from core.errors import (
-                    AccessDeniedError,
-                    ConcurrentModificationError,
-                    NodeNotFoundError,
-                )
-                from fs.agfs_adapter.client import NativeAGFSHTTPError, confirmed_rejection
-
-                # pyagfs wraps HTTP rejections but preserves their exception context.
-                # Only definite filesystem rejections are complete; timeouts and
-                # gateway/server errors can still leave remote writes in flight.
-                rejected = (getattr(exc, 'agfs_request_rejected', False) is True or
-                            isinstance(exc, NativeAGFSHTTPError) or
-                            (isinstance(exc, AccessDeniedError)
-                             and getattr(exc, 'sql_write_not_started', False) is True) or
-                            (getattr(exc, 'sql_rollback_confirmed', False) is True) or
-                            (isinstance(exc, (AccessDeniedError, ConcurrentModificationError, NodeNotFoundError, TimeoutError))
-                             and getattr(exc, 'agfs_rejection_settled', False) is True) or
-                            (http_rejections and confirmed_rejection(exc)))
-                if http_rejections and rejected:
-                    exc.agfs_request_rejected = True
-                if write and not rejected:
+                if write and write_completion(exc) is not WriteCompletion.SETTLED:
                     self._operation.get().uncertain = True
                 raise
             finally:
@@ -267,10 +234,10 @@ class Admission:
             raise
         return thread
 
-    def wrap(self, function, *, write=False, backend=False, http_rejections=False, content=True):
+    def wrap(self, function, *, write=False, backend=False, content=True):
         def scope_for(args, kwargs):
             payload = content(*args, **kwargs) if callable(content) else content
-            return (partial(self.backend, http_rejections=http_rejections, content=payload)
+            return (partial(self.backend, content=payload)
                     if backend else self.scope)
         if inspect.isasyncgenfunction(function):
             @wraps(function)
@@ -324,72 +291,65 @@ class Admission:
     def guard(self, storage):
         """Keep concrete adapter types while guarding public backend methods.
 
-        Unknown operations are mutations. Private transport members must not be
-        handed to business callers; migration uses independently opened adapters.
+        Adapters declare reads, runtime writes and internal mutation entry points.
+        Unlisted methods are writes, with content protection unless the adapter
+        declares itself runtime-only. Migration opens its own adapters.
         """
         if storage is None or getattr(storage, "_migration_guard", None) is self:
             return storage
         if getattr(storage, "_migration_guard", None) is not None:
             raise MaintenanceError("storage is already bound to another instance")
+        from pyagfs.client import AGFSClient
+        from fs.agfs_adapter.client import (
+            HTTP_AGFS_READS, HTTP_AGFS_SINGLE_MUTATIONS, NativeAGFSClient, confirmed_rejection,
+        )
+
+        # Unknown operations require a content-write permit by default.
+        adapter = type(storage)
+        sdk = isinstance(storage, AGFSClient)
+        reads = HTTP_AGFS_READS if sdk else getattr(adapter, "_migration_reads", ())
+        runtime_writes = getattr(adapter, "_migration_runtime_writes", ())
+        internal_writes = getattr(adapter, "_migration_internal_writes", ())
+        runtime_only = getattr(adapter, "_migration_runtime_only", False)
         skip = {"close", "close_all", "release_for_migration", "shutdown", "stop"}
-        reads = ("read", "get", "list", "exists", "search", "count", "scan", "iter", "has", "is_", "health", "probe", "check", "validate", "ls", "stat", "cat")
-        content_storage = _content_storage(storage)
-        for name in dir(type(storage)):
-            if name.startswith("_") or name in skip:
+        for name in dir(adapter):
+            if name in skip or (name.startswith("_") and name not in internal_writes):
                 continue
             function = getattr(storage, name, None)
             if not inspect.ismethod(function):
                 continue
-            write = not name.startswith(reads) or name.startswith(("get_or_create", "get_or_init"))
-            if name == 'find_archive_uri':
-                write = False
-            if name in {'load_content', 'hydrate_nodes'}:
-                from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
-                if isinstance(storage, AGFSSpaceBridge):
-                    write = False  # Hydrates authorized immutable bodies only.
-            if name in {"load_snapshot", "load_active", "contributions", "pending_projections", "export"}:
-                from scene.sql_store import _SQLStore
-                if isinstance(storage, _SQLStore):
-                    write = False  # Scene reads do not publish or claim work.
-            # mkdir and rm issue one HTTP request. In particular write()
-            # retries internally: a final rejection cannot settle earlier timeouts.
-            from pyagfs.client import AGFSClient
-            single_attempt = isinstance(storage, AGFSClient) and name in {'mkdir', 'rm', 'mv', 'write'}
-            if isinstance(storage, AGFSClient) and name == 'write':
+            write = name not in reads
+            # The HTTP SDK retries writes by default. A final rejection cannot
+            # confirm whether the preceding attempt wrote anything.
+            if sdk and name == "write":
                 original_write = function
                 @wraps(original_write)
                 def write_once(path, data, max_retries=0, _write=original_write):
                     return _write(path, data, max_retries=0)
                 function = write_once
-            content = _content_arguments if content_storage else False
-            if name in {'session_recovery_lock', 'resource_mutation_lock', 'memory_identity_lock', 'processing_lease'}:
-                content = False
-            from fs.agfs_adapter.client import NativeAGFSClient
+            content = False if runtime_only or name in runtime_writes else _content_arguments
+            if content and name in internal_writes:
+                content = lambda *a, **kw: not self._runtime_backend.get() and _content_arguments(*a, **kw)
+            single_attempt = sdk and name in HTTP_AGFS_SINGLE_MUTATIONS
             if write and isinstance(storage, (AGFSClient, NativeAGFSClient)):
                 signature = inspect.signature(function)
                 @wraps(function)
-                def transport(*args, _function=function, _write=write,
-                              _signature=signature, _rejections=single_attempt, **kwargs):
+                def transport(*args, _function=function, _signature=signature,
+                              _rejections=single_attempt, **kwargs):
                     paths = _transport_paths(_signature, args, kwargs)
                     payload = any(_content_path(p) for p in paths) if paths else True
                     if self._runtime_backend.get():
                         payload = False  # Actual content adapters still acquire their own permit.
-                    with self.backend(write=_write, http_rejections=_rejections, content=payload):
-                        return _function(*args, **kwargs)
+                    with self.backend(write=True, content=payload):
+                        try:
+                            return _function(*args, **kwargs)
+                        except Exception as exc:
+                            if _rejections and confirmed_rejection(exc):
+                                record_write_completion(exc, WriteCompletion.SETTLED)
+                            raise
                 setattr(storage, name, transport)
             else:
-                setattr(storage, name, self.wrap(function, write=write, backend=True,
-                                                 http_rejections=single_attempt, content=content))
-        # AGFS reads may finish an acknowledged deletion. That branch mutates
-        # storage even though its public entry point is a read. Trace reads also
-        # repair their indexes through the guarded file mutation primitives.
-        for name in ("_recover_acknowledging_delete", "_replace_file", "_remove_if_present", "_mkdir_p"):
-            mutation = getattr(storage, name, None)
-            if callable(mutation):
-                setattr(storage, name, self.wrap(mutation, write=True, backend=True,
-                                                  content=(lambda *a, **kw: not self._runtime_backend.get()
-                                                           and _content_arguments(*a, **kw))
-                                                  if content_storage else False))
+                setattr(storage, name, self.wrap(function, write=write, backend=True, content=content))
         storage._migration_guard = self
         return storage
 

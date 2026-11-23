@@ -35,8 +35,6 @@ def close_service(service, *, timeout=30):
     """Stop workers before retiring the process registration and OS lease."""
     import time
 
-    from server.migration_lifecycle import ServiceLifecycle
-
     participant = getattr(service, '_migration_participant', None)
     if participant is None:
         shutdown = getattr(service, 'shutdown', None)
@@ -48,9 +46,7 @@ def close_service(service, *, timeout=30):
     with participant.shutdown_scope(timeout):
         deadline = time.monotonic() + timeout
         participant.wait_for_operations(deadline)
-        lifecycle = ServiceLifecycle(service, timeout=max(0, deadline - time.monotonic()))
-        if lifecycle.pause(migration=False) is not True:
+        if not service.shutdown(join_timeout=max(0, deadline - time.monotonic()), checkpoint=True):
             raise MaintenanceError('business workers have not stopped')
-        service.shutdown(join_timeout=max(0, deadline - time.monotonic()))
     participant.close()
     service._migration_participant = None

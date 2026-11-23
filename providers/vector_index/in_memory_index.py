@@ -32,6 +32,12 @@ class InMemoryVectorIndex(VectorIndex):
     Production should use a proper vector database (Qdrant, Milvus, etc.).
     """
 
+    _migration_runtime_only = True
+    _migration_reads = (
+        "count", "get_embeddings", "get_record", "get_records_at_time", "get_records_by_clips",
+        "search", "search_by_transcript", "search_by_vector", "search_children",
+    )
+
     def __init__(self, dimension: int = 384):
         """Initialize an empty in-memory index.
 

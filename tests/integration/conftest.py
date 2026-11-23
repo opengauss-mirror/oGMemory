@@ -17,6 +17,8 @@ class InMemoryContextFS:
     # crash-recovery semantics.
     """
 
+    _migration_reads = ("exists", "list_children", "read_node", "read_nodes")
+
     def __init__(self):
         self._store: dict[str, ContextNode] = {}
 

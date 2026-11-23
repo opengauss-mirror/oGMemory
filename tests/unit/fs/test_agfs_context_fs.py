@@ -176,6 +176,8 @@ def test_archived_node_version_reads_inactive_metadata():
 class _AtomicMemoryAGFSClient:
     """Thread-safe AGFS double with atomic file/directory rename semantics."""
 
+    _migration_reads = ("ls", "read", "stat")
+
     def __init__(self):
         self.files: dict[str, bytes] = {}
         self.directories: set[str] = {"/", "/local"}

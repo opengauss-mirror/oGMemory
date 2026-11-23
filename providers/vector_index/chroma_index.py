@@ -93,6 +93,12 @@ def _chroma_directory_lock(lock_path: str):
 class ChromaVectorIndex(VectorIndex):
     """Persistent vector index backed by ChromaDB."""
 
+    _migration_runtime_only = True
+    _migration_reads = (
+        "check_migration_target", "count", "get_embeddings", "get_record", "search_by_vector",
+        "search_children",
+    )
+
     def __init__(
         self,
         collection_name: str = "contextengine",

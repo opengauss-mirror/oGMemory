@@ -29,6 +29,7 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.persistence_outcome import WriteCompletion, record_write_completion
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
     RootBindingError,
@@ -294,6 +295,13 @@ class SQLContextFS(PoolAdapterMixin):
         fs.write_node(node, ctx)
     """
 
+    _migration_reads = (
+        "count_memory_children", "exists", "find_archive_uri", "list_children",
+        "list_node_summaries", "list_node_summaries_page", "read_code_workspace_root_binding",
+        "read_node", "read_node_fields", "read_nodes", "scan_session_recovery",
+    )
+    _migration_runtime_writes = ("memory_identity_lock",)
+
     def __init__(
         self,
         connection_string: str | None = None,
@@ -515,7 +523,7 @@ class SQLContextFS(PoolAdapterMixin):
             for uri in uris:
                 self._ensure_accessible(uri, ctx)
         except AccessDeniedError as exc:
-            exc.sql_write_not_started = True
+            record_write_completion(exc, WriteCompletion.SETTLED)
             raise
 
     def _extract_account_id(self, uri: str) -> str:

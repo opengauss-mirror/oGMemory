@@ -7,6 +7,8 @@ from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
 
 
 class LocalClient:
+
+    _migration_reads = ("ls", "read")
     def __init__(self, root):
         self.root = root
         self.timeout = 5

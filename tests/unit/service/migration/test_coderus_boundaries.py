@@ -7,6 +7,7 @@ import pytest
 from core.errors import AccessDeniedError, NodeNotFoundError
 from core.models import RequestContext, Role
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+from core.persistence_outcome import WriteCompletion, write_completion
 from service.migration.admission import Admission
 from service.migration.maintenance import MaintenanceStore
 from tests.migration_fixtures import ConfirmedMemoryAGFSClient
@@ -207,7 +208,7 @@ def test_atomic_resource_conflict_keeps_unknown_cleanup(tmp_path, failed_cleanup
     node = _atomic_code_node(expected_version=2)
     with pytest.raises(ConcurrentModificationError) as error:
         fs.write_node_with_outbox(node, _atomic_code_context(), outbox.build_write_event(node))
-    assert not getattr(error.value, 'agfs_rejection_settled', False)
+    assert write_completion(error.value) is not WriteCompletion.SETTLED
     assert_drain(a, blocked=True)
 
 
@@ -314,11 +315,11 @@ def test_sql_rollback_settlement_and_connection_retirement(committing, rollback_
         with pytest.raises(RuntimeError, match='connection lost'):
             rollback_write(conn, error, committing=committing)
         conn.close.assert_called_once()
-        assert not getattr(error, 'sql_rollback_confirmed', False)
+        assert write_completion(error) is WriteCompletion.UNKNOWN
     else:
         rollback_write(conn, error, committing=committing)
         conn.close.assert_not_called()
-        assert getattr(error, 'sql_rollback_confirmed', False) is (not committing)
+        assert (write_completion(error) is WriteCompletion.SETTLED) is (not committing)
 
 
 def test_maintenance_error_classification_uses_type():

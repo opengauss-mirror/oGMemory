@@ -117,6 +117,13 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         - Cosine similarity search
     """
 
+    _migration_runtime_only = True
+    _migration_reads = (
+        "check_migration_target", "count", "get_embeddings", "get_record", "get_records",
+        "get_records_at_time", "get_records_by_clips", "search", "search_by_transcript",
+        "search_by_vector", "search_children",
+    )
+
     def __init__(
         self,
         connection_string: str = "",

@@ -83,6 +83,9 @@ _SCHEMA = """
 class SQLiteLexicalIndex:
     """Shared local BM25 index with transactional projection checkpoints."""
 
+    _migration_runtime_only = True
+    _migration_reads = ("health", "ready_scopes", "search",)
+
     supported_filters = frozenset(
         {
             "account_id",

@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 class AGFSSpaceBridge(SQLContextFS):
     """Publish immutable AGFS bodies through the existing SQL node transaction."""
 
+    _migration_reads = SQLContextFS._migration_reads + ("hydrate_nodes", "load_content",)
+
     def __init__(self, pool, client, mount_prefix="/local"):
         super().__init__(pool=pool)
         self._agfs = AGFSContextFS(client=client, mount_prefix=mount_prefix)

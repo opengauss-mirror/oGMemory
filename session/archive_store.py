@@ -53,6 +53,11 @@ class SessionArchiveStore:
     Uses ContextFS interface for abstraction over the storage layer.
     """
 
+    _migration_reads = (
+        "get_session_owner", "list_archives", "read_archive", "read_archive_abstract",
+        "read_archive_by_id",
+    )
+
     def __init__(self, fs: ContextFS):
         """Initialize the archive store.
 

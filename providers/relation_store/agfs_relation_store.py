@@ -24,6 +24,8 @@ class AGFSRelationStore(RelationStore):
     Format: JSON array of RelationEdge objects.
     """
 
+    _migration_reads = ("get_edges", "get_one_hop",)
+
     def __init__(self, client: AGFSClient, mount_prefix: str = "/local"):
         """Initialize AGFSRelationStore.
 

@@ -55,6 +55,8 @@ def create_projection_writer(config, vector_index):
 class CompositeProjectionWriter:
     """Write independent projections from the same durable outbox event."""
 
+    _migration_runtime_only = True
+
     def __init__(
         self,
         vector: VectorIndex | None,

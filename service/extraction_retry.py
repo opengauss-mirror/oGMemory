@@ -491,6 +491,14 @@ class ExtractionRetryWorker:
                 journal.mutate(lambda batch: batch.update(retry_task=task))
                 return (delay if task["status"] == "queued" else None), not processing
 
+    def resume(self):
+        with self._condition:
+            self._stop.clear()
+            if self._discover is not None:
+                self._next_discovery = 0
+                self._start_thread()
+                self._condition.notify()
+
     def close(self, timeout=1):
         self._stop.set()
         deadline = time.monotonic() + timeout

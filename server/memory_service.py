@@ -22,7 +22,7 @@ from dataclasses import asdict, replace
 from datetime import UTC
 from datetime import datetime as _dt
 from functools import partial, wraps
-from time import time_ns
+from time import monotonic, time_ns
 from typing import Any
 from uuid import uuid4
 
@@ -792,6 +792,7 @@ class MemoryService:
         self._outbox_stop = threading.Event()
         self._outbox_wakeup = threading.Event()
         self._shutdown_lock = threading.Lock()
+        self._restart_after_maintenance = set()
         self._extraction_retry = ExtractionRetryWorker(self)
         self._extraction_discovery = None
         self._outbox_listener = None
@@ -3275,102 +3276,154 @@ class MemoryService:
             logger.warning("drain_outbox_sync failed: %s", exc)
             return {"processed": 0, "succeeded": 0, "failed": 1, "error": str(exc)}
 
-    def shutdown(self, join_timeout: float = 1.0) -> None:
-        """Stop the outbox worker before closing its shared projections."""
+    def shutdown(self, join_timeout: float = 1.0, *, checkpoint=False) -> bool:
+        """Stop business workers and close their resources before retiring the service."""
         with self._shutdown_lock:
+            if not self._stop_business_resources(join_timeout, checkpoint=checkpoint):
+                logger.warning("Business resources are still draining; shutdown can be retried")
+                return False
             with self._init_lock:
-                self._outbox_stop.set()
-                self._outbox_wakeup.set()
-            self._shutdown_resources(join_timeout)
+                if self._sql_pool is not None:
+                    self._sql_pool.close_all()
+                self._outbox_stop.clear()
+                self._outbox_wakeup.clear()
+            return True
 
-    def _shutdown_resources(self, join_timeout: float) -> None:
-        if self._agfs_fts is not None and not self._agfs_fts.close(join_timeout):
-            logger.warning("AGFS FTS backfill is still draining")
-            return
-        if self._space_worker is not None:
-            if not self._space_worker.stop(timeout=join_timeout):
-                logger.warning("Shared-space work is draining; service resources retained")
-                return
-            self._space_worker = None
-        if self._scene_manager is not None and not self._scene_manager.stop(timeout=join_timeout):
-            logger.warning("Scene worker is completing its current request")
-            return
-        if self._extraction_retry.close(join_timeout) is False:
-            logger.warning("Extraction retries are still draining; service resources retained")
-            return
-        scene_index = getattr(self._scene_source, "candidate_index", None)
-        if scene_index is not None and not scene_index.close(timeout=join_timeout):
-            logger.warning("Scene lexical index is still closing")
-            return
-        if self._code_workspace_sync_service is not None:
-            try:
-                self._code_workspace_sync_service.shutdown()
-            except Exception as exc:
-                logger.warning("Failed to stop code workspace sync scheduler: %s", exc)
-        if self.stop_skill_sedimentation(timeout=join_timeout) is False:
-            return
-        if self._outbox_listener is not None:
-            try:
-                self._outbox_listener.stop()
-            except Exception as exc:
-                logger.warning("Failed to stop outbox listener: %s", exc)
+    def _pause_for_maintenance(self, timeout):
+        with self._shutdown_lock:
+            return self._stop_business_resources(timeout, checkpoint=True, migration=True)
 
-        thread = self._outbox_thread
-        if (
-            thread is not None
-            and hasattr(thread, "is_alive")
-            and thread.is_alive()
-        ):
-            if thread is not threading.current_thread():
-                try:
-                    thread.join(timeout=join_timeout)
-                except Exception as exc:
-                    logger.warning("Failed to join outbox thread: %s", exc)
-            if thread.is_alive():
-                logger.warning("Outbox worker did not stop before shutdown deadline")
-                return
+    def _stop_business_resources(self, timeout, *, checkpoint=False, migration=False):
+        deadline = monotonic() + timeout
 
-        if self._lexical_backfill is not None:
-            if not self._lexical_backfill.close(timeout=join_timeout):
-                logger.warning("Lexical backfill did not stop before shutdown deadline")
-                return
-        if self._lexical_index is not None and self._projection_index is not None:
-            try:
-                if not self._projection_index.close(timeout=join_timeout):
-                    logger.warning("Retrieval projections did not close before deadline")
-                    return
-            except Exception as exc:
-                logger.warning("Failed to close retrieval projections: %s", exc)
-                return
-            self._projection_index = None
-            self._lexical_index = None
-            self._lexical_backfill = None
-            self._vector_index = None
-        if self._space_content_store is not None:
-            if not self._space_content_store.close(timeout=join_timeout):
-                logger.warning("Shared-space content reads are still draining")
-                return
-            self._space_content_store = None
-        if self._lexical_index is None and self._vector_index is not None:
-            close = getattr(self._vector_index, "close", None)
-            if callable(close):
-                try:
-                    if close() is False:
-                        logger.warning("Vector index is still closing; service resources retained")
-                        return
-                except Exception as exc:
-                    logger.warning("Failed to close vector index: %s", exc)
-                    return
-                self._projection_index = None
-                self._vector_index = None
+        def remaining():
+            return max(0, deadline - monotonic()) if checkpoint else timeout
+
         with self._init_lock:
-            if self._sql_pool is not None:
-                self._sql_pool.close_all()
-            self._outbox_listener = None
-            self._outbox_thread = None
-            self._outbox_stop.clear()
-            self._outbox_wakeup.clear()
+            self._outbox_stop.set()
+            self._outbox_wakeup.set()
+        if migration and self._outbox_thread is not None:
+            self._restart_after_maintenance.add("outbox")
+        if self._space_worker is not None:
+            if not self._space_worker.stop(timeout=remaining()):
+                return False
+            self._space_worker = None
+        if self._scene_manager is not None:
+            if migration and self._scene_manager.running:
+                self._restart_after_maintenance.add("scene")
+            if not self._scene_manager.stop(timeout=remaining()):
+                return False
+            self._scene_manager = None
+        if self._extraction_retry.close(remaining()) is False:
+            return False
+        if self.stop_skill_sedimentation(timeout=remaining()) is False:
+            return False
+        listener = self._outbox_listener
+        if listener is not None:
+            listener.stop()
+        thread = self._outbox_thread
+        if thread is not None and thread.is_alive():
+            if thread is threading.current_thread():
+                return False
+            thread.join(timeout=remaining())
+            if thread.is_alive():
+                return False
+        self._outbox_listener = None
 
+        scene_index = getattr(self._scene_source, "candidate_index", None)
+        if scene_index is not None:
+            if not scene_index.close(timeout=remaining()):
+                return False
+            self._scene_source = None
+        if self._code_workspace_sync_service is not None:
+            sync = self._code_workspace_sync_service
+            if migration and sync.running:
+                self._restart_after_maintenance.add("code_sync")
+            sync.shutdown(wait=checkpoint)
+            self._code_workspace_sync_service = None
+        if self._lexical_backfill is not None:
+            if not self._lexical_backfill.close(timeout=remaining()):
+                return False
+            self._lexical_backfill = None
+        if self._tool_result_io_runner is not None and not self._tool_result_io_runner.wait_idle(remaining()):
+            return False
+        if checkpoint and monotonic() >= deadline:
+            return False
+        if checkpoint and self._session_mgr is not None:
+            fallback = RequestContext(self._default_account_id, self._default_user_id,
+                                      self._default_agent_id, "", "migration", Role.ROOT)
+            self._session_mgr.checkpoint_sessions(fallback, partial(self._session_mutation_scope, refresh=False))
+        if self._space_content_store is not None:
+            if not self._space_content_store.close(timeout=remaining()):
+                return False
+            self._space_content_store = None
+        if self._agfs_fts is not None:
+            if not self._agfs_fts.close(remaining()):
+                return False
+            self._agfs_fts = None
+
+        projection = self._projection_index
+        if projection is not None and self._lexical_index is not None:
+            release = getattr(projection, "release_for_migration", None) if migration else None
+            if (release or projection.close)(timeout=remaining()) is False:
+                return False
+        elif self._vector_index is not None:
+            vector = self._vector_index
+            release = getattr(vector, "release_for_migration", None) if migration else None
+            close = release or getattr(vector, "close", None)
+            if callable(close) and close() is False:
+                return False
+            if not callable(close) and not checkpoint:
+                # Keep an in-process index available for the next worker.
+                self._outbox_thread = None
+                return True
+        self._projection_index = self._lexical_index = self._vector_index = None
+        self._outbox_thread = None
+        return not checkpoint or monotonic() <= deadline
+
+    def _reset_business_caches(self, *, modified):
+        """Invalidate read/write clients and caches after maintenance."""
+        # Identity/authentication clients are deliberately retained. All business
+        # clients and session caches will be opened lazily from restored storage.
+        for name in (
+            '_agfs_fts', '_migration_context_fs', '_read_api', '_write_api', '_archive_store', '_trace_event_store',
+            '_vector_index', '_projection_index', '_lexical_index', '_lexical_backfill',
+            '_graph_component_cache', '_bm25_index', '_outbox_listener', '_outbox_thread',
+            '_skill_sedimentation_service', '_skill_sedimentation_worker', '_skill_sedimentation_thread',
+            '_code_resource_lifecycle_service', '_code_workspace_sync_service', '_code_retrieval_service',
+            '_code_file_edit_service', '_tool_output_filter_service',
+            '_scene_manager', '_scene_ranker', '_scene_source', '_scene_service',
+            '_tool_result_store', '_tool_result_externalizer', '_tool_result_turn_ledger',
+            '_tool_result_io_runner', '_tool_result_governance',
+            '_space_worker', '_space_repository', '_space_content_store',
+        ):
+            setattr(self, name, None)
+        self._archive_store_failed = False
+        # A cancelled preflight keeps buffered sessions and pending extraction.
+        if modified:
+            self._session_mgr = self._extraction_discovery = None
+            self._extraction_retry = ExtractionRetryWorker(self)
+
+    def _resume_after_maintenance(self):
+        self._outbox_stop.clear()
+        self._extraction_retry.resume()
+        if self._cfg.tool_result_externalization_enabled:
+            self._initialize_tool_result_externalization(self._configured_tool_result_store)
+        if getattr(self._cfg, 'shared_spaces_enabled', False):
+            self._start_space_worker()
+        if self._cfg.skill_sedimentation_enabled:
+            self._start_skill_sedimentation_worker()
+        self.start_extraction_recovery()
+        if "code_sync" in self._restart_after_maintenance:
+            self._get_code_workspace_sync_service().start()
+            self._restart_after_maintenance.remove("code_sync")
+        if "scene" in self._restart_after_maintenance:
+            self._ensure_scene_runtime()
+            self._scene_manager.start()
+            self._restart_after_maintenance.remove("scene")
+        if "outbox" in self._restart_after_maintenance:
+            self._start_outbox_worker()
+            self._restart_after_maintenance.remove("outbox")
 
     @_serialize_lazy_initialization("_decision_client")
     def get_decision_client(self):

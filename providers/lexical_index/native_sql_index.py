@@ -259,6 +259,8 @@ def supports_native_bm25(cursor) -> bool:
 class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
     """openGauss BM25 provider backed by the native BM25 access method."""
 
+    _migration_reads = DatabaseNativeLexicalIndex._migration_reads + ("search",)
+
     supported_filters = DatabaseNativeLexicalIndex.supported_filters | {"agfs_leaves_only"}
 
     def __init__(

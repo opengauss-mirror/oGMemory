@@ -90,6 +90,9 @@ class PreparedSQLLexicalRecord:
 class SQLNativeProjectionStore:
     """Persistent lifecycle and rebuild store for a native lexical engine."""
 
+    _migration_runtime_only = True
+    _migration_reads = ("health", "ready_scopes",)
+
     supported_filters = _FILTER_COLUMNS
     _schema_version = _SCHEMA_VERSION
 
