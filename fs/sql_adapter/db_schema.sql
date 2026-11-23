@@ -442,6 +442,8 @@ CREATE TABLE IF NOT EXISTS cp_agents (
     PRIMARY KEY (account_id, agent_id)
 );
 ALTER TABLE cp_agents ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'active';
+CREATE INDEX IF NOT EXISTS idx_cp_agents_owner_active
+    ON cp_agents (account_id, owner_user_id, agent_id) WHERE status = 'active';
 
 CREATE TABLE IF NOT EXISTS cp_audit_logs (
     log_id      VARCHAR(36)  PRIMARY KEY,

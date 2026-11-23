@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import re
+from datetime import UTC, datetime
+from itertools import islice
 
 from core.models import RequestContext, Role
 from server.api_keys import APIKeyManager
@@ -23,6 +25,17 @@ class TenantAdminService:
             row["user_count"] = len(self._key_manager.get_users(row["account_id"]))
         return {"accounts": rows}
 
+    def create_account(self, ctx: RequestContext, account_id: str, admin_user_id: str) -> dict:
+        self._require_root(ctx)
+        self._validate_id(account_id, "account_id")
+        self._validate_id(admin_user_id, "admin_user_id")
+        key = self._key_manager.create_account(account_id, admin_user_id)
+        self._audit.record(
+            account_id, actor=ctx.user_id, target=f"account:{account_id}", action="account_created",
+            result="success", trace_id=ctx.trace_id, details={"admin_user_id": admin_user_id},
+        )
+        return {"account_id": account_id, "user_id": admin_user_id, "user_key": key, "role": "ADMIN"}
+
     def get_account(self, ctx: RequestContext, account_id: str) -> dict:
         self._require_account_admin(ctx, account_id)
         users = self._key_manager.get_users(account_id)
@@ -36,6 +49,7 @@ class TenantAdminService:
         self._require_account_admin(ctx, account_id)
         if not self._account_exists(account_id):
             raise ValueError(f"account not found: {account_id}")
+        self._validate_id(user_id, "user_id")
         stored_role = self._storage_role_name(role)
         key = self._key_manager.register_user(account_id, user_id, stored_role)
         self._audit.record(
@@ -54,13 +68,20 @@ class TenantAdminService:
             "role": self._public_role_name(stored_role),
         }
 
-    def list_users(self, ctx: RequestContext, account_id: str) -> dict:
+    def list_users(self, ctx: RequestContext, account_id: str, *, limit=None, after="", q="") -> dict:
         self._require_account_admin(ctx, account_id)
-        return {"users": self._key_manager.get_users(account_id)}
+        read_page = getattr(self._store, "list_identity_page", None)
+        if limit is not None and read_page is not None:
+            return self._page("users", "user_id", read_page("users", account_id, limit, after, q), limit)
+        users = [
+            {field: user[field] for field in ("user_id", "role", "status", "created_at") if field in user}
+            for user in self._key_manager.get_users(account_id)
+        ]
+        return self._filter_page("users", "user_id", users, limit, after, q)
 
     def delete_user(self, ctx: RequestContext, account_id: str, user_id: str) -> dict:
         self._require_account_admin(ctx, account_id)
-        deleted = self._key_manager.delete_user(account_id, user_id)
+        deleted = self._key_manager.delete_user(account_id, user_id, preserve_admin=True)
         self._audit.record(
             account_id,
             actor=ctx.user_id,
@@ -82,9 +103,9 @@ class TenantAdminService:
         }
 
     def set_role(self, ctx: RequestContext, account_id: str, user_id: str, role: str) -> dict:
-        self._require_root(ctx)
+        self._require_account_admin(ctx, account_id)
         stored_role = self._storage_role_name(role)
-        ok = self._key_manager.set_role(account_id, user_id, stored_role)
+        ok = self._key_manager.set_role(account_id, user_id, stored_role, preserve_admin=True)
         self._audit.record(
             account_id,
             actor=ctx.user_id,
@@ -96,31 +117,77 @@ class TenantAdminService:
         )
         return {"updated": ok, "role": self._public_role_name(stored_role)}
 
-    def list_agents(self, ctx: RequestContext, account_id: str) -> dict:
+    def reveal_member_key(self, ctx: RequestContext, account_id: str, user_id: str) -> dict:
         self._require_account_admin(ctx, account_id)
+        key = self._key_manager.get_member_key(account_id, user_id)
+        if not key:
+            raise FileNotFoundError("Active member key not found")
+        self._audit.record(
+            account_id, actor=ctx.user_id, target=f"user:{user_id}", action="user_key_revealed",
+            result="success", trace_id=ctx.trace_id,
+        )
+        return {"account_id": account_id, "user_id": user_id, "user_key": key}
+
+    def rotate_user_key(self, ctx: RequestContext, account_id: str, user_id: str) -> dict:
+        self._require_account_admin(ctx, account_id)
+        key = self._key_manager.rotate_key(account_id, user_id)
+        if key is None:
+            raise FileNotFoundError("user not found")
+        self._audit.record(
+            account_id, actor=ctx.user_id, target=f"user:{user_id}", action="user_key_rotated",
+            result="success", trace_id=ctx.trace_id,
+        )
+        return {"account_id": account_id, "user_id": user_id, "user_key": key}
+
+    def list_agents(
+        self, ctx: RequestContext, account_id: str, *, limit=None, after="", q="", owner_user_id=None,
+    ) -> dict:
+        self._require_account_admin(ctx, account_id)
+        read_page = getattr(self._store, "list_identity_page", None)
+        if limit is not None and read_page is not None:
+            rows = read_page("agents", account_id, limit, after, q, owner_user_id=owner_user_id)
+            return self._page("agents", "agent_id", rows, limit)
         payload = self._store.read_json(self._store.agents_path(account_id), {"agents": {}})
-        return {
-            "agents": [
-                {"agent_id": agent_id, **meta}
-                for agent_id, meta in sorted(payload.get("agents", {}).items())
-            ]
-        }
+        agents = [
+            {"agent_id": agent_id, **meta}
+            for agent_id, meta in sorted(payload.get("agents", {}).items())
+            if owner_user_id is None or meta.get("owner_user_id") == owner_user_id
+        ]
+        return self._filter_page("agents", "agent_id", agents, limit, after, q)
+
+    @staticmethod
+    def _page(resource, id_field, rows, limit):
+        return {resource: rows[:limit], "next_after": rows[limit - 1][id_field] if len(rows) > limit else None}
+
+    def _filter_page(self, resource, id_field, rows, limit, after, q):
+        if limit is None:
+            return {resource: rows}
+        matches = (
+            row for row in rows
+            if row[id_field] > after and q.lower() in row[id_field].lower()
+        )
+        return self._page(resource, id_field, list(islice(matches, limit + 1)), limit)
 
     def create_agent(self, ctx: RequestContext, account_id: str, agent_id: str, owner_user_id: str | None = None) -> dict:
         self._require_account_admin(ctx, account_id)
-        if owner_user_id is not None and not self._user_exists(account_id, owner_user_id):
-            raise ValueError(f"owner user not found: {owner_user_id}")
-        path = self._store.agents_path(account_id)
-        payload = self._store.read_json(path, {"agents": {}})
-        payload.setdefault("agents", {})
-        if agent_id in payload["agents"]:
-            raise ValueError(f"agent already exists: {agent_id}")
-        now = datetime.now(timezone.utc).isoformat()
-        payload["agents"][agent_id] = {
-            "owner_user_id": owner_user_id or ctx.user_id,
-            "created_at": now,
-        }
-        self._store.write_json(path, payload)
+        self._validate_id(agent_id, "agent_id")
+        if not self._account_exists(account_id):
+            raise ValueError(f"account not found: {account_id}")
+        owner_user_id = "" if owner_user_id is None else owner_user_id
+        with self._key_manager.identity_mutation(account_id):
+            if owner_user_id != "" and not self._user_exists(account_id, owner_user_id):
+                raise ValueError(f"owner user not found: {owner_user_id}")
+            path = self._store.agents_path(account_id)
+            payload = self._store.read_json(path, {"agents": {}})
+            payload.setdefault("agents", {})
+            if agent_id in payload["agents"]:
+                raise ValueError(f"agent already exists: {agent_id}")
+            now = datetime.now(UTC).isoformat()
+            payload["agents"][agent_id] = {
+                "owner_user_id": owner_user_id,
+                "created_at": now,
+            }
+            self._store.write_json(path, payload)
         self._audit.record(
             account_id,
             actor=ctx.user_id,
@@ -128,7 +195,7 @@ class TenantAdminService:
             action="agent_created",
             result="success",
             trace_id=ctx.trace_id,
-            details={"owner_user_id": owner_user_id or ctx.user_id},
+            details={"owner_user_id": owner_user_id},
         )
         return {"agent_id": agent_id, **payload["agents"][agent_id]}
 
@@ -142,17 +209,18 @@ class TenantAdminService:
 
     def update_agent(self, ctx: RequestContext, account_id: str, agent_id: str, owner_user_id: str | None = None) -> dict:
         self._require_account_admin(ctx, account_id)
-        if owner_user_id is not None and not self._user_exists(account_id, owner_user_id):
-            raise ValueError(f"owner user not found: {owner_user_id}")
-        path = self._store.agents_path(account_id)
-        payload = self._store.read_json(path, {"agents": {}})
-        payload.setdefault("agents", {})
-        if agent_id not in payload["agents"]:
-            raise FileNotFoundError(f"agent not found: {agent_id}")
-        meta = payload["agents"][agent_id]
-        if owner_user_id is not None:
-            meta["owner_user_id"] = owner_user_id
-        self._store.write_json(path, payload)
+        with self._key_manager.identity_mutation(account_id):
+            if owner_user_id not in (None, "") and not self._user_exists(account_id, owner_user_id):
+                raise ValueError(f"owner user not found: {owner_user_id}")
+            path = self._store.agents_path(account_id)
+            payload = self._store.read_json(path, {"agents": {}})
+            payload.setdefault("agents", {})
+            if agent_id not in payload["agents"]:
+                raise FileNotFoundError(f"agent not found: {agent_id}")
+            meta = payload["agents"][agent_id]
+            if owner_user_id is not None:
+                meta["owner_user_id"] = owner_user_id
+            self._store.write_json(path, payload)
         self._audit.record(
             account_id,
             actor=ctx.user_id,
@@ -183,7 +251,7 @@ class TenantAdminService:
 
     def get_agent_owner(self, account_id: str, agent_id: str) -> str | None:
         payload = self._store.read_json(self._store.agents_path(account_id), {"agents": {}})
-        return payload.get("agents", {}).get(agent_id, {}).get("owner_user_id")
+        return payload.get("agents", {}).get(agent_id, {}).get("owner_user_id") or None
 
     def list_visible_agent_ids(self, account_id: str, user_id: str, cfg) -> list[str]:
         payload = self._store.read_json(self._store.agents_path(account_id), {"agents": {}})
@@ -191,7 +259,7 @@ class TenantAdminService:
         agents = payload.get("agents", {})
         shared = set(cfg.agent_shared_list) if cfg.role_control_enabled and cfg.agent_shared_mode == "user" else set()
         for agent_id, meta in sorted(agents.items()):
-            if meta.get("owner_user_id") == user_id or agent_id in shared:
+            if (user_id and meta.get("owner_user_id") == user_id) or agent_id in shared:
                 visible.append(agent_id)
         return visible
 
@@ -238,10 +306,15 @@ class TenantAdminService:
         return normalized
 
     @staticmethod
+    def _validate_id(value: str, name: str) -> None:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+            raise ValueError(f"{name} must be 1–128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit")
+
+    @staticmethod
     def _storage_role_name(role: str) -> str:
-        normalized = str(role).strip()
-        if normalized in ("ADMIN", "admin"):
+        normalized = str(role).strip().lower()
+        if normalized == "admin":
             return "admin"
-        if normalized in ("MEMBER", "member", "user"):
+        if normalized in ("member", "user"):
             return "user"
-        return normalized
+        raise ValueError("role must be ADMIN or MEMBER")
