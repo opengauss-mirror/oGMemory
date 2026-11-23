@@ -357,6 +357,7 @@ def test_tool_units_keep_typed_history_and_rebuild_all_retrieval_layers():
     from dataclasses import replace
 
     from commit.agent_memory import AgentMemoryArchiveBuilder, AgentMemoryPolicy
+    from commit.dreaming_facts import assess_facts
     from core.uri_resolver import URIResolver
     from extraction.agent_memory import AgentMemoryExtractor, render_agent_memory
     from index.index_record_builder import build_index_records
@@ -385,6 +386,10 @@ def test_tool_units_keep_typed_history_and_rebuild_all_retrieval_layers():
              "title": "Inspect batch responses", "content": "Inspect the response for each API batch.",
              "grounding": [{"source_id": source_id}]}
     second.structured_fields["units"] = [added]
+    second.value_review = {"routing_keys": [second.routing_key], "decisions": [{
+        "id": "0:response_check", "keep": True,
+        "fields": {"title": added["title"], "content": added["content"]},
+    }]}
     second.memory_context.update(
         operation_id="second", base_units={"batch_limit": 1},
         grounding={"response_check": [{**source, "source_id": source_id}]},
@@ -422,6 +427,7 @@ def test_tool_units_keep_typed_history_and_rebuild_all_retrieval_layers():
     assert revision.metadata["agent_memory"]["units"]["response_check"]["revision"] == 2
 
     withdrawn = replace(corrected, structured_fields={**corrected.structured_fields, "units": []},
+                        value_review={"routing_keys": [corrected.routing_key], "decisions": []},
                         memory_context={**corrected.memory_context, "operation_id": "fourth",
                             "base_units": {"batch_limit": 1, "response_check": 2}, "corrections": [],
                             "removals": [{"key": "response_check", "reason": "The updated contract replaces this check.",
@@ -434,6 +440,9 @@ def test_tool_units_keep_typed_history_and_rebuild_all_retrieval_layers():
     assert final.metadata["derived_from"] == sorted({g["uri"] for g in retained["grounding"]})
     assert final.content == render_agent_memory("tool", final.metadata["structured_fields"], grounding=retained["grounding"])
     assert final.metadata["agent_memory"]["units"]["response_check"]["grounding"][0]["locator"] == source["locator"]
+    review = assess_facts(final, read_source=lambda _: page["events"])
+    assert review["units"]["batch_limit"]["confidence"] == .8
+    assert (review["value_band"], review["value_reason"]) == ("high", "reusable_agent_unit")
     assert worker.process_event(first_event).success
     assert worker.process_event(outbox.build_write_event(final)).success
     hits = index.search_by_vector([1.0, 0.0], {"account_id": "acct", "owner_space": "agent:codex"}, 10)

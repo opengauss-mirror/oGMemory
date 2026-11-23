@@ -96,6 +96,11 @@ def agent_source_id(uri):
     return "s" + hashlib.sha256(uri.encode()).hexdigest()[:24]
 
 
+def agent_source_body(event):
+    fields = {key: value for key, value in event.items() if key not in {"ordinal", "event_type", "truncated"}}
+    return json.dumps(fields, ensure_ascii=False) if fields else ""
+
+
 def memory_units(category, fields):
     """Return active units from the canonical category-specific content fields."""
     return fields.get("units", []) if category == "tool" else ([fields] if fields else [])
@@ -254,10 +259,9 @@ class AgentMemoryExtractor:
                 break
             kind = event["event_type"]
             lane = "tool" if kind.startswith("tool_") else "experience"
-            content = {k: v for k, v in event.items() if k not in {"ordinal", "event_type", "truncated"}}
-            if not content:
+            body = agent_source_body(event)
+            if not body:
                 continue
-            body = json.dumps(content, ensure_ascii=False)
             fingerprint = hashlib.sha256(body.encode()).hexdigest()
             excerpt = body[:min(10000, remaining)]
             remaining -= len(excerpt)

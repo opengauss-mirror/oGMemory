@@ -2,6 +2,7 @@
 import json
 import re
 from copy import deepcopy
+from hashlib import sha256
 
 from core.interfaces import ContextFS, MergePolicy
 from core.models import CandidateMemory, RequestContext, WritePlan
@@ -39,6 +40,28 @@ def _unique(values):
 def _same_content(before, after):
     return ({name: value for name, value in before.items() if name != 'grounding'} ==
             {name: value for name, value in after.items() if name != 'grounding'})
+
+
+def reviewed_agent_units(units, routing_key, audit, recorded=None):
+    """Bind retained review decisions to the active title and content."""
+    def version(unit):
+        return sha256(json.dumps([unit['title'], unit['content']], ensure_ascii=False).encode()).hexdigest()
+
+    versions = {key: version(unit) for key, unit in units.items()}
+    recorded = recorded if isinstance(recorded, dict) else {}
+    reviewed = {key: digest for key, digest in versions.items() if recorded.get(key) == digest}
+    if not isinstance(audit, dict):
+        return reviewed
+    positions = {str(index) for index, key in enumerate(audit.get('routing_keys') or []) if key == routing_key}
+    for decision in audit.get('decisions') or []:
+        if not isinstance(decision, dict) or decision.get('keep') is not True:
+            continue
+        position, _, key = str(decision.get('id', '')).partition(':')
+        fields = decision.get('fields') or {}
+        if (position in positions and key in units and isinstance(fields, dict)
+                and all(fields.get(field) == units[key][field] for field in ('title', 'content'))):
+            reviewed[key] = versions[key]
+    return reviewed
 
 
 def _merge_grounding(previous, current):
@@ -265,8 +288,13 @@ class AgentMemoryPolicy(MergePolicy):
         previous = existing.metadata.get('provenance_ids', []) if existing else []
         _need(isinstance(previous, list) and isinstance(candidate.provenance_ids, list)
               and all(_text(value) for value in previous+candidate.provenance_ids), 'AGENT_MEMORY_PROVENANCE_INVALID')
+        metadata = existing.metadata if existing else {}
+        old_reviews = reviewed_agent_units(old_items, candidate.routing_key, metadata.get('agent_memory_value_review'),
+                                           metadata.get('agent_memory_unit_reviews'))
+        unit_reviews = reviewed_agent_units(merged, candidate.routing_key, candidate.value_review, old_reviews)
         return WritePlan(action='merge' if existing or archived_version is not None else 'create', target_uri=target,
             merged_fields={'agent_memory_fields': full, 'agent_memory_context': state,
+                           'agent_memory_unit_reviews': unit_reviews,
                            'expected_version': version,
                            'provenance_ids': _unique([*previous, *candidate.provenance_ids])},
             relation_edges=[])
@@ -296,6 +324,7 @@ class AgentMemoryArchiveBuilder:
             "agent_memory_layers_version": 2,
             "structured_fields": fields, "agent_memory": state,
             "agent_memory_value_review": deepcopy(candidate.value_review),
+            "agent_memory_unit_reviews": plan.merged_fields["agent_memory_unit_reviews"],
             "provenance_ids": plan.merged_fields["provenance_ids"],
             "derived_from": sorted({g["uri"] for g in grounding}),
             "_expected_version": plan.merged_fields["expected_version"],
