@@ -123,7 +123,7 @@ def test_mixed_query_retains_each_tool_unit_and_user_memory(unit_memory, expand_
                                  HierarchicalSearcher(index, cfg), ResultRanker(cfg), cfg,
                                  context_reader=reader)
     api = ReadAPI(pipeline, reader, cfg)
-    service = SimpleNamespace(_cfg=SimpleNamespace(), get_read_api=lambda: api,
+    service = SimpleNamespace(_cfg=SimpleNamespace(retrieval_default_top_k=10, retrieval_max_top_k=50), get_read_api=lambda: api,
                               _get_context_fs=lambda: fs)
 
     response = query_memory(service, query="search research memory", request_context=ctx)
