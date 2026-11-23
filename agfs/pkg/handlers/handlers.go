@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
@@ -26,6 +27,7 @@ import (
 
 // Handler wraps the FileSystem and provides HTTP handlers
 type Handler struct {
+	registrations  sync.Map
 	fs             filesystem.FileSystem
 	version        string
 	gitCommit      string
@@ -309,7 +311,16 @@ func (h *Handler) ListDirectory(w http.ResponseWriter, r *http.Request) {
 		path = "/"
 	}
 
-	files, err := h.fs.ReadDir(path)
+	readDir := h.fs.ReadDir
+	if r.URL.Query().Get("fresh") == "true" {
+		if reader, ok := h.fs.(interface {
+			ReadDirFresh(string) ([]filesystem.FileInfo, error)
+		}); ok {
+			readDir = reader.ReadDirFresh
+		}
+		w.Header().Set("X-AGFS-Fresh", "true")
+	}
+	files, err := readDir(path)
 	if err != nil {
 		// Map error to appropriate HTTP status code
 		status := mapErrorToStatus(err)
@@ -623,21 +634,8 @@ func (h *Handler) Touch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SuccessResponse{Message: "touched"})
 }
 
-// SetupRoutes sets up all HTTP routes with /api/v1 prefix
-func (h *Handler) SetupRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/v1/health", h.Health)
-	mux.HandleFunc("/api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		h.Capabilities(w, r)
-	})
-
-	// Setup handle routes (file handles for stateful operations)
-	h.SetupHandleRoutes(mux)
-
-	mux.HandleFunc("/api/v1/files", func(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) setupFileRoutes(mux *http.ServeMux, prefix string) {
+	mux.HandleFunc(prefix+"/files", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
 			h.CreateFile(w, r)
@@ -651,7 +649,7 @@ func (h *Handler) SetupRoutes(mux *http.ServeMux) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 	})
-	mux.HandleFunc("/api/v1/directories", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(prefix+"/directories", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
 			h.CreateDirectory(w, r)
@@ -663,20 +661,39 @@ func (h *Handler) SetupRoutes(mux *http.ServeMux) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 	})
-	mux.HandleFunc("/api/v1/stat", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(prefix+"/stat", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		h.Stat(w, r)
 	})
-	mux.HandleFunc("/api/v1/rename", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(prefix+"/rename", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		h.Rename(w, r)
 	})
+}
+
+// SetupRoutes sets up all HTTP routes with /api/v1 prefix
+func (h *Handler) SetupRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/v1/registration-session", h.registration)
+	mux.HandleFunc("/api/v1/registration-session/", h.registrationOperation)
+	mux.HandleFunc("/api/v1/health", h.Health)
+	mux.HandleFunc("/api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.Capabilities(w, r)
+	})
+
+	// Setup handle routes (file handles for stateful operations)
+	h.SetupHandleRoutes(mux)
+
+	h.setupFileRoutes(mux, "/api/v1")
 	mux.HandleFunc("/api/v1/chmod", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")

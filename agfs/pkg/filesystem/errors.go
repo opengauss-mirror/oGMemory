@@ -25,7 +25,8 @@ var (
 	ErrNotDirectory = errors.New("not a directory")
 
 	// ErrNotSupported indicates the operation is not supported by this filesystem
-	ErrNotSupported = errors.New("operation not supported")
+	ErrNotSupported     = errors.New("operation not supported")
+	ErrRegistrationBusy = errors.New("workspace registration is busy")
 )
 
 // NotFoundError represents a file or directory not found error with context

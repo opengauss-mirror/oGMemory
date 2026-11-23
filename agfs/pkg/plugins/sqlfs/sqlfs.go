@@ -204,9 +204,9 @@ func (p *SQLFSPlugin) Shutdown() error {
 
 // SQLFS implements FileSystem interface using a database backend
 type SQLFS struct {
-	db         *sql.DB
+	db         sqlExecutor
 	backend    DBBackend
-	mu         sync.RWMutex
+	mu         *sync.RWMutex
 	pluginName string
 	listCache  *ListDirCache // cache for directory listings
 }
@@ -252,6 +252,7 @@ func NewSQLFS(backend DBBackend, config map[string]interface{}) (*SQLFS, error) 
 	}
 
 	fs := &SQLFS{
+		mu:         new(sync.RWMutex),
 		db:         db,
 		backend:    backend,
 		pluginName: PluginName,
@@ -303,6 +304,21 @@ func (fs *SQLFS) ensureRootExists() error {
 	}
 
 	return nil
+}
+
+func (fs *SQLFS) RegistrationLockFile(_ string) (string, error) {
+	if fs.backend.GetDriverName() != "sqlite3" {
+		return "", nil
+	}
+	var seq int
+	var name, file string
+	if err := fs.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+		return "", err
+	}
+	if file == "" {
+		return "", nil
+	}
+	return file + ".registration.sqlite", nil
 }
 
 // Close closes the database connection
@@ -638,13 +654,21 @@ func (fs *SQLFS) Write(path string, data []byte, offset int64, flags filesystem.
 }
 
 func (fs *SQLFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
+	return fs.readDir(path, true)
+}
+
+// ReadDirFresh reads the committed directory entries across SQLFS instances.
+func (fs *SQLFS) ReadDirFresh(path string) ([]filesystem.FileInfo, error) {
+	return fs.readDir(path, false)
+}
+
+func (fs *SQLFS) readDir(path string, cached bool) ([]filesystem.FileInfo, error) {
 	path = filesystem.NormalizePath(path)
-
-	// Try to get from cache first
-	if files, found := fs.listCache.Get(path); found {
-		return files, nil
+	if cached {
+		if files, found := fs.listCache.Get(path); found {
+			return files, nil
+		}
 	}
-
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 
@@ -705,9 +729,9 @@ func (fs *SQLFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
 		return nil, err
 	}
 
-	// Cache the result
-	fs.listCache.Put(path, files)
-
+	if cached {
+		fs.listCache.Put(path, files)
+	}
 	return files, nil
 }
 

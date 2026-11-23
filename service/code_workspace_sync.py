@@ -476,20 +476,6 @@ class CodeWorkspaceSyncService:
         cap = self._max_files_setting(max_files)
         effective_wait_mode = self._wait_mode(wait_mode)
         hints = normalize_language_hints(language_hints)
-        root_slug, fingerprint = self._resolve_registration_binding(
-            root,
-            server_accessible=server_accessible,
-            ctx=ctx,
-            name=name,
-            root_id=root_id,
-            expected_fingerprint=fingerprint,
-        )
-        self._reserve_root_binding(
-            ctx=ctx,
-            root_id=root_id,
-            root_slug=root_slug,
-            fingerprint=fingerprint,
-        )
         now = self._clock()
         canonical_path = str(root)
 
@@ -521,15 +507,41 @@ class CodeWorkspaceSyncService:
             )
             return state
 
-        state = self._store.mutate_code_workspace_sync_state(
-            ctx.account_id,
-            root_id,
-            transition,
-        )
+        with self._store.code_workspace_registration_lock():
+            root_slug, fingerprint = self._resolve_registration_binding(
+                root,
+                server_accessible=server_accessible,
+                ctx=ctx,
+                name=name,
+                root_id=root_id,
+                expected_fingerprint=fingerprint,
+            )
+            self._reserve_root_binding(
+                ctx=ctx,
+                root_id=root_id,
+                root_slug=root_slug,
+                fingerprint=fingerprint,
+            )
+            state = self._store.mutate_code_workspace_sync_state(
+                ctx.account_id, root_id, transition
+            )
         self._remember_context(ctx, root_id)
         if bool(getattr(self._cfg, "code_sync_enabled", False)):
             self.start()
         return self._render_state(state, accepted=True, filesystem_complete=False)
+
+    def _check_directory_conflict(self, root: Path) -> None:
+        for _, registered_id, state in self._store.list_code_workspace_sync_registrations():
+            if registered_id == CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID:
+                continue
+            path = state.get("workspace_path")
+            if not isinstance(path, str) or "\x00" in path:
+                raise RuntimeError("workspace registry record is unreadable")
+            registered_root = Path(path)
+            if not registered_root.is_absolute() or ".." in registered_root.parts:
+                raise RuntimeError("workspace registry record is unreadable")
+            if root.is_relative_to(registered_root) or registered_root.is_relative_to(root):
+                raise FileExistsError("workspace directory conflicts with an existing registration")
 
     def get_state(self, *, root_id: str, ctx: RequestContext) -> dict[str, Any]:
         """Return a non-sensitive freshness projection for one registered root."""
@@ -1173,6 +1185,8 @@ class CodeWorkspaceSyncService:
                     "workspace root fingerprint is already registered with a different root slug"
                 )
             requested_name = existing_slug
+        else:
+            self._check_directory_conflict(root)
         if server_accessible:
             binding = self._lifecycle.resolve_workspace_binding(
                 workspace_root=root,

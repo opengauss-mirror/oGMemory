@@ -516,6 +516,14 @@ func (mfs *MountableFS) Write(path string, data []byte, offset int64, flags file
 }
 
 func (mfs *MountableFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
+	return mfs.readDir(path, false)
+}
+
+func (mfs *MountableFS) ReadDirFresh(path string) ([]filesystem.FileInfo, error) {
+	return mfs.readDir(path, true)
+}
+
+func (mfs *MountableFS) readDir(path string, fresh bool) ([]filesystem.FileInfo, error) {
 	// Lock-free implementation
 	path = filesystem.NormalizePath(path)
 
@@ -523,7 +531,14 @@ func (mfs *MountableFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
 	mount, relPath, found := mfs.findMount(path)
 	if found {
 		// Get contents from the mounted filesystem
-		infos, err := mount.Plugin.GetFileSystem().ReadDir(relPath)
+		fs := mount.Plugin.GetFileSystem()
+		readDir := fs.ReadDir
+		if reader, ok := fs.(interface {
+			ReadDirFresh(string) ([]filesystem.FileInfo, error)
+		}); fresh && ok {
+			readDir = reader.ReadDirFresh
+		}
+		infos, err := readDir(relPath)
 		if err != nil {
 			return nil, err
 		}

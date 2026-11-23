@@ -12,6 +12,8 @@ import copy
 import logging
 import threading
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from fs.sql_adapter.pool import PoolAdapterMixin
@@ -30,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 # Sentinel prefix — never collides with real filesystem paths.
 _CP = "__cp__"
+_registration_connection: ContextVar[tuple[object, Any] | None] = ContextVar(
+    "workspace_registration_connection", default=None
+)
 
 
 class SQLControlPlaneStore(PoolAdapterMixin):
@@ -38,6 +43,45 @@ class SQLControlPlaneStore(PoolAdapterMixin):
     Path helpers return sentinel strings that ``read_json`` / ``write_json``
     dispatch to the correct table operations.
     """
+
+    _registration_lock = threading.Lock()
+
+    @contextmanager
+    def code_workspace_registration_lock(self):
+        """Use a separate connection so registration also works with pool_size=1."""
+        with self._registration_lock:
+            conn = psycopg2.connect(self._connection_string, connect_timeout=5)
+            token = _registration_connection.set((self, conn))
+            try:
+                # The scan after the advisory lock must see the previous holder's commit.
+                conn.set_session(isolation_level="READ COMMITTED")
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL statement_timeout = 5000")
+                    cur.execute("SELECT pg_advisory_xact_lock(%s)", (0x4F474D5753524547,))
+                yield
+                conn.commit()
+            finally:
+                _registration_connection.reset(token)
+                conn.close()
+
+    @contextmanager
+    def _workspace_sync_connection(self, *, write=False):
+        active = _registration_connection.get()
+        if active is not None and active[0] is self:
+            yield active[1]
+            return
+        conn = self._get_connection()
+        try:
+            yield conn
+            if write:
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
 
     def __init__(
         self,
@@ -98,8 +142,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         """Read the protected durable state for one registered workspace."""
 
         self._validate_workspace_sync_identity(account_id, root_id)
-        conn = self._get_connection()
-        try:
+        with self._workspace_sync_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT state, lease_owner, lease_expires_at "
@@ -114,9 +157,6 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             state["lease_owner"] = row[1]
             state["lease_expires_at"] = row[2].timestamp() if row[2] is not None else None
             return state
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
 
     def write_code_workspace_sync_state(
         self,
@@ -135,8 +175,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         """List one account's durable workspace states for reconciliation."""
 
         self._validate_workspace_sync_identity(account_id, "registry")
-        conn = self._get_connection()
-        try:
+        with self._workspace_sync_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT root_id, state, lease_owner, lease_expires_at "
@@ -154,17 +193,13 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 )
                 result.append((root_id, state))
             return result
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
 
     def list_code_workspace_sync_registrations(
         self,
     ) -> list[tuple[str, str, dict[str, Any]]]:
         """List durable workspace registrations for server-owned recovery."""
 
-        conn = self._get_connection()
-        try:
+        with self._workspace_sync_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT account_id, root_id, state, lease_owner, lease_expires_at "
@@ -186,9 +221,6 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 )
                 result.append((account_id, root_id, state))
             return result
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
 
     def mutate_code_workspace_sync_state(
         self,
@@ -201,8 +233,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         self._validate_workspace_sync_identity(account_id, root_id)
         if not callable(mutator):
             raise ValueError("workspace sync mutator must be callable")
-        conn = self._get_connection()
-        try:
+        with self._workspace_sync_connection(write=True) as conn:
             with conn.cursor() as cur:
                 self.sql_dialect.ensure_workspace_root(cur, account_id, root_id)
                 cur.execute(
@@ -236,13 +267,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                         root_id,
                     ),
                 )
-            conn.commit()
             return result
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self._return_connection(conn)
 
     @staticmethod
     def _validate_workspace_sync_identity(account_id: str, root_id: str) -> None:

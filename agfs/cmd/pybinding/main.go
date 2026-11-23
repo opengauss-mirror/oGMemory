@@ -14,6 +14,7 @@ import (
 	"path"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -39,14 +40,16 @@ import (
 )
 
 var (
-	globalFS      *mountablefs.MountableFS
-	globalFSMu    sync.RWMutex
-	handleMap     = make(map[int64]filesystem.FileHandle)
-	handleMapMu   sync.RWMutex
-	handleIDGen   int64
-	errorBuffer   = make(map[int64]string)
-	errorBufferMu sync.RWMutex
-	errorIDGen    int64
+	globalFS          *mountablefs.MountableFS
+	globalFSMu        sync.RWMutex
+	registrationLocks sync.Map
+	registrationID    atomic.Int64
+	handleMap         = make(map[int64]filesystem.FileHandle)
+	handleMapMu       sync.RWMutex
+	handleIDGen       int64
+	errorBuffer       = make(map[int64]string)
+	errorBufferMu     sync.RWMutex
+	errorIDGen        int64
 )
 
 func init() {
@@ -122,6 +125,45 @@ func removeHandle(id int64) {
 	handleMapMu.Unlock()
 }
 
+//export AGFS_LockRegistration
+func AGFS_LockRegistration(clientID int64, path *C.char) *C.char {
+	globalFSMu.RLock()
+	fs := globalFS
+	globalFSMu.RUnlock()
+	locked, err := fs.LockRegistration(C.GoString(path))
+	if err == mountablefs.ErrRegistrationUnsupported {
+		return C.CString(`{"supported":false}`)
+	}
+	if err != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(err)))
+	}
+	id := -registrationID.Add(1)
+	registrationLocks.Store(id, locked)
+	return C.CString(fmt.Sprintf(`{"supported":true,"id":%d}`, id))
+}
+
+//export AGFS_UnlockRegistration
+func AGFS_UnlockRegistration(id int64) {
+	if release, ok := registrationLocks.LoadAndDelete(id); ok {
+		release.(*mountablefs.Registration).Close()
+	}
+}
+
+func clientFilesystem(id int64) (*mountablefs.MountableFS, func(), error) {
+	if id < 0 {
+		if value, ok := registrationLocks.Load(id); ok {
+			lock := value.(*mountablefs.Registration)
+			if done, open := lock.Enter(); open {
+				return lock.FS, done, nil
+			}
+		}
+		return nil, nil, fmt.Errorf("registration session closed")
+	}
+	globalFSMu.RLock()
+	defer globalFSMu.RUnlock()
+	return globalFS, func() {}, nil
+}
+
 //export AGFS_NewClient
 func AGFS_NewClient() int64 {
 	return 1
@@ -159,12 +201,27 @@ func AGFS_GetCapabilities(clientID int64) *C.char {
 
 //export AGFS_Ls
 func AGFS_Ls(clientID int64, path *C.char) *C.char {
-	p := C.GoString(path)
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	return listDirectory(clientID, path, false)
+}
 
-	files, err := fs.ReadDir(p)
+//export AGFS_LsFresh
+func AGFS_LsFresh(clientID int64, path *C.char) *C.char {
+	return listDirectory(clientID, path, true)
+}
+
+func listDirectory(clientID int64, path *C.char, fresh bool) *C.char {
+	p := C.GoString(path)
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(sessionErr)))
+	}
+	defer done()
+
+	readDir := fs.ReadDir
+	if fresh {
+		readDir = fs.ReadDirFresh
+	}
+	files, err := readDir(p)
 	if err != nil {
 		errorID := storeError(err)
 		return C.CString(fmt.Sprintf(`{"error_id": %d}`, errorID))
@@ -188,9 +245,11 @@ func AGFS_Ls(clientID int64, path *C.char) *C.char {
 //export AGFS_Read
 func AGFS_Read(clientID int64, path *C.char, offset C.int64_t, size C.int64_t, outData **C.char, outSize *C.int64_t) C.int64_t {
 	p := C.GoString(path)
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.int64_t(storeError(sessionErr))
+	}
+	defer done()
 
 	data, err := fs.Read(p, int64(offset), int64(size))
 	if err != nil && err.Error() != "EOF" {
@@ -213,9 +272,11 @@ func AGFS_Write(clientID int64, path *C.char, data unsafe.Pointer, dataSize C.in
 	p := C.GoString(path)
 	bytesData := C.GoBytes(data, C.int(dataSize))
 
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(sessionErr)))
+	}
+	defer done()
 
 	n, err := fs.Write(p, bytesData, -1, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate)
 	if err != nil {
@@ -230,9 +291,11 @@ func AGFS_Write(clientID int64, path *C.char, data unsafe.Pointer, dataSize C.in
 func AGFS_Create(clientID int64, path *C.char) *C.char {
 	p := C.GoString(path)
 
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(sessionErr)))
+	}
+	defer done()
 
 	err := fs.Create(p)
 	if err != nil {
@@ -247,9 +310,11 @@ func AGFS_Create(clientID int64, path *C.char) *C.char {
 func AGFS_Mkdir(clientID int64, path *C.char, mode C.uint) *C.char {
 	p := C.GoString(path)
 
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(sessionErr)))
+	}
+	defer done()
 
 	err := fs.Mkdir(p, uint32(mode))
 	if err != nil {
@@ -264,9 +329,11 @@ func AGFS_Mkdir(clientID int64, path *C.char, mode C.uint) *C.char {
 func AGFS_Rm(clientID int64, path *C.char, recursive C.int) *C.char {
 	p := C.GoString(path)
 
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(sessionErr)))
+	}
+	defer done()
 
 	var err error
 	if recursive != 0 {
@@ -287,9 +354,11 @@ func AGFS_Rm(clientID int64, path *C.char, recursive C.int) *C.char {
 func AGFS_Stat(clientID int64, path *C.char) *C.char {
 	p := C.GoString(path)
 
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(sessionErr)))
+	}
+	defer done()
 
 	info, err := fs.Stat(p)
 	if err != nil {
@@ -303,6 +372,7 @@ func AGFS_Stat(clientID int64, path *C.char) *C.char {
 		"mode":    info.Mode,
 		"modTime": info.ModTime.Format(time.RFC3339Nano),
 		"isDir":   info.IsDir,
+		"meta":    info.Meta,
 	}
 
 	data, _ := json.Marshal(result)
@@ -314,9 +384,11 @@ func AGFS_Mv(clientID int64, oldPath *C.char, newPath *C.char) *C.char {
 	oldP := C.GoString(oldPath)
 	newP := C.GoString(newPath)
 
-	globalFSMu.RLock()
-	fs := globalFS
-	globalFSMu.RUnlock()
+	fs, done, sessionErr := clientFilesystem(clientID)
+	if sessionErr != nil {
+		return C.CString(fmt.Sprintf(`{"error_id":%d}`, storeError(sessionErr)))
+	}
+	defer done()
 
 	err := fs.Rename(oldP, newP)
 	if err != nil {

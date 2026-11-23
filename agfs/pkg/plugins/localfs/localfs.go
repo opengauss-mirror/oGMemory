@@ -75,6 +75,11 @@ func (fs *LocalFS) ResolvePath(path string) string {
 	return fs.resolvePath(path)
 }
 
+func (fs *LocalFS) RegistrationLockFile(path string) (string, error) {
+	filename := fs.resolvePath(path) + ".sqlite"
+	return filename, os.MkdirAll(filepath.Dir(filename), 0755)
+}
+
 func (fs *LocalFS) Create(path string) error {
 	localPath := fs.resolvePath(path)
 
