@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Literal
+from unicodedata import normalize
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,34 @@ def eligible_for_promotion(evidence: Iterable[Evidence]) -> bool:
     return len(weights) >= 2 and all(
         support > 0 and refutation == 0 for support, refutation in weights.values()
     )
+
+
+@dataclass(frozen=True)
+class Claim:
+    subject: str
+    predicate: str
+    value: str
+    scope: str = ""
+    qualifiers: tuple[str, ...] = ()
+    occurrence_id: str = ""
+
+    def identity(self) -> tuple[str, ...]:
+        return tuple(normalize("NFC", part.strip()) for part in (
+            self.subject, self.predicate, self.value, self.scope, self.occurrence_id,
+            *self.qualifiers,
+        ))
+
+
+def equivalent(left: Claim, right: Claim) -> bool:
+    return left.identity() == right.identity()
+
+
+def split_claims(claims: Iterable[Claim]) -> tuple[Claim, ...]:
+    """Keep atomic claims in source order."""
+    distinct: dict[tuple[str, ...], Claim] = {}
+    for claim in claims:
+        distinct.setdefault(claim.identity(), claim)
+    return tuple(distinct.values())
 
 
 def valid_at(at: datetime, *, valid_from: datetime | None = None, valid_to: datetime | None = None) -> bool:

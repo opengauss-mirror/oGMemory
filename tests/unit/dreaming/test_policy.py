@@ -1,13 +1,17 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from commit.dreaming_policy import (
+    Claim,
     Evidence,
     Lifecycle,
     advance_lifecycle,
     eligible_for_promotion,
+    equivalent,
     evidence_score,
+    split_claims,
 )
 
 
@@ -51,3 +55,19 @@ def test_protected_memory_stays_active_during_cold_storage():
     )
 
     assert (result.tier, result.eligibility) == ("cold", "active")
+
+
+def test_grouped_tool_claims_split_into_distinct_claims():
+    timezone = Claim("calendar", "requires", "timezone", "calendar API")
+    limit = Claim("calendar", "limit", "100", "calendar API")
+    timezone_copy = replace(timezone, value="timezone ")
+
+    assert equivalent(timezone, timezone_copy)
+    assert split_claims([timezone, limit, timezone_copy]) == (timezone, limit)
+
+
+def test_same_meeting_title_retains_both_occurrences():
+    first = Claim("project", "held", "review", occurrence_id="2026-11-18")
+    second = replace(first, occurrence_id="2026-11-21")
+
+    assert split_claims([first, second]) == (first, second)
