@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from commit.dreaming_facts import assess_facts, visible_facts
+from commit.dreaming_facts import assess_facts, correction_plan, visible_facts
 from core.dreaming_evidence import EVIDENCE_KEY, bind_archive_evidence
 from core.models import ContextNode
 from core.provenance_resolver import ProvenanceResolver
@@ -108,6 +108,99 @@ def test_explicit_dated_correction_closes_only_the_matching_slot():
     after = visible_facts(node, datetime(2026, 6, 1, tzinfo=UTC))
     assert {fact["abstract"] for fact in before.values()} == {old, other}
     assert {fact["abstract"] for fact in after.values()} == {new, other}
+
+
+def test_cross_node_correction_follows_reviewed_source_across_resweeps():
+    old, new = "Harbor mooring: A7", "Harbor mooring: B6"
+    prior = _node("Alice", old)
+    current = _node("Alice", new)
+    current.uri = prior.uri + "-update"
+    original_text, correction_text = "A7 is the berth through June", "B6 replaces A7 starting June 1"
+    original = _archive("original", _message("original-message", original_text))
+    update = _archive("update", _message("correction-message", correction_text))
+    archives = {"original": original, "update": update}
+    _bind(prior, original, [
+        _evidence(old, "Alice", original_text, slot="berth", value="A7", valid_to="2026-07-01"),
+    ])
+    _bind(current, update, [
+        _evidence(new, "Alice", correction_text, slot="berth", value="B6", effect="correction", valid_from="2026-06-01"),
+    ])
+
+    def reassess(node):
+        node.metadata["dreaming_review"] = {
+            **assess_facts(node, read_source=archives.get), "version": node.metadata["version"],
+        }
+
+    def apply_correction():
+        prior.metadata["dreaming_review"] = correction_plan(current, prior)
+        reassess(prior)
+        fact, = prior.metadata["dreaming_review"]["facts"].values()
+        return fact
+
+    reassess(prior)
+    reassess(current)
+    fact = apply_correction()
+    assert fact["superseded_by_node"] == current.uri
+    assert fact["valid_to"] == "2026-06-01T00:00:00+00:00"
+    assert fact["supersession_evidence"][0]["message_id"] == "correction-message"
+
+    current.metadata.update(version=2, valid_from="2026-06-10")
+    reassess(current)
+    assert apply_correction()["valid_to"] == "2026-06-10T00:00:00+00:00"
+    during = datetime(2026, 6, 9, tzinfo=UTC)
+    assert {fact["value"] for fact in visible_facts(prior, during).values()} == {"A7"}
+
+    update.messages[0]["content"] = "The change request is withdrawn"
+    current.metadata["version"] = 3
+    reassess(current)
+    assert apply_correction()["valid_to"] == "2026-07-01T00:00:00+00:00"
+    late = datetime(2026, 6, 20, tzinfo=UTC)
+    assert {fact["value"] for fact in visible_facts(prior, late).values()} == {"A7"}
+
+
+def _reviewed_berth(value, start=None):
+    claim = f"Harbor mooring: {value}"
+    node = _node("Alice", claim)
+    node.uri += f"-{value}"
+    archive = _archive(value, _message(value, claim))
+    bounds = {"effect": "correction", "valid_from": start} if start else {"valid_to": "2026-07-01"}
+    _bind(node, archive, [_evidence(claim, "Alice", claim, slot="berth", value=value, **bounds)])
+    node.metadata["dreaming_review"] = {**assess_facts(node, read_source=lambda _: archive), "version": 1}
+    return node, archive
+
+
+def test_retracting_one_correction_restores_the_other_source_bound():
+    prior, original = _reviewed_berth("A7")
+    later, _ = _reviewed_berth("B6", "2026-06-10")
+    earlier, retracted = _reviewed_berth("C5", "2026-06-01")
+    prior.metadata["dreaming_review"] = correction_plan(later, prior)
+    prior.metadata["dreaming_review"] = correction_plan(earlier, prior)
+    assert prior.metadata["dreaming_review"]["valid_to"] == "2026-06-01T00:00:00+00:00"
+    prior.metadata["dreaming_review"] = {
+        **assess_facts(prior, read_source=lambda _: original), "version": 1,
+    }
+
+    retracted.messages[0]["content"] = "Change request withdrawn"
+    earlier.metadata["dreaming_review"] = {
+        **assess_facts(earlier, read_source=lambda _: retracted), "version": 1,
+    }
+    plan = correction_plan(earlier, prior)
+    assert plan["valid_to"] == "2026-06-10T00:00:00+00:00"
+    fact, = plan["facts"].values()
+    assert fact["superseded_by_node"] == later.uri
+
+
+def test_correction_moving_to_another_scope_restores_the_original_fact():
+    prior, _ = _reviewed_berth("A7")
+    current, archive = _reviewed_berth("B6", "2026-06-10")
+    prior.metadata["dreaming_review"] = correction_plan(current, prior)
+    current.metadata.update(routing_key="another-harbor", version=2)
+    current.metadata["dreaming_review"] = {
+        **assess_facts(current, read_source=lambda _: archive), "version": 2,
+    }
+    plan = correction_plan(current, prior)
+    assert plan is not None
+    assert plan["valid_to"] == "2026-07-01T00:00:00+00:00"
 
 
 def test_quote_resolves_to_the_authorized_user_message():

@@ -235,9 +235,9 @@ def _episode(fact):
     return fact["content"], fact.get("episode_valid_from", fact["valid_from"])
 
 
-def _close_facts(facts, prior):
+def _close_facts(facts, prior, *, corrections=None):
     by_slot = {}
-    for key, fact in facts.items():
+    for key, fact in (facts if corrections is None else corrections).items():
         if (start := _correction_start(fact)) is not None:
             by_slot.setdefault(fact["slot"], []).append((start, key, fact))
     for candidates in by_slot.values():
@@ -263,7 +263,7 @@ def _close_facts(facts, prior):
         if any(fact["value"] != new["value"] for _, _, fact in same_day):
             continue
         result[key] = {
-            **old, "valid_to": new["valid_from"], "superseded_by": new_key,
+            **old, "valid_to": start.isoformat(), "superseded_by": new_key,
             "source_valid_to": old.get("valid_to"),
             "supersession_evidence": [item for item in new["evidence"] if item["supports"]],
         }
@@ -283,6 +283,56 @@ def _effective_bounds(fact, node_start, node_end):
     start = max(filter(None, (timestamp(fact.get("valid_from")), node_start)), default=None)
     end = min(filter(None, (timestamp(fact.get("valid_to")), node_end)), default=None)
     return {"valid_from": start.isoformat() if start else None, "valid_to": end.isoformat() if end else None}
+
+
+_SUPERSESSION_FIELDS = ("valid_to", "superseded_by", "supersession_evidence", "source_valid_to")
+
+
+def _without_external_closures(fact):
+    base = {field: value for field, value in fact.items() if field not in (
+        "external_corrections", "external_correction_base", "superseded_by_node",
+    )}
+    if original := fact.get("external_correction_base"):
+        for field in _SUPERSESSION_FIELDS:
+            base.pop(field, None)
+        base.update(original)
+    return base
+
+
+def _with_external_closures(fact, sources):
+    if not sources:
+        return fact
+    result = {**fact, "external_corrections": sources}
+    first = min(bound["valid_to"] for bound in sources.values())
+    earliest = {uri: bound for uri, bound in sources.items() if bound["valid_to"] == first}
+    if len({bound["value"] for bound in earliest.values()}) != 1:
+        return result
+    if (end := timestamp(fact.get("valid_to"))) is not None and timestamp(first) >= end:
+        return result
+    uri = min(earliest)
+    bound = earliest[uri]
+    return {
+        **result, "valid_to": first, "superseded_by": bound["superseded_by"],
+        "superseded_by_node": uri, "supersession_evidence": bound["supersession_evidence"],
+        "source_valid_to": fact.get("source_valid_to", fact.get("valid_to")),
+        "external_correction_base": {field: fact[field] for field in _SUPERSESSION_FIELDS if field in fact},
+    }
+
+
+def _restore_external_closures(facts, prior):
+    supported = {_episode(fact) for fact in facts.values()
+                 if fact["grade"] == "high" and fact["support"] != "disputed"}
+    by_episode = {}
+    for previous in prior.values():
+        identity = (_episode(previous), previous["slot"], previous["value"])
+        sources = by_episode.setdefault(identity, {})
+        for uri, bound in previous.get("external_corrections", {}).items():
+            if uri not in sources or bound["valid_to"] < sources[uri]["valid_to"]:
+                sources[uri] = bound
+    for key, fact in facts.items():
+        identity = (_episode(fact), fact["slot"], fact["value"])
+        if _episode(fact) in supported:
+            facts[key] = _with_external_closures(fact, by_episode.get(identity, {}))
 
 
 def _summarize(node, items):
@@ -309,6 +359,7 @@ def assess_facts(node, *, read_source=None):
     retained = _retain_history(node, records, prior)
     facts = _assess_node_claims(node, [record for record in records if record[0]], assertions)
     facts.update(_close_facts(facts, prior))
+    _restore_external_closures(facts, prior)
     for fact in facts.values():
         if fact["content"] in retained:
             fact["retained_history"] = True
@@ -350,3 +401,50 @@ def visible_facts(node, when):
         return {}
     return {key: fact | _effective_bounds(fact, start, end)
             for key, fact in review.get("facts", {}).items() if _fact_applies(fact, when)}
+
+
+def correction_plan(current, prior):
+    """Recompute prior fact windows from a reviewed correction in the same scope."""
+    if current.uri == prior.uri or current.uri.split("/", 3)[:3] != prior.uri.split("/", 3)[:3]:
+        return None
+    new_review = current.metadata.get("dreaming_review", {})
+    old_review = prior.metadata.get("dreaming_review", {})
+    for node, review in ((current, new_review), (prior, old_review)):
+        version = node.metadata.get("version")
+        if version is None or review.get("version") != version:
+            return None
+
+    corrections = {}
+    if (current.owner_space == prior.owner_space and current.category == prior.category
+            and all(current.metadata.get(field) == prior.metadata.get(field) for field in ("scope_ref", "routing_key", "who"))):
+        current_start = timestamp(current.metadata.get("valid_from"))
+        current_end = timestamp(current.metadata.get("valid_to"))
+        for key, fact in new_review.get("facts", {}).items():
+            if (start := _correction_start(fact)) is None:
+                continue
+            start = max(start, current_start) if current_start else start
+            if _fact_applies(fact, start) and valid_at(start, valid_to=current_end):
+                corrections[key] = {**fact, "valid_from": start.isoformat()}
+
+    old_facts = old_review.get("facts", {})
+    originals = {key: _without_external_closures(fact) for key, fact in old_facts.items()}
+    closed = _close_facts(originals, old_facts, corrections=corrections)
+    facts = {}
+    for key, fact in old_facts.items():
+        sources = dict(fact.get("external_corrections", {}))
+        sources.pop(current.uri, None)
+        if bound := closed.get(key):
+            successor = bound["superseded_by"]
+            sources[current.uri] = {
+                "valid_to": bound["valid_to"], "superseded_by": successor,
+                "supersession_evidence": bound["supersession_evidence"], "value": corrections[successor]["value"],
+            }
+        facts[key] = _with_external_closures(originals[key], sources)
+    if facts == old_facts:
+        return None
+    items = [fact for fact in facts.values() if not fact.get("superseded_by")]
+    single = next(iter(facts.values())) if len(facts) == 1 else {}
+    return {
+        **old_review, "facts": facts, **_summarize(prior, items),
+        **_effective_bounds(single, timestamp(prior.metadata.get("valid_from")), timestamp(prior.metadata.get("valid_to"))),
+    }
