@@ -70,6 +70,7 @@ class _Observation:
     value: str
     effect: str
     retain: bool
+    durability: str
 
     @property
     def correction(self):
@@ -83,7 +84,9 @@ class _Observation:
             return "explicit"
         if self.end:
             return "deadline"
-        return "correction" if self.correction else ""
+        if self.correction:
+            return "correction"
+        return {"long_term": "constraint", "transient": "transient"}.get(self.durability, "")
 
 
 def _revocation(observation):
@@ -118,6 +121,9 @@ def _assess_claim(node, claim, content, observations, window=(None, None)):
     refs = list(dict.fromkeys(proof["source_ref"] for proof in proofs.values()))
     if expiry and expiry.proof["source_ref"] not in refs:
         refs.append(expiry.proof["source_ref"])
+    reason = next((name for name in ("explicit", "deadline", "correction", "constraint") if name in reasons), "")
+    if not reason and reasons and all(name == "transient" for name in reasons):
+        reason = "transient"
     return {
         "abstract": (next((line[2:] for line in content.splitlines() if line.startswith("- ")), claim)
                      if claim != content or content != node.content else node.abstract or claim),
@@ -128,7 +134,7 @@ def _assess_claim(node, claim, content, observations, window=(None, None)):
         "valid_to": end.isoformat() if end else None,
         "expiry_evidence": expiry.proof if expiry else None,
         "correction": correction,
-        "value_reason": "explicit" if "explicit" in reasons else next(filter(None, reasons), ""),
+        "value_reason": reason,
         "evidence_state": "verified" if proofs else "pending",
         **_assessment(list(proofs.values())),
     }
@@ -181,7 +187,7 @@ def _assess_node_claims(node, records, assertions):
     for assertion, proof in assertions:
         by_claim.setdefault(claim_text(assertion.claim), []).append(_Observation(
             proof, timestamp(assertion.valid_from), timestamp(assertion.valid_to),
-            assertion.slot, assertion.value, assertion.effect, assertion.retain,
+            assertion.slot, assertion.value, assertion.effect, assertion.retain, assertion.durability,
         ))
     prepared, departures = {}, {}
     for claim, content in records:
@@ -203,11 +209,18 @@ def _assess_node_claims(node, records, assertions):
     return facts
 
 
-def _value(items):
-    if reason := next((item["value_reason"] for item in items if item.get("value_reason")), ""):
+def _value(node, items):
+    if reason := next((item["value_reason"] for item in items
+                       if item.get("value_reason") and item["value_reason"] != "transient"), ""):
         return "high", reason
+    if items and all(item["value_reason"] == "transient" for item in items):
+        return "low", "transient"
     if any(item["support"] == "corroborated" for item in items):
         return "high", "reusable_supported"
+    declared = node.metadata.get("value_band")
+    if (declared in ("low", "medium", "high") and items
+            and all(item["support"] in ("observation", "corroborated") for item in items)):
+        return declared, "declared"
     return "medium", "observed" if any(item["evidence"] for item in items) else "pending_source_review"
 
 
@@ -283,7 +296,7 @@ def assess_facts(node, *, read_source=None):
         if fact["content"] in retained:
             fact["retained_history"] = True
     current = [fact for fact in facts.values() if not fact.get("superseded_by")]
-    value_band, value_reason = _value(current)
+    value_band, value_reason = _value(node, current)
     single = next(iter(facts.values())) if len(facts) == 1 else {}
     valid_from, valid_to = timestamp(node.metadata.get("valid_from")), timestamp(node.metadata.get("valid_to"))
     scores = [item["confidence"] for item in current if item["confidence"] is not None]

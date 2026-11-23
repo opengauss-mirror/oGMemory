@@ -156,3 +156,19 @@ def test_source_correction_precedes_node_visibility_window():
     assert historical["valid_to"] == "2026-09-01T00:00:00+00:00"
     current, = visible_facts(node, datetime(2026, 10, 1, tzinfo=UTC)).values()
     assert (current["abstract"], current["valid_from"]) == (new, "2026-10-01T00:00:00+00:00")
+
+
+@pytest.mark.parametrize("durability, expected", [
+    ("long_term", ("high", "constraint")),
+    ("transient", ("low", "transient")),
+    ("", ("medium", "observed")),
+])
+def test_value_uses_source_bound_durability(durability, expected):
+    claim = "Use the service entrance"
+    node = _node("Alice", claim)
+    archive = _archive("one", _message("one", claim))
+    _bind(node, archive, [_evidence(claim, "Alice", claim, durability=durability)])
+
+    review = assess_facts(node, read_source=lambda _: archive)
+    assert (review["value_band"], review["value_reason"]) == expected
+    assert review["confidence"] == .8

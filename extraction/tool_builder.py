@@ -140,6 +140,8 @@ _EVIDENCE_SCHEMA = {
             "effect": {"type": "string", "enum": ["correction", "revocation"],
                        "description": "Use only for an explicit dated replacement or withdrawal."},
             "retain": {"type": "boolean", "description": "The source explicitly asks to retain this fact."},
+            "durability": {"type": "string", "enum": ["long_term", "transient"],
+                           "description": "An explicitly ongoing constraint or explicitly short-lived fact."},
         },
         "required": ["claim", "subject", "quote", "relation"],
         "additionalProperties": False,
