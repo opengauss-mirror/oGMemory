@@ -102,8 +102,10 @@ def serialized_topics(function):
     """Serialize topic decisions for callers using synchronous publication."""
     @wraps(function)
     def wrapped(self, messages, ctx, *args, **kwargs):
+        from service.extraction_checkpoint import checkpoint_extraction_config
+
         checkpoint = kwargs.get("candidate_checkpoint")
-        engine = (checkpoint.journal.batch.get("extraction_config", {}).get("engine", "llm")
+        engine = (checkpoint_extraction_config(checkpoint).get("engine", "llm")
                   if checkpoint is not None else getattr(self, "_extraction_engine", "llm"))
         if kwargs.get("publication_scope") is not None or engine != "llm":
             return function(self, messages, ctx, *args, **kwargs)

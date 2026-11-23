@@ -176,3 +176,12 @@ def reassemble_messages(messages: list[dict]) -> list[dict]:
             raise ValidationError("source", "fragments differ from original message")
         complete[key] = assembled
     return [complete[key] for key in order]
+
+
+def fact_source_refs(records):
+    return [ref for record in records for ref in record["source_refs"]]
+
+
+def deterministic_payload(records, *, existing=None):
+    fields = {"schema_version": 1, "extraction_method": "deterministic"} if existing is None else existing
+    return {**fields, "fact_records": records, "source_refs": fact_source_refs(records)}

@@ -126,6 +126,10 @@ class MemoryIdentityResolver:
                 stack.enter_context(self._lock(directory, ctx))
             yield
 
+    def lock_directory(self, directory, ctx):
+        """Hold one directory identity lock using the resolver's reentrancy rules."""
+        return self._lock(directory, ctx)
+
     @contextmanager
     def _lock(self, directory, ctx):
         key = (ctx.account_id, directory)

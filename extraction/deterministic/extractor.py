@@ -10,7 +10,7 @@ import re
 from collections import defaultdict
 from itertools import islice
 
-from core.evidence import digest, message_source, reassemble_messages
+from core.evidence import deterministic_payload, digest, message_source, reassemble_messages
 from core.evidence_timing import operation
 from core.models import CandidateMemory
 from core.operation_deadline import check_deadline
@@ -405,14 +405,12 @@ class DeterministicExtractor:
             if schema is None or not schema.enabled:
                 return
             abstract, overview, content = render_records(title, records)
-            refs = [ref for record in records for ref in record["source_refs"]]
             candidates.append(CandidateMemory(
                 category=category, owner_scope="user", routing_key="det_" + key,
                 abstract=abstract, overview=overview, content=content, confidence=1.0,
                 title=title, who=records[0]["subject"], when=records[0]["event_time"],
                 object_name=title, scope_ref="det_" + key,
-                metadata={"deterministic": {"schema_version": 1, "extraction_method": "deterministic",
-                                            "fact_records": records, "source_refs": refs}},
+                metadata={"deterministic": deterministic_payload(records)},
             ))
 
         for record in facts:

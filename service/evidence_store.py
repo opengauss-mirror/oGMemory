@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from functools import lru_cache
 from itertools import islice
@@ -20,9 +20,25 @@ from core.models import ContextNode, RequestContext
 from core.operation_deadline import check_deadline
 
 
+@contextmanager
+def leaf_publication_lock(store, outbox, uri, ctx, target_lock):
+    """Acquire leaf locks in the same order for writes and revocation."""
+    processing = (outbox.processing_lock(uri) if callable(
+        getattr(type(outbox), "processing_lock", None)) else nullcontext())
+    with processing, store.session_lock(ctx), target_lock(uri.rsplit("/", 1)[0], ctx):
+        yield
+
+
 class EvidenceStore:
     def __init__(self, fs):
         self.fs = fs
+
+    @contextmanager
+    def source_session_locks(self, refs, ctx):
+        with ExitStack() as stack:
+            for session in sorted({ref["session_id"] for ref in refs}):
+                stack.enter_context(self.session_lock(ctx, session_id=session))
+            yield
 
     @contextmanager
     def session_lock(self, ctx: RequestContext, *, session_id=None):

@@ -241,7 +241,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             }
         """
         from service.deterministic_ingest import commit_deterministic, extraction_configuration
-        frozen = (candidate_checkpoint.journal.batch.get("extraction_config", {"engine": "llm"})
+        from service.extraction_checkpoint import checkpoint_extraction_config
+        frozen = (checkpoint_extraction_config(candidate_checkpoint)
                   if candidate_checkpoint is not None else extraction_configuration(self))
         if candidate_checkpoint is not None:
             from service.extraction_checkpoint import RecoveryNeedsConfirmationError

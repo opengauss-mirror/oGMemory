@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import replace
 
 from core.errors import NodeNotFoundError, ValidationError
-from core.evidence import digest
+from core.evidence import deterministic_payload, digest, fact_source_refs
 from core.models import WritePlan
 from core.operation_deadline import check_deadline
 from core.validation import validate_candidate
 from extraction.deterministic.extractor import render_records
-from service.evidence_store import EvidenceStore
 
 _TRUSTED_BATCH = ContextVar("deterministic_batch", default=False)
 
@@ -39,7 +39,7 @@ def validate_payload(candidate, store, ctx, *, verify_structure=True, resolve=No
     records, refs = data.get("fact_records"), data.get("source_refs")
     if not isinstance(records, list) or not records or not isinstance(refs, list) or not refs:
         raise ValidationError("deterministic", "records and source references are required")
-    if refs != [ref for record in records for ref in record["source_refs"]]:
+    if refs != fact_source_refs(records):
         raise ValidationError("deterministic", "fact references differ from candidate sources")
     from extraction.deterministic.verification import record_verifier
     trusted = _TRUSTED_BATCH.get()
@@ -59,53 +59,29 @@ def validate_payload(candidate, store, ctx, *, verify_structure=True, resolve=No
     return deepcopy(data)
 
 
-def write_deterministic(writer, candidate, ctx, commit, recover_receipt):
+def require_deterministic_batch():
     if not _TRUSTED_BATCH.get():
         raise ValidationError("deterministic", "reserved for source-verified extraction batches")
-    candidate = validate_candidate(candidate)
-    store = EvidenceStore(writer._fs)
-    data = validate_payload(candidate, store, ctx)
-    resolver = writer._identity_resolver
-    uri = resolver.uris.resolve(candidate.category, {"routing_key": candidate.routing_key}, ctx)
-    if candidate.target_uri and candidate.target_uri != uri:
-        raise ValidationError("deterministic", "candidate changed its deterministic target")
-    store.add_support(uri, data["source_refs"], ctx)
-    # The shared session lock fences source revocation through final persistence.
-    processing = (writer._outbox_store.processing_lock(uri) if callable(
-        getattr(type(writer._outbox_store), "processing_lock", None)) else nullcontext())
-    with processing, store.session_lock(ctx), resolver._lock(uri.rsplit("/", 1)[0], ctx):
-        # A fresh read under the publication lock must see any intervening revocation.
-        validate_payload(candidate, store, ctx, verify_structure=False)
-        if candidate.write_operation_id:
-            committed = recover_receipt()
-            if committed is not None:
-                return committed
-        try:
-            current = writer._fs.read_node(uri, ctx)
-        except NodeNotFoundError:
-            current = None
-        if current is not None and not current.metadata.get("deterministic"):
-            raise ValidationError("deterministic", "cannot overwrite another extraction engine")
-        records = {record["fact_id"]: record for record in (
-            current.metadata["deterministic"]["fact_records"] if current else [])}
-        for record in data["fact_records"]:
-            if record["fact_id"] in records and records[record["fact_id"]] != record:
-                raise ValidationError("deterministic", "immutable fact identity changed")
-            records[record["fact_id"]] = record
-        data["fact_records"] = [records[key] for key in sorted(records)]
-        data["source_refs"] = [ref for record in data["fact_records"] for ref in record["source_refs"]]
-        abstract, overview, content = render_records(candidate.object_name or candidate.title,
-                                                      data["fact_records"])
-        # Length validation is applied to the merged result as well as the input.
-        from dataclasses import replace
-        validate_candidate(replace(candidate, abstract=abstract, overview=overview, content=content))
-        same = current is not None and data == current.metadata["deterministic"]
-        plan = WritePlan("skip" if same else "merge" if current else "create", uri,
-                         {"identity_metadata": {"deterministic": data},
-                          "expected_version": current.metadata.get("version", 0) if current else 0,
-                          "identity_create": current is None, "resolved_abstract": abstract,
-                          "resolved_overview": overview, "resolved_content": content})
-        return commit(candidate, ctx, plan)
+
+
+def plan_deterministic_write(candidate, uri, data, current):
+    if current is not None and not current.metadata.get("deterministic"):
+        raise ValidationError("deterministic", "cannot overwrite another extraction engine")
+    records = {record["fact_id"]: record for record in (
+        current.metadata["deterministic"]["fact_records"] if current else [])}
+    for record in data["fact_records"]:
+        if record["fact_id"] in records and records[record["fact_id"]] != record:
+            raise ValidationError("deterministic", "immutable fact identity changed")
+        records[record["fact_id"]] = record
+    data = deterministic_payload([records[key] for key in sorted(records)], existing=data)
+    abstract, overview, content = render_records(candidate.object_name or candidate.title, data["fact_records"])
+    validate_candidate(replace(candidate, abstract=abstract, overview=overview, content=content))
+    same = current is not None and data == current.metadata["deterministic"]
+    return WritePlan("skip" if same else "merge" if current else "create", uri,
+                     {"identity_metadata": {"deterministic": data},
+                      "expected_version": current.metadata.get("version", 0) if current else 0,
+                      "identity_create": current is None, "resolved_abstract": abstract,
+                      "resolved_overview": overview, "resolved_content": content})
 
 
 def check_engine_target(fs, candidate, uri, ctx):

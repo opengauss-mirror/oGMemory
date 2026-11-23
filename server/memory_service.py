@@ -113,6 +113,7 @@ from service.extraction_checkpoint import (
     ExtractionBatchJournal,
     RecoveryNeedsConfirmationError,
     RecoveryPersistenceError,
+    frozen_extraction_config,
     recovery_owner,
     request_message_id,
 )
@@ -2077,9 +2078,9 @@ class MemoryService:
 
     def _new_extraction_config(self, buffer=None):
         if buffer is not None:
-            pending = buffer.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+            pending = buffer.runtime_extensions.get(EXTENSION_KEY, {}).get("batch")
             if pending is not None:
-                return pending.get("extraction_config", {"engine": "llm"})
+                return frozen_extraction_config(pending)
         from service.api import MemoryWriteAPI
         from service.deterministic_ingest import extraction_configuration
         api = self.get_write_api()
@@ -2113,7 +2114,7 @@ class MemoryService:
         session_time = _parse_session_time(batch.get("session_time"))
 
         def make_chunks():
-            if batch.get("extraction_config", {}).get("engine") == "deterministic":
+            if journal.extraction_engine == "deterministic":
                 return [messages]
             chunker = self._get_chunker()
             return chunker.chunk_messages(messages, flush=True).chunks if chunker else [messages]
@@ -6530,7 +6531,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "error": str(exc), "retryable": not isinstance(exc, RecoveryNeedsConfirmationError)}
 
         if (extraction_journal is not None
-                and extraction_journal.batch.get("extraction_config", {}).get("engine") == "deterministic"):
+                and extraction_journal.extraction_engine == "deterministic"):
             # The frozen deterministic input includes assistant evidence even
             # when the legacy LLM input has no extractable messages.
             extraction_messages = extraction_journal.batch["messages"]
@@ -7547,7 +7548,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def _compaction_journal(self, result):
         from session.session_manager import generate_archive_id
         buf = result["buffer"]
-        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        pending = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch")
         snapshot = result["source_snapshot"]
         return LifecycleBatchJournal(result["mgr"], buf, result["ctx"], snapshot,
             kind="compaction", archive_id=(pending["archive_id"] if pending
@@ -7555,7 +7556,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             messages=result["messages"],
             session_time=result["session_time"], session_summary=buf.extraction_summary,
             tool_stats_text=result["tool_stats_text"],
-            extraction_config=(pending.get("extraction_config", {"engine": "llm"})
+            extraction_config=(frozen_extraction_config(pending)
                 if pending else self._new_extraction_config()))
 
     def bootstrap(self, params: dict) -> dict:
@@ -7667,12 +7668,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def _dispose_journal(self, mgr, buf, ctx, snapshot):
         from session.session_manager import generate_archive_id
         state = self._build_incremental_extraction_state(buf, incremental=snapshot)
-        pending = buf.runtime_extensions.get("memory_extraction_recovery", {}).get("batch")
+        pending = buf.runtime_extensions.get(EXTENSION_KEY, {}).get("batch")
         return LifecycleBatchJournal(mgr, buf, ctx, snapshot, kind="dispose",
             archive_id=pending["archive_id"] if pending else generate_archive_id(), messages=state["messages"],
             session_time=state["session_time"], session_summary=buf.extraction_summary,
             tool_stats_text=state["tool_stats_text"],
-            extraction_config=(pending.get("extraction_config", {"engine": "llm"})
+            extraction_config=(frozen_extraction_config(pending)
                 if pending else self._new_extraction_config()))
 
     def _prepare_dispose_source(self, mgr, buf, ctx, params):

@@ -1,6 +1,6 @@
 """Source authority for directory summaries derived from deterministic cards."""
 
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from uuid import NAMESPACE_URL, uuid5
 
@@ -44,19 +44,32 @@ def summary_source_refs(fs, node, ctx, seen=None):
 
 
 @contextmanager
+def source_publication_locks(store, node, ctx, *, lock_directory):
+    with store.source_session_locks(source_refs(node), ctx):
+        lock = (directory_lock(store.fs, node.uri, ctx)
+                if lock_directory else nullcontext())
+        with lock:
+            yield
+
+
+def read_publication_revision(fs, uri, ctx, revision):
+    current = fs.read_node(uri, ctx)
+    if current.metadata.get("version") != revision:
+        raise NodeNotFoundError(uri)
+    return current
+
+
+@contextmanager
 def publication_guard(fs, node, ctx, *, revision=None):
     """Keep all source locks through the final write, after model work finishes."""
     store = EvidenceStore(fs)
     refs = source_refs(node)
-    with ExitStack() as stack:
-        for session in sorted({ref["session_id"] for ref in refs}):
-            stack.enter_context(store.session_lock(ctx, session_id=session))
-        stack.enter_context(directory_lock(fs, node.uri, ctx))
+    with source_publication_locks(store, node, ctx, lock_directory=True):
         if not store.verify_refs(refs, ctx):
             raise NodeNotFoundError(node.uri)
         if revision is not None:
-            current = fs.read_node(node.uri, ctx)
-            if (current.metadata.get("version") != revision or current.metadata.get("evidence_directory_invalidated")
+            current = read_publication_revision(fs, node.uri, ctx, revision)
+            if (current.metadata.get("evidence_directory_invalidated")
                     or current.abstract != node.abstract or current.overview != node.overview
                     or source_refs(current) != refs):
                 raise NodeNotFoundError(node.uri)

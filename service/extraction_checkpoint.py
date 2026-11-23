@@ -40,6 +40,14 @@ def request_message_id(ctx, request_id, index):
     return "msg_request_" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def frozen_extraction_config(batch):
+    return batch.get("extraction_config", {"engine": "llm"})
+
+
+def checkpoint_extraction_config(checkpoint):
+    return frozen_extraction_config(checkpoint.journal.batch)
+
+
 class ExtractionBatchJournal:
     @classmethod
     def resume(cls, manager, buffer, ctx):
@@ -106,6 +114,10 @@ class ExtractionBatchJournal:
             self._replace(batch)
         self._archive_id = batch["archive_id"]
         restore_outbox_events(batch, ctx.account_id)
+
+    @property
+    def extraction_engine(self):
+        return frozen_extraction_config(self.batch).get("engine", "llm")
 
     @property
     def batch(self):

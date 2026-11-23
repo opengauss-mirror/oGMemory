@@ -1,16 +1,15 @@
 """Source revocation and canonical read protection, independent of active engine."""
 
 import time
-from contextlib import nullcontext
 from dataclasses import replace
 from itertools import chain
 from uuid import NAMESPACE_URL, uuid5
 
 from core.errors import NodeNotFoundError
-from core.evidence import digest, evidence_uri
+from core.evidence import deterministic_payload, digest, evidence_uri
 from core.models import OutboxEvent
 from extraction.deterministic.extractor import render_records
-from service.evidence_store import EvidenceStore
+from service.evidence_store import EvidenceStore, leaf_publication_lock
 
 
 def ensure_sources_active(node, fs, ctx):
@@ -95,10 +94,7 @@ class EvidenceLifecycle:
         # Revoke first, then follow the same processing → source → target order as writes.
         cleaned = 0
         for uri in sorted(manifest["supports"]):
-            processing = (self.outbox.processing_lock(uri) if callable(
-                getattr(type(self.outbox), "processing_lock", None)) else nullcontext())
-            with processing, self.store.session_lock(ctx), self.store.fs.memory_identity_lock(
-                    uri.rsplit("/", 1)[0], ctx):
+            with leaf_publication_lock(self.store, self.outbox, uri, ctx, self.store.fs.memory_identity_lock):
                 manifest, version = self.store.manifest(ctx)
                 completed = set(manifest.get("cleanup_completed", []))
                 if uri in completed:
@@ -115,8 +111,7 @@ class EvidenceLifecycle:
                     if remaining:
                         if remaining != data["fact_records"]:
                             abstract, overview, content = render_records(node.metadata.get("object_name", node.category), remaining)
-                            data = {**data, "fact_records": remaining,
-                                    "source_refs": [ref for record in remaining for ref in record["source_refs"]]}
+                            data = deterministic_payload(remaining, existing=data)
                             updated = replace(node, abstract=abstract, overview=overview, content=content,
                                 metadata={**node.metadata, "deterministic": data,
                                           "_expected_version": node.metadata.get("version", 0)})
