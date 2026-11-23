@@ -256,6 +256,7 @@ def _json_object_body() -> dict:
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
     from scene.config import ConfigRevisionError
+    from server.control_plane_store import IdentityMutationBusyError
     from service.operator_service import OperatorServiceBusyError
 
     if isinstance(exc, OperatorServiceBusyError):
@@ -265,6 +266,8 @@ def _error_response(exc: Exception):
         return jsonify({"error": exc.description}), 413
     if isinstance(exc, AuthenticationError):
         return jsonify({"error": str(exc)}), 401
+    if isinstance(exc, IdentityMutationBusyError):
+        return jsonify({"error": str(exc), "retryable": True}), 503
     if isinstance(exc, ControlPlaneDisabledError):
         return jsonify({"error": str(exc)}), 503
     if isinstance(exc, ArtifactStoreUnavailableError):
@@ -1635,14 +1638,30 @@ def handle_call(method: str):
         return _error_response(exc)
 
 
-@app.route("/api/v1/admin/accounts", methods=["GET"])
+def _identity_page_params():
+    if not any(name in request.args for name in ("limit", "after", "q")):
+        return {}
+    limit = int(request.args.get("limit", 20))
+    after = request.args.get("after", "")
+    query = request.args.get("q", "").strip()
+    if not 1 <= limit <= 100 or len(after) > 128 or len(query) > 128:
+        raise ValueError("Invalid identity page parameters")
+    return {"limit": limit, "after": after, "q": query}
+
+
+@app.route("/api/v1/admin/accounts", methods=["GET", "POST"])
 def handle_admin_accounts():
     svc = _get_service()
     try:
         if not svc.get_auth_service().role_control_active():
             raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
-        return jsonify(svc.get_tenant_admin_service().list_accounts(ctx))
+        admin = svc.get_tenant_admin_service()
+        if request.method == "GET":
+            return jsonify(admin.list_accounts(ctx))
+        body = _json_object_body()
+        result = admin.create_account(ctx, body.get("account_id"), body.get("admin_user_id"))
+        return jsonify(result), 201, {"Cache-Control": "no-store"}
     except Exception as exc:
         return _error_response(exc)
 
@@ -1669,8 +1688,9 @@ def handle_admin_users(account_id):
         ctx = _build_authenticated_context(params)
         admin = svc.get_tenant_admin_service()
         if request.method == "GET":
-            return jsonify(admin.list_users(ctx, account_id))
-        return jsonify(admin.create_user(ctx, account_id, params["user_id"], params.get("role", "user")))
+            return jsonify(admin.list_users(ctx, account_id, **_identity_page_params()))
+        result = admin.create_user(ctx, account_id, params.get("user_id"), params.get("role", "user"))
+        return jsonify(result), 200, {"Cache-Control": "no-store"}
     except Exception as exc:
         return _error_response(exc)
 
@@ -1700,6 +1720,32 @@ def handle_admin_set_role(account_id, user_id):
         return _error_response(exc)
 
 
+@app.post("/api/v1/admin/accounts/<account_id>/users/<user_id>/key")
+def handle_admin_rotate_user_key(account_id, user_id):
+    svc = _get_service()
+    try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
+        ctx = _build_authenticated_context({})
+        result = svc.get_tenant_admin_service().rotate_user_key(ctx, account_id, user_id)
+        return jsonify(result), 200, {"Cache-Control": "no-store"}
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.post("/api/v1/admin/accounts/<account_id>/users/<user_id>/key/reveal")
+def handle_admin_reveal_member_key(account_id, user_id):
+    svc = _get_service()
+    try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
+        ctx = _build_authenticated_context({})
+        result = svc.get_tenant_admin_service().reveal_member_key(ctx, account_id, user_id)
+        return jsonify(result), 200, {"Cache-Control": "no-store"}
+    except Exception as exc:
+        return _error_response(exc)
+
+
 @app.route("/api/v1/admin/accounts/<account_id>/roles", methods=["GET"])
 def handle_admin_roles(account_id):
     svc = _get_service()
@@ -1722,8 +1768,15 @@ def handle_admin_agents(account_id):
         ctx = _build_authenticated_context(params)
         admin = svc.get_tenant_admin_service()
         if request.method == "GET":
-            return jsonify(admin.list_agents(ctx, account_id))
-        return jsonify(admin.create_agent(ctx, account_id, params["agent_id"], params.get("owner_user_id")))
+            page = _identity_page_params()
+            owner = request.args.get("owner_user_id")
+            if owner is not None:
+                if not owner or len(owner) > 128:
+                    raise ValueError("Invalid owner_user_id")
+                page.setdefault("limit", 20)
+                page["owner_user_id"] = owner
+            return jsonify(admin.list_agents(ctx, account_id, **page))
+        return jsonify(admin.create_agent(ctx, account_id, params.get("agent_id"), params.get("owner_user_id")))
     except Exception as exc:
         return _error_response(exc)
 
@@ -1739,7 +1792,10 @@ def handle_admin_agent(account_id, agent_id):
         admin = svc.get_tenant_admin_service()
         if request.method == "GET":
             return jsonify(admin.get_agent(ctx, account_id, agent_id))
-        return jsonify(admin.update_agent(ctx, account_id, agent_id, params.get("owner_user_id")))
+        owner = params.get("owner_user_id")
+        if owner is None and "owner_user_id" in params:
+            owner = ""
+        return jsonify(admin.update_agent(ctx, account_id, agent_id, owner))
     except Exception as exc:
         return _error_response(exc)
 

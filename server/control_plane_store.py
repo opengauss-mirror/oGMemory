@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,10 @@ from typing import Any
 # slug/fingerprint bijection. It is never a schedulable workspace registration.
 CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID = "__workspace_sync_bindings__"
 _WORKSPACE_SYNC_MUTEX_INITIALIZATION_GRACE_SECONDS = 5.0
+
+
+class IdentityMutationBusyError(RuntimeError):
+    pass
 
 
 class ControlPlaneStore:
@@ -30,6 +36,33 @@ class ControlPlaneStore:
         self._client = client
         self._mount_prefix = mount_prefix.rstrip("/")
         self._local_root = Path(local_root) if local_root else None
+
+    @contextmanager
+    def identity_mutation(self, account_id: str | None = None):
+        path = self.users_path(account_id) if account_id is not None else self.global_accounts_path()
+        if self._local_root is not None:
+            lock_path = path + ".lock"
+            self._ensure_parent(lock_path)
+            with open(lock_path, "a+b") as stream:
+                if os.name == "nt":
+                    import msvcrt
+
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                yield
+            return
+
+        # AGFS deletion cannot check the lock token atomically. Clear an
+        # abandoned identity lock only after stopping every identity writer.
+        lock = self._acquire_control_plane_mutex(path, attempts=100, reclaim_stale=False)
+        try:
+            yield
+        finally:
+            self._release_control_plane_mutex(lock)
 
     def global_accounts_path(self) -> str:
         return self._join("_system", "accounts.json")
@@ -189,7 +222,7 @@ class ControlPlaneStore:
         if not callable(mutator):
             raise ValueError("workspace sync mutator must be callable")
         with self._workspace_sync_lock:
-            lock_path = self._acquire_workspace_sync_mutex(account_id, root_id)
+            lock = self._acquire_control_plane_mutex(self.code_workspace_sync_path(account_id, root_id))
             try:
                 current = self.read_code_workspace_sync_state(account_id, root_id)
                 updated = mutator(copy.deepcopy(current))
@@ -199,7 +232,7 @@ class ControlPlaneStore:
                 self.write_json(self.code_workspace_sync_path(account_id, root_id), result)
                 return result
             finally:
-                self._release_workspace_sync_mutex(lock_path)
+                self._release_control_plane_mutex(lock)
 
     def read_json(self, path: str, default: Any) -> Any:
         try:
@@ -284,17 +317,10 @@ class ControlPlaneStore:
         value = getattr(entry, "name", "")
         return Path(value).name if isinstance(value, str) else ""
 
-    def _acquire_workspace_sync_mutex(
-        self,
-        account_id: str,
-        root_id: str,
+    def _acquire_control_plane_mutex(
+        self, state_path: str, *, attempts: int = 8, reclaim_stale: bool = True,
     ) -> tuple[str, str] | None:
-        """Acquire a brief AGFS-only mutex for a state transition.
-
-        Local test storage is protected by the class lock above. AGFS must
-        expose atomic file creation; a durable work lease is deliberately not
-        used to decide ownership of this short state-transition mutex.
-        """
+        """Acquire a short AGFS mutex using atomic creation."""
 
         if self._local_root is not None or self._client is None:
             return None
@@ -304,7 +330,6 @@ class ControlPlaneStore:
         if not callable(create) or not callable(remove) or not callable(stat):
             raise RuntimeError("AGFS does not support atomic workspace sync state locking")
 
-        state_path = self.code_workspace_sync_path(account_id, root_id)
         self._ensure_parent(state_path)
         lock_path = state_path + ".lock"
         token = uuid.uuid4().hex
@@ -317,12 +342,15 @@ class ControlPlaneStore:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        for _attempt in range(8):
+        for _attempt in range(attempts):
             try:
                 create(lock_path)
             except Exception as exc:
                 if "exists" not in str(exc).lower():
                     raise
+                if not reclaim_stale:
+                    time.sleep(0.02)
+                    continue
                 marker = self._read_workspace_sync_mutex(lock_path)
                 if marker is not None and marker.get("token") == token:
                     return lock_path, token
@@ -349,9 +377,11 @@ class ControlPlaneStore:
             # this process still owns the lock. Do not mutate state without a
             # fencing marker; another process may have reclaimed a stale file.
             time.sleep(0.02)
+        if not reclaim_stale:
+            raise IdentityMutationBusyError("Tenant identity storage is busy")
         raise RuntimeError("workspace sync state transition is busy")
 
-    def _release_workspace_sync_mutex(self, lock: tuple[str, str] | None) -> None:
+    def _release_control_plane_mutex(self, lock: tuple[str, str] | None) -> None:
         if lock is None or self._client is None:
             return
         remove = getattr(self._client, "rm", None) or getattr(self._client, "remove", None)

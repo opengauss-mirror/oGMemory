@@ -170,8 +170,12 @@ def test_registered_directory_drives_team_membership(spaces):
     available = repository.list_principals(bob, space_id='ops', kind='user')['items']
     assert [row['principal'] for row in available] == ['user:carol']
     restored = retained + [{'principal': available[0]['principal'], 'role': 'member'}]
-    repository.set_members(bob, 'ops', {'members': restored}, expected_rev=removed['authz_rev'])
+    saved = repository.set_members(bob, 'ops', {'members': restored}, expected_rev=removed['authz_rev'])
     assert len(repository.list_spaces(bob, 'ops')['space']['members']) == 4
+    admin.update_agent(ctx, ctx.account_id, 'ops-agent', '')
+    repository.set_members(bob, 'ops', {'members': retained}, expected_rev=saved['authz_rev'])
+    members_after_unbinding = repository.list_spaces(bob, 'ops')['space']['members']
+    assert [row['principal'] for row in members_after_unbinding] == ['agent:ops-agent', 'user:alice', 'user:bob']
 
 
 def test_registered_identity_spelling_is_preserved_in_members_and_rule_acl(spaces):

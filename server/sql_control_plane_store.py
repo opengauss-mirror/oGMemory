@@ -16,6 +16,7 @@ from typing import Any
 
 from fs.sql_adapter.pool import PoolAdapterMixin
 from server.control_plane_store import CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID
+from server.space_locks import lock_space_account
 
 try:
     import psycopg2
@@ -289,6 +290,69 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             snapshots[path] = copy.deepcopy(result)
         return result
 
+    def list_identity_page(
+        self, kind: str, account_id: str, limit: int, after: str, query: str, *, owner_user_id: str | None = None,
+    ) -> list[dict]:
+        table, id_field, fields = {
+            "users": ("cp_users", "user_id", "user_id, role, status, created_at"),
+            "agents": ("cp_agents", "agent_id", "agent_id, owner_user_id, status, created_at"),
+        }[kind]
+        params = [account_id, after, query]
+        owner_filter = ""
+        if kind == "agents" and owner_user_id is not None:
+            owner_filter = "AND owner_user_id=%s "
+            params.append(owner_user_id)
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {fields} FROM {table} WHERE account_id=%s AND status='active' "
+                    f"AND {id_field}>%s AND POSITION(LOWER(%s) IN LOWER({id_field}))>0 "
+                    f"{owner_filter}ORDER BY {id_field} LIMIT %s",
+                    (*params, limit + 1),
+                )
+                columns = fields.split(", ")
+                return [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def create_account_with_admin(self, account_id: str, user_id: str, key: str) -> None:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                lock_space_account(cur, "__accounts__")
+                cur.execute("SELECT 1 FROM cp_accounts WHERE account_id=%s", (account_id,))
+                if cur.fetchone():
+                    raise ValueError(f"account already exists: {account_id}")
+                cur.execute("INSERT INTO cp_accounts(account_id) VALUES (%s)", (account_id,))
+                cur.execute(
+                    "INSERT INTO cp_users(account_id,user_id,role,key) VALUES (%s,%s,'admin',%s)",
+                    (account_id, user_id, key),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
+    def get_member_key(self, account_id: str, user_id: str) -> str | None:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT u.key FROM cp_users u JOIN cp_accounts a USING(account_id) "
+                    "WHERE u.account_id=%s AND u.user_id=%s AND u.status='active' AND a.status='active' "
+                    "AND LOWER(u.role) IN ('user', 'member')",
+                    (account_id, user_id),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
     def resolve_user_key(self, api_key: str, account_hint: str | None = None) -> dict | None:
         conn = self._get_connection()
         try:
@@ -407,12 +471,10 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             conn.rollback()
             self._return_connection(conn)
 
-    def write_json(self, path: str, data: Any) -> None:
+    def write_json(self, path: str, data: Any, *, preserve_admin: bool = False) -> None:
         entity, account_id = self._parse_path(path)
         if entity not in ("accounts", "users", "agents"):
             return self._write_json(path, data)
-        from server.space_locks import lock_space_account
-
         snapshots = getattr(self._snapshots, "values", {})
         previous = snapshots.pop(path, {}).get(entity, {})
         current = data.get(entity, {})
@@ -426,9 +488,29 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         try:
             with conn.cursor() as cur:
                 lock_space_account(cur, account_id or "__accounts__")
+                had_admin = False
+                if preserve_admin:
+                    cur.execute(
+                        "SELECT 1 FROM cp_users WHERE account_id=%s AND role='admin' "
+                        "AND status='active' LIMIT 1", (account_id,),
+                    )
+                    had_admin = bool(cur.fetchone())
                 for identity in previous.keys() - current.keys():
                     if entity == "users":
-                        self._delete_user_row(cur, account_id, identity)
+                        if preserve_admin:
+                            cur.execute(
+                                "SELECT 1 FROM cp_agents WHERE account_id=%s AND owner_user_id=%s "
+                                "AND status='active' LIMIT 1", (account_id, identity),
+                            )
+                            if cur.fetchone():
+                                raise ValueError("Reassign the user's Agents before removing this user")
+                            cur.execute(
+                                "UPDATE cp_users SET status='deleted', key='revoked' "
+                                "WHERE account_id=%s AND user_id=%s",
+                                (account_id, identity),
+                            )
+                        else:
+                            self._delete_user_row(cur, account_id, identity)
                         continue
                     where = f"{id_column}=%s"
                     values = [identity]
@@ -438,6 +520,14 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                     cur.execute(f"UPDATE {table} SET status='deleted' WHERE {where}", values)
                 for identity, info in current.items():
                     before = previous.get(identity)
+                    owner = info.get("owner_user_id")
+                    if entity == "agents" and owner and owner != (before or {}).get("owner_user_id"):
+                        cur.execute(
+                            "SELECT 1 FROM cp_users WHERE account_id=%s AND user_id=%s AND status='active'",
+                            (account_id, owner),
+                        )
+                        if not cur.fetchone():
+                            raise ValueError("Agent owner is no longer registered")
                     if before is None:
                         where = f"{id_column}=%s"
                         identity_values = [identity]
@@ -477,6 +567,14 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                         cur.execute(f"UPDATE {table} SET " + ','.join(f"{field}=%s" for field in changed) + f" WHERE {where}", values)
                         if entity == "users" and cur.rowcount == 0:
                             raise ValueError(f"user no longer exists: {identity}")
+                if had_admin:
+                    cur.execute(
+                        "SELECT 1 FROM cp_users WHERE account_id=%s AND role='admin' "
+                        "AND status='active' LIMIT 1",
+                        (account_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError("Keep at least one tenant administrator")
                 if entity in ("users", "agents"):
                     cur.execute("UPDATE cp_accounts SET authz_rev=authz_rev+1 WHERE account_id=%s", (account_id,))
             conn.commit()

@@ -84,8 +84,7 @@ class AuthService:
                 existing.add(account_id)
 
     def role_control_active(self) -> bool:
-        has_privileged = bool(self._cfg.root_api_key or self._cfg.admin_api_keys)
-        return bool(self._cfg.role_control_enabled and has_privileged)
+        return bool(self._cfg.role_control_enabled)
 
     def resolve_identity(self, headers: dict | None) -> ResolvedIdentity | None:
         if not self.role_control_active():
@@ -110,7 +109,7 @@ class AuthService:
             return ResolvedIdentity(
                 role=Role.ADMIN,
                 account_id=admin_account,
-                user_id=headers.get("x-user-id") or "admin",
+                user_id="admin",
             )
 
         resolved = self._key_manager.resolve_user_key(

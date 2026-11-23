@@ -45,7 +45,7 @@ def test_create_user_and_list_roles(services):
     assert {"user_id": "bob", "role": "MEMBER"} in roles["roles"]
 
 
-def test_set_role_requires_root(services):
+def test_set_role_requires_admin(services):
     _, _, admin, _, _, member_ctx = services
 
     with pytest.raises(PermissionError):
@@ -114,6 +114,7 @@ def test_update_agent_rejects_missing_agent(services):
 def test_list_roles_preserves_member_mapping(services):
     key_manager, _, admin, root_ctx, admin_ctx, _ = services
     key_manager.register_user("acct-1", "bob", "MEMBER")
+    key_manager.register_user("acct-1", "carol", "admin")
     admin.set_role(root_ctx, "acct-1", "alice", "MEMBER")
 
     roles = admin.list_roles(admin_ctx, "acct-1")

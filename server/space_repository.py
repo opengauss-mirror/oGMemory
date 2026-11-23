@@ -392,12 +392,14 @@ class SpaceRepository(SpaceJobRepository):
             current = {row['principal']: row['role'] for row in cur.fetchall()}
             users = [row[0] for row in wanted.values() if row[0] is not None]
             agents = [row[1] for row in wanted.values() if row[1] is not None]
+            retained_agents = [row[1] for subject, row in wanted.items() if subject in current and row[1] is not None]
             cur.execute("""SELECT 'user:'||user_id AS principal FROM cp_users
                 WHERE account_id=%s AND user_id=ANY(%s) AND status='active'
                 UNION ALL SELECT 'agent:'||a.agent_id FROM cp_agents a
-                JOIN cp_users u ON u.account_id=a.account_id AND u.user_id=a.owner_user_id AND u.status='active'
-                WHERE a.account_id=%s AND a.agent_id=ANY(%s) AND a.status='active'""",
-                (ctx.account_id, users, ctx.account_id, agents))
+                LEFT JOIN cp_users u ON u.account_id=a.account_id AND u.user_id=a.owner_user_id AND u.status='active'
+                WHERE a.account_id=%s AND a.agent_id=ANY(%s) AND a.status='active'
+                AND (u.user_id IS NOT NULL OR (a.owner_user_id='' AND a.agent_id=ANY(%s)))""",
+                (ctx.account_id, users, ctx.account_id, agents, retained_agents))
             registered = {row['principal'] for row in cur.fetchall()}
             if owner in current and wanted[owner][2] == current[owner]:
                 registered.add(owner)
