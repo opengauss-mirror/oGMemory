@@ -13,7 +13,12 @@ from dataclasses import replace
 from functools import lru_cache
 from itertools import islice
 
-from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
+from core.errors import (
+    AccessDeniedError,
+    NodeNotFoundError,
+    OperationDeadlineExceededError,
+    ValidationError,
+)
 from core.evidence import content_hash, digest, evidence_uri, message_source, reassemble_messages
 from core.evidence_timing import stage, timed
 from core.models import ContextNode, RequestContext
@@ -314,12 +319,18 @@ class EvidenceStore:
         return sources
 
     @timed("source_validate")
-    def read_source(self, key: str, ctx: RequestContext, *, owner_ctx=None) -> dict | None:
+    def read_source(self, key: str, ctx: RequestContext, *, owner_ctx=None, deadline=None) -> dict | None:
+        def check_read_budget():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise OperationDeadlineExceededError("Evidence source read deadline exceeded")
+
         # The owner locates evidence; only the original caller authorizes reads.
         source_ctx = owner_ctx or ctx
+        check_read_budget()
         value, version = self._read(evidence_uri(source_ctx, "sources", key), ctx, owner_ctx=owner_ctx)
 
         def manifest_for(source_ctx, *, session_id):
+            check_read_budget()
             return self.manifest(ctx, session_id=session_id, owner_ctx=source_ctx)
 
         return self._validate_source(key, value, version, source_ctx, manifest_for)

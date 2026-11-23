@@ -6,7 +6,7 @@ import json
 import re
 import time
 
-from core.errors import NodeNotFoundError
+from core.errors import NodeNotFoundError, OperationDeadlineExceededError
 from core.evidence import evidence_uri
 from core.evidence_query import EvidenceQuery, MessageEvidenceResult, facts_supported_by
 from core.evidence_timing import operation, request_id, stage, timed
@@ -222,6 +222,8 @@ class EvidenceService:
             from retrieval.evidence.auxiliary import fuse_auxiliary
             scores, auxiliary = fuse_auxiliary(request, scores, units, sources, deadline=deadline)
             diagnostics["auxiliary"] = auxiliary
+            if auxiliary["reason"] == "deadline":
+                diagnostics["partial"] = True
         with stage("format"):
             # Count the complete serialized units and their facts, not only raw text.
             @timed("serialize")
@@ -241,11 +243,12 @@ class EvidenceService:
         with stage("final_source_check"):
             evidence = []
             for key in selected:
-                if time.monotonic() >= deadline:
+                item = units[key]
+                try:
+                    current = self.store.read_source(item["source_key"], ctx, deadline=deadline)
+                except OperationDeadlineExceededError:
                     diagnostics["partial"] = True
                     break
-                item = units[key]
-                current = self.store.read_source(item["source_key"], ctx)
                 if current is not None and current["source_node_version"] == item["source_node_version"]:
                     evidence.append(item)
                 else:

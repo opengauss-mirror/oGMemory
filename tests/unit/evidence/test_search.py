@@ -1,15 +1,32 @@
 """Message-only retrieval, mixed memories, privacy and evidence/fact alignment."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from core.models import CandidateMemory
+from core.operation_deadline import operation_deadline
 from core.provenance_resolver import ProvenanceResolver
 from service.evidence_service import EvidenceService
 from tests.unit.evidence.test_sources import CTX, message
 from tests.unit.evidence.test_writer import write_candidates
+
+
+@pytest.fixture
+def deadline_clock(monkeypatch):
+    import core.operation_deadline as operation
+    import retrieval.evidence.auxiliary as auxiliary
+    import service.evidence_service as search
+    import service.evidence_store as store
+
+    clock = SimpleNamespace(now=100.0, budget=1.0)
+    clock.monotonic = lambda: clock.now
+    monkeypatch.setattr(operation, "monotonic", clock.monotonic)
+    for module in (search, store, auxiliary):
+        monkeypatch.setattr(module, "time", clock)
+    return clock
 
 
 def test_message_only_and_no_vector_dependency(setup):
@@ -146,10 +163,10 @@ def test_shared_dependencies_are_removed_when_their_source_fails_final_check(set
     original = service.store.read_source
     select_groups = search.select_groups
 
-    def read_source(key, ctx):
+    def read_source(key, ctx, **kwargs):
         if key == root:
             return None
-        return original(key, ctx)
+        return original(key, ctx, **kwargs)
 
     def invalidate_after_selection(*args, **kwargs):
         selected = select_groups(*args, **kwargs)
@@ -163,10 +180,9 @@ def test_shared_dependencies_are_removed_when_their_source_fails_final_check(set
 
 
 @pytest.mark.parametrize("available_reads", [0, 2])
-def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(setup, monkeypatch, available_reads):
-    from time import monotonic
-    from types import SimpleNamespace
-
+def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(
+    setup, monkeypatch, deadline_clock, available_reads,
+):
     import service.evidence_service as search
 
     fs, _, _, _ = setup
@@ -176,31 +192,27 @@ def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(setu
         message("It was unforgettable.", id="followup", sequence=3, role="assistant"),
     ])
     service = EvidenceService(fs)
-    now = monotonic()
-    deadline = now + 20
     checks = []
     read_source = service.store.read_source
-    monkeypatch.setattr(search, "time", SimpleNamespace(monotonic=lambda: now))
 
-    def check_source(key, ctx):
-        nonlocal now
+    def check_source(key, ctx, **kwargs):
+        source = read_source(key, ctx, **kwargs)
         checks.append(key)
-        source = read_source(key, ctx)
         if len(checks) == available_reads:
-            now = deadline
+            deadline_clock.now += deadline_clock.budget
         return source
 
     def select_then_expire(_query, _scores, units, *_args, **_kwargs):
-        nonlocal now
         keys = {unit["message_id"]: key for key, unit in units.items()}
         monkeypatch.setattr(service.store, "read_source", check_source)
         if available_reads == 0:
-            now = deadline
+            deadline_clock.now += deadline_clock.budget
         paris, rome, followup = (keys[name] for name in ("paris", "rome", "followup"))
         return [paris, rome, followup], [[paris], [rome, followup]]
 
     monkeypatch.setattr(search, "select_groups", select_then_expire)
-    result = service.search("Where did I travel to Paris and Rome?", CTX, use_memories=True)
+    with operation_deadline(deadline_clock.budget):
+        result = service.search("Where did I travel to Paris and Rome?", CTX, use_memories=True)
 
     assert len(checks) == available_reads
     assert result.diagnostics["partial"]
@@ -208,6 +220,67 @@ def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(setu
     assert [fact["quote"] for fact in result.facts] == (["I visited Paris."] if available_reads else [])
     assert len(result.diagnostics["evidence_groups"]) == bool(available_reads)
     assert result.diagnostics["uncovered_branches"] == ([1] if available_reads else [0, 1])
+
+
+@pytest.mark.parametrize("inherited_budget", [False, True])
+def test_final_source_read_cannot_start_manifest_read_after_deadline(
+    setup, monkeypatch, deadline_clock, inherited_budget,
+):
+    import service.evidence_service as search
+    from core.evidence import evidence_uri, message_source
+
+    fs, _, store, _ = setup
+    msg = message("I visited Paris.")
+    store.register([msg], CTX, batch_id="single-source")
+    source_uri = evidence_uri(CTX, "sources", message_source(msg, CTX).source_key)
+    select_groups, read_node = search.select_groups, fs.read_node
+    reads = []
+
+    def expire_after_source(uri, ctx):
+        node = read_node(uri, ctx)
+        reads.append(uri)
+        if uri == source_uri:
+            deadline_clock.now += deadline_clock.budget
+        return node
+
+    def track_final_reads(*args, **kwargs):
+        selected = select_groups(*args, **kwargs)
+        monkeypatch.setattr(fs, "read_node", expire_after_source)
+        return selected
+
+    monkeypatch.setattr(search, "select_groups", track_final_reads)
+    if not inherited_budget:
+        monkeypatch.setattr(search, "remaining_seconds", lambda: deadline_clock.budget)
+    with operation_deadline(deadline_clock.budget if inherited_budget else None):
+        result = EvidenceService(fs).search("Paris", CTX)
+
+    assert reads == [source_uri]
+    assert result.diagnostics["partial"]
+    assert result.evidence == [] and result.diagnostics["evidence_groups"] == []
+
+
+def test_time_channel_deadline_marks_partial_without_lexical_hits(setup, monkeypatch, deadline_clock):
+    import retrieval.evidence.auxiliary as auxiliary
+
+    fs, _, store, _ = setup
+    store.register([message("I visited Paris.", recorded_at="2026-05-01T12:00:00Z")], CTX, batch_id="time")
+    service = EvidenceService(fs)
+    query = "2026-05-01"
+    assert service.search(query, CTX, use_time=True).evidence
+    fuse_auxiliary = auxiliary.fuse_auxiliary
+
+    def expire_before_fusion(request, scores, *args, **kwargs):
+        assert not scores
+        deadline_clock.now += deadline_clock.budget
+        return fuse_auxiliary(request, scores, *args, **kwargs)
+
+    monkeypatch.setattr(auxiliary, "fuse_auxiliary", expire_before_fusion)
+    with operation_deadline(deadline_clock.budget):
+        result = service.search(query, CTX, use_time=True)
+
+    assert not result.evidence
+    assert result.diagnostics["auxiliary"]["reason"] == "deadline"
+    assert result.diagnostics["partial"]
 
 
 def test_reported_groups_only_reference_final_evidence_within_response_budget(setup):
