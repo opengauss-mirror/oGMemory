@@ -21,6 +21,7 @@
   --amber: light-dark(#505050, #c2c2c2);
   --amber-soft: var(--violet-soft);
   --red: var(--ink);
+  --error-ink: light-dark(#a51d2a, #ff9b9f);
   --red-soft: var(--violet-soft);
   --scrollbar-thumb: light-dark(#797979, #777);
   --scrollbar-track: light-dark(#eeeeee, #282828);

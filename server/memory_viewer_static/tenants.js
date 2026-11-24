@@ -14,6 +14,11 @@ window.tenantAdmin = (() => {
   const roleNames = { ROOT: '部署管理员', ADMIN: '租户管理员', MEMBER: '普通用户' };
   const base = '/api/v1/admin/accounts';
   const pageSize = 20;
+  const duplicateIdentities = {
+    account: ['account_id', '租户标识已存在，请换一个。'],
+    user: ['user_id', '用户标识已存在，请换一个。'],
+    agent: ['agent_id', 'Agent 标识已存在，请换一个。'],
+  };
   let section = 'users';
   let deploymentDetail = false;
   let catalogPage = 0;
@@ -32,17 +37,26 @@ window.tenantAdmin = (() => {
     if (error.name === 'TimeoutError') return '请求超时，请刷新目录后重试。';
     if (error.status === 401) return 'Key 已失效，请在「身份与 API Key」中更新。';
     if (error.status === 403) return '当前身份无法管理此租户。';
-    if (error.message.startsWith('account already exists:')) return '这个租户标识已被使用，请换一个。';
+    if (error instanceof TypeError || error.status >= 500) return '服务暂不可用，请稍后重试。';
+    if (error.status === 404) return '记录已不存在，请刷新目录。';
     if (error.message === 'Keep at least one tenant administrator') return '请先设置另一位租户管理员。';
     if (error.message === "Reassign the user's Agents before removing this user") return '请先在 Agent 列表中变更归属。';
     if (error.message.startsWith('owner user not found') || error.message === 'Agent owner is no longer registered') return '请选择当前租户中已注册的用户。';
     return error.message;
   }
 
-  function message(text, error = false) {
-    const status = $('#tenant-message');
+  function setStatus(status, text, error = false) {
     status.textContent = text;
     status.classList.toggle('error', error);
+  }
+
+  function message(text, error = false) {
+    setStatus($('#tenant-message'), text, error);
+  }
+
+  function fieldProblem(field, text) {
+    field.setAttribute('aria-describedby', feedback.id);
+    showFieldProblem(field, feedback, text);
   }
 
   function api(path, method, data) {
@@ -310,6 +324,7 @@ window.tenantAdmin = (() => {
     function select(record) {
       pending.selection = record;
       save.disabled = form.hasAttribute('aria-busy') || (!record && !optionalOwner) || (!users && record?.owner_user_id === pending.id);
+      status.classList.remove('error');
       if (!record) status.textContent = '';
       else if (pending.name === 'agent') {
         status.textContent = record.owner_user_id === pending.id ? '该 Agent 已归属此用户。'
@@ -326,7 +341,7 @@ window.tenantAdmin = (() => {
       prev.disabled = next.disabled = true;
       results.setAttribute('aria-busy', 'true');
       results.inert = true;
-      status.textContent = '正在读取…';
+      setStatus(status, '正在读取…');
       try {
         const data = await fetchJson(apiUrl(path + '/' + kind, {
           limit: 8, q: filter.value.trim(), after: offsets[index], owner_user_id: owner,
@@ -360,7 +375,7 @@ window.tenantAdmin = (() => {
       } catch (error) {
         if (request.signal.aborted) return;
         results.replaceChildren();
-        status.textContent = errorText(error);
+        setStatus(status, errorText(error), true);
       } finally {
         if (controller === request) {
           results.removeAttribute('aria-busy');
@@ -453,9 +468,9 @@ window.tenantAdmin = (() => {
       $(selector).addEventListener('click', async () => {
         try {
           await copyCredential(value);
-          status.textContent = done;
+          setStatus(status, done);
         } catch {
-          status.textContent = '复制失败，请显示 Key 后手动复制。';
+          setStatus(status, '复制失败，请显示 Key 后手动复制。', true);
         }
       });
     }
@@ -464,16 +479,20 @@ window.tenantAdmin = (() => {
     $('#tenant-copy-key').focus();
   }
 
+  fields.addEventListener('input', (event) => {
+    const field = event.target;
+    if (!field.hasAttribute('aria-invalid')) return;
+    field.removeAttribute('aria-describedby');
+    clearFieldProblem(field, feedback);
+  });
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     if (!action || save.disabled || form.hasAttribute('aria-busy')) return;
     feedback.textContent = '';
     const invalid = [...fields.querySelectorAll('input')].find((field) => !field.validity.valid);
     if (invalid) {
-      invalid.setAttribute('aria-invalid', 'true');
-      invalid.setAttribute('aria-describedby', feedback.id);
-      feedback.textContent = '请输入以字母或数字开头的标识，可使用字母、数字、点、下划线和连字符。';
-      invalid.focus();
+      fieldProblem(invalid, '请输入以字母或数字开头的标识，可使用字母、数字、点、下划线和连字符。');
       return;
     }
     const pending = action;
@@ -509,7 +528,18 @@ window.tenantAdmin = (() => {
         else if (!affectsCurrentUser || pending.name !== 'key') await load(page, pending.label + '已完成。');
       }
     } catch (error) {
-      if (action === pending) feedback.textContent = errorText(error);
+      if (action !== pending) return;
+      const duplicate = error.message.match(/^(account|user|agent) already exists:/)?.[1];
+      if (duplicate) {
+        const [name, text] = duplicate === 'user' && pending.name === 'account'
+          ? ['admin_user_id', '首位管理员标识已存在，请换一个。']
+          : duplicateIdentities[duplicate];
+        const field = form.elements.namedItem(name);
+        if (field && field.value === data[name]) fieldProblem(field, text);
+        else feedback.textContent = text;
+      } else {
+        feedback.textContent = errorText(error);
+      }
     } finally {
       save.disabled = cancel.disabled = false;
       form.removeAttribute('aria-busy');
