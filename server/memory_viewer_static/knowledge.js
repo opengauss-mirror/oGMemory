@@ -19,6 +19,8 @@
   const libraryForm = element('base-form');
   const libraryName = element('base-name');
   const libraryVisibility = element('base-visibility');
+  const membersDialog = element('members-dialog');
+  const memberQuery = element('member-query');
   let accountId = '';
   let active = false;
   let generation = 0;
@@ -41,6 +43,7 @@
   let libraryAction = null;
   let libraryTrigger = null;
   let libraryBusy = false;
+  let memberSession = null;
 
   function headers() {
     return { ...requestHeaders(), ...(accountId && { 'X-Account-ID': accountId }) };
@@ -86,7 +89,8 @@
     element('base-create').disabled = Boolean(libraryRequest);
     element('base-edit').hidden = !permissions.manage;
     element('base-delete').hidden = !permissions.manage || library?.is_default;
-    for (const action of ['base-edit', 'base-delete']) {
+    element('base-manage-members').hidden = !permissions.manage || library?.visibility !== 'shared';
+    for (const action of ['base-edit', 'base-delete', 'base-manage-members']) {
       element(action).disabled = Boolean(libraryRequest);
     }
     element('base-scope').textContent = library
@@ -127,8 +131,9 @@
         || libraryItems.find((item) => item.id === result.default_knowledge_base_id)
         || libraryItems[0] || null;
       if (next?.id !== library?.id) {
+        closeMembers();
         reset();
-      }
+      } else if (!next?.permissions?.manage) closeMembers();
       library = next;
       renderLibraryOptions();
     } catch (error) {
@@ -563,6 +568,217 @@
     }
   }
 
+  function memberPath(session, user) {
+    const path = `${libraryBase}/${session.id}/members`;
+    return user ? `${path}/${encodeURIComponent(user)}` : path;
+  }
+
+  function memberFeedback(message, error = false) {
+    const region = element('member-feedback');
+    region.textContent = message;
+    region.classList.toggle('is-error', error);
+  }
+
+  function chooseMember(user = '') {
+    if (!memberSession) return;
+    memberSession.selected = user;
+    element('member-selected').textContent = user;
+    element('member-grant').hidden = !user;
+    for (const button of element('member-results').querySelectorAll('button')) {
+      button.setAttribute('aria-pressed', String(button.dataset.user === user));
+    }
+    if (user) {
+      element('member-permission').value = 'read';
+      element('member-permission').focus();
+    }
+  }
+
+  function memberButton(label, destructive = false) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = destructive ? 'secondary-button knowledge-base-danger' : 'secondary-button';
+    button.textContent = label;
+    return button;
+  }
+
+  function renderGrantedMembers(session, members) {
+    const version = JSON.stringify(members);
+    if (version === session.membersVersion) return;
+    session.membersVersion = version;
+    const list = element('member-list');
+    list.replaceChildren();
+    element('member-count').textContent = `${members.length} 位`;
+    element('member-empty').hidden = Boolean(members.length);
+    for (const { user_id: user, permission: saved } of members) {
+      const row = document.createElement('li');
+      row.className = 'knowledge-member-row';
+      const name = document.createElement('strong');
+      name.textContent = user;
+      const controls = document.createElement('div');
+      controls.className = 'knowledge-member-row-actions';
+      const permission = document.createElement('select');
+      permission.dataset.user = user;
+      permission.setAttribute('aria-label', `${user} 的权限`);
+      permission.append(new Option('只读', 'read'), new Option('可编辑', 'write'));
+      permission.value = saved;
+      const save = memberButton('保存权限');
+      save.disabled = true;
+      save.setAttribute('aria-label', `保存 ${user} 的权限`);
+      const revoke = memberButton('撤销', true);
+      revoke.setAttribute('aria-label', `撤销 ${user} 的权限`);
+      permission.addEventListener('change', () => { save.disabled = permission.value === saved; });
+      save.addEventListener('click', () => changeMember(session, user, permission.value, '权限已更新。', 'role'));
+      revoke.addEventListener('click', () => {
+        session.revoke = user;
+        session.revokeTrigger = revoke;
+        element('member-confirm-label').textContent = `撤销「${user}」的知识库授权？`;
+        element('member-confirm').hidden = false;
+        element('member-confirm-cancel').focus();
+      });
+      controls.append(permission, save, revoke);
+      row.append(name, controls);
+      list.append(row);
+    }
+  }
+
+  function renderMembers(session, payload) {
+    renderGrantedMembers(session, payload.members);
+    const results = element('member-results');
+    results.replaceChildren();
+    for (const { user_id: user } of payload.candidates) {
+      const row = document.createElement('li');
+      const select = document.createElement('button');
+      select.type = 'button';
+      select.className = 'knowledge-member-candidate';
+      const name = document.createElement('strong');
+      name.textContent = user;
+      const arrow = document.createElement('span');
+      arrow.setAttribute('aria-hidden', 'true');
+      arrow.textContent = '›';
+      select.dataset.user = user;
+      select.setAttribute('aria-label', `选择 ${user}`);
+      select.setAttribute('aria-pressed', String(user === session.selected));
+      select.addEventListener('click', () => chooseMember(user));
+      select.append(name, arrow);
+      row.append(select);
+      results.append(row);
+    }
+    const empty = element('member-search-empty');
+    empty.textContent = !payload.candidates.length
+      ? session.query ? '没有符合该关键词的可授权成员。' : '当前账户暂无可授权成员。'
+      : payload.candidate_count > payload.candidates.length ? `显示前 ${payload.candidates.length} 位，可缩小搜索范围。` : '';
+    empty.hidden = !empty.textContent;
+    if (session.selected && !payload.candidates.some(({ user_id }) => user_id === session.selected)) {
+      chooseMember();
+    }
+  }
+
+  async function loadMembers(session, message = '') {
+    if (session !== memberSession) return;
+    session.request?.abort();
+    const request = new AbortController();
+    session.request = request;
+    const url = new URL(memberPath(session), location.origin);
+    if (session.query) url.searchParams.set('q', session.query);
+    memberFeedback(message || '正在读取成员…');
+    try {
+      const payload = await getJson(url, { signal: request.signal });
+      if (session !== memberSession || request.signal.aborted) return;
+      renderMembers(session, payload);
+      memberFeedback(message);
+    } catch (error) {
+      if (session === memberSession && !request.signal.aborted) {
+        memberFeedback(errorText(error, '成员暂时无法读取，请重新查找。'), true);
+      }
+    }
+  }
+
+  function hideRevoke(session, restoreFocus = false) {
+    if (restoreFocus) session.revokeTrigger?.focus();
+    session.revoke = null;
+    session.revokeTrigger = null;
+    element('member-confirm').hidden = true;
+  }
+
+  async function changeMember(session, user, permission, message, focus = '') {
+    if (session !== memberSession || session.mutating) return;
+    session.mutating = true;
+    clearTimeout(session.timer);
+    session.request?.abort();
+    const controls = [...membersDialog.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)')];
+    controls.forEach((control) => { control.disabled = true; });
+    memberFeedback('正在保存权限…');
+    try {
+      if (permission) {
+        await getJson(memberPath(session, user), {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ permission }),
+        });
+      } else {
+        const response = await fetch(memberPath(session, user), {
+          method: 'DELETE', headers: headers(), signal: AbortSignal.timeout(12000),
+        });
+        if (!response.ok) throw Object.assign(new Error(), { status: response.status });
+      }
+      if (session !== memberSession) return;
+      hideRevoke(session);
+      chooseMember();
+      await loadMembers(session, message);
+    } catch (error) {
+      if (session !== memberSession) return;
+      const explanation = error.status === 404 ? '知识库或成员已变更，请关闭后重新打开成员管理。'
+        : errorText(error, '权限未确认。可重新查找核对后重试。');
+      memberFeedback(explanation, true);
+    } finally {
+      if (session === memberSession) {
+        session.mutating = false;
+        controls.forEach((control) => { control.disabled = false; });
+        const role = [...element('member-list').querySelectorAll('select')].find((control) => control.dataset.user === user);
+        (focus === 'role' && role ? role : memberQuery).focus();
+      }
+    }
+  }
+
+  function openMembers(event) {
+    if (!library?.permissions?.manage || library.visibility !== 'shared') return;
+    memberSession = { id: library.id, trigger: event.currentTarget, query: '', selected: '' };
+    element('members-context').textContent = library.name;
+    element('member-count').textContent = '';
+    element('member-list').replaceChildren();
+    element('member-results').replaceChildren();
+    for (const name of ['member-empty', 'member-search-empty', 'member-grant', 'member-confirm', 'member-clear']) {
+      element(name).hidden = true;
+    }
+    memberQuery.value = '';
+    membersDialog.showModal();
+    memberQuery.focus();
+    loadMembers(memberSession);
+  }
+
+  function closeMembers(restoreFocus = false) {
+    const session = memberSession;
+    if (!session) return;
+    clearTimeout(session.timer);
+    session.request?.abort();
+    memberSession = null;
+    if (membersDialog.open) membersDialog.close();
+    for (const control of membersDialog.querySelectorAll(':disabled')) control.disabled = false;
+    if (restoreFocus && !session.trigger.hidden && !session.trigger.disabled) session.trigger.focus();
+  }
+
+  function searchMembers(delay = 0) {
+    const session = memberSession;
+    if (!session || session.mutating || session.composing) return;
+    clearTimeout(session.timer);
+    session.request?.abort();
+    chooseMember();
+    element('member-results').replaceChildren();
+    element('member-search-empty').hidden = true;
+    session.query = memberQuery.value.trim();
+    if (delay) session.timer = setTimeout(() => loadMembers(session), delay);
+    else loadMembers(session);
+  }
+
   function reset() {
     generation += 1;
     listRequest?.abort();
@@ -598,6 +814,7 @@
     libraryAction = null;
     libraryTrigger = null;
     setLibraryBusy(false);
+    closeMembers();
     reset();
   }
 
@@ -613,6 +830,7 @@
   librarySelect.addEventListener('change', () => {
     const next = libraryItems.find((item) => item.id === librarySelect.value);
     if (!next || next.id === library?.id) return;
+    closeMembers();
     reset();
     library = next;
     renderLibraryControls();
@@ -621,6 +839,37 @@
   for (const action of ['create', 'edit', 'delete']) {
     element('base-' + action).addEventListener('click', (event) => openLibraryDialog(action, event.currentTarget));
   }
+  element('base-manage-members').addEventListener('click', openMembers);
+  element('members-close').addEventListener('click', () => closeMembers(true));
+  membersDialog.addEventListener('close', () => { if (!membersDialog.open) closeMembers(true); });
+  membersDialog.addEventListener('cancel', (event) => { if (memberSession?.mutating) event.preventDefault(); });
+  memberQuery.addEventListener('compositionstart', () => { if (memberSession) memberSession.composing = true; });
+  memberQuery.addEventListener('compositionend', () => {
+    if (memberSession) memberSession.composing = false;
+    searchMembers(300);
+  });
+  memberQuery.addEventListener('input', () => {
+    element('member-clear').hidden = !memberQuery.value;
+    searchMembers(300);
+  });
+  element('member-search').addEventListener('submit', (event) => {
+    event.preventDefault();
+    searchMembers();
+  });
+  element('member-clear').addEventListener('click', () => {
+    memberQuery.value = '';
+    element('member-clear').hidden = true;
+    memberQuery.focus();
+    searchMembers();
+  });
+  element('member-grant').addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (memberSession?.selected) changeMember(memberSession, memberSession.selected, element('member-permission').value, '成员权限已授予。');
+  });
+  element('member-confirm-cancel').addEventListener('click', () => { if (memberSession) hideRevoke(memberSession, true); });
+  element('member-confirm-submit').addEventListener('click', () => {
+    if (memberSession?.revoke) changeMember(memberSession, memberSession.revoke, '', '成员权限已撤销。');
+  });
   element('base-dialog-cancel').addEventListener('click', () => libraryDialog.close());
   libraryForm.addEventListener('submit', submitLibraryDialog);
   libraryForm.addEventListener('input', (event) => {
