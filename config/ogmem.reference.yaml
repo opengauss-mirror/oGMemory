@@ -245,7 +245,7 @@ sharing:
 memory:
   extraction:
     card_format_enabled: false  # Validate entity/preference cards and recover malformed output in background.
-    mode: eager                   # [all] eager / lazy / fast (one extraction and decision call per batch)
+    mode: fast                    # [all] fast (one extraction and decision call per batch) / eager / lazy
     node_processing_enabled: false # [all] eager or lazy extraction followed by topic node processing
     read_probability_threshold: 0.70  # [all] Minimum JEV probability required for an old-memory read
     dual_pass_enabled: false      # [all] Set true to run two native extraction passes per span

@@ -777,7 +777,7 @@ class OgMemConfig:
     agent_shared_list: list[str] = field(default_factory=list)
 
     # -- Memory extraction -----------------------------------------------------
-    extraction_mode: str = "eager"  # "eager", "lazy", or "fast"
+    extraction_mode: str | None = None
     after_turn_threshold: int = 400
     agent_turn_workers: int = DEFAULT_AGENT_TURN_WORKERS
     agent_turn_scheduler_owner: bool = True
@@ -927,6 +927,14 @@ class OgMemConfig:
             raise ValueError("dual_pass_enabled must be a boolean")
         if type(self.node_processing_enabled) is not bool:
             raise ValueError("node_processing_enabled must be a boolean")
+        if self.extraction_mode is None:
+            eager_options_enabled = (
+                self.source_occurrence_reconciliation_enabled
+                or self.dual_pass_enabled
+                or self.node_processing_enabled
+                or self.directory_summary_enabled
+            )
+            self.extraction_mode = "eager" if eager_options_enabled else "fast"
         if self.graph_backend not in {"none", "sql"}:
             raise ValueError("graph.backend must be none or sql")
         if self.graph_backend == "sql" and self.storage_backend != "sql":
@@ -2346,7 +2354,7 @@ class OgMemConfig:
             extraction_mode=_resolve(
                 memory.get("extraction", {}).get("mode"),
                 "OGMEM_EXTRACTION_MODE",
-                "eager",
+                None,
             ),
             read_probability_threshold=memory.get("extraction", {}).get("read_probability_threshold", 0.70),
             dual_pass_enabled=_resolve_bool(

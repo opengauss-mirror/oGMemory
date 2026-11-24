@@ -210,6 +210,10 @@ mcp:
 
 `read-write` 提供记忆读取和写入能力，不开放删除工具。需要调整时修改 `deploy/compose/ogmemory.yaml`；`all` 和 `full` 工具集会开放删除工具。HTTP 生命周期写入接口仍可使用。
 
+`OGMEM_IMAGE` 指向包含 Fast 抽取的服务镜像时，默认使用 `fast`。每批一次 LLM 调用，可生成新卡、已读取卡片的更新和会话摘要。需沿用 Eager 或 Lazy 时，在 `deploy/compose/ogmemory.yaml` 中设置 `memory.extraction.mode` 为 `eager` 或 `lazy`，再重新执行 `start`。已有的显式模式配置继续生效。
+
+单次模型输出上限默认为 `4096`。若长批次出现输出截断，可在模型支持时将同一文件中的 `llm.max_tokens` 调至 `8192`。
+
 ### 3.3 模型访问代理
 
 需要代理访问云端 LLM 或 Embedding 时，在本实例 `.env` 中填写：

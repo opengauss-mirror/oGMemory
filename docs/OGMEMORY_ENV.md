@@ -276,6 +276,8 @@ retrieval:
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
+| `memory.extraction.engine` | `OGMEM_EXTRACTION_ENGINE` | `llm` | 否 | `deterministic` 选用确定性引擎，优先于 LLM 抽取模式 |
+| `memory.extraction.mode` | `OGMEM_EXTRACTION_MODE` | `fast` | 否 | LLM 抽取模式，可选 `fast`、`eager` 或 `lazy` |
 | `memory.after_turn_threshold` | `OGMEM_AFTER_TURN_THRESHOLD` | `400` | 否 | 会话缓冲区待处理 token 达到阈值后触发 after_turn 增量抽取 |
 | `memory.rolling_compress_enabled` | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 否 | 启用 Layer 2 滚动会话压缩 |
 | `memory.rolling_compress_fallback_enabled` | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | 否 | LLM 压缩不可用时使用规则 fallback |
@@ -291,6 +293,12 @@ retrieval:
 | `memory.topic_detection_enabled` | `OGMEM_TOPIC_DETECTION_ENABLED` | `false` | 否 | 启用实验性话题检测 |
 | `memory.compression_quality_enabled` | `OGMEM_COMPRESSION_QUALITY_ENABLED` | `false` | 否 | 计算 archive 压缩质量指标 |
 | `memory.compression_quality_persist_metadata` | `OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA` | `false` | 否 | 将压缩质量指标写入 archive metadata |
+
+Fast 每批调用一次模型，可生成新卡、已读取卡片的更新和会话摘要。服务端校验操作并核对旧卡版本。长批次出现输出截断时，可将 `llm.max_tokens` 从默认的 `4096` 调至模型供应商支持的 `8192`，再检查回显确认输出完整。
+
+Fast 支持用户档案、实体、偏好、事件、模式、案例、工具、技能和事实等已注册类型，使用本地规则写入归档摘要。未指定模式时，已启用来源事件归并、双轮抽取、独立节点处理或目录摘要的配置继续使用 Eager。
+
+已有配置文件中的 `mode: eager` 或 `mode: lazy` 继续生效。Eager 预取相关记忆后执行原有抽取，Lazy 使用有轮次上限的 ReAct 循环。YAML 中的显式设置优先于环境变量。
 
 ### 缓存
 

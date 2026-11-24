@@ -151,11 +151,11 @@ These are the core policy examples. Agent-owned tool and experience memory, skil
 
 **What breaks without it:** Concurrent writers can overwrite each other's changes. Version checks detect a stale update before publication.
 
-### Why the ReAct loop for extraction?
+### Memory extraction modes
 
-**The problem:** Extraction quality depends on knowing what already exists. If the system already knows "Alice is a backend engineer," extracting that again wastes LLM tokens and creates duplicate entries that must be deduplicated later.
+The server defaults to `fast`. One LLM call per extraction batch can produce new cards, updates to previously read cards, and a session summary. The server validates the operations and checks the versions of existing cards before writing.
 
-**The solution:** Default eager mode prepares relevant context and extracts once. Optional lazy mode uses a bounded ReAct loop with available memory reads and schema-defined extraction tools. Dual-pass extraction is separately configurable.
+Set `memory.extraction.mode` to `eager` for native extraction with prefetched memory or `lazy` for a bounded ReAct loop. Explicit mode settings continue to apply. The deterministic extraction engine takes precedence over these LLM modes. [Configuration reference](docs/OGMEMORY_ENV.md#记忆与压缩)
 
 ```
   Lazy mode, iteration 1:  read(profile_uri) → "Alice, backend engineer, London"
@@ -165,8 +165,6 @@ These are the core policy examples. Agent-owned tool and experience memory, skil
                  → New: "Alice now also uses Rust for side projects"
                  → extract_entity(routing_key="rust", ...)
 ```
-
-**What breaks without it:** Extraction with no view of existing memory can propose redundant facts. Prepared context, incremental processing, and merge policies help identify and reconcile repeat information.
 
 ---
 
@@ -199,7 +197,7 @@ PostgreSQL with pgvector, Chroma, Milvus, or an in-memory index for development.
   Completed turn or explicit memory write
                       │
           Buffer and extract eligible messages
-               (eager or optional lazy)
+              (fast, eager, or lazy)
                       │
               Typed memory candidates
                       │
@@ -578,8 +576,8 @@ The table lists service fallback values. The [reference YAML](config/ogmem.refer
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
 | `OGMEM_CONFIG` | Project `config/ogmem.yaml` or `/etc/ogmem/config.yaml` | Path to the service YAML |
 | `OGMEM_AFTER_TURN_THRESHOLD` | `400` | Pending token threshold before automatic after-turn extraction |
-| `OGMEM_EXTRACTION_MODE` | `eager` | Extraction mode. Choose `lazy` for bounded ReAct extraction. |
-| `OGMEM_DUAL_PASS_ENABLED` | `false` | Enable a second extraction pass. |
+| `OGMEM_EXTRACTION_MODE` | `fast` | LLM extraction mode. Also accepts `eager` and `lazy`. |
+| `OGMEM_DUAL_PASS_ENABLED` | `false` | Enable a second native extraction pass where supported. |
 | `OGMEM_RETRIEVAL_HYBRID_ENABLED` | `false` | Enable native openGauss BM25 with SQL storage. Eligible first-time local onboarding can enable it. |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | Enable Layer 2 rolling session compression |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | Use rule-based rolling fallback when LLM compression is unavailable |
