@@ -160,21 +160,25 @@ def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, li
     import service.evidence_service as search
     from core.evidence import message_source
 
-    fs, _, store, _ = setup
-    messages = [message(f"I visited Paris on 2026-05-0{i + 1}.", id=str(i), sequence=i) for i in range(2)]
-    first, extra = sorted(messages, key=lambda item: message_source(item, CTX).source_key)
-    write_candidates(setup, [first], categories={"event"})
-    store.register([extra], CTX, batch_id="beyond-source-limit")
+    fs, _, _, _ = setup
+    messages = sorted([message("Paris.", id=str(i), sequence=i * 2) for i in range(3)],
+                      key=lambda item: message_source(item, CTX).source_key)
+    for index, msg in enumerate(messages, start=1):
+        msg["content"] = f"I visited Paris on 2026-05-0{index}."
+    first = messages[0]
+    write_candidates(setup, messages, categories={"event"})
     count_limit = limit == "count"
     if count_limit:
         monkeypatch.setattr(search, "_SOURCE_SCAN_LIMIT", 1)
     else:
         monkeypatch.setattr(search, "_SCAN_BYTE_LIMIT", len(first["content"].encode("utf-8")))
 
-    result = EvidenceService(fs).search("Paris visit", CTX, use_memories=True, use_events=True)
+    # The exact-date events are outside the source scan and would take both event slots.
+    result = EvidenceService(fs).search("Paris visit 2026-05-02 2026-05-03", CTX, use_memories=True, use_events=True)
 
     assert result.diagnostics["scanned_sources"] == (1 if count_limit else 2)
     assert result.diagnostics["partial"] and result.diagnostics["truncated"]
+    assert result.diagnostics["events_matched"] == int(count_limit)
     assert result.diagnostics["events_admitted"] == int(count_limit)
     assert [item["message_id"] for item in result.evidence] == [first["id"]]
     assert [fact["quote"] for fact in result.facts] == ([first["content"]] if count_limit else [])

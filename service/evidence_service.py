@@ -199,12 +199,13 @@ class EvidenceService:
                                     _add_archive_hints(node, sources, memory_texts)
                                 continue
                             candidates = data.get("fact_records", [])
+                            is_event = node.category == "event"
                             for record in candidates:
                                 check_deadline()
                                 refs = record.get("source_refs", [])
                                 fact_eligible = bool(topics & set(terms(record.get("quote", "")))) and fact_matches(query, record)
                                 hints = set()
-                                if (not fact_eligible and refs and request.use_memories and node.category != "event"
+                                if (not fact_eligible and refs and request.use_memories and not is_event
                                         and hint_attempts < request.candidate_limit
                                         and len(context_hints) < request.candidate_limit):
                                     for ref in refs:
@@ -218,7 +219,9 @@ class EvidenceService:
                                             hint_topics_by_unit[key] = context_terms & (set(terms(unit["text"])) - names)
                                         if hint_topics_by_unit[key] - set(terms(record.get("subject", ""))):
                                             hints.add(key)
-                                if not refs or not (fact_eligible or hints):
+                                if not refs or not (fact_eligible or hints) or (
+                                    is_event and any(ref.get("evidence_unit_id") not in units for ref in refs)
+                                ):
                                     diagnostics["rejected_facts"] += 1
                                     continue
                                 if hints and not fact_eligible:
@@ -232,9 +235,9 @@ class EvidenceService:
                                     memory_texts.setdefault(key, units[key]["text"])
                                 if not fact_eligible:
                                     continue
-                                if node.category == "event" and request.use_events:
+                                if is_event and request.use_events:
                                     events.append((node.uri, record))
-                                elif request.use_memories and node.category != "event":
+                                elif request.use_memories and not is_event:
                                     records.append(record)
                         if stop_cards:
                             break
