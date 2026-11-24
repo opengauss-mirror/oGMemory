@@ -470,6 +470,105 @@ def _run_secret_command(command_spec: SecretCommandSpec, *, label: str) -> str:
     return value
 
 
+@dataclass(frozen=True)
+class ExternalKnowledgeBaseConfig:
+    provider: str
+    base_url: str
+    api_key: str = field(repr=False)
+    account_namespaces: dict[str, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("knowledge_base.external.provider must be a nonempty string")
+        _validate_knowledge_base_url(self.base_url)
+        if not isinstance(self.api_key, str) or not self.api_key.strip():
+            raise ValueError("knowledge_base.external.api_key must be a nonempty string")
+        namespaces = self.account_namespaces
+        if not isinstance(namespaces, dict) or not all(
+            isinstance(value, str) and 1 <= len(value) <= 128 and value.strip() == value
+            for pair in namespaces.items()
+            for value in pair
+        ):
+            raise ValueError(
+                "knowledge_base.external.account_namespaces requires nonempty account and "
+                "namespace strings up to 128 characters"
+            )
+        if len(set(namespaces.values())) != len(namespaces):
+            raise ValueError("knowledge_base.external.account_namespaces must be one-to-one")
+
+
+def _validate_knowledge_base_url(base_url: str) -> None:
+    error = "knowledge_base.external.base_url must be an HTTP(S) URL without credentials, query or fragment"
+    if (
+        not isinstance(base_url, str)
+        or any(char.isspace() or not char.isprintable() for char in base_url)
+        or any(char in base_url for char in "\\?#")
+    ):
+        raise ValueError(error)
+    try:
+        url = urlsplit(base_url)
+        port = url.port
+    except ValueError:
+        raise ValueError(error) from None
+    if (
+        url.scheme not in {"http", "https"}
+        or not url.hostname
+        or "%" in url.hostname
+        or url.username is not None
+        or url.netloc.endswith(":")
+        or port == 0
+    ):
+        raise ValueError(error)
+
+
+@dataclass(frozen=True)
+class KnowledgeBaseConfig:
+    mode: str = "local"
+    external: ExternalKnowledgeBaseConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("local", "external"):
+            raise ValueError("knowledge_base.mode must be local or external")
+        if self.mode == "external" and not isinstance(self.external, ExternalKnowledgeBaseConfig):
+            raise ValueError("knowledge_base.external must be configured in external mode")
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> KnowledgeBaseConfig:
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError("knowledge_base must be a mapping")
+        mode = _resolve(raw.get("mode"), "OGMEM_KNOWLEDGE_BASE_MODE", "local")
+        if mode != "external":
+            return cls(mode=mode)
+
+        external = raw.get("external")
+        if external is None:
+            external = {}
+        if not isinstance(external, dict):
+            raise ValueError("knowledge_base.external must be a mapping")
+
+        env_prefix = "OGMEM_KNOWLEDGE_BASE_EXTERNAL_"
+        strings = {}
+        for name in ("provider", "base_url", "api_key"):
+            value = external.get(name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"knowledge_base.external.{name} must be a string")
+            strings[name] = _resolve(value, env_prefix + name.upper(), "")
+        namespaces = _resolve_json_object(
+            external.get("account_namespaces"), env_prefix + "ACCOUNT_NAMESPACES"
+        )
+        return cls(
+            mode=mode,
+            external=ExternalKnowledgeBaseConfig(
+                provider=strings["provider"],
+                base_url=strings["base_url"],
+                api_key=strings["api_key"],
+                account_namespaces=namespaces,
+            ),
+        )
+
+
 @dataclass
 class OgMemConfig:
     """All ogmemory configuration in one place."""
@@ -777,6 +876,7 @@ class OgMemConfig:
     deterministic_spacy_model_en: str = DeterministicConfig.spacy_model_en
     deterministic_spacy_model_zh: str = DeterministicConfig.spacy_model_zh
     deterministic_on_model_missing: str = DeterministicConfig.on_model_missing
+    knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
 
     @property
     def evidence_enabled(self) -> bool:
@@ -1343,6 +1443,7 @@ class OgMemConfig:
 
         cfg = cls(
             decision=decision_config,
+            knowledge_base=KnowledgeBaseConfig.from_mapping(raw.get("knowledge_base")),
             # LLM
             provider=_resolve(llm.get("provider"), "CONTEXTENGINE_PROVIDER", "mock"),
             openai_api_key=llm_api_key,
@@ -2711,6 +2812,8 @@ class OgMemConfig:
                 return "<configured>"
             if "command" in lowered and value is not None:
                 return "<configured>"
+            if isinstance(value, (KnowledgeBaseConfig, ExternalKnowledgeBaseConfig)):
+                return {f.name: sanitize(f.name, getattr(value, f.name)) for f in fields(value)}
             if isinstance(value, dict):
                 return {str(key): sanitize(str(key), item) for key, item in value.items()}
             if isinstance(value, (list, tuple)):
