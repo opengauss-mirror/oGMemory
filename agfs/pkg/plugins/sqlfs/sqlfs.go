@@ -489,34 +489,19 @@ func (fs *SQLFS) RemoveAll(path string) error {
 	// Use batched deletion to avoid long-running transactions and locks
 	const batchSize = 1000
 
-	// If path is root, remove all children but not the root itself
+	predicate := "path = ? OR path LIKE ?"
+	args := []interface{}{path, path + "/%", batchSize}
 	if path == "/" {
-		for {
-			result, err := fs.db.Exec("DELETE FROM files WHERE path != '/' LIMIT ?", batchSize)
-			if err != nil {
-				return err
-			}
-			affected, err := result.RowsAffected()
-			if err != nil {
-				return err
-			}
-			// If no rows were affected, we're done
-			if affected == 0 {
-				break
-			}
-			// If fewer rows than batch size were deleted, we're done
-			if affected < int64(batchSize) {
-				break
-			}
-		}
-		// Invalidate entire cache
-		fs.listCache.InvalidatePrefix("/")
-		return nil
+		predicate = "path != '/'"
+		args = []interface{}{batchSize}
 	}
 
-	// Delete file and all children in batches
+	query := "DELETE FROM files WHERE (" + predicate + ") LIMIT ?"
+	if fs.backend.GetDriverName() == "sqlite3" {
+		query = "DELETE FROM files WHERE path IN (SELECT path FROM files WHERE " + predicate + " LIMIT ?)"
+	}
 	for {
-		result, err := fs.db.Exec("DELETE FROM files WHERE (path = ? OR path LIKE ?) LIMIT ?", path, path+"/%", batchSize)
+		result, err := fs.db.Exec(query, args...)
 		if err != nil {
 			return err
 		}
@@ -524,18 +509,14 @@ func (fs *SQLFS) RemoveAll(path string) error {
 		if err != nil {
 			return err
 		}
-		// If no rows were affected, we're done
-		if affected == 0 {
-			break
-		}
-		// If fewer rows than batch size were deleted, we're done
 		if affected < int64(batchSize) {
 			break
 		}
 	}
 
-	// Invalidate cache for the path and all descendants
-	fs.listCache.InvalidateParent(path)
+	if path != "/" {
+		fs.listCache.InvalidateParent(path)
+	}
 	fs.listCache.InvalidatePrefix(path)
 
 	return nil
