@@ -15,6 +15,7 @@ from psycopg2.extras import Json
 from pyagfs.exceptions import AGFSClientError
 
 from core.errors import NodeBrokenError
+from core.operation_deadline import check_deadline, current_deadline, operation_deadline_at
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from fs.sql_adapter.pool import SharedConnectionPool
 from fs.sql_adapter.sql_context_fs import SQLContextFS, _resource_mutation_lock_key
@@ -34,8 +35,16 @@ class AGFSSpaceBridge(SQLContextFS):
         self._read_futures = set()
 
     def _map_reads(self, function, values):
+        deadline = current_deadline()
+
+        def run(value):
+            with operation_deadline_at(deadline):
+                return function(value)
+
+        worker = function if deadline is None else run
         with self._read_lock:
-            futures = [self._content_reads.submit(function, value) for value in values]
+            check_deadline()
+            futures = [self._content_reads.submit(worker, value) for value in values]
             self._read_futures.update(futures)
         for future in futures:
             future.add_done_callback(self._read_finished)
@@ -126,7 +135,7 @@ class AGFSSpaceBridge(SQLContextFS):
         if (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
                 or pointer.get("path") != path):
             raise NodeBrokenError(uri)
-        payload = self._agfs._client.read(path)
+        payload = self._agfs._read_blob(path)
         if hashlib.sha256(payload).hexdigest() != digest or len(payload) != pointer.get("bytes"):
             raise NodeBrokenError(uri)
         value = json.loads(payload)

@@ -16,8 +16,10 @@ from core.errors import (
     ConcurrentModificationError,
     NodeBrokenError,
     NodeNotFoundError,
+    OperationDeadlineExceededError,
 )
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.operation_deadline import operation_deadline
 from core.resource_identity import RootBindingError, compute_workspace_root_id
 from fs.sql_adapter.sql_context_fs import _resource_mutation_lock_key, parse_uri
 
@@ -614,6 +616,35 @@ class TestSQLContextFSAccess:
 
 
 class TestSQLContextFSReadNode:
+    @pytest.mark.parametrize("entry", ["single", "batch", "page"])
+    def test_deadline_during_tenant_binding_skips_select_and_returns_connection(self, mock_sql_fs, monkeypatch, entry):
+        import core.operation_deadline as deadline
+
+        fs, conn, cursor = mock_sql_fs
+        ctx = _ctx()
+        uri = _profile_node().uri
+        read = {
+            "single": lambda: fs.read_node(uri, ctx),
+            "batch": lambda: fs.read_nodes([uri], ctx),
+            "page": lambda: fs.list_node_summaries_page(uri.rsplit("/", 1)[0], ctx),
+        }[entry]
+        now = 0
+
+        def expire_after_binding(*args):
+            nonlocal now
+            now = 1
+
+        monkeypatch.setattr(deadline, "monotonic", lambda: now)
+        cursor.execute.side_effect = expire_after_binding
+        returned = MagicMock()
+        monkeypatch.setattr(fs, "_return_connection", returned)
+
+        with operation_deadline(1), pytest.raises(OperationDeadlineExceededError):
+            read()
+        cursor.execute.assert_called_once_with("SET LOCAL app.account_id = %s", (ctx.account_id,))
+        conn.rollback.assert_called_once()
+        returned.assert_called_once_with(conn)
+
     def test_read_existing_node(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()
@@ -946,6 +977,25 @@ class TestSQLContextFSListChildren:
         assert "CHAR_LENGTH(uri) > CHAR_LENGTH(%s)" in sql
         assert params[2].endswith("/preferences/")
         assert params[-1] == 1
+
+    def test_list_node_uris_page_checks_visibility_and_resumes_after_cursor(self, mock_sql_fs):
+        fs, _, cursor = mock_sql_fs
+        ctx = _ctx()
+        directory = "ctx://acme/users/alice/memories/preferences"
+        after_uri = f"{directory}/coffee"
+        next_uri = f"{directory}/tea"
+        cursor.fetchall.return_value = [(next_uri,)]
+
+        assert fs.list_node_uris_page(directory, ctx, limit=1, after_uri=after_uri) == [next_uri]
+        cursor.execute.assert_any_call("SET LOCAL app.account_id = %s", ("acme",))
+        sql, params = cursor.execute.call_args.args
+        assert " ".join(sql.split()).startswith("SELECT uri FROM context_nodes")
+        assert "status = 'ACTIVE'" in sql and "ORDER BY uri" in sql
+        assert "AND (%s IS NULL OR uri > %s)" in sql and "POSITION('/' IN SUBSTRING" in sql
+        assert params[3:] == ("acme", "user:alice", "user:alice", after_uri, after_uri, len(directory) + 2, 1)
+
+        with pytest.raises(AccessDeniedError):
+            fs.list_node_uris_page(directory, _ctx(account_id="other"), limit=1)
 
 
 class TestSQLContextFSMoveNode:

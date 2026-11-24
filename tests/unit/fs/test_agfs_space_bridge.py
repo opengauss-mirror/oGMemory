@@ -5,16 +5,20 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from pyagfs.exceptions import AGFSClientError
 
+from core.errors import OperationDeadlineExceededError
 from core.models import ContextNode, RequestContext
+from core.operation_deadline import operation_deadline
 from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
 from fs.sql_adapter.sql_context_fs import SQLContextFS
+from service.evidence_store import EvidenceStore
 
 
 class MemoryAGFS:
@@ -129,6 +133,56 @@ def test_batch_reads_hydrate_agfs(bridge, monkeypatch):
     ctx = RequestContext("acme", "alice", "ops", "session", "trace")
     result = bridge.read_nodes([node.uri for node in nodes], ctx)
     assert [result[node.uri].content for node in nodes] == [node.content for node in nodes]
+
+
+def test_evidence_uri_paging_defers_hydration_until_batch_read(bridge, monkeypatch):
+    ctx = RequestContext("acme", "alice", "ops", "session", "trace")
+    directory = "ctx://acme/users/alice/evidence/sources"
+    nodes = {}
+    for index in range(100):
+        uri = f"{directory}/{index:064x}"
+        metadata = bridge.store_shared(uri, f"Message {index}")
+        nodes[uri] = ContextNode(uri=uri, context_type="RESOURCE", category="evidence", level=2,
+                                 owner_space="user:alice", abstract="", overview="", content="", metadata=metadata)
+    cursor = Mock()
+    cursor.fetchall.return_value = [(uri,) for uri in nodes]
+    monkeypatch.setattr(bridge, "_node_read_cursor", lambda ctx: nullcontext(cursor))
+    monkeypatch.setattr(SQLContextFS, "list_node_summaries_page", lambda *args, **kwargs: list(nodes.values()))
+    monkeypatch.setattr(SQLContextFS, "read_nodes", lambda self, uris, ctx: {uri: nodes[uri] for uri in uris})
+    read_body = Mock(wraps=bridge._agfs._client.read)
+    monkeypatch.setattr(bridge._agfs._client, "read", read_body)
+
+    store = EvidenceStore(bridge)
+    page = next(store.node_pages(store.iter_uris(directory, ctx, 100), ctx, read_limit=32))
+
+    assert [node.content for _, node in page] == [f"Message {index}" for index in range(32)]
+    assert read_body.call_count == 32
+    assert " ".join(cursor.execute.call_args.args[0].split()).startswith("SELECT uri FROM context_nodes")
+
+
+def test_queued_hydration_inherits_deadline(bridge, monkeypatch):
+    import core.operation_deadline as deadline
+
+    uri = source_node().uri
+    metadata = bridge.store_shared(uri, "原始正文")
+    calls = []
+    now = 0
+    read = bridge._agfs._client.read
+
+    def cross_deadline(path):
+        nonlocal now
+        calls.append(path)
+        result = read(path)
+        now = 1
+        return result
+
+    monkeypatch.setattr(deadline, "monotonic", lambda: now)
+    monkeypatch.setattr(bridge._agfs._client, "read", cross_deadline)
+    with ThreadPoolExecutor(max_workers=1) as executor, monkeypatch.context() as patch:
+        patch.setattr(bridge, "_content_reads", executor)
+        with operation_deadline(1), pytest.raises(OperationDeadlineExceededError):
+            bridge.load_content([{"uri": uri, "metadata": metadata} for _ in range(3)])
+    assert calls == [metadata["agfs_content"]["path"]]
 
 
 def test_shared_skill_hydration_and_purge(bridge):

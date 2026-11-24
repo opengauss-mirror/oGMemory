@@ -7,14 +7,26 @@ revocation remains durable even after original session data has been removed.
 from __future__ import annotations
 
 import json
-import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from functools import lru_cache
 from itertools import islice
 
-from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
-from core.evidence import content_hash, digest, evidence_uri, message_source, reassemble_messages
+from core.errors import (
+    AccessDeniedError,
+    NodeNotFoundError,
+    ValidationError,
+)
+from core.evidence import (
+    content_hash,
+    digest,
+    evidence_uri,
+    is_evidence_key,
+    message_source,
+    reassemble_messages,
+    reference_span,
+    reference_unit_id,
+)
 from core.evidence_timing import stage, timed
 from core.models import ContextNode, RequestContext
 from core.operation_deadline import check_deadline
@@ -89,35 +101,42 @@ class EvidenceStore:
     def iter_uris(self, directory, ctx, limit, *, after_uri=None):
         """Yield bounded child URIs in storage order, resuming after a prior URI."""
         fs = self.fs
-        pager = getattr(type(fs), "list_node_summaries_page", None)
-        if callable(pager):
-            cursor = getattr(fs, "list_node_order_key", lambda uri: uri)(after_uri) if after_uri else None
-            count = 0
-            while count < limit:
-                with stage("list"):
-                    page = pager(fs, directory, ctx, limit=min(100, limit - count), after_uri=cursor)
-                if not page:
-                    return
-                for node in page:
-                    yield node.uri
-                    count += 1
-                cursor = getattr(fs, "list_node_order_key", lambda uri: uri)(page[-1].uri)
-        else:
+        uri_pager = getattr(type(fs), "list_node_uris_page", None)
+        summary_pager = getattr(type(fs), "list_node_summaries_page", None)
+        if not callable(uri_pager) and not callable(summary_pager):
+            check_deadline()
             yield from [uri for uri in sorted(fs.list_children(directory, ctx))
                         if after_uri is None or uri > after_uri][:limit]
+            return
 
-    def node_pages(self, uris, ctx, *, read_limit, deadline=None):
+        order_key = getattr(fs, "list_node_order_key", lambda uri: uri)
+        cursor = order_key(after_uri) if after_uri else None
+        count = 0
+        while count < limit:
+            check_deadline()
+            page_limit = min(100, limit - count)
+            with stage("list"):
+                if callable(uri_pager):
+                    page = uri_pager(fs, directory, ctx, limit=page_limit, after_uri=cursor)
+                else:
+                    page = [node.uri for node in summary_pager(fs, directory, ctx, limit=page_limit, after_uri=cursor)]
+            if not page:
+                return
+            yield from page
+            count += len(page)
+            cursor = order_key(page[-1])
+
+    def node_pages(self, uris, ctx, *, read_limit, batch_size=32, deadline=None):
         """Bounded prefetch only; the caller still admits items under its budgets."""
         reader = getattr(type(self.fs), "read_nodes", None)
         iterator = iter(uris)
         remaining = read_limit
         while remaining > 0:
-            page = list(islice(iterator, min(32, remaining) if callable(reader) else 1))
+            check_deadline(deadline)
+            page = list(islice(iterator, min(batch_size, remaining) if callable(reader) else 1))
             if not page:
                 return
-            if deadline is not None and time.monotonic() >= deadline:
-                yield [(page[0], None)]  # Caller observes its deadline before resolving.
-                return
+            check_deadline(deadline)
             with stage("node_batch_read"):
                 if callable(reader):
                     nodes = reader(self.fs, page, ctx)
@@ -126,18 +145,23 @@ class EvidenceStore:
                         nodes = {page[0]: self.fs.read_node(page[0], ctx)}
                     except Exception as exc:
                         nodes = {page[0]: exc}
+            check_deadline(deadline)
+            for uri in page:
+                if isinstance(nodes[uri], TimeoutError):
+                    raise nodes[uri]
             yield [(uri, nodes[uri]) for uri in page]
             remaining -= len(page)
         # Let the caller observe its existing limit sentinel without reading it.
+        check_deadline(deadline)
         for uri in islice(iterator, 1):
             yield [(uri, None)]
 
-    def iter_sources(self, uris, ctx, *, read_limit, deadline=None):
+    def iter_sources(self, uris, ctx, *, read_limit, batch_size=32, deadline=None):
         if not callable(getattr(type(self.fs), "read_nodes", None)):
             for uri in uris:
-                yield uri, lambda uri=uri: self.read_source(uri.rsplit("/", 1)[1], ctx)
+                yield uri, lambda uri=uri: self.read_source(uri.rsplit("/", 1)[1], ctx, deadline=deadline)
             return
-        for page in self.node_pages(uris, ctx, read_limit=read_limit, deadline=deadline):
+        for page in self.node_pages(uris, ctx, read_limit=read_limit, batch_size=batch_size, deadline=deadline):
             values, sessions = {}, {}
             for uri, node in page:
                 if node is None:
@@ -314,12 +338,14 @@ class EvidenceStore:
         return sources
 
     @timed("source_validate")
-    def read_source(self, key: str, ctx: RequestContext, *, owner_ctx=None) -> dict | None:
+    def read_source(self, key: str, ctx: RequestContext, *, owner_ctx=None, deadline=None) -> dict | None:
         # The owner locates evidence; only the original caller authorizes reads.
         source_ctx = owner_ctx or ctx
+        check_deadline(deadline)
         value, version = self._read(evidence_uri(source_ctx, "sources", key), ctx, owner_ctx=owner_ctx)
 
         def manifest_for(source_ctx, *, session_id):
+            check_deadline(deadline)
             return self.manifest(ctx, session_id=session_id, owner_ctx=source_ctx)
 
         return self._validate_source(key, value, version, source_ctx, manifest_for)
@@ -345,18 +371,20 @@ class EvidenceStore:
         return {**source, "source_node_version": version, "archive_ids": value.get("archive_ids", []),
                 "sequence_verified": value.get("sequence_verified", True)}
 
-    @timed("ref_verify")
     def verify_ref(self, ref: dict, ctx: RequestContext, *, owner_ctx=None) -> bool:
         """Check only persisted source authority, never accept a card's quote as proof."""
-        source = self.read_source(ref["source_key"], ctx, owner_ctx=owner_ctx)
-        return self.ref_matches_source(ref, source)
+        return self.reference_reader(ctx, owner_ctx=owner_ctx)(ref) is not None
 
-    def reference_reader(self, ctx, *, owner_ctx=None):
-        """One validation pass with one caller and owner. Start fresh after a lock boundary."""
+    def reference_reader(self, ctx, *, owner_ctx=None, scanned_sources=None):
+        """Resolve refs for one validation pass, using only validated scan snapshots when supplied."""
         @lru_cache(maxsize=8)
         def load(key):
-            source = (self.read_source(key, ctx) if owner_ctx is None
-                      else self.read_source(key, ctx, owner_ctx=owner_ctx))
+            if scanned_sources is not None:
+                source = scanned_sources.get(key)
+            elif owner_ctx is None:
+                source = self.read_source(key, ctx)
+            else:
+                source = self.read_source(key, ctx, owner_ctx=owner_ctx)
             check_deadline()
             units = {unit["evidence_unit_id"]: unit for unit in source["units"]} if source else {}
             return source, units
@@ -364,8 +392,11 @@ class EvidenceStore:
         @timed("ref_verify")
         def resolve(ref):
             check_deadline()
+            unit_id = reference_unit_id(ref)
+            if unit_id is None or not is_evidence_key(ref.get("source_key")):
+                return None
             source, units = load(ref["source_key"])
-            unit = units.get(ref["evidence_unit_id"])
+            unit = units.get(unit_id)
             if unit is not None and self._ref_matches_unit(ref, source, unit):
                 return source, unit
             return None
@@ -377,17 +408,9 @@ class EvidenceStore:
         return all(resolve(ref) is not None for ref in refs)
 
     @staticmethod
-    def ref_matches_source(ref, source):
-        return source is not None and any(
-            unit["evidence_unit_id"] == ref["evidence_unit_id"]
-            and EvidenceStore._ref_matches_unit(ref, source, unit) for unit in source["units"])
-
-    @staticmethod
     def _ref_matches_unit(ref, source, unit):
-        start, end = ref["span"]
-        return (source["content_hash"] == ref["content_hash"]
-                and unit["parent_span"][0] <= start < end <= unit["parent_span"][1]
-                and source["text"][start:end] == ref["quote"])
+        return (source["content_hash"] == ref.get("content_hash")
+                and reference_span(ref, unit, source_text=source["text"]) is not None)
 
     def add_support(self, target_uri: str, refs: list[dict], ctx: RequestContext):
         """Persist reverse references before accepting a memory write."""

@@ -30,6 +30,7 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.operation_deadline import check_deadline
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
     RootBindingError,
@@ -1073,6 +1074,20 @@ class SQLContextFS(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
+    @contextmanager
+    def _node_read_cursor(self, ctx: RequestContext):
+        check_deadline()
+        conn = self._get_connection()
+        try:
+            check_deadline()
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                check_deadline()
+                yield cur
+        finally:
+            conn.rollback()  # Reset SET LOCAL for RLS
+            self._return_connection(conn)
+
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
         """Read a node from PostgreSQL.
 
@@ -1083,14 +1098,8 @@ class SQLContextFS(PoolAdapterMixin):
         """
         self._ensure_accessible(uri, ctx)
 
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                return self.read_node_with_cursor(cur, uri, ctx)
-        finally:
-            conn.rollback()  # Reset SET LOCAL for RLS
-            self._return_connection(conn)
+        with self._node_read_cursor(ctx) as cur:
+            return self.read_node_with_cursor(cur, uri, ctx)
 
     @classmethod
     def read_node_with_cursor(cls, cursor, uri: str, ctx: RequestContext) -> ContextNode:
@@ -1118,15 +1127,9 @@ class SQLContextFS(PoolAdapterMixin):
         if not allowed:
             return results
 
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                cur.execute(_READ_NODE_SQL + " AND uri = ANY(%s)", (ctx.account_id, allowed))
-                rows = {row[0]: row for row in cur.fetchall()}
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
+        with self._node_read_cursor(ctx) as cur:
+            cur.execute(_READ_NODE_SQL + " AND uri = ANY(%s)", (ctx.account_id, allowed))
+            rows = {row[0]: row for row in cur.fetchall()}
 
         for uri in allowed:
             try:
@@ -1622,57 +1625,7 @@ class SQLContextFS(PoolAdapterMixin):
     ) -> list[ContextNode]:
         """List one stable URI-ordered page of immediate child summaries."""
 
-        self._ensure_accessible(uri, ctx)
-        if limit <= 0:
-            return []
-        account_id = self._extract_account_id(uri)
-        parent = uri.rstrip("/")
-        prefix = parent + "/"
-        components = parse_uri(parent)
-        owner_type = components.get("owner_type")
-        owner_id = components.get("owner_id")
-        owner_space = None
-        if owner_type in {"users", "agents"} and owner_id:
-            owner_space = f"{owner_type[:-1]}:{owner_id}"
-
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT uri, context_type, category, level, owner_space,
-                           abstract, metadata, created_at, updated_at, version,
-                           COALESCE(content <> '', false) AS has_content
-                    FROM context_nodes
-                    WHERE SUBSTRING(uri FROM 1 FOR CHAR_LENGTH(%s)) = %s
-                      AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
-                      AND account_id = %s
-                      AND (%s IS NULL OR owner_space = %s)
-                      AND status = 'ACTIVE'
-                      AND (%s IS NULL OR uri > %s)
-                      AND POSITION('/' IN SUBSTRING(uri FROM %s)) = 0
-                    ORDER BY uri
-                    LIMIT %s
-                    """,
-                    (
-                        prefix,
-                        prefix,
-                        prefix,
-                        account_id,
-                        owner_space,
-                        owner_space,
-                        after_uri,
-                        after_uri,
-                        len(prefix) + 1,
-                        limit,
-                    ),
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
-
+        rows = self._list_child_page_rows(uri, ctx, limit=limit, after_uri=after_uri, include_summaries=True)
         summaries: list[ContextNode] = []
         for row in rows:
             (
@@ -1688,9 +1641,6 @@ class SQLContextFS(PoolAdapterMixin):
                 version,
                 has_content,
             ) = row
-            remainder = child_uri[len(prefix) :]
-            if "/" in remainder:
-                continue
             metadata = dict(metadata_raw or {})
             metadata.setdefault("created_at", str(created_at) if created_at else "")
             metadata["_storage_created_at"] = str(created_at) if created_at else ""
@@ -1710,10 +1660,70 @@ class SQLContextFS(PoolAdapterMixin):
                     metadata=metadata,
                 )
             )
-            if len(summaries) >= limit:
-                break
 
         return summaries
+
+    def list_node_uris_page(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        limit: int = 50,
+        after_uri: str | None = None,
+    ) -> list[str]:
+        """Page through visible child URIs using only the SQL catalog."""
+        rows = self._list_child_page_rows(uri, ctx, limit=limit, after_uri=after_uri, include_summaries=False)
+        return [row[0] for row in rows]
+
+    def _list_child_page_rows(self, uri, ctx, *, limit, after_uri, include_summaries):
+        self._ensure_accessible(uri, ctx)
+        if limit <= 0:
+            return []
+        account_id = self._extract_account_id(uri)
+        parent = uri.rstrip("/")
+        prefix = parent + "/"
+        components = parse_uri(parent)
+        owner_type = components.get("owner_type")
+        owner_id = components.get("owner_id")
+        owner_space = None
+        if owner_type in {"users", "agents"} and owner_id:
+            owner_space = f"{owner_type[:-1]}:{owner_id}"
+
+        columns = (
+            "uri, context_type, category, level, owner_space, abstract, metadata, created_at, updated_at, version, "
+            "COALESCE(content <> '', false) AS has_content"
+            if include_summaries else "uri"
+        )
+        with self._node_read_cursor(ctx) as cur:
+            cur.execute(
+                f"""
+                SELECT {columns}
+                FROM context_nodes
+                WHERE SUBSTRING(uri FROM 1 FOR CHAR_LENGTH(%s)) = %s
+                  AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
+                  AND account_id = %s
+                  AND (%s IS NULL OR owner_space = %s)
+                  AND status = 'ACTIVE'
+                  AND (%s IS NULL OR uri > %s)
+                  AND POSITION('/' IN SUBSTRING(uri FROM %s)) = 0
+                ORDER BY uri
+                LIMIT %s
+                """,
+                (
+                    prefix,
+                    prefix,
+                    prefix,
+                    account_id,
+                    owner_space,
+                    owner_space,
+                    after_uri,
+                    after_uri,
+                    len(prefix) + 1,
+                    limit,
+                ),
+            )
+            rows = cur.fetchall()
+        return [row for row in rows if "/" not in row[0][len(prefix):]][:limit]
 
     def move_node(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
         """Move/rename a node (and cascade to children + relation/outbox refs).

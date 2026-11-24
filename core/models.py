@@ -383,6 +383,7 @@ class SearchMemoryResult:
     hits: list[RetrievedBlock] = field(default_factory=list)
     trace: Any = None
     partial: bool = False
+    message_evidence: dict | None = None
 
 
 @dataclass

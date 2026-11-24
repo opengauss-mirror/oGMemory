@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from core.errors import ValidationError
@@ -25,6 +25,27 @@ _TURN = re.compile(r"^\[([^\[\]\r\n:]{1,80})\]:[ \t]*", re.MULTILINE)
 def digest(*values: object) -> str:
     encoded = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def resolve_event_time(quote: str, recorded_at: str | None, timezone: str | None) -> tuple[str | None, str]:
+    """Resolve an explicit date or a relative date anchored in the source time."""
+    absolute = re.search(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)", quote)
+    if absolute:
+        try:
+            return datetime.fromisoformat(absolute[1]).date().isoformat(), absolute[0]
+        except ValueError:
+            return None, absolute[0]
+    relative = re.search(r"\b(yesterday|today|tomorrow)\b|昨天|今天|明天", quote, re.I)
+    if relative and recorded_at:
+        anchor = datetime.fromisoformat(recorded_at)
+        if anchor.tzinfo is None and not timezone:
+            return None, relative[0]
+        if timezone:
+            zone = ZoneInfo(timezone)
+            anchor = anchor.replace(tzinfo=zone) if anchor.tzinfo is None else anchor.astimezone(zone)
+        offset = {"yesterday": -1, "昨天": -1, "today": 0, "今天": 0, "tomorrow": 1, "明天": 1}
+        return (anchor.date() + timedelta(days=offset[relative[0].lower()])).isoformat(), relative[0]
+    return None, relative[0] if relative else ""
 
 
 def content_hash(text: str) -> str:
@@ -51,11 +72,38 @@ def parse_evidence_uri(uri: str) -> dict | None:
             "slug": fields["slug"] or ""}
 
 
+def is_evidence_key(key: object) -> bool:
+    return isinstance(key, str) and _DIGEST.fullmatch(key) is not None
+
+
 def evidence_uri(ctx: RequestContext, kind: str, key: str = "") -> str:
-    if kind not in EVIDENCE_KINDS or key and not _DIGEST.fullmatch(key):
+    if kind not in EVIDENCE_KINDS or key and not is_evidence_key(key):
         raise ValueError("invalid evidence kind or key")
     account, user = _identity(ctx.account_id), _identity(ctx.user_id)
     return f"ctx://{account}/users/{user}/evidence/{kind}" + (f"/{key}" if key else "")
+
+
+def reference_unit_id(ref: object) -> str | None:
+    key = ref.get("evidence_unit_id") if isinstance(ref, dict) else None
+    return key if isinstance(key, str) and key else None
+
+
+def has_source_refs(refs: object) -> bool:
+    return isinstance(refs, (list, tuple)) and bool(refs)
+
+
+def reference_span(ref: dict, unit: dict, *, source_text: str | None = None) -> tuple[int, int] | None:
+    """Return offsets within the unit for a quote aligned with its original text."""
+    span, quote = ref.get("span"), ref.get("quote")
+    if not isinstance(span, (list, tuple)) or len(span) != 2 or not isinstance(quote, str):
+        return None
+    start, end = span
+    offset, unit_end = unit["parent_span"]
+    if type(start) is not int or type(end) is not int or not offset <= start < end <= unit_end:
+        return None
+    relative = (start - offset, end - offset)
+    original = source_text[start:end] if source_text is not None else unit["text"][relative[0]:relative[1]]
+    return relative if quote == original else None
 
 
 @dataclass(frozen=True)

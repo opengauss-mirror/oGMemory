@@ -396,9 +396,9 @@ def create_mcp_server(
         entities, events, cases, and learned patterns. Prefer it over listing all
         memories. Each hit includes a relevance score, summary fields, and an
         exact ogmemory:// URI. Call ogm_read_memory only when the hit lacks the
-        detail needed to answer. Treat no hits as no memory evidence; do not
-        invent missing context. A tool error means retrieval failed, not that
-        the memory is absent; report the failure rather than claiming no memory.
+        detail needed to answer. Check message_evidence for source messages and
+        verified facts, including when hits is empty. Report a tool error as a
+        retrieval failure and leave the availability of memory undetermined.
         """
 
         return query_memory_tool(

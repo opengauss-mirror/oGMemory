@@ -10,7 +10,7 @@ import re
 from collections import defaultdict
 from itertools import islice
 
-from core.evidence import deterministic_payload, digest, message_source, reassemble_messages
+from core.evidence import deterministic_payload, digest, message_source, reassemble_messages, resolve_event_time
 from core.evidence_timing import operation
 from core.models import CandidateMemory
 from core.operation_deadline import check_deadline
@@ -110,29 +110,6 @@ def is_negated(quote, doc):
     negative = (any(token.dep_ == "neg" or token.text in {"不", "没", "未", "无"} for token in doc)
                 if doc is not None else any(char in quote for char in "不没未无"))
     return bool(_NEGATED.search(quote) or negative)
-
-
-def _event_time(quote, source):
-    from datetime import datetime, timedelta
-
-    absolute = re.search(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)", quote)
-    if absolute:
-        try:
-            return datetime.fromisoformat(absolute[1]).date().isoformat(), absolute[0]
-        except ValueError:
-            return None, absolute[0]
-    relative = re.search(r"\b(yesterday|today|tomorrow)\b|昨天|今天|明天", quote, re.I)
-    if relative and source.recorded_at:
-        anchor = datetime.fromisoformat(source.recorded_at)
-        if anchor.tzinfo is None and not source.timezone:
-            return None, relative[0]
-        if source.timezone:
-            from zoneinfo import ZoneInfo
-            zone = ZoneInfo(source.timezone)
-            anchor = anchor.replace(tzinfo=zone) if anchor.tzinfo is None else anchor.astimezone(zone)
-        offset = {"yesterday": -1, "昨天": -1, "today": 0, "今天": 0, "tomorrow": 1, "明天": 1}
-        return (anchor.date() + timedelta(days=offset[relative[0].lower()])).isoformat(), relative[0]
-    return None, relative[0] if relative else ""
 
 
 def _parts(quote, speaker, role, doc):
@@ -278,7 +255,7 @@ def build_assertion(quote, speaker, role, source, doc):
         subject, predicate, obj = _parts(quote, speaker, role, doc)
         if not subject:
             return None
-    event_time, expression = _event_time(quote, source)
+    event_time, expression = resolve_event_time(quote, source.recorded_at, source.timezone)
     return {"subject": subject, "predicate": predicate, "object": obj,
             "assertion_type": "recommendation" if recommendation else "observation",
             "event_time": event_time, "time_expression": expression, "quantity": _quantity(quote, doc),

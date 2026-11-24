@@ -1125,6 +1125,8 @@ def query_memory(
                         fill_content_for_top_k=min(top_k, 3),
                         **type_filters,
                         **({"use_scene": use_scene} if use_scene is not None else {}),
+                        **({"_include_message_evidence": not types}
+                           if getattr(getattr(service, "_cfg", None), "evidence_enabled", False) is True else {}),
                     )
                 break
             except Exception as exc:
@@ -1180,7 +1182,18 @@ def query_memory(
     if use_agfs or result.partial:
         payload["retrieval"] = {"mode": "vector_free" if use_agfs else "default",
                                 "status": "partial" if result.partial else "complete"}
-    response = _truncate_query_payload(payload, _configured_max_response_chars(service))
+    max_chars = _configured_max_response_chars(service)
+    response = _truncate_query_payload(payload, max_chars)
+    evidence = getattr(result, "message_evidence", None)
+    if evidence:
+        from retrieval.evidence.context import evidence_is_incomplete, fit_evidence_payload
+
+        if evidence["evidence"] or evidence_is_incomplete(evidence["diagnostics"]):
+            fitted = fit_evidence_payload(evidence, max_chars - len(json.dumps(response, ensure_ascii=False, default=str)))
+            if fitted is not None:
+                response["message_evidence"] = fitted
+            if fitted is None or len(fitted["evidence"]) < len(evidence["evidence"]):
+                response["truncated"] = True
     recorder = getattr(service, "record_retrieval_metric", None)
     if callable(recorder):
         try:
