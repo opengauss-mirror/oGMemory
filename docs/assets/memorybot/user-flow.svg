@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="560" viewBox="0 0 1100 560" role="img" aria-labelledby="title desc">
+  <title id="title">memoryBot：有长期记忆的工作助手</title>
+  <desc id="desc">用户通过对话、文件或网页交代目标。memoryBot记住背景、查清依据、继续工作、交付成果并按计划跟进；新的进展用于下一次工作。底层oGMemory提供身份与空间、会话、记忆、资源和技能。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0L8 4L0 8Z" fill="#64748b"/></marker>
+    <marker id="blue-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0L8 4L0 8Z" fill="#3b82f6"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', sans-serif; }
+      .heading { font-size: 22px; font-weight: 700; fill: #12243d; }
+      .body { font-size: 17px; fill: #52627a; }
+      .small { font-size: 15px; fill: #64748b; }
+      .example { font-size: 14px; fill: #64748b; }
+      .num { font-size: 16px; font-weight: 700; fill: #2563eb; }
+      .link { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1100" height="560" rx="20" fill="#f8fafc"/>
+  <g transform="translate(0 -90)">
+  <rect x="40" y="109" width="1020" height="82" rx="16" fill="#ffffff" stroke="#dce5f0"/>
+  <text x="65" y="144" class="heading">你的输入</text>
+  <text x="65" y="170" class="small">背景、材料与目标</text>
+  <rect x="272" y="130" width="130" height="40" rx="20" fill="#eaf2ff"/>
+  <text x="337" y="157" text-anchor="middle" font-size="18" fill="#2563eb">对话</text>
+  <rect x="418" y="130" width="130" height="40" rx="20" fill="#eaf2ff"/>
+  <text x="483" y="157" text-anchor="middle" font-size="18" fill="#2563eb">文件</text>
+  <rect x="564" y="130" width="130" height="40" rx="20" fill="#eaf2ff"/>
+  <text x="629" y="157" text-anchor="middle" font-size="18" fill="#2563eb">网页</text>
+  <text x="735" y="156" class="body">“整理青禾发布的交接说明”</text>
+  <path d="M130 191V239" class="link"/>
+  <text x="148" y="222" class="small">交代事情</text>
+
+  <g>
+    <rect x="40" y="246" width="180" height="176" rx="16" fill="#ffffff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <circle cx="73" cy="280" r="17" fill="#eaf2ff"/>
+    <text x="73" y="286" text-anchor="middle" class="num">01</text>
+    <text x="62" y="328" class="heading">记住背景</text>
+    <text x="62" y="361" class="body">事实、偏好、约定</text>
+    <text x="60" y="390" class="example">“林悦负责，周五发布”</text>
+  </g>
+  <path d="M223 334H242" class="link"/>
+  <g>
+    <rect x="250" y="246" width="180" height="176" rx="16" fill="#ffffff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <circle cx="283" cy="280" r="17" fill="#eaf2ff"/>
+    <text x="283" y="286" text-anchor="middle" class="num">02</text>
+    <text x="272" y="328" class="heading">查清依据</text>
+    <text x="272" y="361" class="body">答案附上来源</text>
+    <text x="270" y="390" class="example">“为什么选择方案乙？”</text>
+  </g>
+  <path d="M433 334H452" class="link"/>
+  <g>
+    <rect x="460" y="246" width="180" height="176" rx="16" fill="#ffffff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <circle cx="493" cy="280" r="17" fill="#eaf2ff"/>
+    <text x="493" y="286" text-anchor="middle" class="num">03</text>
+    <text x="482" y="328" class="heading">继续工作</text>
+    <text x="482" y="361" class="body">找回进度与下一步</text>
+    <text x="480" y="390" class="example">“联调完成，准备压测”</text>
+  </g>
+  <path d="M643 334H662" class="link"/>
+  <g>
+    <rect x="670" y="246" width="180" height="176" rx="16" fill="#ffffff" stroke="#a7e4cd" stroke-width="1.5"/>
+    <circle cx="703" cy="280" r="17" fill="#e8f8f0"/>
+    <text x="703" y="286" text-anchor="middle" font-size="16" font-weight="700" fill="#16845c">04</text>
+    <text x="692" y="328" class="heading">交付成果</text>
+    <text x="692" y="361" class="body">会话正文、成果文件</text>
+    <text x="690" y="390" class="example">周报 · 交接稿 · 检查表</text>
+  </g>
+  <path d="M853 334H872" class="link"/>
+  <g>
+    <rect x="880" y="246" width="180" height="176" rx="16" fill="#ffffff" stroke="#f1d5a5" stroke-width="1.5"/>
+    <circle cx="913" cy="280" r="17" fill="#fff5e6"/>
+    <text x="913" y="286" text-anchor="middle" font-size="16" font-weight="700" fill="#b96d13">05</text>
+    <text x="902" y="328" class="heading">按计划跟进</text>
+    <text x="902" y="361" class="body">提醒、周期报告</text>
+    <text x="900" y="390" class="example">“每周五生成周报”</text>
+  </g>
+  <path d="M970 422V464H130V429" fill="none" stroke="#3b82f6" stroke-width="2" marker-end="url(#blue-arrow)"/>
+  <rect x="363" y="448" width="374" height="31" rx="15" fill="#f8fafc"/>
+  <text x="550" y="470" text-anchor="middle" font-size="17" fill="#2563eb">新进展成为下一次工作的背景</text>
+
+  <rect x="40" y="514" width="1020" height="103" rx="16" fill="#eaf2ff" stroke="#c9dcf5"/>
+  <text x="66" y="554" font-size="24" font-weight="700" fill="#1e4f91">oGMemory</text>
+  <text x="66" y="586" class="body">沿用身份与授权空间</text>
+  <rect x="340" y="538" width="192" height="54" rx="12" fill="#ffffff"/>
+  <text x="436" y="572" text-anchor="middle" class="heading">会话与记忆</text>
+  <rect x="555" y="538" width="192" height="54" rx="12" fill="#ffffff"/>
+  <text x="651" y="572" text-anchor="middle" class="heading">资料资源</text>
+  <rect x="770" y="538" width="264" height="54" rx="12" fill="#ffffff"/>
+  <text x="902" y="572" text-anchor="middle" class="heading">技能与可复用流程</text>
+  </g>
+</svg>
