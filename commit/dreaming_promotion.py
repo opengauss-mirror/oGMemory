@@ -296,10 +296,15 @@ def resume_promotion(fs, outbox, event, ctx):
         metadata = fs.read_node_metadata_including_inactive(event.uri, ctx)
     except NodeNotFoundError:
         return
-    if metadata.get(DEMOTION) != archive_id or not matches_node_version(metadata, version, created_at):
+    if (metadata.get("status") != NodeStatus.ARCHIVED.value or metadata.get(DEMOTION) != archive_id
+            or (created_at and node_created_at(metadata) != created_at)):
         return
     outbox.register_once(OutboxEvent(
-        archive_id, EventType.ARCHIVE_CONTEXT.value, event.uri, {}, "PENDING",
+        archive_id, EventType.ARCHIVE_CONTEXT.value, event.uri,
+        {"dreaming_archive_revision": {
+            "created_at": node_created_at(metadata), "version": metadata["version"],
+        }},
+        "PENDING",
     ), ctx)
 
 

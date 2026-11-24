@@ -647,6 +647,16 @@ class OutboxWorker:
                                          event.payload.get("expected_created_at"))
                     or not self._hides_dreaming_projection(node.metadata)):
                 return WorkerResult(event_id=event.event_id, success=True)
+        archive_revision = event.payload.get("dreaming_archive_revision")
+        if archive_revision is not None:
+            ctx = ctx or self._build_request_context(event)
+            if self._fs is None or ctx is None:
+                raise ValueError("Dreaming archive projection requires canonical node storage")
+            created_at = archive_revision["created_at"]
+            if not created_at or self._fs.archived_node_version(
+                event.uri, ctx, created_at=created_at,
+            ) != archive_revision["version"]:
+                return WorkerResult(event_id=event.event_id, success=True)
         deleted = self._delete_index_records(event)
         logger.info(
             "Successfully processed ARCHIVE_CONTEXT %s, "

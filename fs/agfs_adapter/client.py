@@ -106,8 +106,8 @@ def list_workspace_registry(client, path):
     return entries or []
 
 
-def publish_workspace_file(client, staged, target, payload):
-    """Publish a staged registry file while its record lock is held."""
+def publish_staged_file(client, staged, target, payload=None):
+    """Atomically publish a staged file while its write lock is held."""
     try:
         client.mv(staged, target)
     except AGFSClientError as exc:
@@ -117,7 +117,7 @@ def publish_workspace_file(client, staged, target, payload):
         if info.get("isDir") is not False or info.get("meta", {}).get("Name") != "sqlfs":
             raise
         # SQLFS writes all bytes with one SQL UPDATE; the old row stays visible until commit.
-        client.write(target, payload)
+        client.write(target, client.read(staged) if payload is None else payload)
         try:
             client.rm(staged)
         except AGFSClientError:
