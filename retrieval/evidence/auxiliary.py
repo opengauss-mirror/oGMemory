@@ -2,10 +2,10 @@
 
 import math
 import re
-import time
 from datetime import UTC, datetime
 
 from core.evidence import resolve_event_time
+from core.operation_deadline import deadline_expired
 
 
 def date_prefixes(query):
@@ -23,8 +23,9 @@ def date_prefixes(query):
 
 
 def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
-    if deadline is not None and time.monotonic() >= deadline:
-        return scores, {"route": "none", "rho": 1.0, "reason": "deadline"}
+    """Return fused scores, channel diagnostics and whether the deadline prevented fusion."""
+    if deadline_expired(deadline):
+        return scores, {"route": "none", "rho": 1.0, "reason": "deadline"}, True
     dates = date_prefixes(request.query)
     todo = bool(re.search(r"\b(todo|pending|unfinished)\b|待办|未完成", request.query, re.I))
     auxiliary, rho, route = {}, 1.0, "none"
@@ -48,8 +49,8 @@ def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
             auxiliary = dict(sorted(auxiliary.items(), key=lambda item: (-item[1], item[0]))[:5])
             rho = .7
     if not auxiliary:
-        return scores, {"route": route, "rho": 1.0, "reason": "disabled_or_no_results"}
+        return scores, {"route": route, "rho": 1.0, "reason": "disabled_or_no_results"}, False
     content_max, auxiliary_max = max(scores.values(), default=0), max(auxiliary.values())
     fused = {key: rho * scores.get(key, 0) / (content_max or 1)
                   + (1 - rho) * auxiliary.get(key, 0) / auxiliary_max for key in set(scores) | set(auxiliary)}
-    return fused, {"route": route, "rho": rho, "reason": "ready"}
+    return fused, {"route": route, "rho": rho, "reason": "ready"}, False

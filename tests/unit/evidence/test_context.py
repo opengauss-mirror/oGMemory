@@ -1,5 +1,6 @@
 """Answer adapters preserve sources, complete dependencies and frozen budgets."""
 
+import json
 from copy import deepcopy
 from dataclasses import asdict
 
@@ -40,6 +41,17 @@ def test_query_response_budget_keeps_groups_and_facts_aligned():
     assert [item["evidence_unit_id"] for item in fitted["evidence"]] == ["c"]
     assert fitted["groups"] == [["c"]] and fitted["facts"] == []
     assert fitted["truncated"]
+
+
+@pytest.mark.parametrize("has_group", [False, True])
+def test_partial_query_response_keeps_empty_status_when_it_fits(has_group):
+    item = unit("a", "I completed pottery.")
+    response = result([item], [fact(item, item["text"])], [["a"]]) if has_group else result([], groups=[])
+    response.diagnostics.update(partial=True, truncated=False)
+    expected = {"evidence": [], "facts": [], "groups": [], "partial": True, "truncated": has_group}
+    budget = len(json.dumps({"message_evidence": expected}, ensure_ascii=False))
+    assert fit_evidence_payload(response.to_dict(), remaining_chars=budget) == expected
+    assert fit_evidence_payload(response.to_dict(), remaining_chars=budget - 1) is None
 
 
 def test_independent_quote_uses_exact_unicode_offsets_and_neighbouring_context():

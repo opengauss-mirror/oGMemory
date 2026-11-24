@@ -10,7 +10,7 @@ from core.errors import NodeNotFoundError, OperationDeadlineExceededError
 from core.evidence import evidence_uri
 from core.evidence_query import EvidenceQuery, MessageEvidenceResult, facts_supported_by
 from core.evidence_timing import operation, request_id, stage, timed
-from core.operation_deadline import remaining_seconds
+from core.operation_deadline import deadline_expired, remaining_seconds
 from providers.token_tracker import request_usage_scope
 from retrieval.evidence.ranking import (
     fact_matches,
@@ -66,7 +66,7 @@ class EvidenceService:
             units, sources, source_bytes = {}, {}, 0
             source_uris = self.store.iter_uris(evidence_uri(ctx, "sources"), ctx, 10001)
             for uri, read_source in self.store.iter_sources(source_uris, ctx, read_limit=10000, deadline=deadline):
-                if diagnostics["scanned_sources"] >= 10000 or time.monotonic() >= deadline:
+                if diagnostics["scanned_sources"] >= 10000 or deadline_expired(deadline):
                     diagnostics.update(partial=True, truncated=True)
                     break
                 diagnostics["scanned_sources"] += 1
@@ -117,7 +117,7 @@ class EvidenceService:
                     stop_cards = False
                     for page in self.store.node_pages(card_uris, ctx, read_limit=2000 - diagnostics["scanned_cards"], deadline=deadline):
                         for uri, value in page:
-                            if diagnostics["scanned_cards"] >= 2000 or time.monotonic() >= deadline:
+                            if diagnostics["scanned_cards"] >= 2000 or deadline_expired(deadline):
                                 diagnostics.update(partial=True, truncated=True)
                                 stop_cards = True
                                 break
@@ -142,7 +142,7 @@ class EvidenceService:
                                 continue
                             candidates = data.get("fact_records", [])
                             for record in candidates:
-                                if time.monotonic() >= deadline:
+                                if deadline_expired(deadline):
                                     diagnostics.update(partial=True, truncated=True)
                                     break
                                 refs = record.get("source_refs", [])
@@ -220,9 +220,9 @@ class EvidenceService:
                                event_bonus=round(event_bonus, 6))
         with stage("auxiliary"):
             from retrieval.evidence.auxiliary import fuse_auxiliary
-            scores, auxiliary = fuse_auxiliary(request, scores, units, sources, deadline=deadline)
+            scores, auxiliary, timed_out = fuse_auxiliary(request, scores, units, sources, deadline=deadline)
             diagnostics["auxiliary"] = auxiliary
-            if auxiliary["reason"] == "deadline":
+            if timed_out:
                 diagnostics["partial"] = True
         with stage("format"):
             # Count the complete serialized units and their facts, not only raw text.

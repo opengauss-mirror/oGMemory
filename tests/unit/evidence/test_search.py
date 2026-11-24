@@ -17,15 +17,12 @@ from tests.unit.evidence.test_writer import write_candidates
 @pytest.fixture
 def deadline_clock(monkeypatch):
     import core.operation_deadline as operation
-    import retrieval.evidence.auxiliary as auxiliary
     import service.evidence_service as search
-    import service.evidence_store as store
 
     clock = SimpleNamespace(now=100.0, budget=1.0)
     clock.monotonic = lambda: clock.now
     monkeypatch.setattr(operation, "monotonic", clock.monotonic)
-    for module in (search, store, auxiliary):
-        monkeypatch.setattr(module, "time", clock)
+    monkeypatch.setattr(search, "time", clock)
     return clock
 
 

@@ -1181,7 +1181,7 @@ def query_memory(
     max_chars = _configured_max_response_chars(service)
     response = _truncate_query_payload(payload, max_chars)
     evidence = getattr(result, "message_evidence", None)
-    if evidence and evidence["evidence"]:
+    if evidence and (evidence["evidence"] or evidence["diagnostics"]["partial"]):
         from retrieval.evidence.context import fit_evidence_payload
 
         fitted = fit_evidence_payload(evidence, max_chars - len(json.dumps(response, ensure_ascii=False, default=str)))

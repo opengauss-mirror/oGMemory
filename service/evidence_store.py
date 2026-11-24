@@ -7,7 +7,6 @@ revocation remains durable even after original session data has been removed.
 from __future__ import annotations
 
 import json
-import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from functools import lru_cache
@@ -22,7 +21,7 @@ from core.errors import (
 from core.evidence import content_hash, digest, evidence_uri, message_source, reassemble_messages
 from core.evidence_timing import stage, timed
 from core.models import ContextNode, RequestContext
-from core.operation_deadline import check_deadline
+from core.operation_deadline import check_deadline, deadline_expired
 
 
 def snapshot_messages(snapshot, ctx, fs):
@@ -120,7 +119,7 @@ class EvidenceStore:
             page = list(islice(iterator, min(32, remaining) if callable(reader) else 1))
             if not page:
                 return
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline_expired(deadline):
                 yield [(page[0], None)]  # Caller observes its deadline before resolving.
                 return
             with stage("node_batch_read"):
@@ -321,7 +320,7 @@ class EvidenceStore:
     @timed("source_validate")
     def read_source(self, key: str, ctx: RequestContext, *, owner_ctx=None, deadline=None) -> dict | None:
         def check_read_budget():
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline_expired(deadline):
                 raise OperationDeadlineExceededError("Evidence source read deadline exceeded")
 
         # The owner locates evidence; only the original caller authorizes reads.

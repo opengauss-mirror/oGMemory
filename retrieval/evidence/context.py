@@ -24,7 +24,13 @@ def fit_evidence_payload(payload, remaining_chars):
     """Fit complete groups and their supporting facts in the query response."""
     units = payload["evidence"]
     facts = payload["facts"]
-    groups = payload["diagnostics"]["evidence_groups"]
+    diagnostics = payload["diagnostics"]
+    groups = diagnostics["evidence_groups"]
+
+    def fits(candidate):
+        # The enclosing object contributes a comma and a space in place of braces.
+        return len(json.dumps({"message_evidence": candidate}, ensure_ascii=False)) <= remaining_chars
+
     fitted = None
     selected = set()
     selected_groups = []
@@ -34,15 +40,20 @@ def fit_evidence_payload(payload, remaining_chars):
             "evidence": [unit for unit in units if unit["evidence_unit_id"] in keys],
             "facts": facts_supported_by(facts, keys),
             "groups": [*selected_groups, group],
-            "partial": payload["diagnostics"]["partial"],
-            "truncated": payload["diagnostics"]["truncated"] or len(keys) < len(units),
+            "partial": diagnostics["partial"],
+            "truncated": diagnostics["truncated"] or len(keys) < len(units),
         }
-        size = len(json.dumps({"message_evidence": trial}, ensure_ascii=False))
-        # The enclosing object contributes a comma and a space in place of braces.
-        if size <= remaining_chars:
+        if fits(trial):
             fitted = trial
             selected = keys
             selected_groups.append(group)
+    if fitted is None and diagnostics["partial"]:
+        empty = {
+            "evidence": [], "facts": [], "groups": [], "partial": True,
+            "truncated": diagnostics["truncated"] or bool(units),
+        }
+        if fits(empty):
+            fitted = empty
     return fitted
 
 

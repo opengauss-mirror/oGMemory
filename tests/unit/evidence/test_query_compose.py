@@ -48,22 +48,27 @@ def test_python_query_returns_both_paths_and_respects_scoped_searches(service):
         assert api.search_memory(QUERY, CTX, **scope).message_evidence is None
 
 
-@pytest.mark.asyncio
-async def test_http_and_mcp_query_responses_round_trip_to_renderer(service, monkeypatch):
+async def _public_query_payloads(service, monkeypatch, query):
     from mcp import Client
 
     from server.mcp_server import create_mcp_server
 
     monkeypatch.setattr(app_module, "_service", service)
     monkeypatch.setattr(app_module, "_build_authenticated_context", lambda params: CTX)
-    result = app_module.app.test_client().post("/api/v1/memories/query", json={"query": QUERY, "top_k": 1})
+    params = {"query": query, "top_k": 1}
+    result = app_module.app.test_client().post("/api/v1/memories/query", json=params)
     assert result.status_code == 200
     payload = result.get_json()
     monkeypatch.setattr("server.mcp_tools.build_mcp_context", lambda *_args, **_kwargs: CTX)
     async with Client(create_mcp_server(service=service, config=service._cfg)) as client:
-        response = await client.call_tool("ogm_query_memory", {"query": QUERY, "top_k": 1})
+        response = await client.call_tool("ogm_query_memory", params)
     assert not response.is_error
-    mcp = response.structured_content
+    return payload, response.structured_content
+
+
+@pytest.mark.asyncio
+async def test_http_and_mcp_query_responses_round_trip_to_renderer(service, monkeypatch):
+    payload, mcp = await _public_query_payloads(service, monkeypatch, QUERY)
     assert payload["hits"] == mcp["hits"] and payload["hits"][0]["type"] == "entity"
     assert payload["message_evidence"] == mcp["message_evidence"]
     assert payload["message_evidence"]["evidence"][0]["text"] == QUOTE
@@ -75,6 +80,34 @@ async def test_http_and_mcp_query_responses_round_trip_to_renderer(service, monk
     filtered = query_memory(service, query=QUERY, request_context=CTX, types=["entity"])
     assert filtered["hits"] == mcp["hits"] and "message_evidence" not in filtered
     assert render_evidence_context(filtered).text == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expires", [False, True])
+async def test_http_and_mcp_only_expose_empty_evidence_when_partial(service, monkeypatch, expires):
+    from time import monotonic
+
+    import retrieval.evidence.auxiliary as auxiliary
+
+    fuse_auxiliary = auxiliary.fuse_auxiliary
+
+    def expire_before_fusion(*args, deadline):
+        return fuse_auxiliary(*args, deadline=monotonic())
+
+    if expires:
+        monkeypatch.setattr(auxiliary, "fuse_auxiliary", expire_before_fusion)
+
+    http, mcp = await _public_query_payloads(service, monkeypatch, "2026-05-01")
+    assert http["hits"] == mcp["hits"] and http["hits"][0]["type"] == "entity"
+    for payload in (http, mcp):
+        if expires:
+            assert payload["message_evidence"] == {
+                "evidence": [], "facts": [], "groups": [], "partial": True, "truncated": False,
+            }
+        else:
+            assert "message_evidence" not in payload
+        assert payload["truncated"] is False
+        assert render_evidence_context(payload).text == ""
 
 
 def test_public_query_rendering_keeps_independent_groups_when_budget_is_tight(service, setup):

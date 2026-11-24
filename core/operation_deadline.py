@@ -15,6 +15,11 @@ from core.errors import OperationDeadlineExceededError
 _deadline = ContextVar("operation_deadline", default=None)
 
 
+def deadline_expired(deadline: float | None) -> bool:
+    """Check an optional absolute deadline on the monotonic clock."""
+    return deadline is not None and monotonic() >= deadline
+
+
 def remaining_seconds():
     end = _deadline.get()
     if end is None:
