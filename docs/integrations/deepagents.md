@@ -2,7 +2,7 @@
 
 oGMemory 提供 `OGMemoryMiddleware`，直接接入 Python `deepagents` 的
 `create_deep_agent(middleware=[...])`。支持同步 `invoke/stream` 和异步
-`ainvoke/astream`，自动召回长期记忆、完成轮次写回，以及跨会话召回。
+`ainvoke/astream`，自动召回长期记忆、完成轮次写回、上传 Agent 执行轨迹，以及跨会话召回。
 已验证 Deep Agents 0.7.23、LangChain 1.4.4、LangGraph 1.2.14。
 
 ## 安装与配置
@@ -16,6 +16,14 @@ python -m pip install '.[deepagents]'
 
 普通安装不引入 Deep Agents。模型服务凭据由 Deep Agents 单独配置；默认模型
 使用 `ANTHROPIC_API_KEY`，也可向 `create_deep_agent(model=...)` 传入已有模型。
+
+轨迹上传默认随 `auto_capture=True` 开启，无需单独配置客户端。
+如需从轨迹中抽取 Agent 记忆，在服务端 `ogmemory.yaml` 中开启：
+
+```yaml
+agent_memory:
+  enabled: true
+```
 
 ## 最小接入
 
@@ -60,6 +68,40 @@ await memory.adispose("conversation-002")
 作用域，不能把其他用户的对话历史传入当前实例。
 
 可运行交互示例：`python -m examples.deepagents_memory`。
+
+### 工具调用与轨迹上传
+
+沿用上面的 `memory` 配置，为 Agent 添加工具并发起一次调用：
+
+```python
+from pathlib import Path
+from langchain_core.tools import tool
+
+@tool
+def list_project_files(directory: str = ".") -> str:
+    """列出目录中的文件名。"""
+    return "\n".join(sorted(path.name for path in Path(directory).iterdir()))
+
+agent = create_deep_agent(
+    tools=[list_project_files], middleware=[memory], checkpointer=InMemorySaver()
+)
+result = agent.invoke(
+    {"messages": [{"role": "user", "content":
+        "请调用 list_project_files 列出当前目录文件，再概括项目结构。"}]},
+    config={"configurable": {"thread_id": "tool-conversation-001"}},
+)
+print(result["messages"][-1].content)
+memory.dispose("tool-conversation-001")
+```
+
+预期 Agent 实际调用工具，并根据工具结果回答。完整轮次结束时，中间件自动向
+`/api/v1/after_turn` 提交普通 `messages` 和独立的 `traceMessages`，保留本轮输入、
+助手输出、工具调用 ID、工具名称、参数、结果及明确的错误状态；无文本的助手
+工具调用消息也会保留。无需手动构造或上传轨迹。
+
+响应中的 `trace_captured=true` 且 `trace_status=CAPTURED` 表示轨迹已保存；
+`false/PENDING` 或缺少确认按 `fail_open` 告警或抛错。HTTP 成功和轨迹保存均不代表
+Agent 记忆抽取完成；还需等待后台处理。没有可复用知识的轨迹允许不产出记忆。
 
 ### E2E 接入测试
 
@@ -126,13 +168,19 @@ ogmem onboard --mode plugin --agent deepagents --non-interactive \
 
 - 每次用户输入开始时调用 `/compose`，仅取 `_ogmem: true` 的记忆内容，
   标记为不可信历史数据后临时注入模型请求。记忆不写入对话消息列表。
-- 完成轮次后调用 `/after_turn`，仅上传本轮用户输入及新生成的助手/工具文本，
+- 完成轮次后调用 `/after_turn`，通过 `messages` 写回本轮用户输入及新生成的助手/工具文本，
+  同时通过 `traceMessages` 上传本轮执行轨迹；召回上下文不进入轨迹。
   不重复上传 checkpoint 中的旧历史；不上传图片、音频、系统消息和推理块。
   写回保留消息 ID，使连续相同文本的不同消息仍能被服务端区分。
   `return_direct=True` 工具直接返回并正常结束的轮次也会写回；未完成的工具调用不会写回。
+  checkpoint 恢复后沿用本轮轨迹与请求标识，客户端不自动重试。
+  参数解析失败是已结束的失败调用；有框架错误结果时保留原始参数与关联失败轨迹。
+  已完成轮次的轨迹无法完整关联时，仅写回普通消息并告警，不补造调用或结果。
 - `dispose/adispose` 在会话结束时调用 `/dispose`，服务端异步刷新剩余内容。
 - HTTP 超时、错误状态或无效响应默认记录不含内容/凭据的告警并继续主对话。
-  可设置 `fail_open=False` 让错误抛出。失败写入不会在客户端持久化或自动重试。
+  可设置 `fail_open=False` 让错误抛出。轨迹准备异常发生于已完成轮次时，先写回普通消息，
+  再按 `fail_open` 告警或抛错；输入/身份校验及模型、工具自身异常仍按原流程处理。
+  失败写入不会在客户端持久化或自动重试。
 - `timeout` 默认 30 秒，`token_budget` 默认 6000，`force_extract` 默认 `False`。
   `auto_recall` 和 `auto_capture` 可分别关闭。根 Agent 的 middleware 不自动装到
   独立子 Agent；需要时为子 Agent 显式配置，且使用独立会话 ID。
@@ -143,5 +191,6 @@ ogmem onboard --mode plugin --agent deepagents --non-interactive \
 仍须等待后台处理完成。
 
 中间件不替换 Deep Agents 的文件系统、checkpointer 或默认摘要机制，也不接管
-oGMemory 两阶段压缩和 Trace 采集。若摘要移除了中间工具消息，写回使用仍可见的
-本轮输出；应在长工具链任务中按业务需要单独采集完整 Trace。
+oGMemory 两阶段压缩。已观察到的本轮工具调用与结果保存在 checkpoint 私有状态中，
+不会被后续摘要或工具结果卸载覆盖；普通 `messages` 仍使用结束时可见的本轮文本。
+自定义 middleware 若在本中间件观察前删除消息，无法通过轨迹上传还原这些内容。
