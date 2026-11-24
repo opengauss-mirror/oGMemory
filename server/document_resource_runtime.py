@@ -274,6 +274,66 @@ class DocumentResourceRuntime:
                 adapter.delete_dataset_if_empty(base.namespace)
             store.catalog.remove(base)
 
+    def list_knowledge_base_members(
+        self, ctx: KnowledgeBaseContext, knowledge_base_id: UUID, query: str
+    ) -> dict:
+        query = query.strip()
+        if len(query) > 128:
+            raise ValueError("candidate search must be at most 128 characters")
+        query = query.casefold()
+        store = self._resource_store(ctx)
+        _, grants = self._shared_members(store, ctx, knowledge_base_id)
+        users = self._member_generations(ctx)
+        members = [
+            {"user_id": user_id, "permission": grant.permission}
+            for user_id, grant in sorted(grants.items())
+            if users.get(user_id) == grant.user_generation
+        ]
+        granted_ids = {member["user_id"] for member in members}
+        candidates = [
+            user_id
+            for user_id in sorted(users)
+            if user_id not in granted_ids and query in user_id.casefold()
+        ]
+        return {
+            "members": members,
+            "candidates": [{"user_id": user_id} for user_id in candidates[:50]],
+            "candidate_count": len(candidates),
+        }
+
+    def put_knowledge_base_member(
+        self, ctx: KnowledgeBaseContext, knowledge_base_id: UUID, user_id: str, body: dict
+    ) -> dict:
+        permission = body.get("permission")
+        if set(body) != {"permission"} or permission not in ("read", "write"):
+            raise ValueError("permission must be read or write")
+        store = self._resource_store(ctx)
+        base, _ = self._shared_members(store, ctx, knowledge_base_id)
+        generation = self._member_generations(ctx).get(user_id)
+        if generation is None:
+            raise ValueError("member must be an active account user with assignable permissions")
+        with store.lock_knowledge_base(base):
+            base, _ = self._shared_members(store, ctx, knowledge_base_id)
+            store.catalog.put_member(base, user_id, KnowledgeBaseGrant(permission, generation))
+        return {"user_id": user_id, "permission": permission}
+
+    def remove_knowledge_base_member(
+        self, ctx: KnowledgeBaseContext, knowledge_base_id: UUID, user_id: str
+    ) -> None:
+        store = self._resource_store(ctx)
+        base, _ = self._shared_members(store, ctx, knowledge_base_id)
+        with store.lock_knowledge_base(base):
+            base, _ = self._shared_members(store, ctx, knowledge_base_id)
+            store.catalog.remove_member(base, user_id)
+
+    def _shared_members(
+        self, store: SQLDocumentResourceStore, ctx: KnowledgeBaseContext, identifier: UUID
+    ) -> tuple[KnowledgeBase, dict[str, KnowledgeBaseGrant]]:
+        base, members = self._authorized(store, ctx, identifier, "manage")
+        if base.visibility != "shared":
+            raise ValueError("only shared knowledge bases support member grants")
+        return base, members
+
     def _member_generations(
         self, ctx: KnowledgeBaseContext, *, include_admins: bool = False
     ) -> dict[str, str]:
