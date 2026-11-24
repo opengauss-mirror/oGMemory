@@ -155,6 +155,42 @@ func (r *managed) Require(ops ...Operation) error {
 func (r *managed) Get(ctx context.Context, k string) (Value, error) {
 	return call(r, ctx, func(c context.Context) (Value, error) { return r.p.Get(c, k) })
 }
+
+// GetNonEmpty reads values for consumers whose format cannot be empty.
+// Built-in providers bound the transfer into Go; injected runtimes can
+// implement the same optional method to bound their own transport.
+func GetNonEmpty(ctx context.Context, r Runtime, key string, maxBytes int) (Value, error) {
+	if maxBytes < 1 || maxBytes >= int(^uint(0)>>1) {
+		return Value{}, ErrInvalidArgument
+	}
+	if bounded, ok := r.(interface {
+		GetNonEmpty(context.Context, string, int) (Value, error)
+	}); ok {
+		v, err := bounded.GetNonEmpty(ctx, key, maxBytes)
+		return nonEmpty(v, err, maxBytes)
+	}
+	v, err := r.Get(ctx, key)
+	return nonEmpty(v, err, maxBytes)
+}
+
+func nonEmpty(v Value, err error, maxBytes int) (Value, error) {
+	if err != nil || !v.Found || len(v.Data) == 0 || len(v.Data) > maxBytes {
+		return Value{}, err
+	}
+	return v, nil
+}
+
+func (r *managed) GetNonEmpty(ctx context.Context, key string, maxBytes int) (Value, error) {
+	return call(r, ctx, func(c context.Context) (Value, error) {
+		if p, ok := r.p.(interface {
+			getNonEmpty(context.Context, string, int) (Value, error)
+		}); ok {
+			return p.getNonEmpty(c, key, maxBytes)
+		}
+		v, err := r.p.Get(c, key)
+		return nonEmpty(v, err, maxBytes)
+	})
+}
 func (r *managed) Set(ctx context.Context, k string, v []byte, ttl time.Duration) error {
 	if ttl < 0 {
 		return ErrInvalidArgument

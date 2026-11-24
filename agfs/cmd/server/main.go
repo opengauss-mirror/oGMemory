@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/config"
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/handlers"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/mountablefs"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
@@ -242,15 +243,15 @@ func main() {
 		})
 	}
 
-	logMountError := func(format string, args ...interface{}) {
-		if cfg.CacheFS.Enabled {
-			log.Fatalf(format, args...)
-		}
-		log.Errorf(format, args...)
-	}
-
-	// mountPlugin initializes and mounts a plugin asynchronously unless caching requires validated mounts.
+	// Only selected mounts must finish validation before serving HTTP.
 	mountPlugin := func(pluginName, instanceName, mountPath string, pluginConfig map[string]interface{}) {
+		selected := cfg.CacheFS.Selected(mountPath)
+		logMountError := func(format string, args ...interface{}) {
+			if selected {
+				log.Fatalf(format, args...)
+			}
+			log.Errorf(format, args...)
+		}
 		// Get plugin factory (try built-in first, then external)
 		factory, ok := availablePlugins[pluginName]
 		var p plugin.ServicePlugin
@@ -259,6 +260,9 @@ func main() {
 			// Try to get external plugin from mfs
 			p = mfs.CreatePlugin(pluginName)
 			if p == nil {
+				if selected {
+					log.Fatalf("CacheFS mount %s uses unknown plugin %s", mountPath, pluginName)
+				}
 				log.Warnf("Unknown plugin: %s, skipping instance '%s'", pluginName, instanceName)
 				return
 			}
@@ -304,6 +308,7 @@ func main() {
 
 			// Mount plugin
 			if err := mfs.Mount(mountPath, p); err != nil {
+				_ = p.Shutdown()
 				logMountError("Failed to mount %s instance '%s' at %s: %v", pluginName, instanceName, mountPath, err)
 				return
 			}
@@ -311,7 +316,7 @@ func main() {
 			// Log success
 			log.Infof("%s instance '%s' mounted at %s", pluginName, instanceName, mountPath)
 		}
-		if cfg.CacheFS.Enabled {
+		if selected {
 			mountInstance()
 		} else {
 			go mountInstance()
@@ -374,6 +379,15 @@ func main() {
 			}
 
 			mountPlugin(pluginName, instance.Name, instance.Path, instance.Config)
+		}
+	}
+
+	if cfg.CacheFS.Enabled {
+		mounted := mfs.CacheStats()
+		for _, mount := range cfg.CacheFS.Mounts {
+			if _, ok := mounted[filesystem.NormalizePath(mount)]; !ok {
+				log.Fatalf("CacheFS mount %s is missing or disabled", mount)
+			}
 		}
 	}
 

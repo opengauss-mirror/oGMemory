@@ -32,3 +32,12 @@ func cacheStorageID(backend DBBackend, c map[string]interface{}) string {
 	}
 	return fmt.Sprintf("mysql:tcp:%s:%s/%s", getStringConfig(c, "host", "127.0.0.1"), getStringConfig(c, "port", "4000"), getStringConfig(c, "database", "sqlfs"))
 }
+
+// ValidateSQLiteCache restricts caching to the path semantics verified for SQLite.
+// MySQL/TiDB can use a deployment-specific collation for equality and LIKE.
+func (fs *SQLFS) ValidateSQLiteCache() error {
+	if fs.backend.GetDriverName() != "sqlite3" {
+		return fmt.Errorf("cachefs SQLFS mounts currently require SQLite path semantics")
+	}
+	return nil
+}

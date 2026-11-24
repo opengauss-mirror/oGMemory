@@ -38,12 +38,13 @@ type PluginFactory func() plugin.ServicePlugin
 
 // MountableFS is a FileSystem that supports mounting service plugins at specific paths
 type MountableFS struct {
-	cacheConfig  cachefs.Config
-	cacheRuntime cache.Runtime
-	ownsCache    bool
-	closing      atomic.Bool
-	closeMu      sync.Mutex
-	closeAttempt *closeAttempt
+	cacheConfig         cachefs.Config
+	cacheRuntime        cache.Runtime
+	ownsCache           bool
+	localCacheAmbiguous bool // protected by mu, sticky until the filesystem is recreated
+	closing             atomic.Bool
+	closeMu             sync.Mutex
+	closeAttempt        *closeAttempt
 	// mountTree stores the radix tree for mount routing.
 	// We use atomic.Value to store *iradix.Tree to enable lock-free reads.
 	mountTree atomic.Value
@@ -937,8 +938,8 @@ func (mfs *MountableFS) CloseHandle(id int64) error {
 
 	// Close the underlying local handle
 	err := info.localHandle.Close()
-	if err == nil {
-		// Remove from mapping
+	if err == nil || info.mount.cache != nil {
+		// CacheFS handle close is terminal even when it reports a write error.
 		mfs.handleInfosMu.Lock()
 		delete(mfs.handleInfos, id)
 		mfs.handleInfosMu.Unlock()

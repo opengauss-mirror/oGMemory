@@ -100,3 +100,33 @@ func TestTimeoutRetainsSlotAndCloseWaits(t *testing.T) {
 		t.Fatal("close not once")
 	}
 }
+
+func TestRedisBoundedNonEmptyRead(t *testing.T) {
+	server := miniredis.RunT(t)
+	r, err := New(Config{Provider: "redis", CommandTimeoutMS: 500,
+		Params: map[string]interface{}{"endpoints": []string{"redis://" + server.Addr()}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	defer r.Close(ctx)
+	for _, tc := range []struct {
+		key, data string
+		found     bool
+	}{
+		{"empty", "", false},
+		{"exact", "abc", true},
+		{"oversized", "abcd", false},
+		{"missing", "", false},
+	} {
+		if tc.key != "missing" {
+			if err := r.Set(ctx, tc.key, []byte(tc.data), 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		v, err := GetNonEmpty(ctx, r, tc.key, 3)
+		if err != nil || v.Found != tc.found || (v.Found && string(v.Data) != tc.data) {
+			t.Fatalf("%s: %+v, %v", tc.key, v, err)
+		}
+	}
+}

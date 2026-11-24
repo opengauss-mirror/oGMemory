@@ -23,11 +23,18 @@ var tempMeta = regexp.MustCompile(`^\.(meta\.(update|mutation)|delete_tombstone\
 // Policy takes the canonical mount-relative path. Rules match components, never
 // arbitrary substrings or JSON contents. Formal metadata and recovery files cache.
 func Policy(p, mount string, prefixes []string) Decision {
-	p = path.Clean("/" + strings.TrimPrefix(p, "/"))
-	parts := strings.Split(strings.Trim(p, "/"), "/")
+	return policy(p, mount, prefixes, false)
+}
+
+func policy(p, mount string, prefixes []string, fold bool) Decision {
+	full := path.Join(mount, p)
+	if fold {
+		full = strings.ToLower(full)
+	}
+	parts := strings.Split(strings.Trim(full, "/"), "/")
 	d := Cacheable
 	for i, s := range parts {
-		if s == ".path.ovlock" || strings.HasSuffix(s, ".lock") || strings.HasSuffix(s, ".lck") || lockDir.MatchString(s) {
+		if s == ".path.ovlock" || registrationSidecar(s) || strings.HasSuffix(s, ".lock") || strings.HasSuffix(s, ".lck") || lockDir.MatchString(s) {
 			return MandatoryBypass
 		}
 		if staging.MatchString(s) || tempMeta.MatchString(s) {
@@ -73,11 +80,23 @@ func Policy(p, mount string, prefixes []string) Decision {
 	if d != Cacheable {
 		return d
 	}
-	full := path.Join(mount, p)
 	for _, prefix := range prefixes {
+		if fold {
+			prefix = strings.ToLower(prefix)
+		}
 		if within(full, path.Clean(prefix)) {
 			return UserBypass
 		}
 	}
 	return Cacheable
+}
+
+func registrationSidecar(name string) bool {
+	const base = "code_workspace_registration.lock.sqlite"
+	switch name {
+	case base, base + "-journal", base + "-wal", base + "-shm":
+		return true
+	default:
+		return false
+	}
 }

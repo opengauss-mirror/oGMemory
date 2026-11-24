@@ -22,16 +22,19 @@ func (mfs *MountableFS) ConfigureCache(c cachefs.Config, rc cache.Config) error 
 	if err != nil {
 		return err
 	}
-	if err = mfs.UseCache(c, r); err != nil {
+	if err = mfs.useCache(c, r, true); err != nil {
 		_ = r.Close(context.Background())
 		return err
 	}
-	mfs.ownsCache = true
 	return nil
 }
 
 // UseCache injects an application-owned runtime without transferring ownership.
 func (mfs *MountableFS) UseCache(c cachefs.Config, r cache.Runtime) error {
+	return mfs.useCache(c, r, false)
+}
+
+func (mfs *MountableFS) useCache(c cachefs.Config, r cache.Runtime, owns bool) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
@@ -45,6 +48,7 @@ func (mfs *MountableFS) UseCache(c cachefs.Config, r cache.Runtime) error {
 	}
 	mfs.cacheConfig = c.Defaults()
 	mfs.cacheRuntime = r
+	mfs.ownsCache = owns
 	return nil
 }
 func allowedCachePlugin(name string) bool {
@@ -91,17 +95,40 @@ func (mfs *MountableFS) executionFS(mount string, p plugin.ServicePlugin) (files
 		}
 	}
 	if !selected {
+		mfs.guardLocalCacheTopology(p.Name(), nil)
 		return backend, nil, nil
-	}
-	if disable, ok := backend.(interface{ DisableInternalCache() }); ok {
-		disable.DisableInternalCache()
 	}
 	f, err := cachefs.New(backend, mfs.cacheRuntime, mfs.cacheConfig, mount)
 	if err != nil {
 		return nil, nil, err
 	}
+	if disable, ok := backend.(interface{ DisableInternalCache() }); ok {
+		disable.DisableInternalCache()
+	}
+	mfs.guardLocalCacheTopology(p.Name(), f)
 	return cachefs.Wrap(f), f, nil
 }
+
+// Root comparison cannot detect symlink or hard-link aliases across disjoint
+// LocalFS mounts. Retire caching before publishing a second LocalFS mount.
+// Do not reactivate on unmount, as existing routed writes may still finish.
+func (mfs *MountableFS) guardLocalCacheTopology(pluginName string, next *cachefs.FS) {
+	if !mfs.cacheConfig.Enabled || pluginName != "localfs" {
+		return
+	}
+	for _, mount := range mfs.GetMounts() {
+		if mount.Plugin.Name() == "localfs" {
+			mfs.localCacheAmbiguous = true
+			if mount.cache != nil {
+				mount.cache.Disable()
+			}
+		}
+	}
+	if next != nil && mfs.localCacheAmbiguous {
+		next.Disable()
+	}
+}
+
 func pathWithin(p, root string) bool {
 	p = filepath.ToSlash(p)
 	root = filepath.ToSlash(root)
@@ -159,6 +186,11 @@ func (mfs *MountableFS) Close(ctx context.Context) error {
 	}
 }
 func (mfs *MountableFS) drainCache() error {
+	// Close sets closing before this runs. Wait for a configuration or mount
+	// that already entered its critical section before taking the snapshot.
+	mfs.mu.Lock()
+	owns, runtime := mfs.ownsCache, mfs.cacheRuntime
+	mfs.mu.Unlock()
 	mfs.handleInfosMu.RLock()
 	ids := make([]int64, 0, len(mfs.handleInfos))
 	for id := range mfs.handleInfos {
@@ -175,8 +207,8 @@ func (mfs *MountableFS) drainCache() error {
 			return err
 		}
 	}
-	if mfs.ownsCache {
-		return mfs.cacheRuntime.Close(context.Background())
+	if owns {
+		return runtime.Close(context.Background())
 	}
 	return nil
 }

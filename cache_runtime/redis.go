@@ -86,6 +86,15 @@ func (r *redisProvider) Get(c context.Context, k string) (Value, error) {
 	}
 	return Value{v, true}, nil
 }
+func (r *redisProvider) getNonEmpty(c context.Context, k string, maxBytes int) (Value, error) {
+	// Redis range endpoints are inclusive. One extra byte detects an
+	// oversized value without fetching or returning the complete value.
+	v, err := r.client.GetRange(c, k, 0, int64(maxBytes)).Bytes()
+	if err == redis.Nil {
+		return Value{}, nil
+	}
+	return nonEmpty(Value{Data: v, Found: true}, err, maxBytes)
+}
 func (r *redisProvider) Set(c context.Context, k string, v []byte, t time.Duration) error {
 	return r.client.Set(c, k, v, t).Err()
 }

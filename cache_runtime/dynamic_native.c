@@ -127,12 +127,13 @@ NativeResult native_get(NativeCache *n, const void *k, size_t len) {
   OvCacheOptionalOwnedBufferV1 out = {0};
   OvCacheOwnedBufferV1 err = {0};
   int s = n->api->get(n->provider, (OvCacheByteSliceV1){k, len}, &out, &err);
+  if (out.value.data && out.value.data == err.data) {
+    native_release(err);
+    return (NativeResult){.status = OV_CACHE_STATUS_INVALID_DATA};
+  }
   int ok = valid(out.value) && out.present <= 1 &&
            (out.present || (!out.value.data && !out.value.len)) &&
-           (!s || (!out.present && !out.value.data && !out.value.len)) &&
-           out.value.data != err.data;
-  if (!out.value.data && !err.data)
-    ok = valid(out.value) && out.present <= 1 && (!s || !out.present);
+           (!s || (!out.present && !out.value.data && !out.value.len));
   s = finish(s, err);
   if (!ok)
     s = OV_CACHE_STATUS_INVALID_DATA;
@@ -154,13 +155,13 @@ NativeResult native_set(NativeCache *n, const void *k, size_t kl, const void *v,
     s = OV_CACHE_STATUS_INVALID_DATA;
   return (NativeResult){.status = s};
 }
-NativeResult native_delete(NativeCache *n, const void *k, size_t kl) {
+NativeResult native_delete(NativeCache *n, const OvCacheByteSliceV1 *keys,
+                           size_t len) {
   OvCacheOwnedBufferV1 err = {0};
   uint64_t count = 0;
-  OvCacheByteSliceV1 key = {k, kl};
-  int s = n->api->del(n->provider, &key, 1, &count, &err);
+  int s = n->api->del(n->provider, keys, len, &count, &err);
   s = finish(s, err);
-  if ((!s && count > 1) || (s && count))
+  if ((!s && count > len) || (s && count))
     s = OV_CACHE_STATUS_INVALID_DATA;
   return (NativeResult){.status = s, .count = count};
 }

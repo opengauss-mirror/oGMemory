@@ -1,6 +1,6 @@
 # CacheFS 使用与验证
 
-CacheFS 默认关闭。适用于由一个 AGFS 实例独占写入的 LocalFS、S3FS、SQLFS 挂载；多个 Python HTTP 客户端可共享该 AGFS 服务。所有修改必须经过该服务，不能另起 embedded AGFS 或直接修改同一存储。程序拒绝已识别的重叠存储别名，但不能发现所有外部写者。
+CacheFS 默认关闭。适用于由一个 AGFS 实例独占写入的 LocalFS、S3FS、SQLite 版 SQLFS 挂载；多个 Python HTTP 客户端可共享该 AGFS 服务。所有修改必须经过该服务，不能另起 embedded AGFS 或直接修改同一存储。程序拒绝已识别的重叠存储别名。两个 LocalFS 挂载可能通过符号链接或硬链接写入同一对象，共存时该 AGFS 实例的 LocalFS 缓存会停止使用，直至重建实例。MySQL/TiDB 版 SQLFS 保留现有直连用法，启用 CacheFS 前需要验证数据库排序规则。
 
 ## 启用
 
@@ -35,11 +35,13 @@ cachefs:
 
 `namespace` 用于部署隔离，`mounts` 是 AGFS 绝对挂载路径。每次挂载及故障恢复都会生成新 epoch，旧 key 等待 TTL 回收，无需 FLUSHDB。单文件配置上限 16 MiB，目录编码上限 32 MiB / 65536 项，TTL 最大 86400 秒。默认只缓存完整文件 `Read(0,-1)` 与原始 ReadDir；Stat、范围读取和流式读取保持回源。`cached_traversal` 会关闭本地 ripgrep 快速路径，使普通遍历经过包装 FS，尚未实现批量预取。
 
-锁、lease/claim 等协调文件和默认不缓存的暂存/工作状态直接 bypass，其余对象按通用大小和操作条件缓存。自定义 bypass 只能追加，使用 AGFS 绝对路径和分量边界。bypass 对象的修改仍使相关目录失效。可写 stream/handle 存续期间整个挂载 bypass，关闭成功后通过新 epoch 恢复缓存。
+锁、lease/claim 等协调文件和默认不缓存的暂存/工作状态直接 bypass，其余对象按通用大小和操作条件缓存。自定义 bypass 只能追加，使用 AGFS 绝对路径和分量边界。bypass 对象的修改仍使相关目录失效。可写 stream/handle 存续期间整个挂载 bypass，关闭成功后通过新 epoch 恢复缓存。若关闭报错且写入结果不确定，挂载继续回源，排空资源后可卸载重挂。
 
 S3FS/SQLFS 被包装时自动关闭插件内部缓存。Redis 不可用时返回真实 backend 结果，进入 bypass；每秒有界探测成功后换 epoch 恢复。DynamicProvider 在成功创建实例后适用相同恢复流程，动态库加载/ABI/create 失败则拒绝启动。
 
-显式请求 `fresh=true` 的目录读取直接回源。绑定数据库连接的 workspace 注册会话期间，原挂载暂停缓存，直到会话关闭后切换 epoch。
+显式请求 `fresh=true` 的目录读取直接回源。创建 workspace 注册锁和锁数据库期间，受影响的挂载暂时回源，会话关闭后切换 epoch。SQLite SQLFS 继续使用原有路径匹配规则，遇到匹配范围不确定的递归变更时切换整个挂载的 epoch。
+
+Redis CacheFS 读取使用有长度上限的 `GETRANGE`。若配置 Redis ACL，缓存账号要有专用 key 范围的 `GETRANGE`、`GET`、`SET`、`DEL`、`PING` 权限。缓存值包含文件原文，跨主机连接应使用受信任的 `rediss://` 服务，并按业务信任边界隔离缓存访问权限。namespace 用于键空间区分。
 
 ## DynamicProvider
 

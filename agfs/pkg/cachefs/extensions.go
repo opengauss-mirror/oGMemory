@@ -11,27 +11,27 @@ import (
 type touch struct{ f *FS }
 
 func (t *touch) Touch(p string) error {
-	return t.f.mutation([]string{p}, false, func() error { return t.f.backend.(filesystem.Toucher).Touch(p) })
+	return t.f.mutation([]string{p}, false, false, func() error { return t.f.backend.(filesystem.Toucher).Touch(p) })
 }
 
 type truncate struct{ f *FS }
 
 func (t *truncate) Truncate(p string, n int64) error {
-	return t.f.mutation([]string{p}, false, func() error { return t.f.backend.(filesystem.Truncater).Truncate(p, n) })
+	return t.f.mutation([]string{p}, false, false, func() error { return t.f.backend.(filesystem.Truncater).Truncate(p, n) })
 }
 
 type randomWrite struct{ f *FS }
 
 func (t *randomWrite) WriteAt(p string, b []byte, o int64) (int64, error) {
 	var n int64
-	e := t.f.mutation([]string{p}, false, func() error { var e error; n, e = t.f.backend.(filesystem.RandomWriter).WriteAt(p, b, o); return e })
+	e := t.f.mutation([]string{p}, false, false, func() error { var e error; n, e = t.f.backend.(filesystem.RandomWriter).WriteAt(p, b, o); return e })
 	return n, e
 }
 
 type syncFile struct{ f *FS }
 
 func (t *syncFile) Sync(p string) error {
-	return t.f.mutation([]string{p}, false, func() error { return t.f.backend.(filesystem.Syncer).Sync(p) })
+	return t.f.mutation([]string{p}, false, false, func() error { return t.f.backend.(filesystem.Syncer).Sync(p) })
 }
 
 type stream struct{ f *FS }
@@ -112,7 +112,7 @@ func (h *cachedHandle) Close() error {
 		h.err = h.FileHandle.Close()
 		if h.writable {
 			h.owner.f.endWriter(h.err)
-		} else if h.err == nil {
+		} else {
 			h.owner.f.endReader()
 		}
 		h.owner.mu.Lock()
@@ -132,9 +132,7 @@ type cachedStream struct {
 func (s *cachedStream) Close() error {
 	s.once.Do(func() {
 		s.err = s.StreamReader.Close()
-		if s.err == nil {
-			s.f.endReader()
-		}
+		s.f.endReader()
 	})
 	return s.err
 }

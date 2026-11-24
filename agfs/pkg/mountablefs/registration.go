@@ -114,6 +114,22 @@ func (mfs *MountableFS) LockRegistration(path string) (*Registration, error) {
 	if !ok {
 		return nil, ErrRegistrationUnsupported
 	}
+	// LocalFS creates a directory and SQLite sidecar outside CacheFS's write
+	// entry points. Keep the cache retired through sidecar close as well.
+	endWrite := func() {}
+	committed := false
+	if _, local := fs.(interface{ ResolvePath(string) string }); local && mount.cache != nil {
+		end, err := mount.cache.BeginScopedWrite()
+		if err != nil {
+			return nil, err
+		}
+		endWrite = end
+	}
+	defer func() {
+		if !committed {
+			endWrite()
+		}
+	}()
 	filename, err := provider.RegistrationLockFile(relative)
 	if err != nil {
 		return nil, err
@@ -138,5 +154,10 @@ func (mfs *MountableFS) LockRegistration(path string) (*Registration, error) {
 		}
 		return nil, err
 	}
-	return &Registration{FS: mfs, release: func() { tx.Rollback(); db.Close() }}, nil
+	committed = true
+	return &Registration{FS: mfs, release: func() {
+		defer endWrite()
+		_ = tx.Rollback()
+		_ = db.Close()
+	}}, nil
 }

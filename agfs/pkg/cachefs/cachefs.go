@@ -16,10 +16,12 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	cache "github.com/ogmemory/cache-runtime"
@@ -27,6 +29,9 @@ import (
 
 const maxStateEntries = 65536
 const maxFlights = 1024
+const maxPathBytes = 4096
+const maxPathDepth = 64
+const maxVersionBytes = 16 << 20
 const magic = "OGCF\x01"
 
 type envelope struct {
@@ -38,9 +43,11 @@ type envelope struct {
 	Entries []filesystem.FileInfo
 }
 type flight struct {
-	done  chan struct{}
-	value envelope
-	err   error
+	done    chan struct{}
+	value   envelope
+	err     error
+	waiters bool
+	share   bool
 }
 type Counters struct{ Hits, Misses, Bypasses, Failures, Fills, Coalesced, Epochs uint64 }
 type metrics struct{ hits, misses, bypasses, failures, fills, coalesced, epochs atomic.Uint64 }
@@ -56,6 +63,10 @@ type FS struct {
 	epoch                           string
 	seq                             uint64
 	versions                        map[string]uint64
+	versionBytes                    int
+	disabled                        bool
+	sqlite                          bool
+	local                           bool
 	flights                         map[string]*flight
 	bypass, closed, uncertainWriter bool
 	writers, readers                int
@@ -82,8 +93,15 @@ func New(backend filesystem.FileSystem, r cache.Runtime, c Config, mount string)
 	if err := r.Require(cache.OpGet, cache.OpSet, cache.OpDelete, cache.OpMGet); err != nil {
 		return nil, err
 	}
+	validator, sqlite := backend.(interface{ ValidateSQLiteCache() error })
+	if sqlite {
+		if err := validator.ValidateSQLiteCache(); err != nil {
+			return nil, err
+		}
+	}
+	_, local := backend.(interface{ ResolvePath(string) string })
 	c = c.Defaults()
-	f := &FS{backend: backend, runtime: r, cfg: c, mount: path.Clean(mount), epoch: token(), versions: map[string]uint64{}, flights: map[string]*flight{}, stop: make(chan struct{}), done: make(chan struct{})}
+	f := &FS{backend: backend, runtime: r, cfg: c, mount: path.Clean(mount), sqlite: sqlite, local: local, epoch: token(), versions: map[string]uint64{}, flights: map[string]*flight{}, stop: make(chan struct{}), done: make(chan struct{})}
 	f.prefix = "ogmem:cachefs:v1:" + digest(c.Namespace) + ":" + digest(f.mount) + ":"
 	go f.recoverLoop()
 	return f, nil
@@ -94,6 +112,7 @@ func (f *FS) Stats() Counters {
 func (f *FS) rotateLocked() {
 	f.epoch = token()
 	f.versions = map[string]uint64{}
+	f.versionBytes = 0
 	f.seq++
 	f.stats.epochs.Add(1)
 }
@@ -107,10 +126,10 @@ func (f *FS) fail() {
 func (f *FS) Close() error {
 	f.ops.Lock()
 	f.mu.Lock()
-	if f.writers > 0 || f.readers > 0 || f.uncertainWriter {
+	if f.writers > 0 || f.readers > 0 {
 		f.mu.Unlock()
 		f.ops.Unlock()
-		return fmt.Errorf("cachefs has active or unconfirmed streams/handles")
+		return fmt.Errorf("cachefs has active streams/handles")
 	}
 	if !f.closed {
 		f.closed = true
@@ -132,7 +151,7 @@ func (f *FS) recoverLoop() {
 			return
 		case <-ticker.C:
 			f.mu.Lock()
-			probe := f.bypass && !f.closed && f.writers == 0 && !f.uncertainWriter
+			probe := f.bypass && !f.disabled && !f.closed && f.writers == 0 && !f.uncertainWriter
 			f.mu.Unlock()
 			if !probe {
 				continue
@@ -158,7 +177,7 @@ func (f *FS) recoverLoop() {
 			if err == nil {
 				f.ops.Lock()
 				f.mu.Lock()
-				if !f.closed && f.writers == 0 && !f.uncertainWriter {
+				if !f.disabled && !f.closed && f.writers == 0 && !f.uncertainWriter {
 					f.rotateLocked()
 					f.bypass = false
 				}
@@ -169,10 +188,42 @@ func (f *FS) recoverLoop() {
 	}
 }
 
-// Each mutation advances exact-object versions, plus subtree versions where
-// needed. This authoritative in-process table is valid only for the single
-// writer and current random epoch; capacity rollover discards the entire epoch.
+// Disable retires the cache for the lifetime of this mount. The backend remains usable.
+func (f *FS) Disable() {
+	f.ops.Lock()
+	defer f.ops.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.disabled {
+		f.disabled = true
+		f.rotateLocked()
+	}
+}
+
+func trackablePath(p string) bool {
+	return len(p) <= maxPathBytes && strings.Count(p, "/") <= maxPathDepth
+}
+
+func asciiPath(p string) bool {
+	for i := 0; i < len(p); i++ {
+		if p[i] >= utf8.RuneSelf || p[i] == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *FS) versionPath(p string) string {
+	if f.local || f.sqlite {
+		// Aliases share invalidation state while the actual cache keys retain their spelling.
+		return strings.ToLower(p)
+	}
+	return p
+}
+
+// The table only belongs to this mount and epoch. Never evict individual versions.
 func (f *FS) versionLocked(p string) string {
+	p = f.versionPath(p)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d", f.versions["exact:"+p])
 	for q := p; ; q = path.Dir(q) {
@@ -183,34 +234,53 @@ func (f *FS) versionLocked(p string) string {
 	}
 	return digest(b.String())
 }
-func (f *FS) invalidate(paths []string, subtree bool) {
+
+func (f *FS) setVersionLocked(key string) bool {
+	if _, exists := f.versions[key]; !exists {
+		if len(f.versions) >= maxStateEntries || f.versionBytes+len(key) > maxVersionBytes {
+			return false
+		}
+		f.versionBytes += len(key)
+	}
+	f.versions[key] = f.seq
+	return true
+}
+
+func (f *FS) invalidate(paths []string, subtree, rotate bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.seq++
-	keys := []string{}
-	for _, p := range paths {
-		p = filesystem.NormalizePath(p)
-		f.versions["exact:"+p] = f.seq
-		// Ancestor directory entries can change (mtime or S3 implicit prefixes).
-		for q := path.Dir(p); ; q = path.Dir(q) {
-			f.versions["exact:"+q] = f.seq
-			keys = append(keys, f.keyLocked("dir", q))
-			if q == "/" {
-				break
-			}
-		}
-		if subtree {
-			f.versions["tree:"+p] = f.seq
-		}
-		keys = append(keys, f.keyLocked("file", p), f.keyLocked("dir", p))
+	if f.closed || f.disabled || f.bypass || f.uncertainWriter || f.writers > 0 {
+		return
 	}
-	if len(f.versions) > maxStateEntries {
+	if rotate {
 		f.rotateLocked()
 		return
 	}
-	if f.closed || f.bypass || f.writers > 0 {
-		return
+	f.seq++
+	keys := make([]string, 0, len(paths)*3)
+	for _, p := range paths {
+		versionPath := f.versionPath(p)
+		if !f.setVersionLocked("exact:"+versionPath) ||
+			(subtree && !f.setVersionLocked("tree:"+versionPath)) {
+			f.rotateLocked()
+			return
+		}
+		qp := path.Dir(p)
+		for q := path.Dir(versionPath); ; q = path.Dir(q) {
+			if !f.setVersionLocked("exact:" + q) {
+				f.rotateLocked()
+				return
+			}
+			keys = append(keys, f.keyLocked("dir", qp))
+			if q == "/" {
+				break
+			}
+			qp = path.Dir(qp)
+		}
+		keys = append(keys, f.keyLocked("file", p), f.keyLocked("dir", p))
 	}
+	slices.Sort(keys)
+	keys = slices.Compact(keys)
 	if _, err := f.runtime.Delete(context.Background(), keys); err != nil {
 		f.bypass = true
 		f.rotateLocked()
@@ -220,8 +290,12 @@ func (f *FS) invalidate(paths []string, subtree bool) {
 func (f *FS) keyLocked(kind, p string) string {
 	return f.prefix + f.epoch + ":" + kind + ":" + digest(p)
 }
-func (f *FS) allowed(p string) bool {
-	if Policy(p, f.mount, f.cfg.BypassPrefixes) != Cacheable {
+func (f *FS) allowed(kind, p string) bool {
+	if !trackablePath(p) || (f.local && !asciiPath(p)) ||
+		(f.sqlite && kind == "dir" && strings.ContainsAny(p, "%_")) {
+		return false
+	}
+	if policy(p, f.mount, f.cfg.BypassPrefixes, f.local) != Cacheable {
 		return false
 	}
 	if c, ok := f.backend.(filesystem.CapabilityProvider); ok {
@@ -280,18 +354,23 @@ func (f *FS) ResolvePath(p string) string {
 	}
 	return ""
 }
-func (f *FS) load(kind, p string, read func() (envelope, error)) (envelope, error) {
+func (f *FS) load(kind, p string, read func() (envelope, error)) (value envelope, err error) {
 	f.ops.RLock()
 	defer f.ops.RUnlock()
-	if f.isClosed() {
+	f.mu.Lock()
+	closed := f.closed
+	unavailable := f.disabled || f.bypass || f.writers > 0 || f.uncertainWriter
+	f.mu.Unlock()
+	if closed {
 		return envelope{}, os.ErrClosed
 	}
-	if !f.allowed(p) {
+	if unavailable || !f.allowed(kind, p) {
 		f.stats.bypasses.Add(1)
 		return read()
 	}
 	f.mu.Lock()
-	if f.closed || f.bypass || f.writers > 0 || f.uncertainWriter {
+	// Another read can trip bypass while this path is being checked.
+	if f.bypass || f.uncertainWriter {
 		f.mu.Unlock()
 		f.stats.bypasses.Add(1)
 		return read()
@@ -301,9 +380,13 @@ func (f *FS) load(kind, p string, read func() (envelope, error)) (envelope, erro
 	key := f.keyLocked(kind, p)
 	flightKey := fmt.Sprintf("%s:%d", key, f.seq)
 	if pending := f.flights[flightKey]; pending != nil {
+		pending.waiters = true
 		f.mu.Unlock()
 		f.stats.coalesced.Add(1)
 		<-pending.done
+		if !pending.share {
+			return read()
+		}
 		return clone(pending.value), pending.err
 	}
 	if len(f.flights) >= maxFlights {
@@ -314,14 +397,30 @@ func (f *FS) load(kind, p string, read func() (envelope, error)) (envelope, erro
 	pending := &flight{done: make(chan struct{})}
 	f.flights[flightKey] = pending
 	f.mu.Unlock()
-	v, err := f.cachedLoad(kind, p, key, epoch, version, read)
-	f.mu.Lock()
-	pending.value = clone(v)
-	pending.err = err
-	delete(f.flights, flightKey)
-	close(pending.done)
-	f.mu.Unlock()
-	return v, err
+
+	completed := false
+	share := false
+	defer func() {
+		f.mu.Lock()
+		delete(f.flights, flightKey)
+		if !completed {
+			pending.share = true
+			pending.err = errors.New("cachefs read did not complete")
+		} else if share && pending.waiters {
+			pending.share = true
+			pending.value, pending.err = value, err
+		}
+		close(pending.done)
+		f.mu.Unlock()
+		if completed && pending.share {
+			// Waiters and the leader must each own their result. The shared copy
+			// is immutable and copies do not hold the mount state lock.
+			value = clone(value)
+		}
+	}()
+	value, err, share = f.cachedLoad(kind, p, key, epoch, version, read)
+	completed = true
+	return value, err
 }
 func clone(v envelope) envelope {
 	v.Data = bytes.Clone(v.Data)
@@ -346,8 +445,8 @@ func (f *FS) limit(kind string) int {
 	}
 	return f.cfg.MaxDirEncodedBytes + 8192
 }
-func (f *FS) cachedLoad(kind, p, key, epoch, version string, read func() (envelope, error)) (envelope, error) {
-	got, err := f.runtime.Get(context.Background(), key)
+func (f *FS) cachedLoad(kind, p, key, epoch, version string, read func() (envelope, error)) (envelope, error, bool) {
+	got, err := cache.GetNonEmpty(context.Background(), f.runtime, key, f.limit(kind))
 	if err != nil {
 		f.fail()
 	} else if got.Found {
@@ -359,27 +458,28 @@ func (f *FS) cachedLoad(kind, p, key, epoch, version string, read func() (envelo
 			if valid {
 				f.stats.hits.Add(1)
 				if v.EOF {
-					return v, io.EOF
+					return v, io.EOF, true
 				}
-				return v, nil
+				return v, nil, true
 			}
 		}
 	}
 	f.stats.misses.Add(1)
 	v, e := read()
 	if e != nil && !errors.Is(e, io.EOF) {
-		return v, e
+		return v, e, len(v.Data) == 0 && len(v.Entries) == 0
 	}
 	if kind == "file" && len(v.Data) > f.cfg.MaxFileSizeBytes {
-		return v, e
+		return v, e, false
 	}
 	if kind == "dir" {
 		if len(v.Entries) > f.cfg.MaxDirEntries {
-			return v, e
+			return v, e, false
 		}
 		for _, entry := range v.Entries {
-			if len(entry.Meta.Content) > 0 && Policy(path.Join(p, entry.Name), f.mount, nil) == MandatoryBypass {
-				return v, e
+			if !validEntryEncoding(entry) ||
+				(len(entry.Meta.Content) > 0 && policy(path.Join(p, entry.Name), f.mount, nil, f.local) == MandatoryBypass) {
+				return v, e, false
 			}
 		}
 	}
@@ -393,10 +493,10 @@ func (f *FS) cachedLoad(kind, p, key, epoch, version string, read func() (envelo
 	v.EOF = errors.Is(e, io.EOF)
 	b, encErr := json.Marshal(v)
 	if encErr != nil {
-		return v, e
+		return v, e, false
 	}
 	if kind == "dir" && len(b) > f.cfg.MaxDirEncodedBytes {
-		return v, e
+		return v, e, false
 	}
 	f.mu.Lock()
 	active := !f.closed && !f.bypass && f.epoch == epoch && f.writers == 0
@@ -408,7 +508,18 @@ func (f *FS) cachedLoad(kind, p, key, epoch, version string, read func() (envelo
 			f.stats.fills.Add(1)
 		}
 	}
-	return v, e
+	return v, e, true
+}
+func validEntryEncoding(entry filesystem.FileInfo) bool {
+	if !utf8.ValidString(entry.Name) || !utf8.ValidString(entry.Meta.Name) || !utf8.ValidString(entry.Meta.Type) {
+		return false
+	}
+	for key, value := range entry.Meta.Content {
+		if !utf8.ValidString(key) || !utf8.ValidString(value) {
+			return false
+		}
+	}
+	return true
 }
 func (f *FS) Read(p string, offset, size int64) ([]byte, error) {
 	p = filesystem.NormalizePath(p)
@@ -444,48 +555,48 @@ func (f *FS) ReadDirFresh(p string) ([]filesystem.FileInfo, error) {
 	}
 	return f.backend.ReadDir(p)
 }
-func (f *FS) mutation(paths []string, subtree bool, run func() error) error {
+func (f *FS) mutation(paths []string, subtree, broadSQL bool, run func() error) error {
 	f.ops.Lock()
 	defer f.ops.Unlock()
 	if f.isClosed() {
 		return os.ErrClosed
 	}
-	unsafe := false
-	for _, p := range paths {
-		if !f.aliasSafe(filesystem.NormalizePath(p)) {
-			unsafe = true
+	rotate := false
+	for i, raw := range paths {
+		p := filesystem.NormalizePath(raw)
+		paths[i] = p
+		if !trackablePath(p) || (f.local && (!asciiPath(p) || !f.aliasSafe(p))) ||
+			(f.sqlite && broadSQL && (strings.ContainsAny(p, "%_") || !asciiPath(p))) {
+			rotate = true
 		}
 	}
-	e := run()
-	f.invalidate(paths, subtree)
-	if unsafe {
-		f.mu.Lock()
-		f.rotateLocked()
-		f.mu.Unlock()
-	}
-	return e
+	completed := false
+	defer func() { f.invalidate(paths, subtree, rotate || !completed) }()
+	err := run()
+	completed = true
+	return err
 }
 func (f *FS) Create(p string) error {
-	return f.mutation([]string{p}, false, func() error { return f.backend.Create(p) })
+	return f.mutation([]string{p}, false, false, func() error { return f.backend.Create(p) })
 }
 func (f *FS) Mkdir(p string, m uint32) error {
-	return f.mutation([]string{p}, true, func() error { return f.backend.Mkdir(p, m) })
+	return f.mutation([]string{p}, true, false, func() error { return f.backend.Mkdir(p, m) })
 }
 func (f *FS) Remove(p string) error {
-	return f.mutation([]string{p}, true, func() error { return f.backend.Remove(p) })
+	return f.mutation([]string{p}, true, false, func() error { return f.backend.Remove(p) })
 }
 func (f *FS) RemoveAll(p string) error {
-	return f.mutation([]string{p}, true, func() error { return f.backend.RemoveAll(p) })
+	return f.mutation([]string{p}, true, true, func() error { return f.backend.RemoveAll(p) })
 }
 func (f *FS) Rename(a, b string) error {
-	return f.mutation([]string{a, b}, true, func() error { return f.backend.Rename(a, b) })
+	return f.mutation([]string{a, b}, true, true, func() error { return f.backend.Rename(a, b) })
 }
 func (f *FS) Chmod(p string, m uint32) error {
-	return f.mutation([]string{p}, true, func() error { return f.backend.Chmod(p, m) })
+	return f.mutation([]string{p}, true, false, func() error { return f.backend.Chmod(p, m) })
 }
 func (f *FS) Write(p string, b []byte, o int64, flags filesystem.WriteFlag) (int64, error) {
 	var n int64
-	e := f.mutation([]string{p}, false, func() error { var e error; n, e = f.backend.Write(p, b, o, flags); return e })
+	e := f.mutation([]string{p}, false, false, func() error { var e error; n, e = f.backend.Write(p, b, o, flags); return e })
 	return n, e
 }
 func (f *FS) Stat(p string) (*filesystem.FileInfo, error) {
@@ -584,9 +695,7 @@ type reader struct {
 func (r *reader) Close() error {
 	r.once.Do(func() {
 		r.err = r.ReadCloser.Close()
-		if r.err == nil {
-			r.fs.endReader()
-		}
+		r.fs.endReader()
 	})
 	return r.err
 }

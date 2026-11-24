@@ -43,7 +43,7 @@ cache:
 cachefs:
   enabled: false
   namespace: ogmemory-dev
-  mounts: [/local]              # localfs, s3fs, sqlfs only; never queuefs
+  mounts: [/local]              # localfs, s3fs, SQLite sqlfs
   max_file_size_bytes: 1048576
   max_dir_entries: 4096
   max_dir_encoded_bytes: 4194304

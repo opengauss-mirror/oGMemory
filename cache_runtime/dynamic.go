@@ -60,6 +60,12 @@ func newDynamic(params map[string]interface{}) (Provider, error) {
 	return &dynamicProvider{n}, nil
 }
 func (p *dynamicProvider) Get(c context.Context, k string) (Value, error) {
+	return p.get(c, k, 0)
+}
+func (p *dynamicProvider) getNonEmpty(c context.Context, k string, maxBytes int) (Value, error) {
+	return p.get(c, k, maxBytes)
+}
+func (p *dynamicProvider) get(c context.Context, k string, maxBytes int) (Value, error) {
 	if e := c.Err(); e != nil {
 		return Value{}, e
 	}
@@ -69,6 +75,9 @@ func (p *dynamicProvider) Get(c context.Context, k string) (Value, error) {
 	defer C.native_release(r.value)
 	if e := nativeError(r.status); e != nil {
 		return Value{}, e
+	}
+	if maxBytes > 0 && (r.value.len == 0 || r.value.len > C.size_t(maxBytes)) {
+		return Value{}, nil
 	}
 	return Value{C.GoBytes(unsafe.Pointer(r.value.data), C.int(r.value.len)), r.found != 0}, nil
 }
@@ -89,21 +98,34 @@ func (p *dynamicProvider) Set(c context.Context, k string, v []byte, t time.Dura
 	}
 	return nativeError(C.native_set(p.native, key, C.size_t(len(k)), data, C.size_t(len(v)), C.int64_t(ttl)).status)
 }
-func (p *dynamicProvider) Delete(c context.Context, ks []string) (uint64, error) {
-	var n uint64
-	for _, k := range ks {
-		if e := c.Err(); e != nil {
-			return n, e
-		}
-		key := C.CBytes([]byte(k))
-		r := C.native_delete(p.native, key, C.size_t(len(k)))
-		C.free(key)
-		if e := nativeError(r.status); e != nil {
-			return n, e
-		}
-		n += uint64(r.count)
+func (p *dynamicProvider) Delete(c context.Context, keys []string) (uint64, error) {
+	if len(keys) == 0 {
+		return 0, nil
 	}
-	return n, nil
+	if err := c.Err(); err != nil {
+		return 0, err
+	}
+	// Elements point only to C-owned bytes and are borrowed for this call.
+	nativeKeys := make([]C.OvCacheByteSliceV1, len(keys))
+	defer func() {
+		for _, key := range nativeKeys {
+			C.free(unsafe.Pointer(key.data))
+		}
+	}()
+	for i, key := range keys {
+		if key != "" {
+			nativeKeys[i].data = (*C.uint8_t)(C.CBytes([]byte(key)))
+			nativeKeys[i].len = C.size_t(len(key))
+		}
+	}
+	if err := c.Err(); err != nil {
+		return 0, err
+	}
+	result := C.native_delete(p.native, &nativeKeys[0], C.size_t(len(nativeKeys)))
+	if err := nativeError(result.status); err != nil {
+		return 0, err
+	}
+	return uint64(result.count), nil
 }
 func (p *dynamicProvider) Ping(c context.Context) error {
 	if e := c.Err(); e != nil {

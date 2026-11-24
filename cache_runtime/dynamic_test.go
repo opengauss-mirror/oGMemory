@@ -104,3 +104,25 @@ func TestDynamicKVAndInvalidOutputs(t *testing.T) {
 		t.Fatal("accepted wrong ABI")
 	}
 }
+
+func TestDynamicAliasedOutputAndBatchDelete(t *testing.T) {
+	ctx := context.Background()
+	r, err := New(Config{Provider: "dynamic", CommandTimeoutMS: 500, Params: map[string]interface{}{
+		"library": compileFixture(t, false), "mode": "aliasoutput,batchdelete",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close(ctx)
+	for _, key := range []string{"first", "second"} {
+		if err := r.Set(ctx, key, []byte("value"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Get(ctx, key); !errors.Is(err, ErrInvalidData) {
+			t.Fatalf("aliased output: %v", err)
+		}
+	}
+	if count, err := r.Delete(ctx, []string{"first", "", "second", "first"}); err != nil || count != 2 {
+		t.Fatalf("batch delete: count=%d err=%v", count, err)
+	}
+}

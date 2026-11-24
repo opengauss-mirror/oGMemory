@@ -17,7 +17,7 @@ typedef struct {
   pthread_mutex_t mu;
   const OvCacheHostApiV1 *host;
   Entry *entries;
-  int bad;
+  int bad, alias_output, require_batch;
 } Store;
 static int64_t now_ms(void) {
   struct timespec t;
@@ -60,6 +60,8 @@ static int create(const OvCacheHostApiV1 *h, OvCacheByteSliceV1 params,
   }
   memcpy(p, params.data, params.len);
   s->bad = strstr(p, "badoutput") != NULL;
+  s->alias_output = strstr(p, "aliasoutput") != NULL;
+  s->require_batch = strstr(p, "batchdelete") != NULL;
   free(p);
   *out = s;
   return 0;
@@ -97,6 +99,8 @@ static int get(void *p, OvCacheByteSliceV1 k, OvCacheOptionalOwnedBufferV1 *out,
     memcpy(out->value.data, entry->value, entry->len);
     if (s->bad)
       out->value.len += 123;
+    if (s->alias_output)
+      *e = out->value;
   }
   out->present = entry != NULL;
   pthread_mutex_unlock(&s->mu);
@@ -138,6 +142,8 @@ static int del(void *p, const OvCacheByteSliceV1 *k, size_t count,
                uint64_t *removed, OvCacheOwnedBufferV1 *e) {
   (void)e;
   Store *s = p;
+  if (s->require_batch && count < 2)
+    return OV_CACHE_STATUS_INVALID_ARGUMENT;
   pthread_mutex_lock(&s->mu);
   for (size_t i = 0; i < count; i++) {
     Entry **slot = find(s, k[i]);

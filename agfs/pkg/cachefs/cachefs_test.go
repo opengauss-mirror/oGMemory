@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -638,5 +639,119 @@ func TestMutationInvalidatesAncestorDirectoryMetadata(t *testing.T) {
 	_, _ = f.ReadDir("/")
 	if b.dirs.Load() != 2 {
 		t.Fatal("stale ancestor directory metadata")
+	}
+}
+
+type terminalWriteCloser struct{ io.WriteCloser }
+
+func (w terminalWriteCloser) Close() error {
+	if err := w.WriteCloser.Close(); err != nil {
+		return err
+	}
+	return errors.New("terminal close error")
+}
+
+type terminalWriteFS struct{ filesystem.FileSystem }
+
+func (b terminalWriteFS) OpenWrite(p string) (io.WriteCloser, error) {
+	w, err := b.FileSystem.OpenWrite(p)
+	if err != nil {
+		return nil, err
+	}
+	return terminalWriteCloser{w}, nil
+}
+
+func TestTerminalWriteCloseAllowsUnmount(t *testing.T) {
+	f, b, _, _ := fixture(t)
+	f.backend = terminalWriteFS{b}
+	w, err := f.OpenWrite("/item")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("lost terminal close error")
+	}
+	read(t, f, "/item", "new")
+	if s := f.Stats(); s.Fills != 0 || s.Bypasses != 1 {
+		t.Fatalf("expected bypass after uncertain write: %+v", s)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("closed stream prevented unmount: %v", err)
+	}
+}
+
+func expectCacheTestPanic(t *testing.T, run func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected backend panic")
+		}
+	}()
+	run()
+}
+
+type panicWriteFS struct{ filesystem.FileSystem }
+
+func (b panicWriteFS) Write(p string, data []byte, off int64, flags filesystem.WriteFlag) (int64, error) {
+	n, err := b.FileSystem.Write(p, data, off, flags)
+	if err == nil {
+		panic("backend panicked after write")
+	}
+	return n, err
+}
+
+func TestPanicRetiresFlightAndPartialMutation(t *testing.T) {
+	f, b, _, _ := fixture(t)
+	expectCacheTestPanic(t, func() {
+		_, _ = f.load("file", "/item", func() (envelope, error) { panic("backend read panic") })
+	})
+	if len(f.flights) != 0 {
+		t.Fatal("panic left an active flight")
+	}
+	write(t, f, "/item", "old")
+	read(t, f, "/item", "old")
+	f.backend = panicWriteFS{b}
+	expectCacheTestPanic(t, func() { write(t, f, "/item", "new") })
+	read(t, f, "/item", "new")
+}
+
+func TestUntrackableMutationDoesNotGrowVersionTable(t *testing.T) {
+	f, _, s, _ := fixture(t)
+	write(t, f, "/item", "old")
+	read(t, f, "/item", "old")
+	for _, p := range []string{"/" + strings.Repeat("deep/", maxPathDepth) + "leaf", "/" + strings.Repeat("x", maxPathBytes)} {
+		before := f.Stats()
+		if _, err := f.Read(p, 0, -1); err == nil {
+			t.Fatal("expected missing or invalid backend path")
+		}
+		if _, err := f.Write(p, nil, -1, filesystem.WriteFlagCreate); err == nil {
+			t.Fatal("expected backend write error")
+		}
+		if len(f.versions) != 0 || f.versionBytes != 0 || f.Stats().Epochs != before.Epochs+1 {
+			t.Fatal("untrackable write did not retire epoch without version entries")
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gets != 1 {
+		t.Fatalf("untrackable read queried cache: %d gets", s.gets)
+	}
+}
+
+func TestProtectedAncestorInMountPath(t *testing.T) {
+	for _, tc := range []struct {
+		mount string
+		want  Decision
+	}{
+		{"/data/.node.resource-mutation-lock", MandatoryBypass},
+		{"/data/.node.resource-create-owner", DefaultBypass},
+		{"/data/node", Cacheable},
+	} {
+		if got := Policy("/item", tc.mount, nil); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.mount, got, tc.want)
+		}
 	}
 }

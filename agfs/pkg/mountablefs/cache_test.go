@@ -3,7 +3,9 @@ package mountablefs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -207,5 +209,157 @@ func TestCacheBypassesPinnedRegistrationSession(t *testing.T) {
 	get("new")
 	if stats := m.CacheStats()["/data"]; stats.Hits != 1 {
 		t.Fatalf("expected cache to resume after registration: %+v", stats)
+	}
+}
+
+func mountLocalForCacheTest(t *testing.T, m *MountableFS, path, dir string) {
+	t.Helper()
+	m.RegisterPluginFactory("localfs", func() plugin.ServicePlugin { return localfs.NewLocalFSPlugin() })
+	if err := m.MountPlugin("localfs", path, map[string]interface{}{"local_dir": dir}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCacheSQLiteRecursiveOperationsMatchBackend(t *testing.T) {
+	for _, tc := range []struct {
+		name, source, sibling string
+		rename                bool
+	}{
+		{"underscore", "old_name", "oldXname", false},
+		{"percent", "old%name", "oldLongname", true},
+		{"case", "branch", "Branch", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := cachedMounts(t)
+			m.RegisterPluginFactory("sqlfs", func() plugin.ServicePlugin { return sqlfs.NewSQLFSPlugin() })
+			if err := m.MountPlugin("sqlfs", "/data", map[string]interface{}{
+				"backend": "sqlite", "db_path": filepath.Join(t.TempDir(), "store.db"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, dir := range []string{tc.source, tc.sibling} {
+				if err := m.Mkdir("/data/"+dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			item := "/" + tc.sibling + "/item"
+			if _, err := m.Write("/data"+item, []byte("stored"), -1, filesystem.WriteFlagCreate); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 2; i++ {
+				_, _ = m.Read("/data"+item, 0, -1)
+			}
+			if m.CacheStats()["/data"].Hits != 1 {
+				t.Fatal("expected warm file")
+			}
+			var err error
+			if tc.rename {
+				err = m.Rename("/data/"+tc.source, "/data/destination")
+			} else {
+				err = m.RemoveAll("/data/" + tc.source)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, backendErr := m.GetMounts()[0].Plugin.GetFileSystem().Read(item, 0, -1)
+			got, cachedErr := m.Read("/data"+item, 0, -1)
+			if string(want) != string(got) || fmt.Sprint(backendErr) != fmt.Sprint(cachedErr) {
+				t.Fatalf("backend=%q %v, cache=%q %v", want, backendErr, got, cachedErr)
+			}
+		})
+	}
+}
+
+func TestCacheLocalRegistrationSidecars(t *testing.T) {
+	m := cachedMounts(t)
+	mountLocalForCacheTest(t, m, "/data", t.TempDir())
+	for i := 0; i < 2; i++ {
+		if _, err := m.ReadDir("/data"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lockPath := "/data/_system/code_workspace_registration.lock"
+	session, err := m.LockRegistration(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Close()
+	entries, err := m.ReadDir("/data")
+	if err != nil || len(entries) != 1 || entries[0].Name != "_system" {
+		t.Fatalf("registration created a missing directory entry: %v, %v", entries, err)
+	}
+	before := m.CacheStats()["/data"].Bypasses
+	_, _ = m.Read(lockPath+".sqlite", 0, -1)
+	if m.CacheStats()["/data"].Bypasses != before+1 {
+		t.Fatal("registration lock database was admitted to cache")
+	}
+}
+
+func TestCacheLocalCrossMountAliasRetiresCache(t *testing.T) {
+	m := cachedMounts(t)
+	root, other := t.TempDir(), t.TempDir()
+	if err := os.Symlink(root, filepath.Join(other, "link")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	mountLocalForCacheTest(t, m, "/data", root)
+	if _, err := m.Write("/data/item", []byte("old"), -1, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		_, _ = m.Read("/data/item", 0, -1)
+	}
+	if m.CacheStats()["/data"].Hits != 1 {
+		t.Fatal("expected warm file before alias mount")
+	}
+	mountLocalForCacheTest(t, m, "/other", other)
+	if _, err := m.Write("/other/link/item", []byte("new"), -1, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	data, err := m.Read("/data/item", 0, -1)
+	if string(data) != "new" || (err != nil && !errors.Is(err, io.EOF)) {
+		t.Fatalf("cached old value after cross-mount write: %q, %v", data, err)
+	}
+}
+
+func TestCacheLocalPreservesInvalidUTF8DirectoryName(t *testing.T) {
+	m := cachedMounts(t)
+	root := t.TempDir()
+	name := "local-" + string([]byte{0xff})
+	if err := os.WriteFile(filepath.Join(root, name), []byte("x"), 0644); err != nil {
+		t.Skipf("filesystem does not support non-UTF-8 names: %v", err)
+	}
+	mountLocalForCacheTest(t, m, "/data", root)
+	for i := 0; i < 2; i++ {
+		entries, err := m.ReadDir("/data")
+		if err != nil || len(entries) != 1 || entries[0].Name != name {
+			t.Fatalf("read %d: %+v, %v", i, entries, err)
+		}
+	}
+}
+
+func TestCacheLocalCaseAliasInvalidates(t *testing.T) {
+	m := cachedMounts(t)
+	root := t.TempDir()
+	mountLocalForCacheTest(t, m, "/data", root)
+	if _, err := m.Write("/data/Item", []byte("old"), -1, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "item")); os.IsNotExist(err) {
+		t.Skip("case-sensitive local volume")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		_, _ = m.Read("/data/Item", 0, -1)
+	}
+	if m.CacheStats()["/data"].Hits != 1 {
+		t.Fatal("expected warm file")
+	}
+	if _, err := m.Write("/data/item", []byte("new"), -1, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	data, err := m.Read("/data/Item", 0, -1)
+	if string(data) != "new" || (err != nil && !errors.Is(err, io.EOF)) {
+		t.Fatalf("cached old value after case-alias write: %q, %v", data, err)
 	}
 }
