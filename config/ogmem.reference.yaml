@@ -96,6 +96,18 @@ service:
   # http_ip_allowlist_trust_proxy: false              # [all]
   # http_trusted_proxies: ["127.0.0.1"]               # [all]
 
+# ---- Knowledge Base [all] ----
+# Default mode: local. Set OGMEM_KNOWLEDGE_BASE_MODE=external or uncomment below.
+# The mode selects one backend for both document resource writes and search.
+# knowledge_base:
+#   mode: external
+#   external:
+#     provider: ragflow                       # OGMEM_KNOWLEDGE_BASE_EXTERNAL_PROVIDER
+#     base_url: "https://ragflow.example.com"  # OGMEM_KNOWLEDGE_BASE_EXTERNAL_BASE_URL
+#     # Supply the token through OGMEM_KNOWLEDGE_BASE_EXTERNAL_API_KEY.
+#     account_namespaces:                    # OGMEM_KNOWLEDGE_BASE_EXTERNAL_ACCOUNT_NAMESPACES (JSON)
+#       acme: "private-dataset-id"
+
 # ---- Code Memory Features [all, opt-in] ----
 features:
   code_resources_enabled: false
