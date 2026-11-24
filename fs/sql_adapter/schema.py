@@ -7,6 +7,7 @@ store is instantiated first.
 """
 
 import logging
+import re
 import threading
 from contextlib import nullcontext
 from pathlib import Path
@@ -77,6 +78,22 @@ def _target_lock(target):
         return _unidentified_schema_lock
     with _schema_locks_guard:
         return _schema_locks.setdefault(target, threading.Lock())
+
+
+def ensure_control_plane_schema(conn, dialect: str | SQLDialect) -> None:
+    ddl = _SCHEMA_SQL.split("-- BEGIN CONTROL PLANE", 1)[1].split("-- END CONTROL PLANE", 1)[0]
+    adapter = resolve_sql_dialect(dialect)
+    if adapter.name == "opengauss":
+        ddl = re.sub(
+            r"(ALTER TABLE \w+ ADD COLUMN) IF NOT EXISTS ([^;]+);",
+            r"DO $$ BEGIN \1 \2; EXCEPTION WHEN duplicate_column THEN NULL; END $$;",
+            ddl,
+        )
+    with conn.cursor() as cur:
+        adapter.validate_connection(cur)
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (0x4F474D454D435041,))
+        cur.execute(ddl)
+    conn.commit()
 
 
 def ensure_schema(conn, dialect: str | SQLDialect = "postgresql") -> None:

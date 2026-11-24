@@ -95,9 +95,14 @@ class DocumentResourceService:
         )
 
     def search(self, query: str, *, limit: int) -> list[ResourceChunk]:
-        refs = self._store.list_active(
-            self._account_id, self._backend.name, self._backend.namespace
-        )
+        scope = self._account_id, self._backend.name, self._backend.namespace
+        search_catalog = getattr(self._backend, "search_catalog", None)
+        if search_catalog is not None:
+            def resolve(ids: list[str]) -> dict[str, DocumentResource]:
+                return {ref.object_id: ref.resource for ref in self._store.list_active(*scope, object_ids=ids)}
+
+            return search_catalog(query, resolve, limit=limit)
+        refs = self._store.list_active(*scope)
         if not refs:
             return []
         return self._backend.search(query, refs, limit=limit)

@@ -77,8 +77,17 @@ class KnowledgeBaseRepository:
 
     def add(self, base: KnowledgeBase, members: dict[str, KnowledgeBaseGrant]) -> None:
         with self._transaction() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (knowledge_base_lock_id(base),))
             self._insert(cur, base)
             self._add_members(cur, base, members)
+
+    def uses_namespace(self, backend: str, namespace: str) -> bool:
+        with self._transaction() as cur:
+            cur.execute(
+                "SELECT 1 FROM knowledge_bases WHERE backend = %s AND namespace = %s",
+                (backend, namespace),
+            )
+            return cur.fetchone() is not None
 
     def update(self, base: KnowledgeBase, members: dict[str, KnowledgeBaseGrant] | None) -> None:
         key = (base.account_id, str(base.id))

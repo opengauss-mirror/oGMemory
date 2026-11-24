@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
@@ -91,19 +91,21 @@ class RagFlowResourceAdapter:
             raise RagFlowError("unexpected RAGFlow dataset identity")
         return dataset_id
 
-    def delete_dataset_if_empty(self, dataset_id: str) -> None:
+    def delete_dataset_if_empty(self, dataset_id: str, *, expected_name: str | None = None) -> None:
         """Delete an exclusively managed, private dataset after checking it is empty."""
         if not _REMOTE_ID.fullmatch(dataset_id):
             raise ValueError("invalid RAGFlow dataset ID")
         with _DATASET_LOCKS[hash(dataset_id) % len(_DATASET_LOCKS)]:
-            self._delete_dataset_if_empty(dataset_id)
+            self._delete_dataset_if_empty(dataset_id, expected_name)
 
-    def _delete_dataset_if_empty(self, dataset_id: str) -> None:
+    def _delete_dataset_if_empty(self, dataset_id: str, expected_name: str | None) -> None:
         path = f"api/v1/datasets/{dataset_id}"
         try:
             dataset = self._json_request("GET", path)
             if not isinstance(dataset, dict) or dataset.get("id") != dataset_id:
                 raise RagFlowError("unexpected RAGFlow dataset identity")
+            if expected_name is not None and dataset.get("name") != expected_name:
+                raise FileExistsError("RAGFlow dataset name no longer matches the requested name")
             permission = dataset.get("permission")
             count, size, connectors = (
                 dataset.get("document_count"),
@@ -243,13 +245,38 @@ class RagFlowResourceAdapter:
                 "include_knowledge_compilation": False,
             },
         )
+        return self._search_hits(self._search_rows(data), resources, limit)
+
+    def search_dataset(
+        self, query: str, dataset_id: str, resolve: Callable[[list[str]], dict[str, DocumentResource]],
+        *, limit: int,
+    ) -> list[ResourceChunk]:
+        window = max(64, limit)
+        data = self._json_request("POST", "api/v1/retrieval", json={
+            "question": query, "dataset_ids": [dataset_id], "page_size": window,
+            "rerank_candidates_count": window, "include_knowledge_compilation": False,
+        })
+        rows = self._search_rows(data)[:window]
+        ids = list(dict.fromkeys(row["document_id"] for row in rows
+                                 if row.get("dataset_id") == dataset_id and isinstance(row.get("document_id"), str)))
+        resources = {(dataset_id, object_id): resource for object_id, resource in resolve(ids).items()}
+        return self._search_hits(rows, resources, limit)
+
+    @staticmethod
+    def _search_rows(data: Any) -> list[dict]:
         rows = data.get("chunks") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             raise RagFlowError("unexpected RAGFlow retrieval result")
+        return rows
+
+    @staticmethod
+    def _search_hits(
+        rows: list[dict], resources: dict[tuple[str, str], DocumentResource], limit: int
+    ) -> list[ResourceChunk]:
         hits: list[ResourceChunk] = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise RagFlowError("unexpected RAGFlow chunk")
+        for row in rows:
+            if len(hits) == limit:
+                break
             dataset_id, document_id = row.get("dataset_id"), row.get("document_id")
             if not isinstance(dataset_id, str) or not isinstance(document_id, str):
                 raise RagFlowError("unexpected RAGFlow chunk document identity")

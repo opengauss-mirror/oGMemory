@@ -91,6 +91,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         dialect: str = "postgresql",
         *,
         initialize_schema: bool = True,
+        control_plane_only: bool = False,
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
@@ -100,19 +101,20 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._snapshots = threading.local()
         if initialize_schema:
-            self._ensure_table()
+            self._ensure_table(control_plane_only=control_plane_only)
 
     # ------------------------------------------------------------------
     # Connection pool: provided by PoolAdapterMixin (bounded standalone
     # pool; shared pool binds its own methods at __init__ time).
     # ------------------------------------------------------------------
 
-    def _ensure_table(self) -> None:
-        from fs.sql_adapter.schema import ensure_schema
+    def _ensure_table(self, *, control_plane_only: bool = False) -> None:
+        from fs.sql_adapter.schema import ensure_control_plane_schema, ensure_schema
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn, self.sql_dialect)
+            initializer = ensure_control_plane_schema if control_plane_only else ensure_schema
+            initializer(conn, self.sql_dialect)
         except Exception:
             conn.rollback()
             raise
