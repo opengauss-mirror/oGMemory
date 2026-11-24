@@ -44,11 +44,12 @@ def test_query_response_budget_keeps_groups_and_facts_aligned():
 
 
 @pytest.mark.parametrize("has_group", [False, True])
-def test_partial_query_response_keeps_empty_status_when_it_fits(has_group):
+@pytest.mark.parametrize("partial,truncated", [(True, False), (False, True)])
+def test_incomplete_query_response_keeps_empty_status_when_it_fits(has_group, partial, truncated):
     item = unit("a", "I completed pottery.")
     response = result([item], [fact(item, item["text"])], [["a"]]) if has_group else result([], groups=[])
-    response.diagnostics.update(partial=True, truncated=False)
-    expected = {"evidence": [], "facts": [], "groups": [], "partial": True, "truncated": has_group}
+    response.diagnostics.update(partial=partial, truncated=truncated)
+    expected = {"evidence": [], "facts": [], "groups": [], "partial": partial, "truncated": truncated or has_group}
     budget = len(json.dumps({"message_evidence": expected}, ensure_ascii=False))
     assert fit_evidence_payload(response.to_dict(), remaining_chars=budget) == expected
     assert fit_evidence_payload(response.to_dict(), remaining_chars=budget - 1) is None

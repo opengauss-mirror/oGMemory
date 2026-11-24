@@ -20,6 +20,10 @@ class EvidenceContext:
         return asdict(self)
 
 
+def evidence_is_incomplete(diagnostics) -> bool:
+    return diagnostics["partial"] or diagnostics["truncated"]
+
+
 def fit_evidence_payload(payload, remaining_chars):
     """Fit complete groups and their supporting facts in the query response."""
     units = payload["evidence"]
@@ -47,9 +51,9 @@ def fit_evidence_payload(payload, remaining_chars):
             fitted = trial
             selected = keys
             selected_groups.append(group)
-    if fitted is None and diagnostics["partial"]:
+    if fitted is None and evidence_is_incomplete(diagnostics):
         empty = {
-            "evidence": [], "facts": [], "groups": [], "partial": True,
+            "evidence": [], "facts": [], "groups": [], "partial": diagnostics["partial"],
             "truncated": diagnostics["truncated"] or bool(units),
         }
         if fits(empty):

@@ -84,7 +84,7 @@ async def test_http_and_mcp_query_responses_round_trip_to_renderer(service, monk
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expires", [False, True])
-async def test_http_and_mcp_only_expose_empty_evidence_when_partial(service, monkeypatch, expires):
+async def test_http_and_mcp_distinguish_a_timeout_from_a_complete_miss(service, monkeypatch, expires):
     from time import monotonic
 
     import retrieval.evidence.auxiliary as auxiliary
@@ -110,6 +110,23 @@ async def test_http_and_mcp_only_expose_empty_evidence_when_partial(service, mon
             assert "message_evidence" not in payload
         assert payload["truncated"] is False
         assert render_evidence_context(payload).text == ""
+
+
+@pytest.mark.asyncio
+async def test_http_and_mcp_report_truncation_when_no_complete_group_fits(service, setup, monkeypatch):
+    setup[2].register([
+        message("Did you repair the telescope?", role="assistant", id="question", sequence=10),
+        message("Yes, I repaired the telescope.", id="answer", sequence=11),
+    ], CTX, batch_id="paired")
+    query = "repair telescope"
+    full = service.get_read_api().search_memory(query, CTX, top_k=2).message_evidence
+    assert {item["message_id"] for item in full["evidence"]} == {"question", "answer"}
+
+    http, mcp = await _public_query_payloads(service, monkeypatch, query)
+    assert http["hits"] == mcp["hits"] and http["hits"]
+    assert http["message_evidence"] == mcp["message_evidence"] == {
+        "evidence": [], "facts": [], "groups": [], "partial": False, "truncated": True,
+    }
 
 
 @pytest.mark.asyncio
