@@ -192,7 +192,6 @@ async function loadTree(verifiedScope = null) {
     state.tenantScope = scope;
     const tenantNav = $('[data-view="tenants"]');
     tenantNav.hidden = !adminMode;
-    tenantNav.querySelector('.nav-label').textContent = scope.role === 'ROOT' ? '部署管理' : '租户管理';
     state.tree = body;
     state.accountId = body.account_id || '';
     state.accountTrees.clear();
@@ -1376,7 +1375,7 @@ function switchView(view, loadContent = true) {
   elements.monitoringView.hidden = !monitoring;
   elements.tasksView.hidden = !tasks;
   elements.scenesView.hidden = !scenes;
-  elements.pageTitle.textContent = bot ? 'memoryBot' : spaces ? '团队空间' : tenants ? (state.tenantScope?.role === 'ROOT' ? '部署管理' : '租户管理') : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : '记忆';
+  elements.pageTitle.textContent = bot ? 'memoryBot' : spaces ? '团队空间' : tenants ? '租户管理' : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : '记忆';
   document.title = `${elements.pageTitle.textContent} · oGMemory`;
   if (spaces) { if (loadContent) window.sharedSpaces?.load(); return; }
   if (tenants) { if (loadContent) window.tenantAdmin?.load(); return; }
