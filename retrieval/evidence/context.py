@@ -35,27 +35,31 @@ def fit_evidence_payload(payload, remaining_chars):
         # The enclosing object contributes a comma and a space in place of braces.
         return len(json.dumps({"message_evidence": candidate}, ensure_ascii=False)) <= remaining_chars
 
+    def build_payload(included_units, included_facts, included_groups):
+        return {
+            "evidence": included_units,
+            "facts": included_facts,
+            "groups": included_groups,
+            "partial": diagnostics["partial"],
+            "truncated": diagnostics["truncated"] or len(included_units) < len(units),
+        }
+
     fitted = None
     selected = set()
     selected_groups = []
     for group in groups:
         keys = selected | set(group)
-        trial = {
-            "evidence": [unit for unit in units if unit["evidence_unit_id"] in keys],
-            "facts": facts_supported_by(facts, keys),
-            "groups": [*selected_groups, group],
-            "partial": diagnostics["partial"],
-            "truncated": diagnostics["truncated"] or len(keys) < len(units),
-        }
+        trial = build_payload(
+            [unit for unit in units if unit["evidence_unit_id"] in keys],
+            facts_supported_by(facts, keys),
+            [*selected_groups, group],
+        )
         if fits(trial):
             fitted = trial
             selected = keys
             selected_groups.append(group)
     if fitted is None and evidence_is_incomplete(diagnostics):
-        empty = {
-            "evidence": [], "facts": [], "groups": [], "partial": diagnostics["partial"],
-            "truncated": diagnostics["truncated"] or bool(units),
-        }
+        empty = build_payload([], [], [])
         if fits(empty):
             fitted = empty
     return fitted

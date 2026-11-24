@@ -8,7 +8,12 @@ import time
 
 from core.errors import NodeNotFoundError, OperationDeadlineExceededError
 from core.evidence import evidence_uri
-from core.evidence_query import EvidenceQuery, MessageEvidenceResult, facts_supported_by
+from core.evidence_query import (
+    EvidenceQuery,
+    MessageEvidenceResult,
+    facts_supported_by,
+    source_refs_covered,
+)
 from core.evidence_timing import operation, request_id, stage, timed
 from core.operation_deadline import check_deadline, operation_deadline_at
 from providers.token_tracker import request_usage_scope
@@ -219,8 +224,9 @@ class EvidenceService:
                                             hint_topics_by_unit[key] = context_terms & (set(terms(unit["text"])) - names)
                                         if hint_topics_by_unit[key] - set(terms(record.get("subject", ""))):
                                             hints.add(key)
-                                if not refs or not (fact_eligible or hints) or (
-                                    is_event and any(ref.get("evidence_unit_id") not in units for ref in refs)
+                                if (
+                                    not refs or not (fact_eligible or hints)
+                                    or (is_event and not source_refs_covered(refs, units))
                                 ):
                                     diagnostics["rejected_facts"] += 1
                                     continue

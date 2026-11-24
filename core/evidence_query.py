@@ -5,9 +5,12 @@ from dataclasses import asdict, dataclass, field
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+def source_refs_covered(source_refs, evidence_ids) -> bool:
+    return all(ref.get("evidence_unit_id") in evidence_ids for ref in source_refs)
+
+
 def facts_supported_by(facts, evidence_ids):
-    return [fact for fact in facts
-            if all(ref["evidence_unit_id"] in evidence_ids for ref in fact["source_refs"])]
+    return [fact for fact in facts if source_refs_covered(fact["source_refs"], evidence_ids)]
 
 
 class EvidenceQuery(BaseModel):

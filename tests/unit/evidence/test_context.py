@@ -35,7 +35,10 @@ def test_query_response_budget_keeps_groups_and_facts_aligned():
     first = unit("a", "I completed pottery.")
     dependent = unit("b", "It took two months. " * 50)
     independent = unit("c", "I completed photography.")
-    response = result([first, dependent, independent], [fact(first, first["text"])], [["a", "b"], ["c"]])
+    fact_without_unit_id = fact(independent, independent["text"])
+    del fact_without_unit_id["source_refs"][0]["evidence_unit_id"]
+    response = result([first, dependent, independent], [fact(first, first["text"]), fact_without_unit_id],
+                      [["a", "b"], ["c"]])
     response.diagnostics.update(partial=False, truncated=False)
     fitted = fit_evidence_payload(response.to_dict(), remaining_chars=700)
     assert [item["evidence_unit_id"] for item in fitted["evidence"]] == ["c"]
