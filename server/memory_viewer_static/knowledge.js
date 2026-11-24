@@ -9,10 +9,16 @@
     pending: '等待解析', indexing: '解析中', ready: '可检索',
     failed: '解析失败', canceled: '解析已停止', unknown: '状态未知',
   };
+  const dialog = element('dialog');
+  const file = element('file');
   const queryInput = element('query');
   const list = element('list');
-  const downloadButton = element('download');
+  const actions = ['download', 'replace', 'delete'].map(element);
   const librarySelect = element('base-select');
+  const libraryDialog = element('base-dialog');
+  const libraryForm = element('base-form');
+  const libraryName = element('base-name');
+  const libraryVisibility = element('base-visibility');
   let accountId = '';
   let active = false;
   let generation = 0;
@@ -22,12 +28,19 @@
   let listRequest = null;
   let detailRequest = null;
   let poll = null;
+  let dialogAction = null;
+  let dialogTrigger = null;
+  let mutating = false;
   let downloading = false;
   let composing = false;
   let names = new Map();
   let library = null;
   let libraryItems = [];
+  let libraryPermissions = {};
   let libraryRequest = null;
+  let libraryAction = null;
+  let libraryTrigger = null;
+  let libraryBusy = false;
 
   function headers() {
     return { ...requestHeaders(), ...(accountId && { 'X-Account-ID': accountId }) };
@@ -67,9 +80,20 @@
 
   function renderLibraryControls() {
     const permissions = library?.permissions || {};
+    const create = Boolean(libraryPermissions.create || libraryPermissions.create_shared);
     librarySelect.disabled = Boolean(libraryRequest) || libraryItems.length === 0;
+    element('base-create').hidden = !create;
+    element('base-create').disabled = Boolean(libraryRequest);
+    element('base-edit').hidden = !permissions.manage;
+    element('base-delete').hidden = !permissions.manage || library?.is_default;
+    for (const action of ['base-edit', 'base-delete']) {
+      element(action).disabled = Boolean(libraryRequest);
+    }
     element('base-scope').textContent = library
       ? `${library.visibility === 'private' ? '个人' : '账户共享'}${permissions.write ? '' : ' · 只读'}` : '';
+    element('upload').hidden = Boolean(library && !permissions.write);
+    element('upload').disabled = !permissions.write;
+    element('replace').hidden = element('delete').hidden = !permissions.write;
     queryInput.disabled = !permissions.read;
     element('search').querySelector('[type="submit"]').disabled = !permissions.read;
   }
@@ -88,8 +112,7 @@
     librarySelect.value = library?.id || '';
   }
 
-  async function loadLibraries() {
-    const preferred = library?.id;
+  async function loadLibraries({ preferred = library?.id, message = '', focus = false } = {}) {
     libraryRequest?.abort();
     const request = new AbortController();
     libraryRequest = request;
@@ -99,6 +122,7 @@
       const result = await getJson(libraryBase, { signal: request.signal });
       if (request.signal.aborted || request !== libraryRequest || !active) return;
       libraryItems = result.items;
+      libraryPermissions = result.permissions || {};
       const next = libraryItems.find((item) => item.id === preferred)
         || libraryItems.find((item) => item.id === result.default_knowledge_base_id)
         || libraryItems[0] || null;
@@ -112,6 +136,7 @@
       reset();
       library = null;
       libraryItems = [];
+      libraryPermissions = {};
       renderLibraryOptions();
       renderEmpty('暂时无法显示知识库。可使用顶部的刷新按钮。');
       feedback(errorText(error, '读取知识库失败，请刷新后重试。'), true);
@@ -122,7 +147,8 @@
         renderLibraryControls();
       }
     }
-    loadList();
+    if (focus) (libraryItems.length ? librarySelect : element('base-create')).focus();
+    loadList({ message });
     if (selected) loadStatus(Date.now() + 120000);
   }
 
@@ -189,7 +215,7 @@
     element('empty').textContent = message;
   }
 
-  async function loadList() {
+  async function loadList({ message = '' } = {}) {
     listRequest?.abort();
     const request = new AbortController();
     listRequest = request;
@@ -206,7 +232,7 @@
       listRequest = null;
       list.removeAttribute('aria-busy');
       renderEmpty(state.apiKey ? '当前没有可查看的知识库。' : '请先在连接设置中连接账户。');
-      feedback('');
+      feedback(message);
       return;
     }
     list.setAttribute('aria-busy', 'true');
@@ -225,7 +251,7 @@
         const pages = Math.max(1, Math.ceil(total / pageSize));
         if (page > pages) {
           page = pages;
-          return loadList();
+          return loadList({ message });
         }
         names = new Map(rows.map((item) => [item.id, item.filename]));
         element('page').textContent = '第 ' + page + ' / ' + pages + ' 页';
@@ -237,9 +263,9 @@
       renderRows(rows, searching);
       if (!list.childElementCount) {
         renderEmpty(searching ? '暂无相关片段。可以换个关键词再试。'
-          : '此知识库暂无文档。');
+          : library.permissions.write ? '暂无文档。上传文档后即可开始检索。' : '此知识库暂无文档。');
       }
-      feedback('');
+      feedback(message);
     } catch (error) {
       if (request.signal.aborted || current !== generation) return;
       renderEmpty('暂时无法显示文档。可使用顶部的刷新按钮。');
@@ -264,7 +290,7 @@
     element('document-chunks').textContent = '—';
     element('evidence').hidden = !record.excerpt;
     element('excerpt').textContent = record.excerpt || '';
-    downloadButton.disabled = false;
+    actions.forEach((action) => { action.disabled = false; });
     updateSelection();
     if (focus && window.matchMedia('(max-width: 760px)').matches) {
       element('document-title').focus();
@@ -301,13 +327,102 @@
       if (request.signal.aborted || record !== selected) return;
       element('document-state').textContent = '无法读取';
       if (error.status === 404 || error.status === 403 || error.status === 401) {
-        downloadButton.disabled = true;
+        actions.forEach((action) => { action.disabled = true; });
       }
       feedback(errorText(error, '无法读取解析状态。请重试。'), true);
     } finally {
       if (detailRequest === request) {
         detailRequest = null;
         element('status-refresh').disabled = false;
+      }
+    }
+  }
+
+  function openDialog(action, trigger) {
+    if (!library?.permissions?.write) return;
+    const record = selected;
+    if (action !== 'upload' && !record) return;
+    dialogTrigger = trigger;
+    dialogAction = { action, record };
+    file.value = '';
+    file.removeAttribute('aria-invalid');
+    element('dialog-error').textContent = '';
+    const deleting = action === 'delete';
+    const titles = { upload: '上传文档', replace: '替换文档', delete: '删除文档' };
+    const description = {
+      upload: '选择本地文件。解析完成后可从知识库检索。',
+      replace: '将「' + (record?.filename || '当前文档') + '」替换为新文件。文档地址保持不变。',
+      delete: '将从知识库「' + library.name + '」删除「' + (record?.filename || '当前文档') + '」及其索引片段。',
+    };
+    element('dialog-title').textContent = titles[action];
+    element('dialog-description').textContent = description[action];
+    element('dialog-submit').textContent = titles[action];
+    element('dialog-submit').classList.toggle('space-danger-button', deleting);
+    element('file-field').hidden = deleting;
+    dialog.showModal();
+    (deleting ? element('dialog-cancel') : file).focus();
+  }
+
+  async function submitDialog(event) {
+    event.preventDefault();
+    if (!dialogAction || mutating) return;
+    const pending = dialogAction;
+    const { action, record } = pending;
+    const errorRegion = element('dialog-error');
+    errorRegion.textContent = '';
+    const chosen = file.files[0];
+    if (action !== 'delete' && (!chosen || !chosen.size || chosen.size > 31 * 1024 * 1024)) {
+      errorRegion.textContent = '请选择一个 31 MiB 以内的非空文件。';
+      file.setAttribute('aria-invalid', 'true');
+      file.focus();
+      return;
+    }
+    const current = generation;
+    const submit = element('dialog-submit');
+    mutating = true;
+    submit.disabled = true;
+    element('dialog-cancel').disabled = true;
+    file.disabled = true;
+    element('form').setAttribute('aria-busy', 'true');
+    submit.textContent = '处理中…';
+    try {
+      const path = documentUrl(record && action !== 'upload' ? '/' + record.id : '');
+      let result;
+      if (action === 'delete') {
+        const response = await fetch(path, {
+          method: 'DELETE', headers: headers(), signal: AbortSignal.timeout(45000),
+        });
+        if (!response.ok) throw Object.assign(new Error(), { status: response.status });
+      } else {
+        const body = new FormData();
+        body.append('file', chosen);
+        result = await getJson(path, { method: action === 'upload' ? 'POST' : 'PUT', body, timeout: 45000 });
+      }
+      if (current !== generation) return;
+      if (action !== 'delete') {
+        query = '';
+        queryInput.value = '';
+        element('clear').hidden = true;
+        if (action === 'upload') page = 1;
+        openDocument({ ...result, key: result.id });
+      } else clearDetail();
+      dialog.close();
+      const message = action === 'delete' ? '文档已删除。'
+        : result.cleanup_pending ? '已提交替换。旧版文件等待清理。'
+        : action === 'replace' ? '已提交替换。' : '已上传并提交解析。';
+      loadList({ message });
+    } catch (error) {
+      if (current === generation) {
+        errorRegion.textContent = errorText(error, '操作未完成，请刷新确认状态后重试。');
+      }
+    } finally {
+      if (dialogAction === pending) {
+        mutating = false;
+        submit.disabled = false;
+        element('dialog-cancel').disabled = false;
+        file.disabled = false;
+        element('form').removeAttribute('aria-busy');
+        submit.textContent = element('dialog-title').textContent;
       }
     }
   }
@@ -345,6 +460,109 @@
     }
   }
 
+  function openLibraryDialog(action, trigger) {
+    if (trigger.disabled || trigger.hidden) return;
+    libraryAction = { action, item: library };
+    libraryTrigger = trigger;
+    const creating = action === 'create';
+    const deleting = action === 'delete';
+    const titles = { create: '新建知识库', edit: '重命名知识库', delete: '删除空库' };
+    const submitLabels = { create: '新建知识库', edit: '保存名称', delete: '删除知识库' };
+    element('base-dialog-title').textContent = titles[action];
+    element('base-dialog-description').textContent = deleting
+      ? `将删除知识库「${library.name}」。仅可删除空知识库。`
+      : creating ? '选择知识库的可见范围。' : `当前名称为「${library.name}」。`;
+    element('base-dialog-error').textContent = '';
+    element('base-dialog-submit').textContent = submitLabels[action];
+    element('base-dialog-submit').classList.toggle('space-danger-button', deleting);
+    element('base-name-field').hidden = deleting;
+    element('base-visibility-field').hidden = !creating;
+    libraryName.value = creating ? '' : library.name;
+    libraryName.removeAttribute('aria-invalid');
+    libraryVisibility.replaceChildren();
+    if (libraryPermissions.create_private) libraryVisibility.append(new Option('个人', 'private'));
+    if (libraryPermissions.create_shared) libraryVisibility.append(new Option('账户共享', 'shared'));
+    libraryDialog.showModal();
+    (deleting ? element('base-dialog-cancel') : libraryName).focus();
+  }
+
+  function libraryFormValues(action) {
+    const error = element('base-dialog-error');
+    const invalid = (field, message) => {
+      field.setAttribute('aria-invalid', 'true');
+      error.textContent = message;
+      field.focus();
+      return null;
+    };
+    const name = libraryName.value.trim();
+    if (!name) return invalid(libraryName, '请输入知识库名称。');
+    const body = { name };
+    if (action === 'create') body.visibility = libraryVisibility.value;
+    return body;
+  }
+
+  function setLibraryBusy(busy) {
+    libraryBusy = busy;
+    for (const control of libraryForm.elements) {
+      control.disabled = busy;
+    }
+    if (busy) libraryForm.setAttribute('aria-busy', 'true');
+    else libraryForm.removeAttribute('aria-busy');
+  }
+
+  async function submitLibraryDialog(event) {
+    event.preventDefault();
+    if (!libraryAction || libraryBusy) return;
+    const pending = libraryAction;
+    const { action, item } = pending;
+    const errorRegion = element('base-dialog-error');
+    errorRegion.textContent = '';
+    const deleting = action === 'delete';
+    const body = deleting ? null : libraryFormValues(action);
+    if (!deleting && !body) return;
+    const currentAccount = accountId;
+    const submit = element('base-dialog-submit');
+    const idleLabel = submit.textContent;
+    setLibraryBusy(true);
+    submit.textContent = '处理中…';
+    const current = () => libraryAction === pending && currentAccount === accountId && active;
+    try {
+      let result;
+      if (deleting) {
+        const response = await fetch(`${libraryBase}/${item.id}`, {
+          method: 'DELETE', headers: headers(), signal: AbortSignal.timeout(45000),
+        });
+        if (!response.ok) throw Object.assign(new Error(), { status: response.status });
+      } else {
+        const creating = action === 'create';
+        result = await getJson(creating ? libraryBase : `${libraryBase}/${item.id}`, {
+          method: creating ? 'POST' : 'PATCH', body: JSON.stringify(body),
+          headers: { 'Content-Type': 'application/json' }, timeout: 45000,
+        });
+      }
+      if (!current()) return;
+      libraryDialog.close();
+      if (deleting) {
+        library = null;
+        reset();
+      }
+      const messages = { create: '知识库已新建。', edit: '知识库名称已更新。', delete: '知识库已删除。' };
+      loadLibraries({ preferred: result?.id, message: messages[action], focus: true });
+    } catch (error) {
+      if (!current()) return;
+      errorRegion.textContent = deleting && error.status === 409
+        ? '此知识库仍有文档。请先清理文档，再删除知识库。'
+        : error.status === 404 || error.status === 409 ? '知识库已变更，请刷新后重试。'
+          : error.status === 400 ? '请输入有效的知识库名称。'
+            : errorText(error, '知识库操作未完成，请重试。');
+    } finally {
+      if (current()) {
+        setLibraryBusy(false);
+        submit.textContent = idleLabel;
+      }
+    }
+  }
+
   function reset() {
     generation += 1;
     listRequest?.abort();
@@ -362,17 +580,31 @@
     renderEmpty('');
     clearDetail();
     feedback('');
+    dialogAction = null;
+    dialogTrigger = null;
+    file.value = '';
+    file.disabled = false;
+    mutating = false;
+    element('dialog-submit').disabled = false;
+    element('dialog-cancel').disabled = false;
+    element('form').removeAttribute('aria-busy');
+    if (dialog.open) dialog.close();
   }
 
   function stopLibraries() {
     libraryRequest?.abort();
     libraryRequest = null;
+    if (libraryDialog.open) libraryDialog.close();
+    libraryAction = null;
+    libraryTrigger = null;
+    setLibraryBusy(false);
     reset();
   }
 
   function clearLibrary() {
     library = null;
     libraryItems = [];
+    libraryPermissions = {};
     stopLibraries();
     renderLibraryOptions();
     renderLibraryControls();
@@ -386,6 +618,24 @@
     renderLibraryControls();
     loadList();
   });
+  for (const action of ['create', 'edit', 'delete']) {
+    element('base-' + action).addEventListener('click', (event) => openLibraryDialog(action, event.currentTarget));
+  }
+  element('base-dialog-cancel').addEventListener('click', () => libraryDialog.close());
+  libraryForm.addEventListener('submit', submitLibraryDialog);
+  libraryForm.addEventListener('input', (event) => {
+    event.target.removeAttribute('aria-invalid');
+    element('base-dialog-error').textContent = '';
+  });
+  libraryDialog.addEventListener('cancel', (event) => { if (libraryBusy) event.preventDefault(); });
+  libraryDialog.addEventListener('close', () => {
+    if (libraryTrigger?.isConnected && !libraryTrigger.hidden && !libraryTrigger.disabled) libraryTrigger.focus();
+    else if (active && !librarySelect.disabled) librarySelect.focus();
+    libraryAction = null;
+    libraryTrigger = null;
+    setLibraryBusy(false);
+  });
+
   element('search').addEventListener('submit', (event) => {
     event.preventDefault();
     if (composing || !library?.permissions?.read) return;
@@ -415,8 +665,26 @@
       loadList();
     });
   }
+  for (const action of ['upload', 'replace', 'delete']) {
+    element(action).addEventListener('click', (event) => openDialog(action, event.currentTarget));
+  }
   element('status-refresh').addEventListener('click', () => loadStatus(Date.now() + 120000));
   element('download').addEventListener('click', download);
+  element('dialog-cancel').addEventListener('click', () => dialog.close());
+  element('form').addEventListener('submit', submitDialog);
+  file.addEventListener('change', () => {
+    file.removeAttribute('aria-invalid');
+    element('dialog-error').textContent = '';
+  });
+  dialog.addEventListener('cancel', (event) => { if (mutating) event.preventDefault(); });
+  dialog.addEventListener('close', () => {
+    if (dialogTrigger?.isConnected && !dialogTrigger.closest('[hidden]')) dialogTrigger.focus();
+    else if (active) element('upload').focus();
+    dialogAction = null;
+    dialogTrigger = null;
+    file.value = '';
+  });
+
   window.knowledgeLibrary = {
     reset() { accountId = ''; active = false; clearLibrary(); },
     show(account) {

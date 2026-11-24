@@ -3,6 +3,13 @@
   margin-bottom: 18px;
 }
 
+.knowledge-heading .primary-button,
+.knowledge-dialog-actions .primary-button {
+  width: auto;
+}
+
+.knowledge-heading-actions,
+.knowledge-base-actions,
 .knowledge-base-picker,
 .knowledge-base-toolbar {
   display: flex;
@@ -27,7 +34,7 @@
   font-weight: 650;
 }
 
-.knowledge-base-picker select {
+:is(.knowledge-base-picker, .knowledge-base-dialog) select {
   min-height: 38px;
   max-width: 100%;
   padding: 4px 9px;
@@ -48,6 +55,11 @@
 #knowledge-base-scope {
   color: var(--muted);
   font-size: 12px;
+}
+
+.knowledge-base-danger {
+  background: var(--surface-solid);
+  color: var(--red);
 }
 
 .knowledge-feedback {
@@ -243,14 +255,73 @@
   font-size: 13px;
 }
 
-.knowledge-actions {
+.knowledge-actions,
+.knowledge-dialog-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
-#knowledge-view :is(button, h2, select):focus-visible {
+.knowledge-delete {
+  margin-inline-start: auto;
+  background: var(--surface-solid);
+  color: var(--red);
+}
+
+.knowledge-dialog-actions {
+  justify-content: flex-end;
+}
+
+.knowledge-dialog-actions .space-danger-button {
+  background: var(--red);
+  color: var(--surface-solid);
+}
+
+.knowledge-dialog-actions .space-danger-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--red) 90%, var(--quiet));
+}
+
+.knowledge-base-dialog {
+  width: min(520px, calc(100% - 32px));
+}
+
+.knowledge-file-field {
+  display: grid;
+  gap: 6px;
+  min-inline-size: 0;
+}
+
+.knowledge-file-field input {
+  width: 100%;
+  height: auto;
+  padding: 6px;
+}
+
+.knowledge-file-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.knowledge-file-field input::file-selector-button {
+  margin-inline-end: 8px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface-solid);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.knowledge-file-field input::file-selector-button:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-rail);
+}
+
+#knowledge-view :is(button, h2, select):focus-visible,
+.knowledge-dialog :is(button, input, select):focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
@@ -259,7 +330,8 @@
   outline-offset: -3px;
 }
 
-#knowledge-view :is(button, select):disabled {
+#knowledge-view :is(button, select):disabled,
+.knowledge-dialog :is(button, select):disabled {
   opacity: 0.52;
   cursor: default;
 }
@@ -281,9 +353,21 @@
   .knowledge-placeholder {
     min-block-size: 150px;
   }
+
+  .knowledge-delete {
+    margin-inline-start: 0;
+  }
 }
 
 @media (max-width: 440px) {
+  .knowledge-heading-actions {
+    gap: 6px;
+  }
+
+  .knowledge-heading-actions :is(.primary-button, .secondary-button) {
+    padding-inline: 10px;
+  }
+
   .knowledge-base-picker {
     flex-basis: 100%;
   }
