@@ -682,6 +682,17 @@ func (h *Handler) SetupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/registration-session", h.registration)
 	mux.HandleFunc("/api/v1/registration-session/", h.registrationOperation)
 	mux.HandleFunc("/api/v1/health", h.Health)
+	mux.HandleFunc("/api/v1/cachefs/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if fs, ok := h.fs.(*mountablefs.MountableFS); ok {
+			writeJSON(w, http.StatusOK, fs.CacheStats())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{})
+	})
 	mux.HandleFunc("/api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -949,12 +960,15 @@ func (h *Handler) resolveRipgrepPath(vfsPath string) (string, string, string, bo
 		if !found {
 			return "", "", "", false
 		}
-		resolver, ok := mount.Plugin.GetFileSystem().(localPathResolver)
+		resolver, ok := mount.ExecutionFS().(localPathResolver)
 		if !ok {
 			return "", "", "", false
 		}
 		localPath := resolver.ResolvePath(relPath)
 		basePath := resolver.ResolvePath("/")
+		if localPath == "" || basePath == "" {
+			return "", "", "", false
+		}
 		return localPath, basePath, mount.Path, true
 	}
 
@@ -964,6 +978,9 @@ func (h *Handler) resolveRipgrepPath(vfsPath string) (string, string, string, bo
 	}
 	localPath := resolver.ResolvePath(vfsPath)
 	basePath := resolver.ResolvePath("/")
+	if localPath == "" || basePath == "" {
+		return "", "", "", false
+	}
 	return localPath, basePath, "/", true
 }
 

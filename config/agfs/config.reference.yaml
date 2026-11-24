@@ -18,6 +18,40 @@ server:
   address: ":1833"               # [all] listen address (default :1833)
   log_level: info                 # [all] debug / info / warn / error
 
+# ---- Shared CacheRuntime / CacheFS [all, opt-in] ----
+# Requires one AGFS writer per storage backend; all mutations go through AGFS.
+# The selected S3FS/SQLFS mounts have their internal caches disabled automatically.
+cache:
+  provider: redis
+  command_timeout_ms: 50
+  max_inflight: 32
+  params:
+    mode: standalone
+    endpoints: ["redis://127.0.0.1:6379"]
+    pool_size: 32
+    connect_timeout_ms: 1000
+    # password_env: OGMEM_CACHE_REDIS_PASSWORD
+# Dynamic provider alternative (PR v1 C ABI, native SDK adapter only):
+# cache:
+#   provider: dynamic
+#   command_timeout_ms: 50
+#   max_inflight: 32
+#   params:
+#     library: /opt/ogmem/providers/libcache_adapter.so
+#     endpoint: 127.0.0.1:31501
+
+cachefs:
+  enabled: false
+  namespace: ogmemory-dev
+  mounts: [/local]              # localfs, s3fs, sqlfs only; never queuefs
+  max_file_size_bytes: 1048576
+  max_dir_entries: 4096
+  max_dir_encoded_bytes: 4194304
+  file_ttl_seconds: 300
+  dir_ttl_seconds: 30
+  traversal_mode: backend       # cached_traversal disables local ripgrep fast path
+  bypass_prefixes: []           # additional absolute AGFS paths, including descendants
+
 # ---- Core Plugins [all] ----
 plugins:
   serverinfofs:

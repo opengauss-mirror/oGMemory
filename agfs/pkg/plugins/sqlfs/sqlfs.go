@@ -208,6 +208,7 @@ type SQLFS struct {
 	backend    DBBackend
 	mu         *sync.RWMutex
 	pluginName string
+	storageID  string
 	listCache  *ListDirCache // cache for directory listings
 }
 
@@ -254,6 +255,7 @@ func NewSQLFS(backend DBBackend, config map[string]interface{}) (*SQLFS, error) 
 	fs := &SQLFS{
 		mu:         new(sync.RWMutex),
 		db:         db,
+		storageID:  cacheStorageID(backend, config),
 		backend:    backend,
 		pluginName: PluginName,
 		listCache:  NewListDirCache(cacheMaxSize, time.Duration(cacheTTLSeconds)*time.Second, cacheEnabled),
@@ -983,3 +985,12 @@ LIMITATIONS:
 // Ensure SQLFSPlugin implements ServicePlugin
 var _ plugin.ServicePlugin = (*SQLFSPlugin)(nil)
 var _ filesystem.FileSystem = (*SQLFS)(nil)
+
+// DisableInternalCache is called before a mount starts serving through CacheFS.
+func (fs *SQLFS) DisableInternalCache() {
+	fs.listCache.mu.Lock()
+	defer fs.listCache.mu.Unlock()
+	fs.listCache.enabled = false
+}
+
+func (fs *SQLFS) CacheStorageIdentity() (string, string) { return fs.storageID, "/" }

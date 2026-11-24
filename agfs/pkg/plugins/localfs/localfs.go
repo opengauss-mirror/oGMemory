@@ -776,3 +776,12 @@ func (p *LocalFSPlugin) Shutdown() error {
 // Ensure LocalFSPlugin implements ServicePlugin
 var _ plugin.ServicePlugin = (*LocalFSPlugin)(nil)
 var _ filesystem.FileSystem = (*LocalFS)(nil)
+
+// CacheStorageIdentity rejects overlapping mounts of the same local backend.
+func (fs *LocalFS) CacheStorageIdentity() (string, string) {
+	root, err := filepath.EvalSymlinks(fs.basePath)
+	if err != nil {
+		root = fs.basePath
+	}
+	return "local", filepath.ToSlash(root)
+}

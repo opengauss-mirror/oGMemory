@@ -90,6 +90,20 @@ func (mfs *MountableFS) LockRegistration(path string) (*Registration, error) {
 			}
 			point := *mount
 			point.Plugin = registrationPlugin{point.Plugin, scoped}
+			point.FileSystem = scoped
+			point.cache = nil
+			if mount.cache != nil {
+				endWrite, err := mount.cache.BeginScopedWrite()
+				if err != nil {
+					release()
+					return nil, err
+				}
+				closeSession := release
+				release = func() {
+					defer endWrite()
+					closeSession()
+				}
+			}
 			tree, _, _ := iradix.New().Insert([]byte(point.Path), &point)
 			view := new(MountableFS)
 			view.mountTree.Store(tree)

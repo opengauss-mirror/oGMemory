@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/config"
@@ -221,6 +226,9 @@ func main() {
 
 	// Create mountable file system
 	mfs := mountablefs.NewMountableFS(poolConfig)
+	if err := mfs.ConfigureCache(cfg.CacheFS, cfg.Cache); err != nil {
+		log.Fatalf("Cache configuration failed: %v", err)
+	}
 
 	// Create traffic monitor early so it can be injected into plugins during mounting
 	trafficMonitor := handlers.NewTrafficMonitor()
@@ -234,7 +242,14 @@ func main() {
 		})
 	}
 
-	// mountPlugin initializes and mounts a plugin asynchronously
+	logMountError := func(format string, args ...interface{}) {
+		if cfg.CacheFS.Enabled {
+			log.Fatalf(format, args...)
+		}
+		log.Errorf(format, args...)
+	}
+
+	// mountPlugin initializes and mounts a plugin asynchronously unless caching requires validated mounts.
 	mountPlugin := func(pluginName, instanceName, mountPath string, pluginConfig map[string]interface{}) {
 		// Get plugin factory (try built-in first, then external)
 		factory, ok := availablePlugins[pluginName]
@@ -267,35 +282,40 @@ func main() {
 		}
 
 		// Mount asynchronously
-		go func() {
+		mountInstance := func() {
 			// Inject mount_path into config
-			configWithPath := make(map[string]interface{})
-			for k, v := range pluginConfig {
-				configWithPath[k] = v
+			configWithPath, err := mfs.PrepareMountConfig(pluginName, mountPath, pluginConfig)
+			if err != nil {
+				logMountError("Mount cache configuration failed: %v", err)
+				return
 			}
-			configWithPath["mount_path"] = mountPath
 
 			// Validate plugin configuration
 			if err := p.Validate(configWithPath); err != nil {
-				log.Errorf("Failed to validate %s instance '%s': %v", pluginName, instanceName, err)
+				logMountError("Failed to validate %s instance '%s': %v", pluginName, instanceName, err)
 				return
 			}
 
 			// Initialize plugin
 			if err := p.Initialize(configWithPath); err != nil {
-				log.Errorf("Failed to initialize %s instance '%s': %v", pluginName, instanceName, err)
+				logMountError("Failed to initialize %s instance '%s': %v", pluginName, instanceName, err)
 				return
 			}
 
 			// Mount plugin
 			if err := mfs.Mount(mountPath, p); err != nil {
-				log.Errorf("Failed to mount %s instance '%s' at %s: %v", pluginName, instanceName, mountPath, err)
+				logMountError("Failed to mount %s instance '%s' at %s: %v", pluginName, instanceName, mountPath, err)
 				return
 			}
 
 			// Log success
 			log.Infof("%s instance '%s' mounted at %s", pluginName, instanceName, mountPath)
-		}()
+		}
+		if cfg.CacheFS.Enabled {
+			mountInstance()
+		} else {
+			go mountInstance()
+		}
 	}
 
 	// Load external plugins if enabled
@@ -372,7 +392,27 @@ func main() {
 	// Start server
 	log.Infof("Starting AGFS server on %s", serverAddr)
 
-	if err := http.ListenAndServe(serverAddr, loggedMux); err != nil {
-		log.Fatal(err)
+	server := &http.Server{Addr: serverAddr, Handler: loggedMux}
+	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		<-stop.Done()
+		ctx, done := context.WithTimeout(context.Background(), 10*time.Second)
+		defer done()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Errorf("HTTP shutdown: %v", err)
+		}
+		if err := mfs.Close(ctx); err != nil {
+			log.Errorf("Filesystem shutdown: %v", err)
+		}
+	}()
+	serveErr := server.ListenAndServe()
+	cancel()
+	<-stopped
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		log.Error(serveErr)
+		os.Exit(1)
 	}
 }
