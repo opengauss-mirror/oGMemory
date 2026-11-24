@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from core.evidence import evidence_uri, message_source
 from core.models import CandidateMemory
 from core.operation_deadline import operation_deadline
 from core.provenance_resolver import ProvenanceResolver
@@ -13,6 +14,20 @@ from service.evidence_service import EvidenceService
 from tests.unit.evidence.test_batch_reads import install_batch
 from tests.unit.evidence.test_sources import CTX, message
 from tests.unit.evidence.test_writer import write_candidates
+
+
+def track_body_reads(fs, monkeypatch):
+    read = fs._client.read
+    sizes = []
+
+    def track(path, *args, **kwargs):
+        content = read(path, *args, **kwargs)
+        if path.endswith("/" + fs.FILE_CONTENT):
+            sizes.append((path, len(content)))
+        return content
+
+    monkeypatch.setattr(fs._client, "read", track)
+    return sizes
 
 
 @pytest.fixture
@@ -158,7 +173,6 @@ def test_event_and_memory_channels_are_independent_and_events_are_capped(setup, 
 @pytest.mark.parametrize("limit", ["count", "shared_bytes"])
 def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, limit):
     import service.evidence_service as search
-    from core.evidence import message_source
 
     fs, _, _, _ = setup
     messages = sorted([message("Paris.", id=str(i), sequence=i * 2) for i in range(3)],
@@ -173,6 +187,12 @@ def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, li
     else:
         monkeypatch.setattr(search, "_SCAN_BYTE_LIMIT", len(first["content"].encode("utf-8")))
 
+    paths = [fs._uri_to_agfs_path(evidence_uri(CTX, "sources", message_source(msg, CTX).source_key))
+             + fs.FILE_CONTENT for msg in messages]
+    expected_reads = paths[:2] + paths[:1]
+    expected_bytes = sum(len(fs._client.read(path)) for path in expected_reads)
+    reads = track_body_reads(fs, monkeypatch)
+
     # The exact-date events are outside the source scan and would take both event slots.
     result = EvidenceService(fs).search("Paris visit 2026-05-02 2026-05-03", CTX, use_memories=True, use_events=True)
 
@@ -184,12 +204,42 @@ def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, li
     assert [fact["quote"] for fact in result.facts] == ([first["content"]] if count_limit else [])
     if not count_limit:
         assert result.diagnostics["scanned_cards"] == 0
+        source_reads = [(path, size) for path, size in reads if path in paths]
+        assert [path for path, _ in source_reads] == expected_reads
+        assert sum(size for _, size in source_reads) == expected_bytes
+
+
+@pytest.mark.parametrize("limit", ["card_bytes", "shared_bytes"])
+def test_card_scan_reads_no_bodies_after_the_budget_stops_it(setup, monkeypatch, limit):
+    fs, _, _, _ = setup
+    messages = [message(f"I visited Paris and completed {i} essays.", id=str(i), sequence=i * 2)
+                for i in range(1, 4)]
+    cards = sorted(plan.target_uri for plan in write_candidates(setup, messages, categories={"fact"}))
+    service = EvidenceService(fs)
+    original = fs.read_node(cards[1], CTX)
+    # Exercise the real storage read with multibyte bodies instead of only checking scan counters.
+    content = "字" * (1024 * 1024 if limit == "card_bytes" else 200)
+    fs.write_node(replace(original, content=content), CTX)
+    paths = [fs._uri_to_agfs_path(uri) + fs.FILE_CONTENT for uri in cards]
+    expected_bytes = sum(len(fs._client.read(path)) for path in paths[:2])
+    if limit == "shared_bytes":
+        monkeypatch.setattr("service.evidence_service._SCAN_BYTE_LIMIT",
+                            sum(len(msg["content"].encode("utf-8")) for msg in messages) + expected_bytes - 1)
+    reads = track_body_reads(fs, monkeypatch)
+
+    result = service.search("Paris essays", CTX, use_memories=True)
+
+    assert result.evidence and result.facts
+    assert result.diagnostics["partial"] and result.diagnostics["truncated"]
+    assert result.diagnostics["scanned_cards"] == 2
+    card_reads = [(path, size) for path, size in reads if path in paths]
+    assert [path for path, _ in card_reads] == paths[:2]
+    assert sum(size for _, size in card_reads) == expected_bytes
 
 
 @pytest.mark.parametrize("batch", [False, True])
 def test_shared_dependencies_are_removed_when_their_source_fails_final_check(setup, monkeypatch, batch):
     import service.evidence_service as search
-    from core.evidence import message_source
 
     fs, _, store, _ = setup
     first = message("I opened a studio.", id="first", sequence=0)
@@ -348,7 +398,7 @@ def test_source_read_deadline_stops_manifest_in_all_search_phases(
 
 
 def test_agfs_batch_does_not_refill_workers_after_evidence_expiry(setup, monkeypatch, deadline_clock):
-    from core.evidence import evidence_uri
+    from core.errors import OperationDeadlineExceededError
 
     fs, _, store, _ = setup
     sources = store.register([message("I visited Paris.", id=str(i), sequence=i) for i in range(8)],
@@ -365,10 +415,9 @@ def test_agfs_batch_does_not_refill_workers_after_evidence_expiry(setup, monkeyp
         return node
 
     monkeypatch.setattr(fs, "read_node", expire_after_first)
-    with operation_deadline(deadline_clock.budget):
-        result = EvidenceService(fs).search("Paris", CTX)
+    with operation_deadline(deadline_clock.budget), pytest.raises(OperationDeadlineExceededError):
+        list(store.node_pages(first_page, CTX, read_limit=len(first_page)))
     assert first_page[0] in reads and set(reads) <= set(first_page[:4])
-    assert result.diagnostics["partial"] and not result.evidence
 
 
 def test_expired_query_does_not_start_card_listing_or_group_selection(setup, monkeypatch, deadline_clock):

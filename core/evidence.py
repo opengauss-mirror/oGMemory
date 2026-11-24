@@ -72,11 +72,34 @@ def parse_evidence_uri(uri: str) -> dict | None:
             "slug": fields["slug"] or ""}
 
 
+def is_evidence_key(key: object) -> bool:
+    return isinstance(key, str) and _DIGEST.fullmatch(key) is not None
+
+
 def evidence_uri(ctx: RequestContext, kind: str, key: str = "") -> str:
-    if kind not in EVIDENCE_KINDS or key and not _DIGEST.fullmatch(key):
+    if kind not in EVIDENCE_KINDS or key and not is_evidence_key(key):
         raise ValueError("invalid evidence kind or key")
     account, user = _identity(ctx.account_id), _identity(ctx.user_id)
     return f"ctx://{account}/users/{user}/evidence/{kind}" + (f"/{key}" if key else "")
+
+
+def reference_unit_id(ref: object) -> str | None:
+    key = ref.get("evidence_unit_id") if isinstance(ref, dict) else None
+    return key if isinstance(key, str) and key else None
+
+
+def reference_span(ref: dict, unit: dict, *, source_text: str | None = None) -> tuple[int, int] | None:
+    """Return offsets within the unit for a quote aligned with its original text."""
+    span, quote = ref.get("span"), ref.get("quote")
+    if not isinstance(span, (list, tuple)) or len(span) != 2 or not isinstance(quote, str):
+        return None
+    start, end = span
+    offset, unit_end = unit["parent_span"]
+    if type(start) is not int or type(end) is not int or not offset <= start < end <= unit_end:
+        return None
+    relative = (start - offset, end - offset)
+    original = source_text[start:end] if source_text is not None else unit["text"][relative[0]:relative[1]]
+    return relative if quote == original else None
 
 
 @dataclass(frozen=True)

@@ -115,6 +115,52 @@ def test_context_hint_rejects_tampered_record_and_revoked_or_other_user_sources(
     assert not service.search(query, CTX, use_memories=True).evidence
 
 
+@pytest.mark.parametrize("field,value", [
+    ("quote", None), ("subject", None), ("predicate", None), ("source_refs", 1), ("source_refs", [None]),
+    ("nlp_model", {"name": []}), ("nlp_model", {"version": "1"}),
+    ("source_refs.0.span", None), ("source_refs.0.span", [0, 1.5]),
+    ("source_refs.0.span", [False, 1]), ("source_refs.0.quote", None),
+    ("source_refs.0.evidence_unit_id", None), ("source_refs.0.evidence_unit_id", []),
+    ("source_refs.0.source_key", "invalid"), ("source_refs.0.content_hash", None),
+])
+@pytest.mark.parametrize("query", ["What did Alex recommend?", "What did Morgan recommend?"])
+def test_bad_fact_does_not_hide_verified_facts_or_raw_messages(setup, monkeypatch, field, value, query):
+    fs, _, _, _ = setup
+    write_candidates(setup, [
+        message("[Alex]: I recommend a telescope.", id="alex", sequence=0),
+        message("[Alex]: I recommend a microscope.", id="other", sequence=10),
+        message("[Morgan]: I recommend a binocular telescope.", id="morgan", sequence=20),
+    ], categories={"fact"})
+    read = fs.read_node
+
+    def corrupt(uri, ctx):
+        node = read(uri, ctx)
+        if node.category != "fact":
+            return node
+        node = deepcopy(node)
+        for record in node.metadata["deterministic"]["fact_records"]:
+            if record["quote"] != "I recommend a telescope.":
+                continue
+            if field.startswith("source_refs.0."):
+                ref = record["source_refs"][0]
+                key = field.rsplit(".", 1)[1]
+                if value is None:
+                    del ref[key]
+                else:
+                    ref[key] = value
+            else:
+                record[field] = value
+        return node
+
+    monkeypatch.setattr(fs, "read_node", corrupt)
+    result = EvidenceService(fs).search(query, CTX, use_memories=True)
+    expected = "I recommend a microscope." if "Alex" in query else "I recommend a binocular telescope."
+    assert [fact["quote"] for fact in result.facts] == [expected]
+    assert "alex" in {item["message_id"] for item in result.evidence}
+    assert result.diagnostics["rejected_facts"] > 0
+    assert not result.diagnostics["partial"]
+
+
 def test_context_hint_verification_is_bounded_by_candidate_budget(setup, monkeypatch):
     import extraction.deterministic.verification as verification
 

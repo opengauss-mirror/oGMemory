@@ -6,8 +6,9 @@ import json
 import re
 from dataclasses import asdict, dataclass
 
+from core.evidence import reference_span
 from core.evidence_query import MessageEvidenceResult, facts_supported_by, source_refs_covered
-from retrieval.evidence.ranking import fact_matches, query_topics, terms
+from retrieval.evidence.ranking import fact_is_relevant, query_topics, terms
 
 
 @dataclass
@@ -95,8 +96,7 @@ def _quote_spans(query, facts, topics, units):
     """
     quotes = {key: [] for key in units}
     for record in facts:
-        quote = record.get("quote")
-        if not isinstance(quote, str) or not (topics & set(terms(quote)) and fact_matches(query, record)):
+        if not fact_is_relevant(query, record, topics):
             continue
         refs = record.get("source_refs", [])
         if not source_refs_covered(refs, units):
@@ -105,17 +105,12 @@ def _quote_spans(query, facts, topics, units):
         for ref in refs:
             key = ref["evidence_unit_id"]
             unit = units[key]
-            span = ref.get("span")
-            if not isinstance(span, (list, tuple)) or len(span) != 2:
-                break
-            start, end = span
-            offset = unit["parent_span"][0]
-            if (type(start) is not int or type(end) is not int or not offset <= start < end <= unit["parent_span"][1]
-                    or unit["text"][start - offset:end - offset] != quote or ref.get("quote") != quote
+            span = reference_span(ref, unit)
+            if (span is None or ref["quote"] != record["quote"]
                     or any(ref.get(name) != unit[name] for name in ("source_key", "content_hash", "session_id", "message_id"))
                     or any(record.get(name) != unit.get(name) for name in ("role", "speaker", "recorded_at"))):
                 break
-            aligned.append((key, start - offset, end - offset))
+            aligned.append((key, *span))
         else:
             for key, start, end in aligned:
                 quotes[key].append((start, end))

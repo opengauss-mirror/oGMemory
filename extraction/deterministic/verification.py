@@ -50,6 +50,9 @@ def verify_record(record, store, ctx, *, resolve=None, quoted=overlaps_quotation
         doc = None
         signature = record.get("nlp_model")
         if signature:
+            if (not isinstance(signature, dict) or not isinstance(signature.get("name"), str)
+                    or not isinstance(signature.get("version"), str)):
+                return False
             from extraction.deterministic.nlp import load_model, verified_document
             try:
                 model = load_model(signature["name"])

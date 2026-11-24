@@ -110,12 +110,16 @@ def test_later_dependency_requires_atomic_upgrade_of_earlier_excerpt():
     assert first["text"] in full.text
 
 
-@pytest.mark.parametrize("change", ["quote", "span", "role", "hash", "missing", "missing_id", "missing_span", "topic"])
+@pytest.mark.parametrize("change", [
+    "quote", "null_quote", "span", "role", "hash", "missing", "missing_id", "invalid_id", "missing_span", "topic",
+])
 def test_invalid_or_unrelated_facts_fall_back_to_raw_evidence(change):
     first = unit("a", "Background. " * 30 + "I completed a pottery course. " + "Weather. " * 30)
     record = fact(first, "I completed a pottery course.")
     if change == "quote":
         record["quote"] = "I completed ten courses."
+    elif change == "null_quote":
+        record["quote"] = None
     elif change == "span":
         record["source_refs"][0]["span"][0] += 1
     elif change == "role":
@@ -126,6 +130,8 @@ def test_invalid_or_unrelated_facts_fall_back_to_raw_evidence(change):
         record["source_refs"].append({**record["source_refs"][0], "evidence_unit_id": "absent"})
     elif change == "missing_id":
         del record["source_refs"][0]["evidence_unit_id"]
+    elif change == "invalid_id":
+        record["source_refs"][0]["evidence_unit_id"] = []
     elif change == "missing_span":
         del record["source_refs"][0]["span"]
     else:

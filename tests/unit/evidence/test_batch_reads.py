@@ -48,9 +48,7 @@ def test_batch_and_serial_results_match_with_facts_and_events(setup, monkeypatch
     calls = install_batch(fs, monkeypatch)
     actual = service.search("Paris essays", CTX, use_memories=True, use_events=True)
     assert stable(actual) == stable(expected)
-    assert max(map(len, calls)) == 32
-    manifests = [uris for uris in calls if "/evidence/sessions/" in uris[0]]
-    assert len(manifests) == 2 and all(len(uris) == 1 for uris in manifests)
+    assert calls and all(len(uris) == 1 for uris in calls)
 
 
 def test_read_limit_sentinel_does_not_fetch_or_raise_later_errors(setup, monkeypatch):
@@ -67,7 +65,7 @@ def test_read_limit_sentinel_does_not_fetch_or_raise_later_errors(setup, monkeyp
     assert next(sources)[1]() is None
 
 
-def test_batch_source_prefetch_never_replaces_final_authority_check(setup, monkeypatch):
+def test_source_scan_never_replaces_final_authority_check(setup, monkeypatch):
     import service.evidence_service as search
 
     fs, _, store, _ = setup

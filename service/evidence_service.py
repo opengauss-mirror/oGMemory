@@ -7,7 +7,7 @@ import re
 import time
 
 from core.errors import NodeNotFoundError, OperationDeadlineExceededError
-from core.evidence import evidence_uri
+from core.evidence import evidence_uri, reference_unit_id
 from core.evidence_query import (
     EvidenceQuery,
     MessageEvidenceResult,
@@ -18,7 +18,7 @@ from core.evidence_timing import operation, request_id, stage, timed
 from core.operation_deadline import check_deadline, operation_deadline_at
 from providers.token_tracker import request_usage_scope
 from retrieval.evidence.ranking import (
-    fact_matches,
+    fact_is_relevant,
     lexical_scores,
     parse_evidence_query,
     query_topics,
@@ -118,7 +118,10 @@ class EvidenceService:
         with stage("source_scan"):
             units, sources, source_bytes = {}, {}, 0
             source_uris = self.store.iter_uris(evidence_uri(ctx, "sources"), ctx, _SOURCE_SCAN_LIMIT + 1)
-            for uri, read_source in self.store.iter_sources(source_uris, ctx, read_limit=_SOURCE_SCAN_LIMIT):
+            # Body sizes are unknown until read. Admit each source before fetching another.
+            for uri, read_source in self.store.iter_sources(
+                source_uris, ctx, read_limit=_SOURCE_SCAN_LIMIT, batch_size=1,
+            ):
                 check_deadline()
                 if diagnostics["scanned_sources"] >= _SOURCE_SCAN_LIMIT:
                     diagnostics.update(partial=True, truncated=True)
@@ -176,7 +179,9 @@ class EvidenceService:
                     prefix = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/{directory}"
                     card_uris = [prefix] if directory == "profile" else self.store.iter_uris(prefix, ctx, 2001)
                     stop_cards = False
-                    for page in self.store.node_pages(card_uris, ctx, read_limit=2000 - diagnostics["scanned_cards"]):
+                    for page in self.store.node_pages(
+                        card_uris, ctx, read_limit=2000 - diagnostics["scanned_cards"], batch_size=1,
+                    ):
                         for uri, value in page:
                             check_deadline()
                             if diagnostics["scanned_cards"] >= 2000:
@@ -203,18 +208,27 @@ class EvidenceService:
                                         diagnostics["unverifiable_cards"] += 1
                                     _add_archive_hints(node, sources, memory_texts)
                                 continue
+                            if not isinstance(data, dict):
+                                continue
                             candidates = data.get("fact_records", [])
+                            if not isinstance(candidates, (list, tuple)):
+                                continue
                             is_event = node.category == "event"
                             for record in candidates:
                                 check_deadline()
-                                refs = record.get("source_refs", [])
-                                fact_eligible = bool(topics & set(terms(record.get("quote", "")))) and fact_matches(query, record)
+                                refs = record.get("source_refs") if isinstance(record, dict) else None
+                                if not refs or not isinstance(refs, (list, tuple)):
+                                    diagnostics["rejected_facts"] += 1
+                                    continue
+                                fact_eligible = fact_is_relevant(query, record, topics)
+                                subject = record.get("subject", "")
                                 hints = set()
-                                if (not fact_eligible and refs and request.use_memories and not is_event
+                                if (not fact_eligible and isinstance(subject, str)
+                                        and request.use_memories and not is_event
                                         and hint_attempts < request.candidate_limit
                                         and len(context_hints) < request.candidate_limit):
                                     for ref in refs:
-                                        key = ref["evidence_unit_id"]
+                                        key = reference_unit_id(ref)
                                         if key not in units or key in scores or key in context_hints:
                                             continue
                                         unit = units[key]
@@ -222,10 +236,10 @@ class EvidenceService:
                                         if key not in hint_topics_by_unit:
                                             names = {word.casefold() for word in re.findall(r"\b[A-Z][a-z]+\b", unit["text"])}
                                             hint_topics_by_unit[key] = context_terms & (set(terms(unit["text"])) - names)
-                                        if hint_topics_by_unit[key] - set(terms(record.get("subject", ""))):
+                                        if hint_topics_by_unit[key] - set(terms(subject)):
                                             hints.add(key)
                                 if (
-                                    not refs or not (fact_eligible or hints)
+                                    not (fact_eligible or hints)
                                     or (is_event and not source_refs_covered(refs, units))
                                 ):
                                     diagnostics["rejected_facts"] += 1

@@ -4,9 +4,13 @@ from dataclasses import asdict, dataclass, field
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from core.evidence import reference_unit_id
+
 
 def source_refs_covered(source_refs, evidence_ids) -> bool:
-    return all(ref.get("evidence_unit_id") in evidence_ids for ref in source_refs)
+    return isinstance(source_refs, (list, tuple)) and all(
+        reference_unit_id(ref) in evidence_ids for ref in source_refs
+    )
 
 
 def facts_supported_by(facts, evidence_ids):

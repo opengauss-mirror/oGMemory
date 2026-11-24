@@ -126,7 +126,17 @@ def parse_evidence_query(query: str) -> ParsedEvidenceQuery:
     return ParsedEvidenceQuery(query, tuple(branches))
 
 
+def fact_is_relevant(query, record, topics):
+    if not isinstance(record, dict):
+        return False
+    quote = record.get("quote")
+    return isinstance(quote, str) and bool(topics & set(terms(quote))) and fact_matches(query, record)
+
+
 def fact_matches(query, record):
+    subject, predicate = record.get("subject", ""), record.get("predicate", "")
+    if not isinstance(subject, str) or not isinstance(predicate, str):
+        return False
     # A capitalized destination ("Paris") alone is not a subject constraint.
     names = re.findall(r"\b(?i:did|does|has|had|was|is)\s+([A-Z][a-z]+)\b", query)
     leading = re.match(r"([A-Z][a-z]+)(?:'s\b|\s+(?:visited|attended|completed|and)\b)", query)
@@ -147,12 +157,12 @@ def fact_matches(query, record):
         return recommendation and not names and not self_query and record.get("assertion_type") == "recommendation"
     if record.get("role") != "user":
         return False
-    if recommendation and not ({"recommend", "suggest", "推荐", "建议"} & set(terms(record.get("predicate", "")))):
+    if recommendation and not ({"recommend", "suggest", "推荐", "建议"} & set(terms(predicate))):
         return False
     # A named actor wins over first-person recipients ("Alex recommended to me").
     if names:
-        return bool(set(name.casefold() for name in names) & set(terms(record.get("subject", ""))))
-    if self_query and record.get("subject") not in {"user", "我", "我们"}:
+        return bool(set(name.casefold() for name in names) & set(terms(subject)))
+    if self_query and subject not in {"user", "我", "我们"}:
         return False
     return True
 
