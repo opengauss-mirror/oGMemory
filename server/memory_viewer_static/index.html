@@ -6,7 +6,9 @@
     <meta name="theme-color" content="#f5f5f5">
     <title>oGMemory · 记忆查看器</title>
     <link rel="stylesheet" href="/memory-viewer/styles.css">
+    <link rel="stylesheet" href="/memory-viewer/knowledge.css">
     <script src="/memory-viewer/app.js" defer></script>
+    <script src="/memory-viewer/knowledge.js" defer></script>
     <script src="/memory-viewer/content.js" defer></script>
     <script src="/memory-viewer/spaces.js" defer></script>
     <script src="/memory-viewer/tenants.js" defer></script>
@@ -29,6 +31,7 @@
             <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h14v16H5a2 2 0 0 1-2-2V6c0-1 .9-2 2-2Zm0 13h14M8 8h7m-7 4h5"/></svg></span><span class="nav-label">记忆</span></button>
             <button class="sidebar-link" type="button" data-view="scenes" aria-label="场景记忆"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 21V3m2 4h10m-10 5h6m-6 5h13"/></svg></span><span class="nav-label">场景记忆</span></button>
             <button class="sidebar-link" type="button" data-view="retrieval"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg></span><span class="nav-label">检索</span></button>
+            <button class="sidebar-link" type="button" data-view="knowledge" aria-label="资源管理"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h7l4 4v14H7zM14 3v5h4M10 12h5m-5 4h5M4 6v13"/></svg></span><span class="nav-label">资源管理</span></button>
             <button class="sidebar-link" type="button" data-view="skill"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 5-6 7 6 7m8-14 6 7-6 7m-2-15-4 16"/></svg></span><span class="nav-label">Agent Skill</span></button>
             <button class="sidebar-link" type="button" data-view="spaces"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h18v15H3zM3 10h18M9 10v10"/></svg></span><span class="nav-label">团队空间</span></button>
           </section>
@@ -299,6 +302,71 @@
               <section><h3><span class="detail-level">L1</span>概览</h3><pre id="retrieval-detail-overview" class="detail-text detail-box"></pre></section>
               <section><h3><span class="detail-level">L2</span>命中正文</h3><pre id="retrieval-detail-content" class="detail-content"></pre></section>
               <details class="metadata-section"><summary>检索信息</summary><div id="retrieval-detail-metadata" class="metadata-grid"></div></details>
+            </div>
+          </article>
+        </div>
+      </section>
+      <section id="knowledge-view" hidden aria-labelledby="knowledge-heading">
+        <header class="view-heading knowledge-heading">
+          <h1 id="knowledge-heading">资源管理</h1>
+        </header>
+        <div class="knowledge-base-toolbar">
+          <div class="knowledge-base-picker">
+            <label for="knowledge-base-select">当前知识库</label>
+            <select id="knowledge-base-select" disabled><option value="">选择知识库</option></select>
+            <span id="knowledge-base-scope" aria-live="polite"></span>
+          </div>
+        </div>
+        <form id="knowledge-search" role="search" novalidate>
+          <div class="retrieval-query">
+            <span class="search-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg></span>
+            <input id="knowledge-query" type="search" maxlength="2000" autocomplete="off" placeholder="输入问题或关键词" aria-label="语义检索知识文档" aria-describedby="knowledge-feedback" disabled>
+            <button id="knowledge-clear" class="field-clear" type="button" aria-label="清除知识检索" hidden>×</button>
+            <button class="retrieval-submit" type="submit" disabled>检索</button>
+          </div>
+        </form>
+        <p id="knowledge-feedback" class="form-feedback knowledge-feedback" aria-live="polite" aria-atomic="true"></p>
+        <div class="knowledge-workspace">
+          <section class="knowledge-index" aria-labelledby="knowledge-list-title">
+            <header class="knowledge-index-head">
+              <h2 id="knowledge-list-title">文档列表</h2>
+              <span id="knowledge-count"></span>
+            </header>
+            <ul id="knowledge-list" class="knowledge-list" role="list" aria-labelledby="knowledge-list-title"></ul>
+            <p id="knowledge-empty" class="knowledge-empty" hidden>此知识库暂无文档。</p>
+            <footer id="knowledge-pagination" class="tasks-pagination knowledge-pagination" hidden>
+              <span id="knowledge-page"></span>
+              <div>
+                <button id="knowledge-previous" type="button" disabled>上一页</button>
+                <button id="knowledge-next" type="button" disabled>下一页</button>
+              </div>
+            </footer>
+          </section>
+          <article class="knowledge-document" aria-label="文档详情">
+            <div id="knowledge-detail-placeholder" class="detail-placeholder knowledge-placeholder">
+              <strong>选择一份文档</strong>
+              <p>查看索引状态或检索片段。</p>
+            </div>
+            <div id="knowledge-detail" hidden>
+              <header class="knowledge-document-head">
+                <h2 id="knowledge-document-title" tabindex="-1"></h2>
+                <p id="knowledge-document-uri" class="detail-uri"></p>
+              </header>
+              <div class="knowledge-metadata-panel">
+                <dl class="knowledge-metadata">
+                  <div><dt>文件类型</dt><dd id="knowledge-document-type"></dd></div>
+                  <div><dt>索引状态</dt><dd id="knowledge-document-state" aria-live="polite"></dd></div>
+                  <div><dt>片段数</dt><dd id="knowledge-document-chunks"></dd></div>
+                </dl>
+                <button id="knowledge-status-refresh" class="secondary-button" type="button">刷新状态</button>
+              </div>
+              <section id="knowledge-evidence" class="knowledge-evidence" aria-labelledby="knowledge-evidence-title" hidden>
+                <h3 id="knowledge-evidence-title">命中片段</h3>
+                <pre id="knowledge-excerpt" class="detail-content"></pre>
+              </section>
+              <div class="knowledge-actions" role="group" aria-label="文档操作">
+                <button id="knowledge-download" class="secondary-button" type="button">下载原文</button>
+              </div>
             </div>
           </article>
         </div>

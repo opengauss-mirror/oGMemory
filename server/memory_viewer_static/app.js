@@ -93,6 +93,9 @@ const apiKeyChannel = typeof BroadcastChannel === 'function'
   ? new BroadcastChannel(API_KEY_CHANNEL_NAME)
   : null;
 let initialTreeLoadPending = Boolean(apiKeyChannel && !state.apiKey);
+const KNOWLEDGE_SCOPE_URL = '/api/v1/resources/documents/scope';
+let knowledgeScopeRequestId = 0;
+let knowledgeAccountId = localStorage.getItem('ogmemory-knowledge-account-id') || '';
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
@@ -118,6 +121,7 @@ function setApiKey(value) {
     window.tenantAdmin?.reset();
     state.tenantScope = null;
     $('[data-view="tenants"]').hidden = true;
+    window.knowledgeLibrary?.reset();
   }
   state.apiKey = value.trim();
   if (state.apiKey) sessionStorage.setItem(API_KEY_STORAGE_KEY, state.apiKey);
@@ -139,7 +143,7 @@ function showBot() {
 function loadTreeAfterApiKeySync() {
   if (!initialTreeLoadPending) return;
   initialTreeLoadPending = false;
-  loadTree();
+  loadCurrentScope();
 }
 function apiUrl(path, values = {}) {
   const url = new URL(path, location.origin);
@@ -167,6 +171,53 @@ async function fetchJson(url, options = {}) {
 
 function viewerScopeUrl() {
   return apiUrl('/api/v1/memory-viewer/scope', { includeAgents: state.view === 'tenants' ? 'false' : '' });
+}
+
+function loadCurrentScope(verifiedScope = null) {
+  return state.view === 'knowledge' ? loadKnowledgeScope(verifiedScope) : loadTree(verifiedScope);
+}
+
+async function loadKnowledgeScope(verifiedScope) {
+  const requestId = ++knowledgeScopeRequestId;
+  state.treeRequestId += 1;
+  state.accountRequestId += 1;
+  if (!state.apiKey) {
+    renderAccounts([], '');
+    setLoading(false);
+    setConnection(false);
+    window.knowledgeLibrary?.connection('请在连接设置中填写 oGMemory API Key。');
+    openSettings();
+    return;
+  }
+  setLoading(true);
+  try {
+    const scope = verifiedScope || await fetchJson(apiUrl(KNOWLEDGE_SCOPE_URL), {
+      signal: AbortSignal.timeout(VIEWER_REQUEST_TIMEOUT_MS),
+    });
+    if (requestId !== knowledgeScopeRequestId || state.view !== 'knowledge') return;
+    if (!scope.accounts.some(({ account_id }) => account_id === knowledgeAccountId)) {
+      knowledgeAccountId = scope.account_id;
+    }
+    renderAccounts(scope.accounts, knowledgeAccountId);
+    localStorage.setItem('ogmemory-knowledge-account-id', knowledgeAccountId);
+    setConnection(true);
+    window.knowledgeLibrary?.show(knowledgeAccountId);
+  } catch (error) {
+    if (requestId !== knowledgeScopeRequestId || state.view !== 'knowledge') return;
+    renderAccounts([], '');
+    setConnection(false);
+    if (error.status === 401) {
+      window.knowledgeLibrary?.connection('API Key 无效，请在连接设置中重新填写。', true);
+      openSettings('API Key 无效，请重新填写。');
+    } else {
+      const message = error.status === 403
+        ? '当前账户无法访问知识库。请检查账户权限和知识库配置。'
+        : '知识库暂不可用，请核对服务配置后刷新。';
+      window.knowledgeLibrary?.connection(message, true);
+    }
+  } finally {
+    if (requestId === knowledgeScopeRequestId) setLoading(false);
+  }
 }
 
 async function loadTree(verifiedScope = null) {
@@ -319,13 +370,13 @@ function publicTree(scope) {
   };
 }
 
-function renderAccounts(accounts) {
+function renderAccounts(accounts, selectedAccount = state.accountId) {
   elements.account.innerHTML = accounts.map((account) => {
     const id = String(account.account_id || '');
     const suffix = account.user_count === undefined ? '' : ` · ${account.user_count} 用户`;
     return `<option value="${escapeHtml(id)}">${escapeHtml(id + suffix)}</option>`;
   }).join('');
-  elements.account.value = state.accountId;
+  elements.account.value = selectedAccount;
   elements.account.disabled = accounts.length <= 1;
 }
 
@@ -1348,7 +1399,23 @@ function resetRetrieval() {
   elements.retrievalResults.innerHTML = '<div class="retrieval-empty"><span>⌕</span><strong>输入内容后开始检索</strong><p>结果将按语义相关度排序。</p></div>';
 }
 function switchView(view, loadContent = true) {
+  const leavingKnowledge = state.view === 'knowledge' && view !== 'knowledge';
+  if (leavingKnowledge) {
+    knowledgeScopeRequestId += 1;
+    setLoading(false);
+    window.knowledgeLibrary?.leave();
+  }
   state.view = view;
+  if (leavingKnowledge) {
+    const refreshDirectory = view !== 'tenants' && state.tenantDirectoryChanged;
+    if (refreshDirectory || !state.tree || (view === 'tenants' && !state.tenantScope)) {
+      if (refreshDirectory) state.tenantDirectoryChanged = false;
+      loadTree();
+      loadContent = false;
+    } else {
+      renderAccounts(state.tree.accounts || []);
+    }
+  }
   if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
   document.querySelectorAll('[data-view]').forEach((item) => {
     item.classList.toggle('active', item.dataset.view === view);
@@ -1364,22 +1431,28 @@ function switchView(view, loadContent = true) {
   const spaces = view === 'spaces';
   const tenants = view === 'tenants';
   const bot = view === 'bot';
+  const knowledge = view === 'knowledge';
   elements.botView.hidden = !bot;
   elements.shell.classList.toggle('bot-active', bot);
   elements.dashboardView.hidden = !dashboard;
-  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes || spaces || tenants || bot;
+  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks || scenes || spaces || tenants || bot || knowledge;
   $('#spaces-view').hidden = !spaces;
   $('#tenant-view').hidden = !tenants;
+  $('#knowledge-view').hidden = !knowledge;
   elements.account.closest('.scope-switcher').hidden = spaces || bot || tenants;
   elements.retrievalView.hidden = !retrieval;
   elements.monitoringView.hidden = !monitoring;
   elements.tasksView.hidden = !tasks;
   elements.scenesView.hidden = !scenes;
-  elements.pageTitle.textContent = bot ? 'memoryBot' : spaces ? '团队空间' : tenants ? '租户管理' : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : view === 'skill' ? 'Agent Skill' : '记忆';
+  elements.pageTitle.textContent = bot ? 'memoryBot' : spaces ? '团队空间' : tenants ? '租户管理' : dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : scenes ? '场景记忆' : knowledge ? '资源管理' : view === 'skill' ? 'Agent Skill' : '记忆';
   document.title = `${elements.pageTitle.textContent} · oGMemory`;
   if (spaces) { if (loadContent) window.sharedSpaces?.load(); return; }
   if (tenants) { if (loadContent) window.tenantAdmin?.load(); return; }
   if (bot) { showBot(); return; }
+  if (knowledge) {
+    if (loadContent) loadKnowledgeScope();
+    return;
+  }
   const skill = view === 'skill';
   $('#tree-label').textContent = skill ? 'Agent Skill' : 'ContextFS';
   elements.tree.setAttribute('aria-label', skill ? 'Agent Skill 目录树' : 'ContextFS 目录树');
@@ -1409,7 +1482,7 @@ function switchView(view, loadContent = true) {
 }
 
 function navigateToView(view, trigger) {
-  if (state.view === 'tenants' && view !== 'tenants' && state.tenantDirectoryChanged) {
+  if (state.view === 'tenants' && view !== 'tenants' && view !== 'knowledge' && state.tenantDirectoryChanged) {
     state.tenantDirectoryChanged = false;
     switchView(view, false);
     return loadTree();
@@ -1445,6 +1518,12 @@ function showDetailOnNarrowScreen(selector) {
   panel.scrollIntoView({ block: 'start' });
 }
 elements.account.addEventListener('change', async () => {
+  if (state.view === 'knowledge') {
+    knowledgeAccountId = elements.account.value;
+    localStorage.setItem('ogmemory-knowledge-account-id', knowledgeAccountId);
+    window.knowledgeLibrary?.show(knowledgeAccountId);
+    return;
+  }
   try { await selectAccount(elements.account.value); }
   catch (error) { showTreeError(error.message); }
 });
@@ -1602,6 +1681,7 @@ elements.refresh.addEventListener('click', () => {
   else if (state.view === 'monitoring') loadMonitoring();
   else if (state.view === 'tasks') loadTasks();
   else if (state.view === 'scenes') loadScenes(state.sceneOffset);
+  else if (state.view === 'knowledge') loadKnowledgeScope();
   else loadTree();
 });
 $('#scenes-refresh').addEventListener('click', () => loadScenes(state.sceneOffset));
@@ -1693,8 +1773,8 @@ window.addEventListener('message', (event) => {
 });
 function showHashView({ initial = false } = {}) {
   const view = location.hash.slice(1);
-  if (!['bot', 'memory', 'dashboard', 'scenes', 'retrieval', 'skill', 'monitoring', 'tasks', 'spaces', 'tenants'].includes(view)) return;
-  if (initial) { switchView(view, view !== 'spaces'); return; }
+  if (!['bot', 'memory', 'dashboard', 'scenes', 'retrieval', 'skill', 'monitoring', 'tasks', 'spaces', 'tenants', 'knowledge'].includes(view)) return;
+  if (initial) { switchView(view, view !== 'spaces' && view !== 'knowledge'); return; }
   if (view === state.view) return;
   if (state.view === 'spaces') history.replaceState(null, '', '#spaces');
   navigateToView(view, document.querySelector(`.sidebar-link[data-view="${state.view}"]`));
@@ -1728,7 +1808,8 @@ $('#settings-form').addEventListener('submit', async (event) => {
   saveSettings.textContent = '连接中';
   settingsFeedback.textContent = '';
   try {
-    const scope = await fetchJson(viewerScopeUrl(), {
+    const scopeUrl = state.view === 'knowledge' ? apiUrl(KNOWLEDGE_SCOPE_URL) : viewerScopeUrl();
+    const scope = await fetchJson(scopeUrl, {
       signal: AbortSignal.any([controller.signal, timeout]),
       headers: { 'X-API-Key': candidate },
     });
@@ -1738,7 +1819,7 @@ $('#settings-form').addEventListener('submit', async (event) => {
       setApiKey(candidate);
       apiKeyChannel?.postMessage({ type: 'update', apiKey: state.apiKey });
       elements.settings.close();
-      loadTree(scope);
+      loadCurrentScope(scope);
     };
     if (state.view === 'spaces' && candidate !== state.apiKey) {
       await window.sharedSpaces.guardNavigation(applySettings, event.submitter);
@@ -1773,11 +1854,11 @@ apiKeyChannel?.addEventListener('message', (event) => {
   const initialLoad = initialTreeLoadPending;
   initialTreeLoadPending = false;
   if (apiKey === state.apiKey) {
-    if (initialLoad) loadTree();
+    if (initialLoad) loadCurrentScope();
     return;
   }
   setApiKey(apiKey);
-  loadTree();
+  loadCurrentScope();
 });
 elements.settings.addEventListener('click', (event) => {
   if (event.target === elements.settings) elements.settings.close();
@@ -1790,7 +1871,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (initialTreeLoadPending) {
     apiKeyChannel.postMessage({ type: 'request' });
     setTimeout(loadTreeAfterApiKeySync, 100);
-  } else loadTree();
+  } else loadCurrentScope();
 }, { once: true });
 setInterval(() => {
   if (state.view === 'monitoring' && !$('#monitoring-refresh').disabled) loadMonitoring();
