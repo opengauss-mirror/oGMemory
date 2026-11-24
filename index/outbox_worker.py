@@ -24,10 +24,12 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 
+from core.dreaming_evidence import matches_node_version
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
 from core.models import IndexRecord, OutboxEvent, RequestContext
 from core.projection_ownership import projection_owner
+from index.vector_projection import VectorProjection
 from providers.token_tracker import (
     distributed_usage_scope,
     embedding_scope_weights,
@@ -36,7 +38,6 @@ from providers.token_tracker import (
     request_usage_scope,
     usage_scope,
 )
-from index.vector_projection import VectorProjection
 from retrieval.bm25_index import Bm25Index, build_code_bm25_document
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,7 @@ class OutboxWorker:
         agent_memory_handler=None,
         memory_projection_handler=None,
         edge_projection_components=None,
+        dreaming=None,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -129,6 +131,7 @@ class OutboxWorker:
         self._directory_summary_enabled = directory_summary_enabled
         self._bm25_index = bm25_index if embedder is not None else None
         self._agent_memory_handler = agent_memory_handler
+        self._dreaming = dreaming
         self._memory_projection_handler = (
             memory_projection_handler if embedder is not None else None
         )
@@ -205,7 +208,20 @@ class OutboxWorker:
         try:
             event_type = event.event_type
 
-            if event_type == "EXTRACT_AGENT_MEMORY":
+            if event_type == "DREAM_MEMORY":
+                from commit.dreaming_promotion import PromotionArchiveBlockedError
+
+                resolved_ctx = ctx or self._build_request_context(event)
+                if self._dreaming is None or resolved_ctx is None:
+                    raise ValueError("Dreaming event requires an enabled memory owner")
+                try:
+                    with request_usage_scope(self._usage_context_for_event(event, resolved_ctx)):
+                        self._dreaming.process(event, resolved_ctx)
+                except PromotionArchiveBlockedError as error:
+                    return WorkerResult(event_id=event.event_id, success=False, error_message=str(error),
+                                        deferred=not error.terminal, moved_to_dlq=error.terminal)
+                return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
+            elif event_type == "EXTRACT_AGENT_MEMORY":
                 if self._agent_memory_handler is None:
                     raise RuntimeError("agent memory handler is unavailable")
                 with request_usage_scope(RequestContext(**event.payload["context"])):
@@ -250,7 +266,7 @@ class OutboxWorker:
                         return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
                     return self._process_archive_context(event)
             elif event_type == "ARCHIVE_CONTEXT":
-                return self._process_archive_context(event)
+                return self._process_archive_context(event, ctx)
             elif event_type == "PROJECT_GRAPH":
                 if self._edge_projection_store is None:
                     raise ValueError("Graph projection worker is not enabled")
@@ -387,13 +403,15 @@ class OutboxWorker:
 
     def _is_memory_projection_event(self, event: OutboxEvent) -> bool:
         return bool(self._memory_projection_handler is not None
+                    and event.payload.get("dreaming_visibility") is not True
                     and _MEMORY_OWNER_PATTERN.match(event.uri)
                     and "/memories/" in event.uri
                     and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT", "DELETE_CONTEXT"})
 
     def _current_projection_records(self, event: OutboxEvent, records: list[IndexRecord]) -> list[IndexRecord]:
         lexical_only = self._projection is not None and not self._projection.has_embeddings
-        if not (lexical_only or self._is_memory_projection_event(event) or (
+        visibility_event = event.payload.get("dreaming_visibility") is True
+        if not (visibility_event or lexical_only or self._is_memory_projection_event(event) or (
                 self._fs is not None and _MEMORY_OWNER_PATTERN.match(event.uri)
                 and "/memories/" in event.uri
                 and event.event_type in {"UPSERT_CONTEXT", "ARCHIVE_CONTEXT"})):
@@ -406,10 +424,16 @@ class OutboxWorker:
         try:
             node = self._fs.read_node(event.uri, ctx)
         except NodeNotFoundError:
-            if lexical_only:
+            if lexical_only and not visibility_event:
                 self._confirm_node_publication(event, ctx)
             return []
         if node.metadata.get("evidence_directory_invalidated"):
+            return []
+        if self._hides_dreaming_projection(node.metadata) or (
+            visibility_event and not matches_node_version(
+                node.metadata, event.payload.get("expected_version"), event.payload.get("expected_created_at"),
+            )
+        ):
             return []
         if lexical_only:
             current = build_agfs_lexical_records(node)
@@ -422,6 +446,13 @@ class OutboxWorker:
         event.payload["_memory_projection_version"] = node.metadata.get("version")
         event.payload["_memory_projection_fingerprint"] = self._projection_record_fingerprint(current)
         return current
+
+    def _hides_dreaming_projection(self, metadata: dict) -> bool:
+        if self._dreaming is None:
+            return False
+        from commit.dreaming import projection_hidden
+
+        return projection_hidden(metadata, datetime.now(UTC))
 
     def _notify_memory_projection(self, event: OutboxEvent, result: WorkerResult) -> None:
         if not self._is_memory_projection_event(event):
@@ -591,7 +622,7 @@ class OutboxWorker:
             records_upserted=0,
         )
 
-    def _process_archive_context(self, event: OutboxEvent) -> WorkerResult:
+    def _process_archive_context(self, event: OutboxEvent, ctx: RequestContext | None = None) -> WorkerResult:
         """Process ARCHIVE_CONTEXT event.
 
         Removes vector index records for the archived node so it no
@@ -604,6 +635,18 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
+        if event.payload.get("dreaming_visibility") is True:
+            ctx = ctx or self._build_request_context(event)
+            if self._fs is None or ctx is None:
+                raise ValueError("Dreaming visibility projection requires canonical node storage")
+            try:
+                node = self._fs.read_node(event.uri, ctx)
+            except NodeNotFoundError:
+                return WorkerResult(event_id=event.event_id, success=True)
+            if (not matches_node_version(node.metadata, event.payload.get("expected_version"),
+                                         event.payload.get("expected_created_at"))
+                    or not self._hides_dreaming_projection(node.metadata)):
+                return WorkerResult(event_id=event.event_id, success=True)
         deleted = self._delete_index_records(event)
         logger.info(
             "Successfully processed ARCHIVE_CONTEXT %s, "
@@ -816,6 +859,11 @@ class OutboxWorker:
             return
         if result.success:
             self._notify_memory_projection(event, result)
+            if (self._dreaming is not None and event.event_type == "UPSERT_CONTEXT"
+                    and event.payload.get("dreaming_visibility") is not True):
+                ctx = self._build_request_context(event)
+                if ctx is not None:
+                    self._dreaming.projection_ready(event.uri, ctx, outbox_store)
             outbox_store.mark_done(event, node_uri)
             stats["succeeded"] += 1
             return
@@ -1289,9 +1337,15 @@ class OutboxWorker:
     def excluded_event_types(self) -> list[str]:
         """Events this worker leaves for a handler that can process them."""
         excluded = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
+        if self._dreaming is None:
+            excluded.append("DREAM_MEMORY")
         if self._edge_projection_store is None:
             excluded.append("PROJECT_GRAPH")
         return excluded
+
+    def sweep_dreaming(self, account_ids):
+        if self._dreaming is not None:
+            self._dreaming.sweep(account_ids)
 
     def run_once(
         self,

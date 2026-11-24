@@ -42,6 +42,7 @@ class EventType(str, Enum):
     MOVE_CONTEXT = "MOVE_CONTEXT"          # Rename/relocate a ContextNode
     UPSERT_RELATION = "UPSERT_RELATION"    # Add or update relation edges
     EXTRACT_AGENT_MEMORY = "EXTRACT_AGENT_MEMORY"
+    DREAM_MEMORY = "DREAM_MEMORY"
 
 
 class RetrievalIntent(str, Enum):

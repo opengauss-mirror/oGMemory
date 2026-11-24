@@ -144,7 +144,7 @@ class Assertion:
         return assertion
 
 
-def _archive_ref(value):
+def archive_evidence_ref(value):
     if not isinstance(value, str):
         return None
     try:
@@ -157,10 +157,20 @@ def _archive_ref(value):
     return None
 
 
-def _user_messages(messages, ids):
+def node_created_at(metadata):
+    stored = timestamp(metadata.get("_storage_created_at") or metadata.get("created_at"))
+    return stored.isoformat() if stored else ""
+
+
+def matches_node_version(metadata, version, created_at=""):
+    return metadata.get("version") == version and (not created_at or node_created_at(metadata) == created_at)
+
+
+def archive_user_messages(messages, ids=None):
     users, seen = {}, set()
     for message in messages:
-        if not isinstance(message, dict) or not isinstance(msg_id := message.get("id"), str) or msg_id not in ids:
+        if (not isinstance(message, dict) or not isinstance(msg_id := message.get("id"), str)
+                or (ids is not None and msg_id not in ids)):
             continue
         if msg_id in seen:
             users.pop(msg_id, None)
@@ -174,11 +184,20 @@ def _revision(content):
     return sha256(content.encode("utf-8")).hexdigest()
 
 
+def archive_proof_matches(messages, proof, message_ids):
+    """Verify one cited user message against the captured source revision."""
+    message_id, quote = proof.get("message_id"), proof.get("quote")
+    if not isinstance(message_id, str) or message_id not in message_ids or not isinstance(quote, str) or not quote:
+        return False
+    content = messages.get(message_id)
+    return content is not None and quote in content and _revision(content) == proof.get("source_revision")
+
+
 def bind_archive_evidence(rows, source_ref, messages):
     """Resolve a verbatim quote in exactly one authorized user message."""
-    if not (ref := _archive_ref(source_ref)):
+    if not (ref := archive_evidence_ref(source_ref)):
         return []
-    users = _user_messages(messages, ref[1])
+    users = archive_user_messages(messages, ref[1])
     bound = []
     for row in rows:
         if (assertion := Assertion.parse(row)) is None:
@@ -214,7 +233,7 @@ def verified_assertions(node, read_source):
                 or canonical_scope(assertion.scope_ref) != scope):
             continue
         source_ref, msg_id = row.get("source_ref"), row.get("message_id")
-        if (not isinstance(source_ref, str) or source_ref not in refs or not (ref := _archive_ref(source_ref))
+        if (not isinstance(source_ref, str) or source_ref not in refs or not (ref := archive_evidence_ref(source_ref))
                 or not isinstance(msg_id, str) or msg_id not in ref[1]):
             continue
         archive_id, ids = ref
@@ -224,7 +243,7 @@ def verified_assertions(node, read_source):
         if getattr(archive, "archive_id", None) != archive_id:
             continue
         if source_ref not in messages:
-            messages[source_ref] = _user_messages(archive.messages, ids)
+            messages[source_ref] = archive_user_messages(archive.messages, ids)
         content = messages[source_ref].get(msg_id)
         if content is None or assertion.quote not in content:
             continue
