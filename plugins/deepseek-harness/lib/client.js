@@ -89,13 +89,15 @@ export class OgMemoryClient {
     }, { timeoutMs: this.config.toolTimeoutMs })
   }
 
-  readMemory({ sessionId, uri, level, maxChars }) {
+  readMemory({ sessionId, uri, level, maxChars, ownerAgentId, ownerScope }) {
     return this.request('/api/v1/memories/read', {
       ...this.identity(),
       sessionId,
       uri,
       level,
       max_chars: maxChars,
+      owner_agent_id: ownerAgentId,
+      owner_scope: ownerScope,
     }, { timeoutMs: this.config.toolTimeoutMs })
   }
 

@@ -550,6 +550,16 @@ def create_mcp_server(
             BeforeValidator(_raw_string_argument),
             Field(description="Exact unit_key returned with a Tool or Experience search hit."),
         ] = None,
+        owner_agent_id: Annotated[
+            str | None,
+            BeforeValidator(_raw_string_argument),
+            Field(description="Owner returned with an Agent case hit; pass it together with the URI."),
+        ] = None,
+        owner_scope: Annotated[
+            str | None,
+            BeforeValidator(_raw_string_argument),
+            Field(description="Pass 'user' when returned with a case hit to read from the current user's space."),
+        ] = None,
         session_id: Annotated[
             str | None,
             BeforeValidator(_raw_string_argument),
@@ -582,6 +592,8 @@ def create_mcp_server(
             service,
             uri=uri,
             **({"unit_key": unit_key} if unit_key is not None else {}),
+            **({"owner_agent_id": owner_agent_id} if owner_agent_id is not None else {}),
+            **({"owner_scope": owner_scope} if owner_scope is not None else {}),
             level=level,
             max_chars=max_chars,
             recover_original=recover_original,

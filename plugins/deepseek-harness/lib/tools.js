@@ -45,6 +45,8 @@ export function registerOgMemoryTools(ctx, client, config) {
     description: 'Read one exact ogmemory:// URI returned by oGMemory query results.',
     parameters: {
       uri: { type: 'string', required: true, description: 'Exact ogmemory:// URI.' },
+      owner_agent_id: { type: 'string', description: 'Pass the owner_agent_id returned with an Agent case.' },
+      owner_scope: { type: 'string', enum: ['user'], description: 'Pass the owner_scope returned with a user case.' },
       level: {
         type: 'string',
         enum: ['abstract', 'overview', 'content', 'all'],
@@ -55,6 +57,8 @@ export function registerOgMemoryTools(ctx, client, config) {
     execute: (args, exec) => client.readMemory({
       sessionId: callingSessionId(exec),
       uri: args.uri,
+      ownerAgentId: args.owner_agent_id,
+      ownerScope: args.owner_scope,
       level: args.level ?? 'all',
       maxChars: Math.max(1, Math.min(50_000, args.max_chars ?? 12_000)),
     }),

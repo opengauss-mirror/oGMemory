@@ -701,6 +701,8 @@ def handle_read_memory():
                 _get_service(),
                 uri=params.get("uri", ""),
                 unit_key=params.get("unit_key"),
+                owner_agent_id=params.get("owner_agent_id"),
+                owner_scope=params.get("owner_scope"),
                 level=params.get("level", "all"),
                 max_chars=_memory_tool_integer(params, "max_chars", 12000),
                 session_id=params.get("sessionId") or params.get("session_id"),

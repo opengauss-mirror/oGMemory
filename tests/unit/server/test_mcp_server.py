@@ -66,6 +66,23 @@ def test_read_memory_tool_forwards_selected_unit(monkeypatch):
         ("ogmemory://memories/tool_memory/search", "batch", "content")]
 
 
+def test_read_memory_tool_forwards_case_owner(monkeypatch):
+    handler = Mock(return_value={"content": "shared case"})
+    monkeypatch.setattr("server.mcp_server.read_memory_tool", handler)
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+    anyio.run(mcp.call_tool, "ogm_read_memory", {
+        "uri": "ogmemory://memories/case/debug_api_timeout",
+        "agent_id": "bob-bot", "owner_agent_id": "shared-bot",
+    })
+    assert handler.call_args.kwargs["agent_id"] == "bob-bot"
+    assert handler.call_args.kwargs["owner_agent_id"] == "shared-bot"
+    anyio.run(mcp.call_tool, "ogm_read_memory", {
+        "uri": "ogmemory://memories/case/debug_api_timeout", "owner_scope": "user",
+    })
+    assert handler.call_args.kwargs["owner_scope"] == "user"
+    assert "owner_agent_id" not in handler.call_args.kwargs
+
+
 class _FakeRequest:
     def __init__(self, headers):
         self.headers = headers

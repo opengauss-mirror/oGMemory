@@ -7,11 +7,16 @@ from unittest.mock import Mock
 
 import pytest
 
+from core.errors import NodeNotFoundError
+from core.models import ContextNode, RetrievedBlock, SearchMemoryResult
+from fs.sql_adapter.sql_context_fs import SQLContextFS
 from providers.unified_config import OgMemConfig
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
 from server.auth import AuthService
 from server.control_plane_store import ControlPlaneStore
+from server.mcp_resources import render_collection_resource, render_item_resource
+from server.mcp_tools import list_memories
 from server.mcp_security import UNTRUSTED_DATA_NOTICE  # noqa: E402
 from server.memory_service import MemoryService
 from server.tenant_admin import TenantAdminService
@@ -63,6 +68,191 @@ def _make_service_with_allowlist(tmp_path, allowlist, *, trust_proxy=False, trus
     service = MemoryService(config=cfg)
     service.compose = lambda params: {"ok": True}
     return service
+
+
+def test_http_reads_shared_agent_case_returned_by_query(monkeypatch, tmp_path):
+    service, bob_key = _make_service(tmp_path)
+    service._cfg.agent_shared_mode = "user"
+    service._cfg.agent_shared_list = ["shared-bot"]
+    service.get_key_manager().create_account("acct-other", "other-admin")
+    carol_key = service.get_key_manager().register_user("acct-other", "carol", "user")
+    admin = service.get_tenant_admin_service()
+    root = service.get_auth_service().resolve_identity({"X-API-Key": "root-key", "X-Account-ID": "acct-1"})
+    root_ctx = service.build_context({}, identity=root)
+    for agent, owner in (("bob-bot", "bob"), ("shared-bot", "alice"), ("private-bot", "alice")):
+        admin.create_agent(root_ctx, "acct-1", agent, owner_user_id=owner)
+
+    shared = "ctx://acct-1/agents/shared-bot/memories/cases/shared-case"
+    private = "ctx://acct-1/agents/private-bot/memories/cases/private-case"
+    nodes = {uri: ContextNode(uri=uri, context_type="MEMORY", category="case", level=0,
+                              owner_space=f"agent:{uri.split('/')[4]}", abstract="", overview="",
+                              content=f"memory at {uri.rsplit('/', 1)[-1]}") for uri in (shared, private)}
+
+    listed_dirs = []
+
+    class CaseFS:
+        def exists(self, uri, ctx):
+            return uri in nodes
+
+        def read_node(self, uri, ctx):
+            SQLContextFS._ensure_accessible(uri, ctx)
+            if uri not in nodes:
+                raise NodeNotFoundError(uri)
+            return nodes[uri]
+
+        def read_node_fields(self, uri, ctx, level):
+            return self.read_node(uri, ctx)
+
+        def list_children(self, uri, ctx):
+            SQLContextFS._ensure_accessible(uri, ctx)
+            listed_dirs.append(uri)
+            return [node_uri for node_uri in nodes if node_uri.rsplit("/", 1)[0] == uri]
+
+    query_hit = shared
+
+    def search_memory(query, ctx, **kwargs):
+        assert SQLContextFS._is_accessible(shared, ctx)
+        assert not SQLContextFS._is_accessible(private, ctx)
+        return SearchMemoryResult(request_id="query-1", query=query, hits=[
+            RetrievedBlock(uri=query_hit, score=0.9, category="case", has_content=True),
+        ])
+
+    monkeypatch.setattr(service, "_get_context_fs", lambda: CaseFS())
+    monkeypatch.setattr(service, "get_read_api", lambda: Mock(search_memory=search_memory))
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    headers = {"X-API-Key": bob_key, "X-Account-ID": "acct-1"}
+    result = client.post("/api/v1/memories/query", headers=headers, json={"agentId": "bob-bot", "query": "memory"})
+    assert result.status_code == 200
+    uri = result.json["hits"][0]["uri"]
+    assert uri == "ogmemory://memories/case/shared-case"
+    assert result.json["hits"][0]["owner_agent_id"] == "shared-bot"
+
+    def read(agent, uri, headers, **fields):
+        return client.post("/api/v1/memories/read", headers=headers,
+                           json={"agentId": agent, "uri": uri, "level": "content", **fields})
+
+    for agent in ("shared-bot", "bob-bot"):
+        result = read(agent, uri, headers)
+        assert result.status_code == 200
+        assert result.json["content"] == "memory at shared-case"
+    assert shared.rsplit("/", 1)[0] not in listed_dirs
+    assert read("bob-bot", "ogmemory://memories/case/private-case", headers).status_code == 403
+    assert read("", uri, {"X-API-Key": carol_key, "X-Account-ID": "acct-other"}).status_code == 403
+    assert private.rsplit("/", 1)[0] not in listed_dirs
+
+    local = shared.replace("shared-bot", "bob-bot")
+    nodes[local] = ContextNode(uri=local, context_type="MEMORY", category="case", level=0,
+                               owner_space="agent:bob-bot", abstract="", overview="", content="local body")
+    listed_dirs.clear()
+    for owner, body in (("shared-bot", "memory at shared-case"), ("bob-bot", "local body")):
+        result = read("bob-bot", uri, headers, owner_agent_id=owner)
+        assert result.status_code == 200
+        assert result.json["content"] == body
+        assert result.json["owner_agent_id"] == owner
+    assert listed_dirs == []
+
+    result = read("bob-bot", uri, headers)
+    assert result.status_code == 400
+    assert "Ambiguous case URI" in result.json["error"]
+    ctx = service.build_context({"agentId": "bob-bot"}, service.get_auth_service().resolve_identity(headers))
+    with pytest.raises(ValueError, match="Ambiguous case URI"):
+        render_item_resource(service, uri, ctx)
+    assert read("bob-bot", uri, headers, owner_agent_id="private-bot").status_code == 403
+    assert read("bob-bot", "ogmemory://memories/case/private-case", headers,
+                owner_agent_id="shared-bot").status_code == 403
+    assert read("", uri, {"X-API-Key": carol_key, "X-Account-ID": "acct-other"},
+                owner_agent_id="shared-bot").status_code == 403
+
+    shared_dir = shared.rsplit("/", 1)[0]
+    historical = f"{shared_dir}/old%2Dcase"
+    nodes[historical] = ContextNode(uri=historical, context_type="MEMORY", category="case", level=0,
+                                    owner_space="agent:shared-bot", abstract="", overview="", content="old body")
+    query_hit = historical
+    hit = client.post("/api/v1/memories/query", headers=headers,
+                      json={"agentId": "bob-bot", "query": "old"}).json["hits"][0]
+    listed_dirs.clear()
+    assert hit["uri"] == "ogmemory://memories/case/old-case"
+    assert read("bob-bot", hit["uri"], headers, owner_agent_id=hit["owner_agent_id"]).json["content"] == "old body"
+    assert listed_dirs == [shared_dir]
+
+    user_dir = "ctx://acct-1/users/bob/memories/cases"
+    encoded = f"{user_dir}/%E4%B8%AD"
+    nodes[encoded] = ContextNode(uri=encoded, context_type="MEMORY", category="case", level=0,
+                                 owner_space="user:bob", abstract="", overview="", content="encoded")
+    listed_dirs.clear()
+    assert read("bob-bot", "ogmemory://memories/case/%e4%b8%ad", headers, owner_scope="user").json["content"] == "encoded"
+    assert listed_dirs == []
+
+    # Legacy user-owned cases can also share a name with an Agent case.
+    user_case = f"{user_dir}/old-case"
+    nodes[user_case] = ContextNode(uri=user_case, context_type="MEMORY", category="case", level=0,
+                                  owner_space="user:bob", abstract="", overview="", content="user body")
+    query_hit = user_case
+    user_hit = client.post("/api/v1/memories/query", headers=headers,
+                           json={"agentId": "bob-bot", "query": "user body"}).json["hits"][0]
+    assert "owner_agent_id" not in user_hit
+    assert user_hit["owner_scope"] == "user"
+    listed_dirs.clear()
+    selected = read("bob-bot", user_hit["uri"], headers, owner_scope=user_hit["owner_scope"])
+    assert selected.status_code == 200
+    assert selected.json["content"] == "user body"
+    assert selected.json["owner_scope"] == "user"
+    query_hit = historical
+    agent_hit = client.post("/api/v1/memories/query", headers=headers,
+                            json={"agentId": "bob-bot", "query": "old body"}).json["hits"][0]
+    assert agent_hit["uri"] == user_hit["uri"]
+    assert read("bob-bot", agent_hit["uri"], headers, owner_agent_id=agent_hit["owner_agent_id"]).json["content"] == "old body"
+    assert read("bob-bot", user_hit["uri"], headers).status_code == 400
+    tool_list = list_memories(service, agent_id="bob-bot", resolved_identity=service.get_auth_service().resolve_identity(headers))
+    resource_list = render_collection_resource(service, "case", ctx)
+    for listing in (tool_list, resource_list):
+        item = next(item for item in listing["memories"] if item["uri"] == user_hit["uri"])
+        assert item["owner_scope"] == "user"
+        assert read("bob-bot", item["uri"], headers, owner_scope=item["owner_scope"]).json["content"] == "user body"
+    assert read("bob-bot", uri, headers, owner_scope="user").status_code == 403
+    assert read("bob-bot", uri, headers, owner_scope="user", owner_agent_id="shared-bot").status_code == 400
+    assert read("bob-bot", uri, headers, owner_scope="alice").status_code == 400
+    assert read("", user_hit["uri"], {"X-API-Key": carol_key, "X-Account-ID": "acct-other"},
+                owner_scope="user").status_code == 403
+
+
+def test_http_reads_legacy_agent_case_with_owner_from_query(monkeypatch, tmp_path):
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
+
+    service, bob_key = _make_service(tmp_path)
+    # An existing registry can contain IDs that the current create-agent API disallows.
+    store = service.get_control_plane_store()
+    store.write_json(store.agents_path("acct-1"), {"agents": {
+        "_legacy": {"owner_user_id": "bob"}, "_private": {"owner_user_id": "alice"},
+    }})
+    headers = {"X-API-Key": bob_key, "X-Account-ID": "acct-1"}
+    ctx = service.build_context({"agentId": "_legacy"}, service.get_auth_service().resolve_identity(headers))
+    uri = "ctx://acct-1/agents/_legacy/memories/cases/example"
+    fs = AGFSContextFS(_AtomicMemoryAGFSClient())
+    fs.write_node(ContextNode(uri=uri, context_type="MEMORY", category="case", level=0,
+                              owner_space="agent:_legacy", abstract="", overview="", content="legacy body"), ctx)
+    hit = RetrievedBlock(uri=uri, score=1.0, category="case", has_content=True)
+    monkeypatch.setattr(service, "_get_context_fs", lambda: fs)
+    monkeypatch.setattr(service, "get_read_api", lambda: Mock(search_memory=Mock(
+        return_value=SearchMemoryResult(request_id="q", query="example", hits=[hit]))))
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    def post(operation, **params):
+        return client.post(f"/api/v1/memories/{operation}", headers=headers, json={"agentId": "_legacy", **params})
+
+    result = post("query", query="example")
+    assert result.status_code == 200
+    item = result.json["hits"][0]
+    assert item["owner_agent_id"] == "_legacy"
+    result = post("read", uri=item["uri"], owner_agent_id=item["owner_agent_id"], level="content")
+    assert result.status_code == 200
+    assert result.json["content"] == "legacy body"
+    assert post("read", uri=item["uri"], owner_agent_id="_private").status_code == 403
+    for invalid in ("", "../bot", "a/b", "a\\b", "%2F", "a\nb", 42):
+        assert post("read", uri=item["uri"], owner_agent_id=invalid).status_code == 400
 
 
 def test_data_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_path):

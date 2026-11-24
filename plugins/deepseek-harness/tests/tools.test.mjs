@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { resolveConfig } from '../lib/config.js'
+import { OgMemoryClient } from '../lib/client.js'
 import { registerOgMemoryTools } from '../lib/tools.js'
 
 test('registers native read tools by default and keeps mutation tools opt-in', () => {
@@ -63,6 +64,26 @@ test('write and delete tools require explicit plugin opt-in', async () => {
   assert.equal(calls[0][1].text, 'Remember blue.')
   assert.match(calls[0][1].clientRequestId, /^[0-9a-f-]{36}$/)
   assert.equal(calls[1][1].uri, 'ogmemory://memories/preference/1')
+})
+
+test('case reads forward the selected owner without changing the calling identity', async t => {
+  const config = resolveConfig()
+  const client = new OgMemoryClient({ credentials: { resolve: async () => undefined } }, config)
+  const tool = register(config, client).get('ogm_read_memory')
+  const schema = tool.parameters.properties
+  assert.equal(schema.owner_agent_id.type, 'string')
+  assert.deepEqual(schema.owner_scope.enum, ['user'])
+  const requests = []
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    requests.push(JSON.parse(init.body))
+    return Response.json({ ok: true })
+  })
+  for (const selector of [{ owner_scope: 'user' }, { owner_agent_id: 'shared-bot' }, {}]) {
+    await tool.execute({ uri: 'ogmemory://memories/case/example', ...selector }, execution('s1'))
+    const body = requests.at(-1)
+    assert.equal(body.agentId, 'deepseek-harness')
+    assert.deepEqual(Object.fromEntries(Object.entries(body).filter(([key]) => key.startsWith('owner_'))), selector)
+  }
 })
 
 function register(config, client = {}) {

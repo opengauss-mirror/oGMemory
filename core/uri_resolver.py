@@ -5,13 +5,12 @@ RequestContext and field values. Provides sanitization to prevent
 directory traversal attacks.
 """
 
-import unicodedata
 from logging import getLogger
 
 import jinja2
 
 from core.models import RequestContext
-from core.validation import validate_utf8
+from core.validation import validate_identity_segment
 from extraction.schemas.registry import SchemaRegistry
 
 logger = getLogger(__name__)
@@ -123,17 +122,7 @@ class URIResolver:
         }
         required_owner = "agent_id" if owner_scope == "agent" else "user_id"
         for name, value in values.items():
-            if not isinstance(value, str) or (not value and name in {"account_id", required_owner}):
-                raise ValueError(f"{name} must be one safe URI path segment")
-            validate_utf8(value, name)
-            # Backends compare raw identities, so encoded principal syntax is
-            # unsupported. Dot paths/separators are normalized by filesystem
-            # routing; controls cannot be represented safely by the backends.
-            # Reject '..' anywhere to retain validate_uri's existing boundary.
-            if (value == "." or ".." in value
-                    or any(char in value for char in "/\\%")
-                    or any(unicodedata.category(char) in {"Cc", "Cs"} for char in value)):
-                raise ValueError(f"{name} must be one safe URI path segment")
+            validate_identity_segment(value, name, required=name in {"account_id", required_owner})
         return values
 
     def validate_uri(self, uri: str, ctx: RequestContext) -> bool:
