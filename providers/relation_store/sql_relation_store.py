@@ -13,6 +13,7 @@ from commit.outbox_scope import record_persisted_event
 from core.errors import AccessDeniedError
 from core.models import RelationEdge, RelationNeighbor, RequestContext
 from fs.sql_adapter.pool import PoolAdapterMixin
+from fs.sql_adapter.relation_endpoints import lock_relation_endpoints
 
 try:
     import psycopg2
@@ -475,14 +476,10 @@ class SQLRelationStore(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                if self._edge_projection_profile_id:
-                    # Lock every endpoint before any job/edge row. Consistent
-                    # URI order also prevents reversed A->B/B->A deadlocks.
-                    uris = sorted({uri for edge in edges for uri in (edge.from_uri,edge.to_uri)})
-                    cur.execute("SELECT uri FROM context_nodes WHERE account_id=%s AND uri=ANY(%s) ORDER BY uri FOR UPDATE",
-                                (ctx.account_id,uris))
-                    if len(cur.fetchall()) != len(uris):
-                        raise ValueError("Cannot project an edge with missing endpoints")
+                uris = {uri for edge in edges for uri in (edge.from_uri, edge.to_uri)}
+                locked_count = lock_relation_endpoints(cur, ctx.account_id, uris)
+                if self._edge_projection_profile_id and locked_count != len(uris):
+                    raise ValueError("Cannot project an edge with missing endpoints")
                 for edge in sorted(edges, key=lambda e:(e.from_uri,e.to_uri,e.relation_type)):
                     params = (
                         edge.from_uri,
