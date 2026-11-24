@@ -9,6 +9,7 @@
     <script src="/memory-viewer/app.js" defer></script>
     <script src="/memory-viewer/content.js" defer></script>
     <script src="/memory-viewer/spaces.js" defer></script>
+    <script src="/memory-viewer/tenants.js" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">跳至主要内容</a>
@@ -39,7 +40,8 @@
           <section class="nav-group">
             <p>设置</p>
             <a class="sidebar-link" href="/memory-viewer/migration"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h15l-4-4m5 12H5l4 4"/></svg></span><span class="nav-label">导入导出</span></a>
-            <button id="settings-button" class="sidebar-link" type="button"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16m-16 6h16m-16 6h16M8 4v4m8 2v4m-5 2v4"/></svg></span><span class="nav-label">连接设置</span></button>
+            <button id="settings-button" class="sidebar-link" type="button"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16m-16 6h16m-16 6h16M8 4v4m8 2v4m-5 2v4"/></svg></span><span class="nav-label">身份与 API Key</span></button>
+            <button class="sidebar-link" type="button" data-view="tenants" hidden><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="M6 16a3 3 0 0 1 6 0m2-6h3m-3 4h3"/></svg></span><span class="nav-label">租户管理</span></button>
             <button id="theme-button" class="sidebar-link" type="button"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 9 9 0 0 1-9-9Z"/></svg></span><span class="nav-label">外观</span></button>
           </section>
         </nav>
@@ -70,6 +72,51 @@
         <div class="space-layout">
           <section class="space-main"><nav id="space-tabs" class="type-tabs" role="tablist" aria-label="团队空间功能"></nav><div id="space-body" role="tabpanel" tabindex="0"><p class="space-empty">暂无团队空间</p></div></section>
         </div>
+      </section>
+      <section id="tenant-view" class="tenant-view" aria-label="租户管理" hidden>
+        <header class="view-heading tenant-heading">
+          <div class="tenant-context"><h1 id="tenant-account"></h1><p id="tenant-identity"></p></div>
+          <button id="tenant-back" class="secondary-button" type="button" hidden>返回租户目录</button>
+        </header>
+        <section id="tenant-catalog" class="tenant-directory" aria-label="部署租户目录" hidden>
+          <div class="tenant-tools">
+            <h2>租户</h2>
+            <button id="tenant-bootstrap" class="primary-button" type="button">创建租户</button>
+          </div>
+          <div class="tenant-columns" aria-hidden="true"><span>租户标识</span><span>用户数</span><span>操作</span></div>
+          <ul id="tenant-catalog-rows" class="tenant-rows" aria-label="租户"></ul>
+          <nav id="tenant-catalog-pages" class="tenant-pagination" aria-label="租户分页" hidden>
+            <span id="tenant-catalog-page"></span>
+            <button id="tenant-catalog-prev" class="secondary-button" type="button">上一页</button>
+            <button id="tenant-catalog-next" class="secondary-button" type="button">下一页</button>
+          </nav>
+        </section>
+        <section id="tenant-directory" class="tenant-directory" aria-label="租户用户和 Agent" hidden>
+          <div class="tenant-toolbar">
+            <div class="tenant-sections" role="group" aria-label="租户目录">
+              <button class="secondary-button" type="button" data-tenant-section="users" aria-pressed="true">用户</button>
+              <button class="secondary-button" type="button" data-tenant-section="agents" aria-pressed="false">Agent</button>
+            </div>
+          </div>
+          <div class="tenant-tools">
+            <form id="tenant-search" class="tenant-search" role="search" novalidate>
+              <label for="tenant-query" class="sr-only">搜索标识</label>
+              <input id="tenant-query" type="search" maxlength="128" placeholder="搜索用户标识">
+              <button id="tenant-clear" class="secondary-button" type="button" hidden>清除</button>
+              <button class="secondary-button" type="submit">搜索</button>
+            </form>
+            <button id="tenant-create-user" class="primary-button" type="button">创建用户</button>
+            <button id="tenant-create-agent" class="primary-button" type="button" hidden>注册 Agent</button>
+          </div>
+          <div class="tenant-columns" id="tenant-columns" aria-hidden="true" hidden>
+            <span id="tenant-id-heading">用户</span><span id="tenant-role-heading">租户角色</span><span>操作</span>
+          </div>
+          <ul id="tenant-rows" class="tenant-rows" aria-label="租户目录结果"></ul>
+          <nav id="tenant-pagination" class="tenant-pagination" aria-label="租户目录分页" hidden>
+            <span id="tenant-page"></span><button id="tenant-prev" class="secondary-button" type="button">上一页</button><button id="tenant-next" class="secondary-button" type="button">下一页</button>
+          </nav>
+        </section>
+        <p id="tenant-message" class="tenant-message" role="status" aria-live="polite"></p>
       </section>
       <section id="bot-view" class="bot-view" aria-label="memoryBot 工作助手" hidden>
         <iframe id="bot-frame" title="memoryBot 工作助手"></iframe>
@@ -273,13 +320,27 @@
       </div>
     </div>
 
+    <dialog id="tenant-dialog" class="settings-dialog tenant-dialog" aria-labelledby="tenant-dialog-title" aria-describedby="tenant-dialog-description">
+      <form id="tenant-form" novalidate>
+        <div class="tenant-dialog-heading">
+          <h2 id="tenant-dialog-title"></h2>
+          <p id="tenant-dialog-description" hidden></p>
+        </div>
+        <div id="tenant-dialog-fields"></div>
+        <p id="tenant-dialog-error" role="alert"></p>
+        <div class="tenant-dialog-actions">
+          <button id="tenant-cancel" class="secondary-button" type="button" autofocus>取消</button>
+          <button id="tenant-save" class="primary-button" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-description">
       <form novalidate id="settings-form">
         <div class="dialog-head">
-          <div><h2 id="settings-title">连接 oGMemory</h2></div>
+          <div><h2 id="settings-title">身份与 API Key</h2></div>
           <button id="settings-close" class="close-button" type="button" aria-label="关闭">×</button>
         </div>
-        <p id="settings-description" class="settings-description">请输入管理员为你分配的 oGMemory API Key。连接后将显示你有权限查看的内容。</p>
+        <p id="settings-description" class="settings-description">输入 API Key 以登录或切换身份。</p>
         <div class="settings-field">
           <label for="api-key-input">API Key</label>
           <div class="secret-control">

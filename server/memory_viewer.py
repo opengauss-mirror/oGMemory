@@ -115,9 +115,12 @@ def create_memory_viewer_blueprint(
     def viewer_scope():
         try:
             service = get_service()
-            context = build_context({})
+            include_agents = request.args.get("includeAgents") != "false"
+            context = build_context({}) if include_agents else build_context({}, include_agent_visibility=False)
             role_control_active = service.get_auth_service().role_control_active()
-            agents = _visible_agents(service, context)
+            role = _role(context) if role_control_active else None
+            admin_mode = role in {Role.ROOT, Role.ADMIN}
+            agents = [] if admin_mode and not include_agents else _visible_agents(service, context)
             default_agent_id = ""
             if not role_control_active:
                 default_agent_id = str(getattr(service, "default_agent_id", "") or "")
@@ -127,8 +130,9 @@ def create_memory_viewer_blueprint(
                     "user_id": context.user_id,
                     "agents": [{"agent_id": agent_id} for agent_id in agents],
                     "default_agent_id": default_agent_id,
+                    "role": role.value if role is not None else None,
                     "role_control_active": role_control_active,
-                    "admin_mode": role_control_active and _role(context) in {Role.ROOT, Role.ADMIN},
+                    "admin_mode": admin_mode,
                 }
             )
         except Exception as exc:

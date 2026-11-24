@@ -130,7 +130,7 @@
     const message = error.message || String(error);
     const banner = $("#status-banner");
     banner.replaceChildren(el("span", message));
-    if (embedded) banner.append(button("连接设置", "connect"));
+    if (embedded) banner.append(button("身份与 API Key", "connect"));
     banner.hidden = false;
   }
   function requestId() {
@@ -1356,6 +1356,6 @@
   else {
     renderConversation();
     for (const name of Object.keys(collectionPaths)) renderCollection(name);
-    if (embedded) report(new Error("在连接设置中填写用户 API Key，开始使用 memoryBot。"));
+    if (embedded) report(new Error("在「身份与 API Key」中填写用户 Key，开始使用 memoryBot。"));
   }
 })();

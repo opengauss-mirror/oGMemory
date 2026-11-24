@@ -561,7 +561,7 @@ window.sharedSpaces = (() => {
     const rows = members.map((member) => {
       const owner = member.principal === `user:${model.space.owner_user_id}`;
       const user = member.principal.startsWith('user:');
-      return `<div class="space-member-row">${memberIdentity(member.principal, '', owner ? '所有者' : '')}${cap('manage_members') && !owner && user ? `<select data-member-role="${escapeHtml(member.principal)}" aria-label="${escapeHtml(member.principal)} 的角色"><option value="member" ${member.role === 'member' ? 'selected' : ''}>成员</option><option value="manager" ${member.role === 'manager' ? 'selected' : ''}>管理者</option></select>` : `<span class="space-member-role">${member.role === 'manager' ? '管理者' : '成员'}</span>`}${cap('manage_members') && !owner ? button('remove-member', '移出', member.principal) : ''}</div>`;
+      return `<div class="space-member-row">${memberIdentity(member.principal)}${cap('manage_members') && !owner && user ? `<select data-member-role="${escapeHtml(member.principal)}" aria-label="${escapeHtml(member.principal)} 的角色"><option value="member" ${member.role === 'member' ? 'selected' : ''}>团队成员</option><option value="manager" ${member.role === 'manager' ? 'selected' : ''}>团队管理员</option></select>` : `<span class="space-member-role">${owner ? '团队所有者' : member.role === 'manager' ? '团队管理员' : '团队成员'}</span>`}${cap('manage_members') && !owner ? button('remove-member', '移出', member.principal) : ''}</div>`;
     }).join('');
     $('#space-members').innerHTML = `<div class="space-member-list">${rows || '<p class="space-empty">暂无成员</p>'}</div>${pagination('members')}`;
   }
@@ -709,7 +709,7 @@ window.sharedSpaces = (() => {
               ${select('acl_mode', '读取方式', { inherit: '继承团队权限', restricted: '指定成员读取' }, item.acl_mode || 'inherit')}
               <fieldset class="space-choices space-acl-readers" ${restricted ? '' : 'hidden disabled'}><legend class="sr-only">可读取的成员</legend>${choices('readers', item.readers || [])}</fieldset>
               <p class="space-acl-inherited" ${restricted ? 'hidden' : ''}>全部团队成员可读取</p>
-              <p class="space-acl-note">空间所有者、管理者及租户管理员保留读取权限。</p>
+              <p class="space-acl-note">团队所有者、团队管理员及租户管理员保留读取权限。</p>
               <div class="space-form-actions">${button('cancel-acl', '取消')}${submit('保存')}</div>
             </form>` : ''}
           </section>

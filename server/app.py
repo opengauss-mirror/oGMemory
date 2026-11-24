@@ -235,10 +235,12 @@ def _get_operator_service():
         return _operator_service
 
 
-def _build_authenticated_context(params: dict):
+def _build_authenticated_context(params: dict, *, include_agent_visibility: bool = True):
     svc = _get_service()
     auth = svc.get_auth_service()
     identity = auth.resolve_identity(dict(request.headers)) if auth.role_control_active() else None
+    if not include_agent_visibility:
+        return svc.build_context(params, identity=identity, include_agent_visibility=False)
     return svc.build_context(params, identity=identity)
 
 
@@ -1658,7 +1660,7 @@ def handle_admin_accounts():
         ctx = _build_authenticated_context({})
         admin = svc.get_tenant_admin_service()
         if request.method == "GET":
-            return jsonify(admin.list_accounts(ctx))
+            return jsonify(admin.list_accounts(ctx, **_identity_page_params()))
         body = _json_object_body()
         result = admin.create_account(ctx, body.get("account_id"), body.get("admin_user_id"))
         return jsonify(result), 201, {"Cache-Control": "no-store"}
@@ -1685,7 +1687,7 @@ def handle_admin_users(account_id):
         if not svc.get_auth_service().role_control_active():
             raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         params = request.get_json(force=True, silent=True) or {}
-        ctx = _build_authenticated_context(params)
+        ctx = _build_authenticated_context(params, include_agent_visibility=request.method != "GET")
         admin = svc.get_tenant_admin_service()
         if request.method == "GET":
             return jsonify(admin.list_users(ctx, account_id, **_identity_page_params()))
@@ -1765,7 +1767,7 @@ def handle_admin_agents(account_id):
         if not svc.get_auth_service().role_control_active():
             raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         params = request.get_json(force=True, silent=True) or {}
-        ctx = _build_authenticated_context(params)
+        ctx = _build_authenticated_context(params, include_agent_visibility=request.method != "GET")
         admin = svc.get_tenant_admin_service()
         if request.method == "GET":
             page = _identity_page_params()
