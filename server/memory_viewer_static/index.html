@@ -309,12 +309,20 @@
       <section id="knowledge-view" hidden aria-labelledby="knowledge-heading">
         <header class="view-heading knowledge-heading">
           <h1 id="knowledge-heading">资源管理</h1>
+          <div class="knowledge-heading-actions">
+            <button id="knowledge-base-create" class="secondary-button" type="button" hidden>新建知识库</button>
+            <button id="knowledge-upload" class="primary-button" type="button" disabled>上传文档</button>
+          </div>
         </header>
         <div class="knowledge-base-toolbar">
           <div class="knowledge-base-picker">
             <label for="knowledge-base-select">当前知识库</label>
             <select id="knowledge-base-select" disabled><option value="">选择知识库</option></select>
             <span id="knowledge-base-scope" aria-live="polite"></span>
+          </div>
+          <div class="knowledge-base-actions" role="group" aria-label="知识库管理">
+            <button id="knowledge-base-edit" class="secondary-button" type="button" hidden>重命名</button>
+            <button id="knowledge-base-delete" class="secondary-button knowledge-base-danger" type="button" hidden>删除空库</button>
           </div>
         </div>
         <form id="knowledge-search" role="search" novalidate>
@@ -333,7 +341,7 @@
               <span id="knowledge-count"></span>
             </header>
             <ul id="knowledge-list" class="knowledge-list" role="list" aria-labelledby="knowledge-list-title"></ul>
-            <p id="knowledge-empty" class="knowledge-empty" hidden>此知识库暂无文档。</p>
+            <p id="knowledge-empty" class="knowledge-empty" hidden>暂无文档。上传文档后可在此查看。</p>
             <footer id="knowledge-pagination" class="tasks-pagination knowledge-pagination" hidden>
               <span id="knowledge-page"></span>
               <div>
@@ -366,6 +374,8 @@
               </section>
               <div class="knowledge-actions" role="group" aria-label="文档操作">
                 <button id="knowledge-download" class="secondary-button" type="button">下载原文</button>
+                <button id="knowledge-replace" class="secondary-button" type="button">替换原文</button>
+                <button id="knowledge-delete" class="secondary-button knowledge-delete" type="button">删除文档</button>
               </div>
             </div>
           </article>
@@ -419,6 +429,43 @@
           <p id="settings-help" class="settings-help">没有 API Key？请联系管理员获取。</p>
         </div>
         <button id="save-settings" class="primary-button" type="submit">连接</button>
+      </form>
+    </dialog>
+
+    <dialog id="knowledge-dialog" class="settings-dialog knowledge-dialog" aria-labelledby="knowledge-dialog-title" aria-describedby="knowledge-dialog-description">
+      <form id="knowledge-form" novalidate>
+        <div class="dialog-head"><h2 id="knowledge-dialog-title">上传文档</h2></div>
+        <p id="knowledge-dialog-description" class="settings-description">选择一份文件。上传后开始解析和索引。</p>
+        <div id="knowledge-file-field" class="knowledge-file-field">
+          <label for="knowledge-file">文件</label>
+          <input id="knowledge-file" name="file" type="file" aria-describedby="knowledge-file-help knowledge-dialog-error" required>
+          <p id="knowledge-file-help" class="knowledge-file-help">每份文件最多 31 MiB。</p>
+        </div>
+        <p id="knowledge-dialog-error" class="form-feedback" role="alert"></p>
+        <div class="knowledge-dialog-actions">
+          <button id="knowledge-dialog-cancel" class="secondary-button" type="button">取消</button>
+          <button id="knowledge-dialog-submit" class="primary-button" type="submit">上传文档</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="knowledge-base-dialog" class="settings-dialog knowledge-dialog knowledge-base-dialog" aria-labelledby="knowledge-base-dialog-title" aria-describedby="knowledge-base-dialog-description">
+      <form id="knowledge-base-form" novalidate>
+        <div class="dialog-head"><h2 id="knowledge-base-dialog-title">新建知识库</h2></div>
+        <p id="knowledge-base-dialog-description" class="settings-description"></p>
+        <div id="knowledge-base-name-field" class="knowledge-file-field" hidden>
+          <label for="knowledge-base-name">名称</label>
+          <input id="knowledge-base-name" type="text" maxlength="128" aria-describedby="knowledge-base-dialog-error" required>
+        </div>
+        <div id="knowledge-base-visibility-field" class="knowledge-file-field" hidden>
+          <label for="knowledge-base-visibility">可见范围</label>
+          <select id="knowledge-base-visibility"></select>
+        </div>
+        <p id="knowledge-base-dialog-error" class="form-feedback" role="alert"></p>
+        <div class="knowledge-dialog-actions">
+          <button id="knowledge-base-dialog-cancel" class="secondary-button" type="button">取消</button>
+          <button id="knowledge-base-dialog-submit" class="primary-button" type="submit">新建知识库</button>
+        </div>
       </form>
     </dialog>
 
