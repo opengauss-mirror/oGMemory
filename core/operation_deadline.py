@@ -24,6 +24,11 @@ def current_deadline() -> float | None:
     return _deadline.get()
 
 
+def operation_deadline_expired() -> bool:
+    """Report whether the current operation's deadline has passed."""
+    return deadline_expired(current_deadline())
+
+
 def _bounded_deadline(deadline):
     inherited = current_deadline()
     if inherited is None:

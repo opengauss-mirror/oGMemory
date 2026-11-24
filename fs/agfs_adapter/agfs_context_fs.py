@@ -42,7 +42,7 @@ from core.errors import (
 )
 from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
-from core.operation_deadline import check_deadline, current_deadline, deadline_expired
+from core.operation_deadline import check_deadline, current_deadline, operation_deadline_expired
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
     RootBindingError,
@@ -107,7 +107,11 @@ def _is_not_found_error(exc: AGFSClientError) -> bool:
     return any(marker in message for marker in ("no such file", "no such directory", "not found"))
 
 
-def _bounded_read(read, *args):
+def _read_with_deadline_check(read, *args):
+    """Check before reading and translate client timeouts.
+
+    The client controls the timeout of an in-flight read.
+    """
     check_deadline()
     try:
         return read(*args)
@@ -2670,19 +2674,19 @@ class AGFSContextFS:
         deadline = time.monotonic() + _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS
         observed_version = 0
         while True:
-            marker = _bounded_read(self._read_update_marker, marker_path)
+            marker = _read_with_deadline_check(self._read_update_marker, marker_path)
             expected = marker.get("expected_version") if marker is not None else None
             if (marker is None or type(expected) is int
-                    and _bounded_read(self._read_node_version, node_path) > expected):
+                    and _read_with_deadline_check(self._read_node_version, node_path) > expected):
                 check_deadline()
                 node, metadata = read()
                 observed_version = node.metadata.get("version", 0)
-                if (_bounded_read(self._read_update_marker, marker_path) == marker
+                if (_read_with_deadline_check(self._read_update_marker, marker_path) == marker
                         and self._read_snapshot_file(node_path + self.FILE_META) == metadata):
                     return node
             check_deadline()
             if time.monotonic() >= deadline:
-                version = _bounded_read(self._read_node_version, node_path)
+                version = _read_with_deadline_check(self._read_node_version, node_path)
                 raise ConcurrentModificationError(uri, observed_version, version)
             time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
 
@@ -2690,11 +2694,11 @@ class AGFSContextFS:
         return self._read_node_snapshot(uri, ctx, lambda: self._read_node_once(uri, ctx))
 
     def _read_snapshot_file(self, path: str) -> str:
-        return _bounded_read(self._read_file, path)
+        return _read_with_deadline_check(self._read_file, path)
 
     def _read_blob(self, path: str) -> bytes:
         """Read raw bytes from a storage path already validated by the caller."""
-        return _bounded_read(self._client.read, path)
+        return _read_with_deadline_check(self._client.read, path)
 
     def read_nodes(
         self, uris: list[str], ctx: RequestContext,
@@ -2718,7 +2722,7 @@ class AGFSContextFS:
         for uri in uris[4:]:
             completed_uri, future = pending.popleft()
             results[completed_uri] = future.result()
-            if deadline_expired(current_deadline()):
+            if operation_deadline_expired():
                 break
             pending.append((uri, _NODE_READS.submit(copy_context().run, read, uri)))
         results.update((uri, future.result()) for uri, future in pending)
@@ -2742,7 +2746,7 @@ class AGFSContextFS:
         """
         # Access control check
         self._ensure_accessible(uri, ctx)
-        if _bounded_read(self.is_tombstoned, uri, ctx):
+        if _read_with_deadline_check(self.is_tombstoned, uri, ctx):
             raise NodeNotFoundError(uri)
 
         node_path = self._uri_to_agfs_path(uri)
@@ -3037,7 +3041,7 @@ class AGFSContextFS:
 
         try:
             parent_path = self._uri_to_agfs_path(uri)
-            files = _bounded_read(self._client.ls, parent_path)
+            files = _read_with_deadline_check(self._client.ls, parent_path)
         except AGFSClientError:
             return []
 
@@ -3056,7 +3060,7 @@ class AGFSContextFS:
             if after_uri is not None and child_uri <= after_uri:
                 continue
             try:
-                if _RESOURCE_URI_PATTERN.match(child_uri) and _bounded_read(self.is_tombstoned, child_uri, ctx):
+                if _RESOURCE_URI_PATTERN.match(child_uri) and _read_with_deadline_check(self.is_tombstoned, child_uri, ctx):
                     continue
                 node_path = self._uri_to_agfs_path(child_uri)
                 meta = json.loads(self._read_snapshot_file(node_path + self.FILE_META))
