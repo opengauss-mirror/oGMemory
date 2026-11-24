@@ -295,7 +295,41 @@ def test_shared_dependencies_are_removed_when_their_source_fails_final_check(set
     assert result.evidence == [] and result.diagnostics["evidence_groups"] == []
 
 
-@pytest.mark.parametrize("available_reads", [0, 2])
+@pytest.mark.parametrize("state", ["active", "revoked", "new_version"])
+def test_final_check_reads_one_body_and_manifest_for_all_units_of_a_source(setup, monkeypatch, state):
+    import service.evidence_service as search
+
+    fs, _, store, _ = setup
+    msg = message("[Alex]: Alex visited Paris.\n[Blair]: Blair visited Paris.")
+    write_candidates(setup, [msg], categories={"fact"})
+    source_uri = evidence_uri(CTX, "sources", message_source(msg, CTX).source_key)
+    node = fs.read_node(source_uri, CTX)
+    body_path = fs._uri_to_agfs_path(source_uri) + fs.FILE_CONTENT
+    manifest_path = fs._uri_to_agfs_path(store.session_uri(CTX)) + fs.FILE_CONTENT
+    reads = track_body_reads(fs, monkeypatch)
+    select_groups = search.select_groups
+
+    def change_after_selection(*args, **kwargs):
+        selected, groups = select_groups(*args, **kwargs)
+        assert len(selected) == 2
+        if state == "revoked":
+            store.revoke_session(CTX)
+        elif state == "new_version":
+            metadata = {**node.metadata, "_expected_version": node.metadata["version"]}
+            fs.write_node(replace(node, metadata=metadata), CTX)
+        reads.clear()
+        return selected, groups
+
+    monkeypatch.setattr(search, "select_groups", change_after_selection)
+    result = EvidenceService(fs).search("Paris", CTX, use_memories=True)
+
+    assert [path for path, _ in reads] == [body_path, manifest_path]
+    assert reads[0][1] == len(node.content.encode("utf-8"))
+    assert result.diagnostics["partial"] == (state != "active")
+    assert len(result.evidence) == len(result.facts) == (2 if state == "active" else 0)
+
+
+@pytest.mark.parametrize("available_reads", [0, 2, 4])
 def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(
     setup, monkeypatch, deadline_clock, available_reads,
 ):
@@ -303,7 +337,7 @@ def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(
 
     fs, _, _, _ = setup
     write_candidates(setup, [
-        message("I visited Paris.", id="paris", sequence=0),
+        message("[Alex]: Alex visited Paris.\n[Blair]: Blair visited Paris.", id="paris", sequence=0),
         message("I visited Rome.", id="rome", sequence=2),
         message("It was unforgettable.", id="followup", sequence=3, role="assistant"),
     ])
@@ -319,23 +353,29 @@ def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(
         return source
 
     def select_then_expire(_query, _scores, units, *_args, **_kwargs):
-        keys = {unit["message_id"]: key for key, unit in units.items()}
+        paris = [key for key, unit in units.items() if unit["message_id"] == "paris"]
+        keys = {unit["message_id"]: key for key, unit in units.items() if unit["message_id"] != "paris"}
         monkeypatch.setattr(service.store, "read_source", check_source)
         if available_reads == 0:
             deadline_clock.now += deadline_clock.budget
-        paris, rome, followup = (keys[name] for name in ("paris", "rome", "followup"))
-        return [paris, rome, followup], [[paris], [rome, followup]]
+        rome, followup = keys["rome"], keys["followup"]
+        return [paris[0], rome, paris[1], followup], [paris, [rome, followup]]
 
     monkeypatch.setattr(search, "select_groups", select_then_expire)
     with operation_deadline(deadline_clock.budget):
-        result = service.search("Where did I travel to Paris and Rome?", CTX, use_memories=True)
+        result = service.search("Where did someone travel to Paris and Rome?", CTX, use_memories=True)
 
-    assert len(checks) == available_reads
-    assert result.diagnostics["partial"]
-    assert [item["message_id"] for item in result.evidence] == (["paris"] if available_reads else [])
-    assert [fact["quote"] for fact in result.facts] == (["I visited Paris."] if available_reads else [])
-    assert len(result.diagnostics["evidence_groups"]) == bool(available_reads)
-    assert result.diagnostics["uncovered_branches"] == ([1] if available_reads else [0, 1])
+    assert len(checks) == len(set(checks)) == min(available_reads, 3)
+    paris_quotes = {"Alex visited Paris.", "Blair visited Paris."}
+    assert result.diagnostics["partial"] == (available_reads < 3)
+    assert [item["message_id"] for item in result.evidence] == {
+        0: [], 2: ["paris", "paris"], 4: ["paris", "rome", "paris", "followup"],
+    }[available_reads]
+    assert {fact["quote"] for fact in result.facts} == {
+        0: set(), 2: paris_quotes, 4: paris_quotes | {"I visited Rome."},
+    }[available_reads]
+    assert len(result.diagnostics["evidence_groups"]) == {0: 0, 2: 1, 4: 2}[available_reads]
+    assert result.diagnostics["uncovered_branches"] == {0: [0, 1], 2: [1], 4: []}[available_reads]
 
 
 def test_final_source_read_cannot_start_manifest_read_after_deadline(

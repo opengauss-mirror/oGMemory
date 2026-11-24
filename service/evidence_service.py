@@ -324,17 +324,17 @@ class EvidenceService:
             if len(selected) < min(len(scores), request.top_k):
                 diagnostics["truncated"] = True
         with stage("final_source_check"):
-            evidence = []
+            selected_units = [units[key] for key in selected]
+            validated_sources = set()
             check_deadline()
-            for key in selected:
-                item = units[key]
+            for source_key in dict.fromkeys(item["source_key"] for item in selected_units):
                 try:
-                    current = self.store.read_source(item["source_key"], ctx)
+                    current = self.store.read_source(source_key, ctx)
                 except TimeoutError:
-                    diagnostics["partial"] = True
                     break
-                if current is not None and current["source_node_version"] == item["source_node_version"]:
-                    evidence.append(item)
-                else:
-                    diagnostics["partial"] = True
+                if current is not None and current["source_node_version"] == sources[source_key]["source_node_version"]:
+                    validated_sources.add(source_key)
+            evidence = [item for item in selected_units if item["source_key"] in validated_sources]
+            if len(evidence) < len(selected_units):
+                diagnostics["partial"] = True
         return evidence, groups, unique.values()
