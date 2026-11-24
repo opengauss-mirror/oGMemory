@@ -92,24 +92,30 @@ class EvidenceStore:
     def iter_uris(self, directory, ctx, limit, *, after_uri=None):
         """Yield bounded child URIs in storage order, resuming after a prior URI."""
         fs = self.fs
-        pager = getattr(type(fs), "list_node_summaries_page", None)
-        if callable(pager):
-            cursor = getattr(fs, "list_node_order_key", lambda uri: uri)(after_uri) if after_uri else None
-            count = 0
-            while count < limit:
-                check_deadline()
-                with stage("list"):
-                    page = pager(fs, directory, ctx, limit=min(100, limit - count), after_uri=cursor)
-                if not page:
-                    return
-                for node in page:
-                    yield node.uri
-                    count += 1
-                cursor = getattr(fs, "list_node_order_key", lambda uri: uri)(page[-1].uri)
-        else:
+        uri_pager = getattr(type(fs), "list_node_uris_page", None)
+        summary_pager = getattr(type(fs), "list_node_summaries_page", None)
+        if not callable(uri_pager) and not callable(summary_pager):
             check_deadline()
             yield from [uri for uri in sorted(fs.list_children(directory, ctx))
                         if after_uri is None or uri > after_uri][:limit]
+            return
+
+        order_key = getattr(fs, "list_node_order_key", lambda uri: uri)
+        cursor = order_key(after_uri) if after_uri else None
+        count = 0
+        while count < limit:
+            check_deadline()
+            page_limit = min(100, limit - count)
+            with stage("list"):
+                if callable(uri_pager):
+                    page = uri_pager(fs, directory, ctx, limit=page_limit, after_uri=cursor)
+                else:
+                    page = [node.uri for node in summary_pager(fs, directory, ctx, limit=page_limit, after_uri=cursor)]
+            if not page:
+                return
+            yield from page
+            count += len(page)
+            cursor = order_key(page[-1])
 
     def node_pages(self, uris, ctx, *, read_limit, deadline=None):
         """Bounded prefetch only; the caller still admits items under its budgets."""

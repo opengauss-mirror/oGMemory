@@ -1551,6 +1551,56 @@ class SQLContextFS(PoolAdapterMixin):
     ) -> list[ContextNode]:
         """List one stable URI-ordered page of immediate child summaries."""
 
+        rows = self._list_child_page_rows(uri, ctx, limit=limit, after_uri=after_uri, include_summaries=True)
+        summaries: list[ContextNode] = []
+        for row in rows:
+            (
+                child_uri,
+                context_type,
+                category,
+                level,
+                owner_space,
+                abstract,
+                metadata_raw,
+                created_at,
+                updated_at,
+                version,
+                has_content,
+            ) = row
+            metadata = dict(metadata_raw or {})
+            metadata.setdefault("created_at", str(created_at) if created_at else "")
+            metadata.setdefault("updated_at", str(updated_at) if updated_at else "")
+            metadata.setdefault("version", version)
+            metadata["has_content"] = bool(has_content)
+            summaries.append(
+                ContextNode(
+                    uri=child_uri,
+                    context_type=context_type,
+                    category=category,
+                    level=level,
+                    owner_space=owner_space,
+                    abstract=abstract or "",
+                    overview="",
+                    content="",
+                    metadata=metadata,
+                )
+            )
+
+        return summaries
+
+    def list_node_uris_page(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        limit: int = 50,
+        after_uri: str | None = None,
+    ) -> list[str]:
+        """Page through visible child URIs using only the SQL catalog."""
+        rows = self._list_child_page_rows(uri, ctx, limit=limit, after_uri=after_uri, include_summaries=False)
+        return [row[0] for row in rows]
+
+    def _list_child_page_rows(self, uri, ctx, *, limit, after_uri, include_summaries):
         self._ensure_accessible(uri, ctx)
         if limit <= 0:
             return []
@@ -1564,12 +1614,15 @@ class SQLContextFS(PoolAdapterMixin):
         if owner_type in {"users", "agents"} and owner_id:
             owner_space = f"{owner_type[:-1]}:{owner_id}"
 
+        columns = (
+            "uri, context_type, category, level, owner_space, abstract, metadata, created_at, updated_at, version, "
+            "COALESCE(content <> '', false) AS has_content"
+            if include_summaries else "uri"
+        )
         with self._node_read_cursor(ctx) as cur:
             cur.execute(
-                """
-                SELECT uri, context_type, category, level, owner_space,
-                       abstract, metadata, created_at, updated_at, version,
-                       COALESCE(content <> '', false) AS has_content
+                f"""
+                SELECT {columns}
                 FROM context_nodes
                 WHERE SUBSTRING(uri FROM 1 FOR CHAR_LENGTH(%s)) = %s
                   AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
@@ -1595,47 +1648,7 @@ class SQLContextFS(PoolAdapterMixin):
                 ),
             )
             rows = cur.fetchall()
-
-        summaries: list[ContextNode] = []
-        for row in rows:
-            (
-                child_uri,
-                context_type,
-                category,
-                level,
-                owner_space,
-                abstract,
-                metadata_raw,
-                created_at,
-                updated_at,
-                version,
-                has_content,
-            ) = row
-            remainder = child_uri[len(prefix) :]
-            if "/" in remainder:
-                continue
-            metadata = dict(metadata_raw or {})
-            metadata.setdefault("created_at", str(created_at) if created_at else "")
-            metadata.setdefault("updated_at", str(updated_at) if updated_at else "")
-            metadata.setdefault("version", version)
-            metadata["has_content"] = bool(has_content)
-            summaries.append(
-                ContextNode(
-                    uri=child_uri,
-                    context_type=context_type,
-                    category=category,
-                    level=level,
-                    owner_space=owner_space,
-                    abstract=abstract or "",
-                    overview="",
-                    content="",
-                    metadata=metadata,
-                )
-            )
-            if len(summaries) >= limit:
-                break
-
-        return summaries
+        return [row for row in rows if "/" not in row[0][len(prefix):]][:limit]
 
     def move_node(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
         """Move/rename a node (and cascade to children + relation/outbox refs).

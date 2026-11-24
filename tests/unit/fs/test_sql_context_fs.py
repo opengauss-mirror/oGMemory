@@ -978,6 +978,25 @@ class TestSQLContextFSListChildren:
         assert params[2].endswith("/preferences/")
         assert params[-1] == 1
 
+    def test_list_node_uris_page_checks_visibility_and_resumes_after_cursor(self, mock_sql_fs):
+        fs, _, cursor = mock_sql_fs
+        ctx = _ctx()
+        directory = "ctx://acme/users/alice/memories/preferences"
+        after_uri = f"{directory}/coffee"
+        next_uri = f"{directory}/tea"
+        cursor.fetchall.return_value = [(next_uri,)]
+
+        assert fs.list_node_uris_page(directory, ctx, limit=1, after_uri=after_uri) == [next_uri]
+        cursor.execute.assert_any_call("SET LOCAL app.account_id = %s", ("acme",))
+        sql, params = cursor.execute.call_args.args
+        assert " ".join(sql.split()).startswith("SELECT uri FROM context_nodes")
+        assert "status = 'ACTIVE'" in sql and "ORDER BY uri" in sql
+        assert "AND (%s IS NULL OR uri > %s)" in sql and "POSITION('/' IN SUBSTRING" in sql
+        assert params[3:] == ("acme", "user:alice", "user:alice", after_uri, after_uri, len(directory) + 2, 1)
+
+        with pytest.raises(AccessDeniedError):
+            fs.list_node_uris_page(directory, _ctx(account_id="other"), limit=1)
+
 
 class TestSQLContextFSMoveNode:
     def test_move_existing(self, mock_sql_fs):
