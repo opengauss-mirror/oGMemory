@@ -51,6 +51,16 @@ def canonical_object_name(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
+def merge_name_aliases(current: dict, source: dict) -> dict[str, list[str]]:
+    merged = {}
+    for name in ("routing_key", "object_name"):
+        field = f"{name}_aliases"
+        aliases = (*current.get(field, ()), *source.get(field, ()), source.get(name))
+        if distinct := list(dict.fromkeys(alias for alias in aliases if alias and alias != current.get(name))):
+            merged[field] = distinct
+    return merged
+
+
 def canonical_scope(value: str) -> str:
     """Normalize scope word separators while retaining identifying symbols."""
     value = unicodedata.normalize("NFKC", value).strip()

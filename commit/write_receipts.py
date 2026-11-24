@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict
 
+from core.dreaming_evidence import node_created_at
 from core.errors import NodeNotFoundError, OperationDeadlineExceededError
 from core.models import CandidateMemory, ContextNode, RequestContext, WritePlan
 
@@ -151,11 +152,43 @@ def _receipt_candidates(fs, directory, operation_id, ctx):
         cursor = order_key(page[-1].uri)
 
 
+def receipt_projection(node, operation_id):
+    projection = node.metadata.get(PROJECTION_RECEIPTS_KEY, {}).get(operation_id)
+    return projection if isinstance(projection, dict) else {}
+
+
+def receipt_origin(node, operation_id):
+    return receipt_projection(node, operation_id).get("origin", [node.uri, node_created_at(node.metadata)])
+
+
+def _resolve_receipt_owner(fs, matches, operation_id, ctx):
+    origin = receipt_origin(matches[0], operation_id)
+    if (not isinstance(origin, list) or len(origin) != 2
+            or not all(isinstance(value, str) and value for value in origin)
+            or origin[0].rsplit("/", 1)[0] != matches[0].parent_uri.rstrip("/")
+            or any(receipt_origin(node, operation_id) != origin for node in matches[1:])):
+        return None
+    instances = {(node.uri, node_created_at(node.metadata)): node for node in matches}
+    if owner := instances.get(tuple(origin)):
+        return owner
+    confirmed = [node for node in matches if receipt_projection(node, operation_id).get("ownership") == "confirmed"]
+    if confirmed:
+        return confirmed[0] if len(confirmed) == 1 else None
+    resolve = getattr(fs, "read_dreaming_alias", None)
+    if callable(resolve):
+        try:
+            canonical = resolve(origin[0], ctx, expected_created_at=origin[1])
+        except NodeNotFoundError:
+            return None
+        return instances.get((canonical.uri, node_created_at(canonical.metadata)))
+    return None
+
+
 def receipt_plan(fs, uris, candidate: CandidateMemory, ctx: RequestContext, *, outbox_store=None):
     """Trust a receipt only after a complete authorized node read.
 
-    Versioned operations resolve their durable target binding. Legacy directory
-    discovery remains inside one schema-owned category and one request owner.
+    Versioned operations check their durable target first. Discovery follows
+    merged receipts within the same schema-owned category and owner.
     """
     if not candidate.write_operation_id:
         return None
@@ -167,50 +200,72 @@ def receipt_plan(fs, uris, candidate: CandidateMemory, ctx: RequestContext, *, o
     directory = uris.get_directory_uri(candidate.category, ctx).rstrip("/")
     expected_owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
     digest = operation_digest(candidate, ctx)
+    located = not schema.is_single_file and candidate.write_operation_id.startswith(LOCATED_OPERATION_PREFIX)
+    resolve_alias = getattr(fs, "read_dreaming_alias", None) if located else None
+
+    def read_matches(candidates, *, follow_alias=False):
+        for uri in candidates:
+            if (not uris.validate_uri(uri, ctx)
+                    or (uri.rsplit("/", 1)[0] != directory and not schema.is_single_file)):
+                continue
+            try:
+                node = fs.read_node(uri, ctx)
+            except NodeNotFoundError:
+                if not follow_alias or not callable(resolve_alias):
+                    continue
+                try:
+                    node = resolve_alias(uri, ctx)
+                except NodeNotFoundError:
+                    continue
+                validate_receipt_target(uris, candidate, ctx, node.uri)
+            if node.category != candidate.category or node.owner_space != expected_owner:
+                continue
+            receipts = node.metadata.get(RECEIPTS_KEY, {})
+            if not isinstance(receipts, dict) or candidate.write_operation_id not in receipts:
+                continue
+            if receipts[candidate.write_operation_id] != digest:
+                raise ValueError("operation receipt does not match the accepted candidate or owner")
+            yield node
+
     if schema.is_single_file:
-        candidates = [uris.resolve(candidate.category, {"routing_key": candidate.routing_key}, ctx)]
-    elif candidate.write_operation_id.startswith(LOCATED_OPERATION_PREFIX):
+        uri = uris.resolve(candidate.category, {"routing_key": candidate.routing_key}, ctx)
+        matches = list(read_matches((uri,)))
+    elif located:
         target = located_target(fs, uris, candidate, ctx)
-        candidates = [target] if target is not None else []
+        if target is None:
+            return None
+        matches = list(read_matches((target,), follow_alias=True))
+        if not matches and callable(resolve_alias):
+            from commit.dreaming import MERGE_CATEGORIES
+
+            if candidate.category in MERGE_CATEGORIES:
+                matches = list(read_matches(_receipt_candidates(fs, directory, candidate.write_operation_id, ctx)))
     else:
-        candidates = _receipt_candidates(fs, directory, candidate.write_operation_id, ctx)
-    matches = []
+        matches = list(read_matches(_receipt_candidates(fs, directory, candidate.write_operation_id, ctx)))
+    if not matches:
+        return None
+    node = matches[0]
+    if len(matches) > 1 or "origin" in receipt_projection(node, candidate.write_operation_id):
+        node = _resolve_receipt_owner(fs, matches, candidate.write_operation_id, ctx)
+        if node is None:
+            if len(matches) > 1:
+                raise ValueError("operation receipt has ambiguous committed nodes")
+            raise ValueError("operation receipt owner cannot be proven")
     projection_refs = []
-    for uri in candidates:
-        if (not uris.validate_uri(uri, ctx)
-                or (uri.rsplit("/", 1)[0] != directory and not schema.is_single_file)):
-            continue
-        try:
-            node = fs.read_node(uri, ctx)
-        except NodeNotFoundError:
-            continue
-        if node.category != candidate.category or node.owner_space != expected_owner:
-            continue
-        receipts = node.metadata.get(RECEIPTS_KEY, {})
-        if not isinstance(receipts, dict) or candidate.write_operation_id not in receipts:
-            continue
-        if receipts[candidate.write_operation_id] != digest:
-            raise ValueError("operation receipt does not match the accepted candidate or owner")
-        matches.append(node.uri)
-        projection = node.metadata.get(PROJECTION_RECEIPTS_KEY, {}).get(candidate.write_operation_id)
-        if isinstance(projection, dict) and projection.get("event_id"):
-            if outbox_store is not None:
-                status = outbox_store.get_event_status(node.uri, projection["event_id"])
-                if status is None:
-                    event = outbox_store.build_write_event(node)
-                    event.event_id = projection["event_id"]
-                    outbox_store.register_once(event, ctx)
-            projection_refs.append([node.uri, projection["event_id"]])
-    if len(matches) > 1:
-        raise ValueError("operation receipt has ambiguous committed nodes")
-    if matches:
+    projection = receipt_projection(node, candidate.write_operation_id)
+    if projection.get("event_id"):
+        event_id = projection["event_id"]
+        if outbox_store is not None and outbox_store.get_event_status(node.uri, event_id) is None:
+            event = outbox_store.build_write_event(node)
+            event.event_id = event_id
+            outbox_store.register_once(event, ctx)
+        projection_refs.append([node.uri, event_id])
         from commit.outbox_scope import record_persisted_event
-        for uri, event_id in projection_refs:
-            record_persisted_event(uri, event_id)
-        return WritePlan(action="skip", target_uri=matches[0],
-                         merged_fields={"status": "operation_committed", "outbox_events": projection_refs,
-                                        "projection_evidence_known": bool(projection_refs)})
-    return None
+
+        record_persisted_event(node.uri, event_id)
+    return WritePlan(action="skip", target_uri=node.uri,
+                     merged_fields={"status": "operation_committed", "outbox_events": projection_refs,
+                                    "projection_evidence_known": bool(projection_refs)})
 
 
 def attach_receipt(fs, node, candidate: CandidateMemory, ctx: RequestContext):

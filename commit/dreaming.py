@@ -27,6 +27,7 @@ logger = get_logger(__name__)
 MANAGED_CATEGORIES = frozenset({
     "case", "entity", "event", "experience", "pattern", "preference", "profile", "skill", "tool",
 })
+MERGE_CATEGORIES = frozenset({"entity", "preference", "pattern", "event", "case"})
 _PENDING_VISIBILITY = "dreaming_pending_visibility"
 
 
@@ -389,7 +390,7 @@ class Dreaming:
         review_only = (not self._allow_merge or not callable(merge_duplicate)
                        or event.payload.get("review_only") or event.payload.get("restore"))
         candidates = []
-        if (not review_only and node.category in {"entity", "preference", "pattern", "event", "case"}
+        if (not review_only and node.category in MERGE_CATEGORIES
                 and not _has_temporal_bounds(node)):
             peers = (self._fs.dreaming_candidates(node, ctx) if self._enqueue_after_projection
                      else self._fs.dreaming_duplicates(node, ctx))

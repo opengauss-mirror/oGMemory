@@ -139,6 +139,7 @@ class RelationEdge:
     relation_type: str  # e.g. "related_to" | "derived_from" | "contradicts" | "SEQUENCE"
     weight: float  # 0.0-1.0
     reason: str
+    target_created_at: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

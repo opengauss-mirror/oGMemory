@@ -208,6 +208,9 @@ class OutboxStore:
             lease.ensure_owned()
             if (_PROCESSING_LEASES.get() or {}).get(self._processing_key(node_uri)) is not lease:
                 raise RuntimeError("Outbox processing lease scope changed")
+        source_lease = getattr(event, "_outbox_archive_source_lease", None)
+        if source_lease is not None:
+            source_lease.ensure_owned()
 
     @contextmanager
     def claim_processing_event(self, event: OutboxEvent, node_uri: str, worker_id: str):
@@ -234,7 +237,14 @@ class OutboxStore:
             event.payload, event.retry_count = data.get("payload", {}), data.get("retry_count", 0)
             event.status, event.next_retry_at = data.get("status", "PENDING"), next_retry_at
             event._outbox_processing_lease = lease
-            yield self.try_acquire(event, node_uri, worker_id)
+            with ExitStack() as locks:
+                if event.event_type == EventType.ARCHIVE_CONTEXT.value and "dreaming_archive_source" in event.payload:
+                    from fs.agfs_adapter.dreaming import archive_source_uri
+
+                    event._outbox_archive_source_lease = locks.enter_context(
+                        self.processing_lock(archive_source_uri(event))
+                    )
+                yield self.try_acquire(event, node_uri, worker_id)
 
     def _write_processing_file(
         self, path: str, data: bytes, event: OutboxEvent, node_uri: str, *, replace_existing: bool = False,

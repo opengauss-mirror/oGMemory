@@ -168,9 +168,15 @@ class ContextReader:
         self._check_acl(uri, ctx)
         if self._fs is None:
             raise NodeNotFoundError(uri)
-        node = self._fs.read_node(strip_l2_suffix(uri), ctx)
+        node_uri = strip_l2_suffix(uri)
+        resolve_alias = (getattr(self._fs, "read_dreaming_alias", None)
+                         if getattr(self._fs, "dreaming_enabled", False) is True else None)
+        node = (resolve_alias if callable(resolve_alias) else self._fs.read_node)(node_uri, ctx)
         if node is None:
             raise NodeNotFoundError(uri)
+        if callable(resolve_alias) and node.uri != node_uri:
+            self._check_acl(node.uri, ctx)
+            uri = node.uri
         metadata = dict(node.metadata or {})
         state = metadata.get("status") or metadata.get("lifecycle_status") or metadata.get("visibility") or ""
         if str(state).lower() in {"archived", "deleted", "broken", "retired", "inactive"}:
