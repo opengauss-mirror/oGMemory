@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 class RagFlowDocumentBackend:
     name = "external/ragflow"
+    creates_distinct_objects = True
 
     def __init__(self, adapter: RagFlowResourceAdapter, namespace: str) -> None:
         self._adapter = adapter

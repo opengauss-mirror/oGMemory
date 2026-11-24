@@ -124,9 +124,13 @@ class APIKeyManager:
                 self._store.write_json(path, payload)
             return True
 
-    def resolve_user_key(self, api_key: str, account_hint: str | None = None) -> dict | None:
+    def resolve_user_key(
+        self, api_key: str, account_hint: str | None = None, *, include_generation: bool = False
+    ) -> dict | None:
         lookup = getattr(self._store, "resolve_user_key", None)
         if lookup is not None:
+            if include_generation:
+                return lookup(api_key, account_hint, include_generation=True)
             return lookup(api_key, account_hint)
         for account in self.get_accounts():
             account_id = account["account_id"]
@@ -137,9 +141,12 @@ class APIKeyManager:
                 if meta.get("status", "active") != "active":
                     continue
                 if meta.get("key") == api_key:
-                    return {
+                    identity = {
                         "account_id": account_id,
                         "user_id": user_id,
                         "role": meta.get("role", "user"),
                     }
+                    if include_generation:
+                        identity["created_at"] = meta.get("created_at")
+                    return identity
         return None

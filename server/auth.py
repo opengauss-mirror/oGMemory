@@ -14,6 +14,8 @@ class ResolvedIdentity:
     role: Role
     account_id: str | None = None
     user_id: str | None = None
+    registered_user: bool = False
+    user_created_at: str | None = None
 
 
 class AuthenticationError(Exception):
@@ -86,7 +88,9 @@ class AuthService:
     def role_control_active(self) -> bool:
         return bool(self._cfg.role_control_enabled)
 
-    def resolve_identity(self, headers: dict | None) -> ResolvedIdentity | None:
+    def resolve_identity(
+        self, headers: dict | None, *, include_user_generation: bool = False
+    ) -> ResolvedIdentity | None:
         if not self.role_control_active():
             return None
         headers = {str(k).lower(): v for k, v in (headers or {}).items()}
@@ -115,6 +119,7 @@ class AuthService:
         resolved = self._key_manager.resolve_user_key(
             api_key=api_key,
             account_hint=headers.get("x-account-id"),
+            **({"include_generation": True} if include_user_generation else {}),
         )
         if not resolved:
             raise AuthenticationError("Invalid API Key")
@@ -124,6 +129,8 @@ class AuthService:
             role=role,
             account_id=resolved["account_id"],
             user_id=resolved["user_id"],
+            registered_user=True,
+            user_created_at=resolved.get("created_at") if include_user_generation else None,
         )
 
     def build_request_context(

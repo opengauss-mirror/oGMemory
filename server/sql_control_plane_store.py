@@ -89,6 +89,8 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         pool_size: int = 5,
         pool=None,
         dialect: str = "postgresql",
+        *,
+        initialize_schema: bool = True,
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
@@ -97,7 +99,8 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             )
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._snapshots = threading.local()
-        self._ensure_table()
+        if initialize_schema:
+            self._ensure_table()
 
     # ------------------------------------------------------------------
     # Connection pool: provided by PoolAdapterMixin (bounded standalone
@@ -396,19 +399,27 @@ class SQLControlPlaneStore(PoolAdapterMixin):
             conn.rollback()
             self._return_connection(conn)
 
-    def resolve_user_key(self, api_key: str, account_hint: str | None = None) -> dict | None:
+    def resolve_user_key(
+        self, api_key: str, account_hint: str | None = None, *, include_generation: bool = False
+    ) -> dict | None:
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT u.account_id,u.user_id,u.role FROM cp_users u "
+                    "SELECT u.account_id,u.user_id,u.role,u.created_at FROM cp_users u "
                     "JOIN cp_accounts a USING(account_id) "
                     "WHERE u.key=%s AND u.status='active' AND a.status='active' "
                     "AND (%s IS NULL OR u.account_id=%s) LIMIT 1",
                     (api_key, account_hint, account_hint),
                 )
                 row = cur.fetchone()
-                return dict(zip(('account_id', 'user_id', 'role'), row, strict=True)) if row else None
+                if row is None:
+                    return None
+                account_id, user_id, role, created_at = row
+                identity = {"account_id": account_id, "user_id": user_id, "role": role}
+                if include_generation and created_at is not None:
+                    identity["created_at"] = created_at.isoformat()
+                return identity
         finally:
             conn.rollback()
             self._return_connection(conn)
