@@ -11,7 +11,6 @@ from core.models import CandidateMemory
 from core.operation_deadline import operation_deadline
 from core.provenance_resolver import ProvenanceResolver
 from service.evidence_service import EvidenceService
-from tests.unit.evidence.test_batch_reads import install_batch
 from tests.unit.evidence.test_sources import CTX, message
 from tests.unit.evidence.test_writer import write_candidates
 
@@ -180,7 +179,7 @@ def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, li
     for index, msg in enumerate(messages, start=1):
         msg["content"] = f"I visited Paris on 2026-05-0{index}."
     first = messages[0]
-    write_candidates(setup, messages, categories={"event"})
+    write_candidates(setup, messages, categories={"fact", "event"})
     count_limit = limit == "count"
     if count_limit:
         monkeypatch.setattr(search, "_SOURCE_SCAN_LIMIT", 1)
@@ -189,7 +188,7 @@ def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, li
 
     paths = [fs._uri_to_agfs_path(evidence_uri(CTX, "sources", message_source(msg, CTX).source_key))
              + fs.FILE_CONTENT for msg in messages]
-    expected_reads = paths[:2] + paths[:1]
+    expected_reads = paths[:1 if count_limit else 2] + paths[:1]
     expected_bytes = sum(len(fs._client.read(path)) for path in expected_reads)
     reads = track_body_reads(fs, monkeypatch)
 
@@ -204,9 +203,37 @@ def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, li
     assert [fact["quote"] for fact in result.facts] == ([first["content"]] if count_limit else [])
     if not count_limit:
         assert result.diagnostics["scanned_cards"] == 0
-        source_reads = [(path, size) for path, size in reads if path in paths]
-        assert [path for path, _ in source_reads] == expected_reads
-        assert sum(size for _, size in source_reads) == expected_bytes
+    source_reads = [(path, size) for path, size in reads if path in paths]
+    assert [path for path, _ in source_reads] == expected_reads
+    assert sum(size for _, size in source_reads) == expected_bytes
+
+
+def test_card_cannot_load_another_source_with_a_scanned_unit_id(setup, monkeypatch):
+    fs, _, _, _ = setup
+    messages = sorted([message(f"I visited Paris on 2026-05-0{i}.", id=str(i), sequence=i)
+                       for i in range(1, 3)], key=lambda item: message_source(item, CTX).source_key)
+    write_candidates(setup, messages, categories={"fact"})
+    scanned, outside = (message_source(msg, CTX) for msg in messages)
+    read_node = fs.read_node
+
+    def corrupt_card(uri, ctx):
+        node = read_node(uri, ctx)
+        if node.category == "fact":
+            for record in node.metadata["deterministic"]["fact_records"]:
+                ref = record["source_refs"][0]
+                if ref["source_key"] == outside.source_key:
+                    ref["evidence_unit_id"] = scanned.units[0].evidence_unit_id
+        return node
+
+    monkeypatch.setattr(fs, "read_node", corrupt_card)
+    monkeypatch.setattr("service.evidence_service._SOURCE_SCAN_LIMIT", 1)
+    reads = track_body_reads(fs, monkeypatch)
+    outside_path = fs._uri_to_agfs_path(evidence_uri(CTX, "sources", outside.source_key)) + fs.FILE_CONTENT
+
+    result = EvidenceService(fs).search("Paris", CTX, use_memories=True)
+
+    assert [fact["quote"] for fact in result.facts] == [scanned.text]
+    assert all(path != outside_path for path, _ in reads)
 
 
 @pytest.mark.parametrize("limit", ["card_bytes", "shared_bytes"])
@@ -369,9 +396,8 @@ def test_time_channel_deadline_marks_partial_without_lexical_hits(setup, monkeyp
     assert result.diagnostics["partial"]
 
 
-@pytest.mark.parametrize("phase", ["serial_scan", "fact_verification"])
-def test_source_read_deadline_stops_manifest_in_all_search_phases(
-    setup, monkeypatch, deadline_clock, search_budget, phase,
+def test_serial_source_scan_deadline_stops_manifest_read(
+    setup, monkeypatch, deadline_clock, search_budget,
 ):
     fs, _, _, _ = setup
     write_candidates(setup, [message("I visited Paris.")])
@@ -385,13 +411,10 @@ def test_source_read_deadline_stops_manifest_in_all_search_phases(
             deadline_clock.now += deadline_clock.budget
         return node
 
-    if phase == "serial_scan":
-        monkeypatch.setattr(type(fs), "read_nodes", None)
-    else:
-        install_batch(fs, monkeypatch)
+    monkeypatch.setattr(type(fs), "read_nodes", None)
     monkeypatch.setattr(fs, "read_node", expire_on_single_source)
     with search_budget:
-        result = EvidenceService(fs).search("Paris", CTX, use_memories=phase == "fact_verification")
+        result = EvidenceService(fs).search("Paris", CTX, use_memories=True)
 
     assert reads == ["sources"]
     assert result.diagnostics["partial"] and not result.evidence and not result.facts

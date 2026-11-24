@@ -31,12 +31,13 @@ def result(items, facts=(), groups=None):
                               {} if groups is None else {"evidence_groups": groups})
 
 
-def test_query_response_budget_keeps_groups_and_facts_aligned():
+@pytest.mark.parametrize("refs", [[], [{}]])
+def test_query_response_budget_keeps_groups_and_facts_aligned(refs):
     first = unit("a", "I completed pottery.")
     dependent = unit("b", "It took two months. " * 50)
     independent = unit("c", "I completed photography.")
     fact_without_unit_id = fact(independent, independent["text"])
-    del fact_without_unit_id["source_refs"][0]["evidence_unit_id"]
+    fact_without_unit_id["source_refs"] = refs
     response = result([first, dependent, independent], [fact(first, first["text"]), fact_without_unit_id],
                       [["a", "b"], ["c"]])
     response.diagnostics.update(partial=False, truncated=False)

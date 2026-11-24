@@ -69,17 +69,19 @@ def test_source_scan_never_replaces_final_authority_check(setup, monkeypatch):
     import service.evidence_service as search
 
     fs, _, store, _ = setup
-    store.register([message("I visited Paris.")], CTX, batch_id="batch")
+    write_candidates(setup, [message("I visited Paris.")], categories={"fact"})
     install_batch(fs, monkeypatch)
-    score = search.lexical_scores
+    select_groups = search.select_groups
 
-    def revoke(query, units):
+    def revoke(*args, **kwargs):
+        selected = select_groups(*args, **kwargs)
+        assert selected[0]
         store.revoke_session(CTX)
-        return score(query, units)
+        return selected
 
-    monkeypatch.setattr(search, "lexical_scores", revoke)
-    result = EvidenceService(fs).search("Paris", CTX)
-    assert not result.evidence and result.diagnostics["partial"]
+    monkeypatch.setattr(search, "select_groups", revoke)
+    result = EvidenceService(fs).search("Paris", CTX, use_memories=True)
+    assert not result.evidence and not result.facts and result.diagnostics["partial"]
 
 
 def test_batch_owner_errors_are_rechecked_in_order_and_missing_sources_are_empty(setup, monkeypatch):
@@ -110,6 +112,16 @@ def test_record_verification_reads_current_source_once_per_reference(setup, monk
     assert read.call_count == len(record["source_refs"])
     store.revoke_session(CTX)
     assert not verify_record(record, store, CTX)
+
+
+@pytest.mark.parametrize("refs", [[], (), None, 1])
+def test_verify_record_rejects_invalid_reference_collections_before_lookup(refs):
+    from extraction.deterministic.verification import verify_record
+
+    record = extractor().extract([message()], CTX)[0].metadata["deterministic"]["fact_records"][0]
+    resolve = Mock()
+    assert not verify_record({**record, "source_refs": refs}, None, CTX, resolve=resolve)
+    resolve.assert_not_called()
 
 
 def test_expired_deadline_does_not_issue_a_prefetch_query(setup, monkeypatch):

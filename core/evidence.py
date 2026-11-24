@@ -88,6 +88,10 @@ def reference_unit_id(ref: object) -> str | None:
     return key if isinstance(key, str) and key else None
 
 
+def has_source_refs(refs: object) -> bool:
+    return isinstance(refs, (list, tuple)) and bool(refs)
+
+
 def reference_span(ref: dict, unit: dict, *, source_text: str | None = None) -> tuple[int, int] | None:
     """Return offsets within the unit for a quote aligned with its original text."""
     span, quote = ref.get("span"), ref.get("quote")

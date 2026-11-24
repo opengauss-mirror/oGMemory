@@ -375,12 +375,16 @@ class EvidenceStore:
         """Check only persisted source authority, never accept a card's quote as proof."""
         return self.reference_reader(ctx, owner_ctx=owner_ctx)(ref) is not None
 
-    def reference_reader(self, ctx, *, owner_ctx=None):
-        """One validation pass with one caller and owner. Start fresh after a lock boundary."""
+    def reference_reader(self, ctx, *, owner_ctx=None, scanned_sources=None):
+        """Resolve refs for one validation pass, using only validated scan snapshots when supplied."""
         @lru_cache(maxsize=8)
         def load(key):
-            source = (self.read_source(key, ctx) if owner_ctx is None
-                      else self.read_source(key, ctx, owner_ctx=owner_ctx))
+            if scanned_sources is not None:
+                source = scanned_sources.get(key)
+            elif owner_ctx is None:
+                source = self.read_source(key, ctx)
+            else:
+                source = self.read_source(key, ctx, owner_ctx=owner_ctx)
             check_deadline()
             units = {unit["evidence_unit_id"]: unit for unit in source["units"]} if source else {}
             return source, units
@@ -402,13 +406,6 @@ class EvidenceStore:
     def verify_refs(self, refs, ctx, *, owner_ctx=None):
         resolve = self.reference_reader(ctx, owner_ctx=owner_ctx)
         return all(resolve(ref) is not None for ref in refs)
-
-    @staticmethod
-    def ref_matches_source(ref, source):
-        unit_id = reference_unit_id(ref)
-        return source is not None and unit_id is not None and any(
-            unit["evidence_unit_id"] == unit_id
-            and EvidenceStore._ref_matches_unit(ref, source, unit) for unit in source["units"])
 
     @staticmethod
     def _ref_matches_unit(ref, source, unit):

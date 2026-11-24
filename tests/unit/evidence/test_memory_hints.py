@@ -115,12 +115,20 @@ def test_context_hint_rejects_tampered_record_and_revoked_or_other_user_sources(
     assert not service.search(query, CTX, use_memories=True).evidence
 
 
+_DELETE_FIELD = object()
+
+
 @pytest.mark.parametrize("field,value", [
     ("quote", None), ("subject", None), ("predicate", None), ("source_refs", 1), ("source_refs", [None]),
     ("nlp_model", {"name": []}), ("nlp_model", {"version": "1"}),
-    ("source_refs.0.span", None), ("source_refs.0.span", [0, 1.5]),
-    ("source_refs.0.span", [False, 1]), ("source_refs.0.quote", None),
-    ("source_refs.0.evidence_unit_id", None), ("source_refs.0.evidence_unit_id", []),
+    pytest.param("source_refs.0.span", _DELETE_FIELD, id="missing-span"),
+    pytest.param("source_refs.0.span", None, id="null-span"),
+    ("source_refs.0.span", [0, 1.5]), ("source_refs.0.span", [False, 1]),
+    pytest.param("source_refs.0.quote", _DELETE_FIELD, id="missing-ref-quote"),
+    pytest.param("source_refs.0.quote", None, id="null-ref-quote"),
+    pytest.param("source_refs.0.evidence_unit_id", _DELETE_FIELD, id="missing-unit-id"),
+    pytest.param("source_refs.0.evidence_unit_id", None, id="null-unit-id"),
+    ("source_refs.0.evidence_unit_id", []),
     ("source_refs.0.source_key", "invalid"), ("source_refs.0.content_hash", None),
 ])
 @pytest.mark.parametrize("query", ["What did Alex recommend?", "What did Morgan recommend?"])
@@ -144,7 +152,7 @@ def test_bad_fact_does_not_hide_verified_facts_or_raw_messages(setup, monkeypatc
             if field.startswith("source_refs.0."):
                 ref = record["source_refs"][0]
                 key = field.rsplit(".", 1)[1]
-                if value is None:
+                if value is _DELETE_FIELD:
                     del ref[key]
                 else:
                     ref[key] = value

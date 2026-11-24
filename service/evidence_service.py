@@ -7,7 +7,7 @@ import re
 import time
 
 from core.errors import NodeNotFoundError, OperationDeadlineExceededError
-from core.evidence import evidence_uri, reference_unit_id
+from core.evidence import evidence_uri
 from core.evidence_query import (
     EvidenceQuery,
     MessageEvidenceResult,
@@ -171,7 +171,9 @@ class EvidenceService:
             if (request.use_memories or request.use_events) and source_bytes <= _SCAN_BYTE_LIMIT:
                 from extraction.deterministic.verification import record_verifier
 
-                verify = record_verifier(self.store, ctx)
+                # Only admitted sources can back facts. Fresh authority is checked before returning.
+                resolve = self.store.reference_reader(ctx, scanned_sources=sources)
+                verify = record_verifier(self.store, ctx, resolve)
                 directories = (["facts", "entities", "profile", "preferences", "cases", "patterns"]
                                if request.use_memories else []) + (["events"] if request.use_events else [])
                 for directory in directories:
@@ -217,7 +219,7 @@ class EvidenceService:
                             for record in candidates:
                                 check_deadline()
                                 refs = record.get("source_refs") if isinstance(record, dict) else None
-                                if not refs or not isinstance(refs, (list, tuple)):
+                                if not source_refs_covered(refs, units):
                                     diagnostics["rejected_facts"] += 1
                                     continue
                                 fact_eligible = fact_is_relevant(query, record, topics)
@@ -228,8 +230,8 @@ class EvidenceService:
                                         and hint_attempts < request.candidate_limit
                                         and len(context_hints) < request.candidate_limit):
                                     for ref in refs:
-                                        key = reference_unit_id(ref)
-                                        if key not in units or key in scores or key in context_hints:
+                                        key = ref["evidence_unit_id"]
+                                        if key in scores or key in context_hints:
                                             continue
                                         unit = units[key]
                                         # Names and greetings alone cannot rescue an unrelated source.
@@ -238,10 +240,7 @@ class EvidenceService:
                                             hint_topics_by_unit[key] = context_terms & (set(terms(unit["text"])) - names)
                                         if hint_topics_by_unit[key] - set(terms(subject)):
                                             hints.add(key)
-                                if (
-                                    not (fact_eligible or hints)
-                                    or (is_event and not source_refs_covered(refs, units))
-                                ):
+                                if not (fact_eligible or hints):
                                     diagnostics["rejected_facts"] += 1
                                     continue
                                 if hints and not fact_eligible:

@@ -4,6 +4,7 @@ from bisect import bisect_right
 from functools import lru_cache, partial
 from types import SimpleNamespace
 
+from core.evidence import has_source_refs
 from core.evidence_timing import timed
 from extraction.deterministic.extractor import (
     RULE_VERSION,
@@ -30,11 +31,12 @@ def record_verifier(store, ctx, resolve=None):
 
 @timed("fact_verify")
 def verify_record(record, store, ctx, *, resolve=None, quoted=overlaps_quotation):
-    if record.get("rule_version") != RULE_VERSION or not record.get("source_refs"):
+    refs = record.get("source_refs") if isinstance(record, dict) else None
+    if not has_source_refs(refs) or record.get("rule_version") != RULE_VERSION:
         return False
     if resolve is None:
         resolve = store.reference_reader(ctx)
-    for ref in record["source_refs"]:
+    for ref in refs:
         resolved = resolve(ref)
         if resolved is None:
             return False
