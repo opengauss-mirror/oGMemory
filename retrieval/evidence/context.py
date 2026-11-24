@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 
-from core.evidence_query import MessageEvidenceResult, facts_supported_by
+from core.evidence_query import MessageEvidenceResult, facts_supported_by, source_refs_covered
 from retrieval.evidence.ranking import fact_matches, query_topics, terms
 
 
@@ -95,23 +95,27 @@ def _quote_spans(query, facts, topics, units):
     """
     quotes = {key: [] for key in units}
     for record in facts:
-        if not (topics & set(terms(record["quote"])) and fact_matches(query, record)):
+        quote = record.get("quote")
+        if not isinstance(quote, str) or not (topics & set(terms(quote)) and fact_matches(query, record)):
             continue
         refs = record.get("source_refs", [])
+        if not source_refs_covered(refs, units):
+            continue
         aligned = []
         for ref in refs:
-            unit = units.get(ref["evidence_unit_id"])
-            if unit is None:
+            key = ref["evidence_unit_id"]
+            unit = units[key]
+            span = ref.get("span")
+            if not isinstance(span, (list, tuple)) or len(span) != 2:
                 break
-            start, end = ref["span"]
+            start, end = span
             offset = unit["parent_span"][0]
-            if (not offset <= start < end <= unit["parent_span"][1]
-                    or unit["text"][start - offset:end - offset] != record["quote"]
-                    or ref["quote"] != record["quote"]
-                    or any(ref[name] != unit[name] for name in ("source_key", "content_hash", "session_id", "message_id"))
+            if (type(start) is not int or type(end) is not int or not offset <= start < end <= unit["parent_span"][1]
+                    or unit["text"][start - offset:end - offset] != quote or ref.get("quote") != quote
+                    or any(ref.get(name) != unit[name] for name in ("source_key", "content_hash", "session_id", "message_id"))
                     or any(record.get(name) != unit.get(name) for name in ("role", "speaker", "recorded_at"))):
                 break
-            aligned.append((ref["evidence_unit_id"], start - offset, end - offset))
+            aligned.append((key, start - offset, end - offset))
         else:
             for key, start, end in aligned:
                 quotes[key].append((start, end))
