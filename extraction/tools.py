@@ -349,6 +349,16 @@ def _sensitive_candidate_has_direct_user_support(
     return False
 
 
+def _has_selected_span_user_support(candidate: CandidateMemory, user_text: str) -> bool:
+    if candidate.category not in {"profile", "preference"}:
+        return True
+    return all(
+        (str(step.evidence_quote or "").strip() or step.category == "preference")
+        and _sensitive_candidate_has_direct_user_support(step, user_text, step.evidence_quote)
+        for step in incremental_source_steps(candidate)
+    )
+
+
 def _get_default_schema_registry() -> SchemaRegistry:
     global _DEFAULT_SCHEMA_REGISTRY, EXTRACTION_TOOLS, TOOL_TO_CATEGORY
     if _DEFAULT_SCHEMA_REGISTRY is None:
@@ -630,7 +640,7 @@ class Extractor:
         validate_prompt_manager(self._prompt_manager, self._extraction_template)
         self._prefetcher: MemoryPrefetcher | None = None
         if (fs and uri_resolver and self._schema_registry
-                and ((vector_index is not None and embedder is not None)
+                and (mode == "fast" or (vector_index is not None and embedder is not None)
                      or (mode == "lazy" and decision_client is not None))):
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
@@ -2646,21 +2656,10 @@ class Extractor:
         """Assign provenance ID to all candidates from a single span."""
         if not span:
             return
-        filter_sensitive = span.had_externalized_stub
-        if filter_sensitive:
+        if span.had_externalized_stub:
             retained = []
             for candidate in candidates:
-                if candidate.category not in {"profile", "preference"}:
-                    retained.append(candidate)
-                    continue
-                supported_by_user = all(
-                    (str(step.evidence_quote or "").strip() or step.category == "preference")
-                    and _sensitive_candidate_has_direct_user_support(
-                        step, span.safe_user_text, step.evidence_quote,
-                    )
-                    for step in incremental_source_steps(candidate)
-                )
-                if supported_by_user:
+                if _has_selected_span_user_support(candidate, span.safe_user_text):
                     retained.append(candidate)
                     continue
                 logger.warning(
@@ -2670,6 +2669,11 @@ class Extractor:
                     candidate.routing_key,
                 )
             candidates[:] = retained
+        self._bind_provenance(candidates, span, archive_id)
+
+    @staticmethod
+    def _bind_provenance(candidates: list[CandidateMemory], span: _Span, archive_id: str | None) -> None:
+        """Attach source IDs and assertions to validated candidates."""
         prov_id = None
         if archive_id and span.message_ids:
             from core.provenance_resolver import ProvenanceResolver
@@ -2689,10 +2693,11 @@ class Extractor:
                 if bound:
                     candidate.metadata[EVIDENCE_KEY] = merge_evidence(candidate.metadata.get(EVIDENCE_KEY), bound)
 
-    def _parse_candidate_calls(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
+    def _parse_candidate_calls(self, calls, prefetch_result, ctx, *, output_label="native tool calls",
+                               prior_contents=None):
         try:
             return self._parse_candidate_calls_checked(
-                calls, prefetch_result, ctx, output_label=output_label,
+                calls, prefetch_result, ctx, output_label=output_label, prior_contents=prior_contents,
             )
         except (ToolCallProtocolError, ValidationError, ValueError, TypeError) as exc:
             # LLM-output problems: keep the existing protocol / repair flow.
@@ -2702,8 +2707,10 @@ class Extractor:
             # output-repair paths — surface it immediately.
             raise _SpanProgrammingError(f"{type(exc).__name__}: {exc}") from exc
 
-    def _parse_candidate_calls_checked(self, calls, prefetch_result, ctx, *, output_label="native tool calls"):
+    def _parse_candidate_calls_checked(self, calls, prefetch_result, ctx, *, output_label="native tool calls",
+                                       prior_contents=None):
         from extraction.relation_proposals import attach, parse_proposal
+        prior_contents = prior_contents or {}
         contents = {}
         entries = []
         proposals = []
@@ -2720,7 +2727,7 @@ class Extractor:
                 parsed = parse_tool_call(
                     call["tool"], inputs, self._schema_registry,
                     read_nodes=prefetch_result.read_nodes if prefetch_result else None, ctx=ctx,
-                    current_content=contents.get(key),
+                    current_content=contents.get(key, prior_contents.get(key)),
                     **({"activation_enabled": True} if self._activation_enabled else {}),
                 )
                 candidate = parsed[2]

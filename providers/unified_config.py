@@ -777,7 +777,7 @@ class OgMemConfig:
     agent_shared_list: list[str] = field(default_factory=list)
 
     # -- Memory extraction -----------------------------------------------------
-    extraction_mode: str = "eager"  # "eager" (prefetch + single-shot) or "lazy" (ReAct loop)
+    extraction_mode: str = "eager"  # "eager", "lazy", or "fast"
     after_turn_threshold: int = 400
     agent_turn_workers: int = DEFAULT_AGENT_TURN_WORKERS
     agent_turn_scheduler_owner: bool = True

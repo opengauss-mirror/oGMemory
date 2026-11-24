@@ -16,7 +16,7 @@ from service.extraction_checkpoint import RecoveryNeedsConfirmationError
 
 def extraction_configuration(api):
     if api._extraction_engine == "llm":
-        return {"engine": "llm"}
+        return {"engine": "llm", "mode": api._extraction_mode}
     extractor = get_extractor(api, asdict(api._deterministic_config))
     return {"engine": "deterministic", "rule_version": RULE_VERSION,
             "options": asdict(api._deterministic_config),

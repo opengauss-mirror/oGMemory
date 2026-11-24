@@ -5,8 +5,10 @@ from unittest.mock import Mock
 import pytest
 
 from extraction.deterministic.nlp import DeterministicConfig
+from extraction.summary_generator import SessionSummaryGenerator
 from fs.agfs_adapter import AGFSContextFS
 from providers.unified_config import OgMemConfig
+from service.api import MemoryWriteAPI
 from service.evidence_store import EvidenceStore
 from tests.unit.evidence.test_sources import CTX
 from tests.unit.fs.test_agfs_context_fs import _AtomicMemoryAGFSClient
@@ -101,7 +103,8 @@ def test_llm_assistant_only_turn_keeps_archive_only_behavior():
 
 
 @pytest.mark.parametrize("role", ["user", "assistant"])
-def test_accepted_batch_recovers_after_engine_switch_without_nlp(monkeypatch, role):
+@pytest.mark.parametrize("mode", ["eager", "fast"])
+def test_accepted_batch_recovers_after_engine_switch_without_nlp(monkeypatch, role, mode):
     from service.extraction_checkpoint import EXTENSION_KEY
 
     client = _AtomicMemoryAGFSClient()
@@ -126,6 +129,11 @@ def test_accepted_batch_recovers_after_engine_switch_without_nlp(monkeypatch, ro
     assert service.after_turn(request)["status"] == "failed"
     assert failed
     restarted, writer, _ = setup_service(fs, CTX)
+    if mode == "fast":
+        writer = MemoryWriteAPI(fs, restarted.get_llm(), extraction_mode=mode, directory_summary_enabled=False)
+        writer._pipeline.extract = Mock()
+        restarted._write_api = writer
+        restarted._cfg.extraction_mode = mode
     restarted._get_context_fs = lambda: fs
     monkeypatch.setattr("extraction.deterministic.nlp.load_model", Mock(side_effect=AssertionError("NLP recovery")))
     monkeypatch.setattr("service.deterministic_ingest.get_extractor", Mock(side_effect=AssertionError("re-extraction")))
@@ -161,6 +169,33 @@ def test_accepted_llm_batch_keeps_old_engine_after_switch(monkeypatch):
     assert result["status"] == "completed", result
     writer._pipeline.extract.assert_not_called()
     assert EvidenceStore(fs).manifest(CTX)[0] is None
+
+
+def test_fast_restores_missing_summary_of_a_deterministic_batch():
+    client = _AtomicMemoryAGFSClient()
+    client.api_base = "http://test-agfs"
+    fs = AGFSContextFS(client, mount_prefix="/local")
+    service, api, _ = configured_service(fs)
+    api.write_raw_chunk = Mock(side_effect=RuntimeError("interrupted before summary creation"))
+    text = "I completed 7 essays."
+    request = params(CTX, content=text)
+    pending = service.after_turn(request)
+    assert pending["request_status"] == "RECOVERING"
+
+    restarted, _, _ = setup_service(fs, CTX)
+    restarted._cfg.extraction_mode = "fast"
+    restarted._get_context_fs = lambda: fs
+    api = MemoryWriteAPI(fs, restarted.get_llm(), extraction_mode="fast", directory_summary_enabled=False)
+    restarted._write_api = api
+    summary = SessionSummaryGenerator.build_candidate({"facts_and_details": text}, text, session_id=CTX.session_id)
+    restarted._generate_summary_candidate = Mock(return_value=summary)
+
+    result = restarted.after_turn(request)
+
+    assert result["request_status"] == "SUCCEEDED"
+    restarted._generate_summary_candidate.assert_called_once()
+    summaries = api._writer._identity_resolver.uris.get_directory_uri("session_summary", CTX)
+    assert [fs.read_node(uri, CTX).content for uri in fs.list_children(summaries, CTX)] == [text]
 
 
 @pytest.mark.parametrize("entry", ["compaction", "dispose"])

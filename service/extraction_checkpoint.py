@@ -120,6 +120,11 @@ class ExtractionBatchJournal:
         return frozen_extraction_config(self.batch).get("engine", "llm")
 
     @property
+    def fast_extraction(self):
+        config = frozen_extraction_config(self.batch)
+        return config.get("engine") == "llm" and config.get("mode") == "fast"
+
+    @property
     def batch(self):
         batch = self.buffer.runtime_extensions.get(EXTENSION_KEY, {}).get("batch")
         if (not isinstance(batch, dict) or batch.get("archive_id") != self._archive_id
@@ -446,9 +451,10 @@ class CandidateCheckpoint:
                   "candidate_digests": [operation_digest(candidate, self.journal.ctx) for candidate in accepted],
                   "extracted": extracted, "filtered": filtered, "operations": {},
                   "operation_id_version": 2, "relation_tracking": True}
+        if node_failures or partial_parent is not None:
+            record["node_failures"] = deepcopy(node_failures)
         if partial_parent is not None:
-            record.update(partial_parent=partial_parent, node_failures=deepcopy(node_failures),
-                          others_complete=others_complete)
+            record.update(partial_parent=partial_parent, others_complete=others_complete)
         self.journal.mutate(lambda value: value["slots"].update({self.slot: record}))
         return accepted
 

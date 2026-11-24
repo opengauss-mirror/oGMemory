@@ -535,9 +535,11 @@ class SessionManager:
         compression_quality_enabled: bool = False,
         compression_quality_persist_metadata: bool = False,
         session_state_bridge_enabled: bool = True,
+        fast_archive: bool = False,
     ):
         self._sessions: dict[str, SessionBuffer] = {}
         self._get_llm = get_llm
+        self._fast_archive = fast_archive
         self._get_write_api = get_write_api
         self._get_agfs = get_agfs
         self._get_archive_store = get_archive_store
@@ -1895,7 +1897,10 @@ class SessionManager:
             store = None
         return store.read_archive(session_id, archive_id, ctx) if store is not None else None
 
-    def _archive_compression_llm(self):
+    def _archive_compression_llm(self, checkpoint=None):
+        fast_archive = self._fast_archive if checkpoint is None else getattr(checkpoint, "fast_extraction", False)
+        if fast_archive:
+            return None
         try:
             return self._get_llm() if self._get_llm is not None else None
         except Exception as exc:
@@ -1932,7 +1937,7 @@ class SessionManager:
         if source_only_reason():
             yield None
             return
-        llm = self._archive_compression_llm()
+        llm = self._archive_compression_llm(checkpoint)
         messages = [{"role": m.role, "content": m.content, "id": m.id,
                      "created_at": m.created_at} for m in snapshot]
         archive_id = checkpoint.batch["archive_id"] if checkpoint is not None else archive_id
@@ -1968,7 +1973,7 @@ class SessionManager:
         if work is None and checkpoint is None:
             previous = self._get_latest_archive_context(session_id, ctx)
             return self._compress(messages, prev_overview=previous[0], prev_abstract=previous[1])
-        llm = work["llm"] if work is not None else self._archive_compression_llm()
+        llm = work["llm"] if work is not None else self._archive_compression_llm(checkpoint)
         archive_id = checkpoint.batch["archive_id"] if checkpoint is not None else archive_id
         inputs = self._archive_compression_inputs(messages, session_id, ctx, llm, archive_id)
         result = work["result"] if work is not None and work["inputs"] == inputs else None
@@ -1993,7 +1998,7 @@ class SessionManager:
         if guard is not None:
             guard.ensure_owned()
         try:
-            if self._get_llm is not None:
+            if self._get_llm is not None and not self._fast_archive:
                 llm = self._get_llm()
                 if llm is not None:
                     from session.compressor import SessionCompressor

@@ -42,7 +42,7 @@ class ArchiveBuilder:
     - Building relations
     """
 
-    def __init__(self, llm: LLM, schema_registry=None, *, card_format_enabled=False):
+    def __init__(self, llm: LLM, schema_registry=None, *, card_format_enabled=False, allow_model_merge=True):
         """Initialize ArchiveBuilder.
 
         Args:
@@ -52,6 +52,7 @@ class ArchiveBuilder:
         self._llm = llm
         self._schema_registry = schema_registry
         self._card_format_enabled = card_format_enabled
+        self._allow_model_merge = allow_model_merge
 
     @staticmethod
     def needs_model(candidate: CandidateMemory, plan: WritePlan) -> bool:
@@ -247,6 +248,8 @@ class ArchiveBuilder:
         incoming = {field: getattr(candidate, field) or "" for field in limits}
         if existing == incoming:
             return existing
+        if not self._allow_model_merge:
+            raise ValidationError("target_uri", "profile updates require a read-bound target in fast mode")
         payload = {
             "existing": existing,
             "incoming": incoming,
@@ -367,6 +370,9 @@ class ArchiveBuilder:
             new = merged_fields.get("content_append", candidate.content)
             if not existing:
                 return new
+            if not self._allow_model_merge and self._card_format_enabled and candidate.category in {"entity", "preference"}:
+                merged = self._deterministic_merge_card(existing, new)
+                return validate_text_length(merged, MAX_CONTENT_LEN, "content")
             # Use LLM merge to deduplicate and reconcile conflicts
             contract = None
             if self._schema_registry is not None:
@@ -375,9 +381,7 @@ class ArchiveBuilder:
                     contract = {"type": candidate.category, "description": schema.description,
                                 "content": next((field.description for field in schema.fields
                                                  if field.name == "content"), "")}
-            if contract:
-                return self._llm_merge_content(existing=existing, new=new, contract=contract, **options)
-            return self._llm_merge_content(existing=existing, new=new, **options)
+            return self._llm_merge_content(existing=existing, new=new, contract=contract, **options)
 
         # For replacement plans
         if "abstract" in merged_fields:
@@ -400,6 +404,10 @@ class ArchiveBuilder:
         Returns:
             Merged content with duplicates removed.
         """
+        if not self._allow_model_merge:
+            merged = self._deterministic_append_content(existing, new)
+            return validate_text_length(merged, MAX_CONTENT_LEN, "content")
+
         schema = {
             "type": "object",
             "properties": {"content": {"type": "string"}},
@@ -475,6 +483,32 @@ class ArchiveBuilder:
     def _merged_content_from_result(result: dict) -> str:
         content = result.get("content") if isinstance(result, dict) else None
         return content.strip() if isinstance(content, str) else ""
+
+    @staticmethod
+    def _deterministic_merge_card(existing: str, new: str) -> str:
+        title, _, old_body = existing.strip().partition("\n")
+        new_title, _, new_body = new.strip().partition("\n")
+        if not title.startswith("# ") or not new_title.startswith("# "):
+            return ArchiveBuilder._deterministic_append_content(existing, new)
+
+        intro = {}
+        sections = {"": ("", {})}
+        for body in (old_body, new_body):
+            facts = sections[""][1]
+            for chunk in re.split(r"(?m)(?=^## |^- )", body):
+                text = chunk.strip()
+                if not text:
+                    continue
+                key = re.sub(r"\s+", " ", text).casefold()
+                if text.startswith("## "):
+                    _, facts = sections.setdefault(key, (text, {}))
+                elif text.startswith("- "):
+                    facts.setdefault(key, text)
+                else:
+                    intro.setdefault(key, text)
+        blocks = ["\n".join(filter(None, (heading, *facts.values())))
+                  for heading, facts in sections.values() if facts]
+        return "\n\n".join(filter(None, (title, " ".join(intro.values()), *blocks)))
 
     @staticmethod
     def _deterministic_append_content(existing: str, new: str) -> str:
