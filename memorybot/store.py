@@ -1162,7 +1162,22 @@ class BotStore:
                 "task.updated",
                 {"state": "waiting_confirmation", "confirmation": error.get("details")},
             )
+            self.notify_memory_confirmation(tx, task)
             return cast(dict, tx.get("bot_task", {"task_id": task_id}))
+
+    def notify_memory_confirmation(self, tx: UnitOfWork, task: dict) -> None:
+        if task["kind"] == "memory_write" and task.get("parent_task_id"):
+            parent = tx.get("bot_task", {"task_id": task["parent_task_id"]})
+            self.append_event(
+                tx,
+                parent["task_id"],
+                "task.updated",
+                {
+                    "state": parent["state"],
+                    "confirmation": None,
+                    "memory_confirmation_task_id": task["task_id"],
+                },
+            )
 
     def set_memory_status(
         self, tx: UnitOfWork, task_id: str, status: str, operation_id: str | None = None

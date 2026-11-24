@@ -245,6 +245,7 @@ def public(kind: str, row: dict) -> dict:
         result["last_event_seq"] = row.get("next_event_seq", 1) - 1
         result["event_floor_seq"] = row.get("event_floor_seq", 1)
         result["confirmation"] = row.get("confirmation")
+        result["pending_memory_confirmations"] = row.get("pending_memory_confirmations", [])
         result["steps"] = row.get("steps", [])
     elif kind == "schedule":
         result["delivery"] = row["task_input"].get("delivery", {})

@@ -6,6 +6,7 @@ import hashlib
 import re
 from datetime import UTC, datetime
 
+from memorybot.handbook import split_text
 from memorybot.models import BotError, jsonable, new_id
 
 
@@ -36,13 +37,10 @@ class ConversationResult:
             "file_ids": [],
         }
         if stream_result:
-            for offset in range(0, len(execution.partial["text"]), 8000):
+            for chunk in split_text(execution.partial["text"], 8192):
                 execution.event(
                     "answer.delta",
-                    {
-                        "attempt": execution.task["attempt"],
-                        "text": execution.partial["text"][offset : offset + 8000],
-                    },
+                    {"attempt": execution.task["attempt"], "text": chunk},
                 )
         return cited_ids
 

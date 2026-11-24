@@ -23,7 +23,9 @@ _DEFAULT_LOCAL_TIME = "09:00:00"
 
 
 def _events_finished(task: dict[str, Any], after: int) -> bool:
-    return task["state"] == "waiting_confirmation" or (
+    if task["state"] == "waiting_confirmation" or task.get("pending_memory_confirmations"):
+        return True
+    return (
         task["state"] in _TERMINAL
         and task.get("memory_status") not in {"pending", "stored"}
         and after >= task["last_event_seq"]
@@ -311,6 +313,7 @@ class BotClient:
         path = f"/tasks/{_id(task_id)}"
         retries = 0
         completed_event_seen = False
+        awaiting_reset = False
         while True:
             headers = {"Accept": "text/event-stream"}
             if after:
@@ -325,7 +328,12 @@ class BotClient:
                 ) as response:
                     if response.status_code == 410:
                         snapshot = self.request("GET", path)["data"]
-                        after = snapshot["last_event_seq"]
+                        awaiting_reset = snapshot["state"] not in _TERMINAL
+                        after = (
+                            snapshot["event_floor_seq"] - 1
+                            if awaiting_reset
+                            else snapshot["last_event_seq"]
+                        )
                         yield {"event": "snapshot", "data": snapshot}
                         if _events_finished(snapshot, after):
                             return
@@ -338,11 +346,27 @@ class BotClient:
                             continue
                         after = seq
                         retries = 0
-                        completed_event_seen |= event["event"] == "task.completed"
+                        kind = event["event"]
+                        completed_event_seen |= kind == "task.completed"
+                        if kind == "answer.reset":
+                            awaiting_reset = False
+                        if kind == "answer.delta" and awaiting_reset:
+                            continue
                         yield event
+                        if kind == "task.updated" and event["data"]["payload"].get(
+                            "memory_confirmation_task_id"
+                        ):
+                            snapshot = self.request("GET", path)["data"]
+                            if snapshot.get("pending_memory_confirmations"):
+                                yield {"event": "snapshot", "data": snapshot}
+                                return
                 snapshot = self.request("GET", path)["data"]
                 if _events_finished(snapshot, after):
-                    if not completed_event_seen or snapshot["state"] == "waiting_confirmation":
+                    if (
+                        not completed_event_seen
+                        or snapshot["state"] == "waiting_confirmation"
+                        or snapshot.get("pending_memory_confirmations")
+                    ):
                         yield {"event": "snapshot", "data": snapshot}
                     return
                 time.sleep(1)
