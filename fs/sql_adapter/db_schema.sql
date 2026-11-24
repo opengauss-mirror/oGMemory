@@ -414,6 +414,7 @@ END $$;
 -- No RLS — control-plane ops run server-side with full authority.
 -- Tenant isolation is enforced by application layer.
 
+-- BEGIN CONTROL PLANE
 CREATE TABLE IF NOT EXISTS cp_accounts (
     account_id   VARCHAR(128) PRIMARY KEY,
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -457,6 +458,7 @@ CREATE TABLE IF NOT EXISTS cp_audit_logs (
     details     JSONB        NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_cp_audit_account ON cp_audit_logs (account_id);
+-- END CONTROL PLANE
 
 -- Protected workspace-sync registry. Canonical local paths stay in the JSON
 -- state owned by the server control plane and never enter ContextFS/index

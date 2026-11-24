@@ -81,6 +81,10 @@ class SQLDocumentResourceStore:
                     PRIMARY KEY (account_id, resource_id, backend, dataset_id, document_id)
                 )
             """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_document_resource_provider_id "
+                "ON document_resource_bindings (account_id, backend, dataset_id, document_id)"
+            )
             self.catalog.ensure_schema(cur)
 
     @contextmanager
@@ -199,16 +203,19 @@ class SQLDocumentResourceStore:
         ref = DocumentRef(resource, backend, namespace, object_id)
         return DocumentBinding(ref, retired_object_id, deleted)
 
-    def list_active(self, account_id: str, backend: str, namespace: str) -> list[DocumentRef]:
+    def list_active(
+        self, account_id: str, backend: str, namespace: str, *, object_ids: list[str] | None = None
+    ) -> list[DocumentRef]:
         with self._transaction() as cur:
             cur.execute(
                 """
                 SELECT resource_id, filename, media_type, document_id
                 FROM document_resource_bindings
                 WHERE account_id = %s AND backend = %s AND dataset_id = %s AND NOT deleted
+                    AND (%s OR document_id = ANY(%s))
                 ORDER BY resource_id
                 """,
-                (account_id, backend, namespace),
+                (account_id, backend, namespace, object_ids is None, object_ids or []),
             )
             rows = cur.fetchall()
         return [

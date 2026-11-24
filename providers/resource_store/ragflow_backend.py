@@ -1,7 +1,7 @@
 """Translate the knowledge backend contract to native RAGFlow operations."""
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Literal
 
 from core.document_backend import (
@@ -99,6 +99,14 @@ class RagFlowDocumentBackend:
     def search(self, query: str, refs: Sequence[DocumentRef], *, limit: int) -> list[ResourceChunk]:
         try:
             return self._adapter.search(query, [self._native_ref(ref) for ref in refs], limit=limit)
+        except RagFlowError as exc:
+            raise DocumentBackendError("document search failed") from exc
+
+    def search_catalog(
+        self, query: str, resolve: Callable[[list[str]], dict[str, DocumentResource]], *, limit: int
+    ) -> list[ResourceChunk]:
+        try:
+            return self._adapter.search_dataset(query, self.namespace, resolve, limit=limit)
         except RagFlowError as exc:
             raise DocumentBackendError("document search failed") from exc
 

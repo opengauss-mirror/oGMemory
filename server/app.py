@@ -37,6 +37,8 @@ from memorybot.http import create_blueprint as create_memorybot_blueprint
 from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
+from server.document_resource_api import create_document_resource_blueprint
+from server.document_resource_runtime import create_document_resource_runtime
 from server.mcp_security import with_untrusted_data_notice
 from server.mcp_tools import (
     bound_tool_result_collection_response,
@@ -309,6 +311,11 @@ app.register_blueprint(
 )
 app.register_blueprint(
     create_scene_blueprint(_get_service, _build_authenticated_context, _error_response)
+)
+app.register_blueprint(
+    create_document_resource_blueprint(
+        lambda: create_document_resource_runtime(get_config()), _error_response
+    )
 )
 
 
