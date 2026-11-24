@@ -29,6 +29,7 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.operation_deadline import check_deadline
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
     RootBindingError,
@@ -1002,6 +1003,20 @@ class SQLContextFS(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
+    @contextmanager
+    def _node_read_cursor(self, ctx: RequestContext):
+        check_deadline()
+        conn = self._get_connection()
+        try:
+            check_deadline()
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                check_deadline()
+                yield cur
+        finally:
+            conn.rollback()  # Reset SET LOCAL for RLS
+            self._return_connection(conn)
+
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
         """Read a node from PostgreSQL.
 
@@ -1012,14 +1027,8 @@ class SQLContextFS(PoolAdapterMixin):
         """
         self._ensure_accessible(uri, ctx)
 
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                return self.read_node_with_cursor(cur, uri, ctx)
-        finally:
-            conn.rollback()  # Reset SET LOCAL for RLS
-            self._return_connection(conn)
+        with self._node_read_cursor(ctx) as cur:
+            return self.read_node_with_cursor(cur, uri, ctx)
 
     @classmethod
     def read_node_with_cursor(cls, cursor, uri: str, ctx: RequestContext) -> ContextNode:
@@ -1047,15 +1056,9 @@ class SQLContextFS(PoolAdapterMixin):
         if not allowed:
             return results
 
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                cur.execute(_READ_NODE_SQL + " AND uri = ANY(%s)", (ctx.account_id, allowed))
-                rows = {row[0]: row for row in cur.fetchall()}
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
+        with self._node_read_cursor(ctx) as cur:
+            cur.execute(_READ_NODE_SQL + " AND uri = ANY(%s)", (ctx.account_id, allowed))
+            rows = {row[0]: row for row in cur.fetchall()}
 
         for uri in allowed:
             try:
@@ -1561,43 +1564,37 @@ class SQLContextFS(PoolAdapterMixin):
         if owner_type in {"users", "agents"} and owner_id:
             owner_space = f"{owner_type[:-1]}:{owner_id}"
 
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT uri, context_type, category, level, owner_space,
-                           abstract, metadata, created_at, updated_at, version,
-                           COALESCE(content <> '', false) AS has_content
-                    FROM context_nodes
-                    WHERE SUBSTRING(uri FROM 1 FOR CHAR_LENGTH(%s)) = %s
-                      AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
-                      AND account_id = %s
-                      AND (%s IS NULL OR owner_space = %s)
-                      AND status = 'ACTIVE'
-                      AND (%s IS NULL OR uri > %s)
-                      AND POSITION('/' IN SUBSTRING(uri FROM %s)) = 0
-                    ORDER BY uri
-                    LIMIT %s
-                    """,
-                    (
-                        prefix,
-                        prefix,
-                        prefix,
-                        account_id,
-                        owner_space,
-                        owner_space,
-                        after_uri,
-                        after_uri,
-                        len(prefix) + 1,
-                        limit,
-                    ),
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
+        with self._node_read_cursor(ctx) as cur:
+            cur.execute(
+                """
+                SELECT uri, context_type, category, level, owner_space,
+                       abstract, metadata, created_at, updated_at, version,
+                       COALESCE(content <> '', false) AS has_content
+                FROM context_nodes
+                WHERE SUBSTRING(uri FROM 1 FOR CHAR_LENGTH(%s)) = %s
+                  AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
+                  AND account_id = %s
+                  AND (%s IS NULL OR owner_space = %s)
+                  AND status = 'ACTIVE'
+                  AND (%s IS NULL OR uri > %s)
+                  AND POSITION('/' IN SUBSTRING(uri FROM %s)) = 0
+                ORDER BY uri
+                LIMIT %s
+                """,
+                (
+                    prefix,
+                    prefix,
+                    prefix,
+                    account_id,
+                    owner_space,
+                    owner_space,
+                    after_uri,
+                    after_uri,
+                    len(prefix) + 1,
+                    limit,
+                ),
+            )
+            rows = cur.fetchall()
 
         summaries: list[ContextNode] = []
         for row in rows:

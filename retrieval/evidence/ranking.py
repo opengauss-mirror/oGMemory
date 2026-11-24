@@ -5,6 +5,8 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
+from core.operation_deadline import check_deadline
+
 _LEMMA = {}
 for _root in "visit attend complete finish join adopt move graduate play repair start recommend suggest enjoy hide like love own mention".split():
     for _form in (_root + "s", _root + "d" if _root.endswith("e") else _root + "ed",
@@ -63,11 +65,16 @@ def supplement_scores(query, units, texts, limit):
 
 def lexical_scores(query, units):
     qterms = set(terms(query))
-    docs = {key: Counter(terms(unit["text"])) for key, unit in units.items()}
+    docs = {}
+    for key, unit in units.items():
+        check_deadline()
+        docs[key] = Counter(terms(unit["text"]))
+    check_deadline()
     frequencies = Counter(word for doc in docs.values() for word in doc)
     average = sum(sum(doc.values()) for doc in docs.values()) / max(1, len(docs))
     scores = {}
     for key, doc in docs.items():
+        check_deadline()
         length = sum(doc.values())
         score = sum(math.log(1 + (len(docs) - frequencies[word] + .5) / (frequencies[word] + .5))
                     * doc[word] * 2.2 / (doc[word] + 1.2 * (.25 + .75 * length / max(1, average)))
@@ -203,6 +210,7 @@ def select_groups(query: ParsedEvidenceQuery, scores, units, top_k, candidate_li
     selected, covered, used_bytes, groups = [], set(), 0, []
     pronoun = re.compile(r"^(yes|no|it|that|this|they|he|she|there|and then)\b|^(是的|不是|它|他|她|那里|然后)", re.I)
     while pending and len(selected) < top_k:
+        check_deadline()
         def priority(key):
             text_terms = set(terms(units[key]["text"]))
             gain = len(query.covered_branch_indices(text_terms) - covered)
@@ -257,6 +265,7 @@ def select_groups(query: ParsedEvidenceQuery, scores, units, top_k, candidate_li
     # Optional explanations/continuations compete only for the remaining
     # capacity, after every independent seed has had its admission attempt.
     for seed_group in list(groups):
+        check_deadline()
         group = list(seed_group)
         while len(group) < 4 and len(selected) < top_k:
             previous = units[group[-1]]

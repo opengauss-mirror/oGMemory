@@ -20,8 +20,19 @@ def deadline_expired(deadline: float | None) -> bool:
     return deadline is not None and monotonic() >= deadline
 
 
+def current_deadline() -> float | None:
+    return _deadline.get()
+
+
+def _bounded_deadline(deadline):
+    inherited = current_deadline()
+    if inherited is None:
+        return deadline
+    return inherited if deadline is None else min(inherited, deadline)
+
+
 def remaining_seconds():
-    end = _deadline.get()
+    end = current_deadline()
     if end is None:
         return None
     remaining = end - monotonic()
@@ -30,8 +41,20 @@ def remaining_seconds():
     return remaining
 
 
-def check_deadline():
-    remaining_seconds()
+def check_deadline(deadline=None):
+    if deadline_expired(_bounded_deadline(deadline)):
+        raise OperationDeadlineExceededError("Operation deadline exceeded")
+
+
+@contextmanager
+def operation_deadline_at(deadline: float | None):
+    """Expose an absolute budget to nested work, including copied contexts."""
+    end = _bounded_deadline(deadline)
+    token = _deadline.set(end)
+    try:
+        yield end
+    finally:
+        _deadline.reset(token)
 
 
 @contextmanager
@@ -47,7 +70,7 @@ def write_outcome_confirmation():
 @contextmanager
 def operation_deadline(timeout_seconds=None):
     """Inherit the current deadline, optionally shortening it with a new budget."""
-    end = _deadline.get()
+    proposed = None
     if timeout_seconds is not None:
         try:
             valid = (type(timeout_seconds) in (int, float)
@@ -57,10 +80,6 @@ def operation_deadline(timeout_seconds=None):
         if not valid:
             raise ValueError("timeoutSeconds must be a positive finite number")
         proposed = monotonic() + timeout_seconds
-        end = proposed if end is None else min(end, proposed)
-    token = _deadline.set(end)
-    try:
+    with operation_deadline_at(proposed):
         check_deadline()
         yield
-    finally:
-        _deadline.reset(token)

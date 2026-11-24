@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.errors import AccessDeniedError, NodeNotFoundError
+from core.errors import AccessDeniedError, NodeNotFoundError, OperationDeadlineExceededError
 from core.evidence import digest, evidence_uri
 from service.evidence_service import EvidenceService
 from tests.unit.evidence.test_extractor import extractor
@@ -118,5 +118,6 @@ def test_expired_deadline_does_not_issue_a_prefetch_query(setup, monkeypatch):
     fs, _, store, _ = setup
     uri = evidence_uri(CTX, "sources", digest("source"))
     calls = install_batch(fs, monkeypatch)
-    assert list(store.node_pages([uri], CTX, read_limit=1, deadline=0)) == [[(uri, None)]]
+    with pytest.raises(OperationDeadlineExceededError):
+        list(store.node_pages([uri], CTX, read_limit=1, deadline=0))
     assert calls == []

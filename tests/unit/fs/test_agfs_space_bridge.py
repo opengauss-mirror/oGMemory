@@ -12,7 +12,9 @@ from unittest.mock import MagicMock
 import pytest
 from pyagfs.exceptions import AGFSClientError
 
+from core.errors import OperationDeadlineExceededError
 from core.models import ContextNode, RequestContext
+from core.operation_deadline import operation_deadline
 from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
 from fs.sql_adapter.sql_context_fs import SQLContextFS
 
@@ -129,6 +131,31 @@ def test_batch_reads_hydrate_agfs(bridge, monkeypatch):
     ctx = RequestContext("acme", "alice", "ops", "session", "trace")
     result = bridge.read_nodes([node.uri for node in nodes], ctx)
     assert [result[node.uri].content for node in nodes] == [node.content for node in nodes]
+
+
+def test_queued_hydration_inherits_deadline(bridge, monkeypatch):
+    import core.operation_deadline as deadline
+
+    uri = source_node().uri
+    metadata = bridge.store_shared(uri, "原始正文")
+    calls = []
+    now = 0
+    read = bridge._agfs._client.read
+
+    def cross_deadline(path):
+        nonlocal now
+        calls.append(path)
+        result = read(path)
+        now = 1
+        return result
+
+    monkeypatch.setattr(deadline, "monotonic", lambda: now)
+    monkeypatch.setattr(bridge._agfs._client, "read", cross_deadline)
+    with ThreadPoolExecutor(max_workers=1) as executor, monkeypatch.context() as patch:
+        patch.setattr(bridge, "_content_reads", executor)
+        with operation_deadline(1), pytest.raises(OperationDeadlineExceededError):
+            bridge.load_content([{"uri": uri, "metadata": metadata} for _ in range(3)])
+    assert calls == [metadata["agfs_content"]["path"]]
 
 
 def test_shared_skill_hydration_and_purge(bridge):

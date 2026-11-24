@@ -10,6 +10,7 @@ from core.models import CandidateMemory
 from core.operation_deadline import operation_deadline
 from core.provenance_resolver import ProvenanceResolver
 from service.evidence_service import EvidenceService
+from tests.unit.evidence.test_batch_reads import install_batch
 from tests.unit.evidence.test_sources import CTX, message
 from tests.unit.evidence.test_writer import write_candidates
 
@@ -247,7 +248,7 @@ def test_final_source_read_cannot_start_manifest_read_after_deadline(
 
     monkeypatch.setattr(search, "select_groups", track_final_reads)
     if not inherited_budget:
-        monkeypatch.setattr(search, "remaining_seconds", lambda: deadline_clock.budget)
+        monkeypatch.setattr(search, "_SEARCH_TIMEOUT_SECONDS", deadline_clock.budget)
     with operation_deadline(deadline_clock.budget if inherited_budget else None):
         result = EvidenceService(fs).search("Paris", CTX)
 
@@ -278,6 +279,117 @@ def test_time_channel_deadline_marks_partial_without_lexical_hits(setup, monkeyp
     assert not result.evidence
     assert result.diagnostics["auxiliary"]["reason"] == "deadline"
     assert result.diagnostics["partial"]
+
+
+@pytest.mark.parametrize("phase", ["serial_scan", "fact_verification"])
+@pytest.mark.parametrize("inherited_budget", [False, True])
+def test_source_read_deadline_stops_manifest_in_all_search_phases(
+    setup, monkeypatch, deadline_clock, phase, inherited_budget,
+):
+    import service.evidence_service as search
+
+    fs, _, _, _ = setup
+    write_candidates(setup, [message("I visited Paris.")])
+    read_node = fs.read_node
+    reads = []
+
+    def expire_on_single_source(uri, ctx):
+        reads.append(uri.split("/")[-2])
+        node = read_node(uri, ctx)
+        if reads[-1] == "sources":
+            deadline_clock.now += deadline_clock.budget
+        return node
+
+    if phase == "serial_scan":
+        monkeypatch.setattr(type(fs), "read_nodes", None)
+    else:
+        install_batch(fs, monkeypatch)
+    monkeypatch.setattr(fs, "read_node", expire_on_single_source)
+    if not inherited_budget:
+        monkeypatch.setattr(search, "_SEARCH_TIMEOUT_SECONDS", deadline_clock.budget)
+    with operation_deadline(deadline_clock.budget if inherited_budget else None):
+        result = EvidenceService(fs).search("Paris", CTX, use_memories=phase == "fact_verification")
+
+    assert reads == ["sources"]
+    assert result.diagnostics["partial"] and not result.evidence and not result.facts
+
+
+def test_agfs_batch_does_not_refill_workers_after_evidence_expiry(setup, monkeypatch, deadline_clock):
+    from core.evidence import evidence_uri
+
+    fs, _, store, _ = setup
+    sources = store.register([message("I visited Paris.", id=str(i), sequence=i) for i in range(8)],
+                             CTX, batch_id="batch-deadline")
+    first_page = sorted(evidence_uri(CTX, "sources", source["source_key"]) for source in sources)
+    read_node = fs.read_node
+    reads = []
+
+    def expire_after_first(uri, ctx):
+        reads.append(uri)
+        node = read_node(uri, ctx)
+        if uri == first_page[0]:
+            deadline_clock.now += deadline_clock.budget
+        return node
+
+    monkeypatch.setattr(fs, "read_node", expire_after_first)
+    with operation_deadline(deadline_clock.budget):
+        result = EvidenceService(fs).search("Paris", CTX)
+    assert first_page[0] in reads and set(reads) <= set(first_page[:4])
+    assert result.diagnostics["partial"] and not result.evidence
+
+
+def test_expired_query_does_not_start_card_listing_or_group_selection(setup, monkeypatch, deadline_clock):
+    import service.evidence_service as search
+
+    fs, _, store, _ = setup
+    store.register([message("I visited Paris.")], CTX, batch_id="deadline")
+    lexical_scores = search.lexical_scores
+
+    def expire_after_lexical(*args):
+        scores = lexical_scores(*args)
+        deadline_clock.now += deadline_clock.budget
+        return scores
+
+    def unexpected_work(*args, **kwargs):
+        pytest.fail("Started new work after the evidence deadline")
+
+    pager = type(fs).list_node_summaries_page
+
+    def list_page(self, uri, ctx, **kwargs):
+        if "/memories/" in uri:
+            unexpected_work()
+        return pager(self, uri, ctx, **kwargs)
+
+    monkeypatch.setattr(search, "lexical_scores", expire_after_lexical)
+    monkeypatch.setattr(type(fs), "list_node_summaries_page", list_page)
+    monkeypatch.setattr(search, "select_groups", unexpected_work)
+    with operation_deadline(deadline_clock.budget):
+        result = EvidenceService(fs).search("Paris", CTX, use_memories=True)
+    assert result.diagnostics["partial"] and not result.evidence
+
+
+@pytest.mark.parametrize("source_count", [1, 3])
+def test_time_channel_stops_on_expiry_and_reports_partial_when_empty(
+    setup, monkeypatch, deadline_clock, source_count,
+):
+    import retrieval.evidence.auxiliary as auxiliary
+
+    fs, _, store, _ = setup
+    store.register([message("I visited Paris.", id=str(i), sequence=i, recorded_at="2026-06-01T12:00:00Z")
+                    for i in range(source_count)], CTX, batch_id="time-miss")
+    resolve = auxiliary.resolve_event_time
+    calls = []
+
+    def expire_after_first(*args):
+        calls.append(args[0])
+        deadline_clock.now += deadline_clock.budget
+        return resolve(*args)
+
+    monkeypatch.setattr(auxiliary, "resolve_event_time", expire_after_first)
+    with operation_deadline(deadline_clock.budget):
+        result = EvidenceService(fs).search("2026-05-01", CTX, use_time=True)
+    assert len(calls) == 1
+    assert result.diagnostics["partial"] and not result.evidence
 
 
 def test_reported_groups_only_reference_final_evidence_within_response_budget(setup):

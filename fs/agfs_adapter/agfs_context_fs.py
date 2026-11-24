@@ -30,6 +30,7 @@ from urllib.parse import unquote
 
 from pyagfs import AGFSClient
 from pyagfs.exceptions import AGFSClientError
+from requests.exceptions import Timeout as RequestsTimeout
 
 from core.enums import EventType, NodeStatus
 from core.errors import (
@@ -37,10 +38,11 @@ from core.errors import (
     ConcurrentModificationError,
     NodeBrokenError,
     NodeNotFoundError,
+    OperationDeadlineExceededError,
 )
 from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
-from core.operation_deadline import check_deadline
+from core.operation_deadline import check_deadline, current_deadline, deadline_expired
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
     RootBindingError,
@@ -103,6 +105,12 @@ class _ResourceMutationLease:
 def _is_not_found_error(exc: AGFSClientError) -> bool:
     message = str(exc).lower()
     return any(marker in message for marker in ("no such file", "no such directory", "not found"))
+
+
+def _raise_bounded_read_timeout(exc: AGFSClientError) -> None:
+    # pyagfs wraps Requests exceptions in AGFSClientError.
+    if current_deadline() is not None and isinstance(exc.__cause__ or exc.__context__, RequestsTimeout):
+        raise OperationDeadlineExceededError("AGFS read timed out") from exc
 
 
 # URI patterns for different memory types
@@ -2659,20 +2667,32 @@ class AGFSContextFS:
         while True:
             check_deadline()
             marker = self._read_update_marker(marker_path)
+            check_deadline()
             expected = marker.get("expected_version") if marker is not None else None
             if (marker is None or type(expected) is int
                     and self._read_node_version(node_path) > expected):
+                check_deadline()
                 node, metadata = read()
                 observed_version = node.metadata.get("version", 0)
+                check_deadline()
                 if (self._read_update_marker(marker_path) == marker
-                        and self._read_file(node_path + self.FILE_META) == metadata):
+                        and self._read_snapshot_file(node_path + self.FILE_META) == metadata):
                     return node
+            check_deadline()
             if time.monotonic() >= deadline:
                 raise ConcurrentModificationError(uri, observed_version, self._read_node_version(node_path))
             time.sleep(_RESOURCE_MUTATION_LOCK_POLL_SECONDS)
 
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
-        return self._read_node_snapshot(uri, ctx, lambda: self._read_node_once(uri, ctx))
+        try:
+            return self._read_node_snapshot(uri, ctx, lambda: self._read_node_once(uri, ctx))
+        except AGFSClientError as exc:
+            _raise_bounded_read_timeout(exc)
+            raise
+
+    def _read_snapshot_file(self, path: str) -> str:
+        check_deadline()
+        return self._read_file(path)
 
     def read_nodes(
         self, uris: list[str], ctx: RequestContext,
@@ -2682,6 +2702,7 @@ class AGFSContextFS:
 
         def read(uri):
             try:
+                check_deadline()
                 return self.read_node(uri, ctx)
             except Exception as exc:
                 return exc
@@ -2689,13 +2710,17 @@ class AGFSContextFS:
         uris = list(dict.fromkeys(uris))
         if len(uris) <= 1 or active_session_guard() is not None:
             return {uri: read(uri) for uri in uris}
+        check_deadline()
         pending = deque((uri, _NODE_READS.submit(copy_context().run, read, uri)) for uri in uris[:4])
         results = {}
         for uri in uris[4:]:
             completed_uri, future = pending.popleft()
             results[completed_uri] = future.result()
+            if deadline_expired(current_deadline()):
+                break
             pending.append((uri, _NODE_READS.submit(copy_context().run, read, uri)))
         results.update((uri, future.result()) for uri, future in pending)
+        check_deadline()
         return results
 
     def _read_node_once(self, uri: str, ctx: RequestContext) -> tuple[ContextNode, str]:
@@ -2723,7 +2748,7 @@ class AGFSContextFS:
 
         # Read and parse .meta.json
         try:
-            meta_content = self._read_file(meta_path)
+            meta_content = self._read_snapshot_file(meta_path)
         except NodeNotFoundError:
             raise NodeNotFoundError(uri)
 
@@ -2746,17 +2771,17 @@ class AGFSContextFS:
             content = meta.get("package_skill_md")
             abstract = meta.get("package_description")
             if content is None:
-                content = self._read_file(content_path)
+                content = self._read_snapshot_file(content_path)
             if abstract is None:
-                abstract = self._read_file(abstract_path)
+                abstract = self._read_snapshot_file(abstract_path)
         else:
-            content = self._read_file(content_path)
-            abstract = self._read_file(abstract_path)
-        overview = self._read_file(overview_path)
+            content = self._read_snapshot_file(content_path)
+            abstract = self._read_snapshot_file(abstract_path)
+        overview = self._read_snapshot_file(overview_path)
 
         # Read relations
         try:
-            relations_content = self._read_file(relations_path)
+            relations_content = self._read_snapshot_file(relations_path)
             relations_data = json.loads(relations_content) if relations_content else []
             relations = [self._dict_to_relation_edge(r) for r in relations_data]
         except (NodeNotFoundError, json.JSONDecodeError):
@@ -3010,12 +3035,16 @@ class AGFSContextFS:
 
         try:
             parent_path = self._uri_to_agfs_path(uri)
+            check_deadline()
             files = self._client.ls(parent_path)
-        except AGFSClientError:
+        except AGFSClientError as exc:
+            _raise_bounded_read_timeout(exc)
             return []
 
+        check_deadline()
         summaries: list[ContextNode] = []
         for file_info in sorted(files, key=lambda item: str(item.get("name", ""))):
+            check_deadline()
             if len(summaries) >= limit:
                 break
             if not file_info.get("isDir", False):
@@ -3032,7 +3061,7 @@ class AGFSContextFS:
                 ):
                     continue
                 node_path = self._uri_to_agfs_path(child_uri)
-                meta = json.loads(self._read_file(node_path + self.FILE_META))
+                meta = json.loads(self._read_snapshot_file(node_path + self.FILE_META))
                 status = meta.get("status")
                 if status == NodeStatus.BROKEN.value:
                     if skip_broken:
@@ -3046,9 +3075,12 @@ class AGFSContextFS:
                     else None
                 )
                 if abstract is None:
-                    abstract = self._read_file(node_path + self.FILE_ABSTRACT)
+                    abstract = self._read_snapshot_file(node_path + self.FILE_ABSTRACT)
             except NodeNotFoundError:
                 continue
+            except AGFSClientError as exc:
+                _raise_bounded_read_timeout(exc)
+                raise
             metadata = self._context_metadata(meta, has_content=True)
             summaries.append(
                 ContextNode(

@@ -16,8 +16,10 @@ from core.errors import (
     ConcurrentModificationError,
     NodeBrokenError,
     NodeNotFoundError,
+    OperationDeadlineExceededError,
 )
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.operation_deadline import operation_deadline
 from core.resource_identity import RootBindingError, compute_workspace_root_id
 from fs.sql_adapter.sql_context_fs import _resource_mutation_lock_key, parse_uri
 
@@ -614,6 +616,35 @@ class TestSQLContextFSAccess:
 
 
 class TestSQLContextFSReadNode:
+    @pytest.mark.parametrize("entry", ["single", "batch", "page"])
+    def test_deadline_during_tenant_binding_skips_select_and_returns_connection(self, mock_sql_fs, monkeypatch, entry):
+        import core.operation_deadline as deadline
+
+        fs, conn, cursor = mock_sql_fs
+        ctx = _ctx()
+        uri = _profile_node().uri
+        read = {
+            "single": lambda: fs.read_node(uri, ctx),
+            "batch": lambda: fs.read_nodes([uri], ctx),
+            "page": lambda: fs.list_node_summaries_page(uri.rsplit("/", 1)[0], ctx),
+        }[entry]
+        now = 0
+
+        def expire_after_binding(*args):
+            nonlocal now
+            now = 1
+
+        monkeypatch.setattr(deadline, "monotonic", lambda: now)
+        cursor.execute.side_effect = expire_after_binding
+        returned = MagicMock()
+        monkeypatch.setattr(fs, "_return_connection", returned)
+
+        with operation_deadline(1), pytest.raises(OperationDeadlineExceededError):
+            read()
+        cursor.execute.assert_called_once_with("SET LOCAL app.account_id = %s", (ctx.account_id,))
+        conn.rollback.assert_called_once()
+        returned.assert_called_once_with(conn)
+
     def test_read_existing_node(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs
         ctx = _ctx()

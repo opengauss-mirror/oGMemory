@@ -110,6 +110,31 @@ async def test_http_and_mcp_only_expose_empty_evidence_when_partial(service, mon
         assert render_evidence_context(payload).text == ""
 
 
+@pytest.mark.asyncio
+async def test_agfs_directory_timeout_is_partial_in_http_and_mcp(service, setup, monkeypatch):
+    from pyagfs import AGFSClient
+    from requests.exceptions import Timeout
+
+    from core.evidence import evidence_uri
+
+    fs = setup[0]
+    directory = evidence_uri(CTX, "sources")
+    path = fs._uri_to_agfs_path(directory)
+    client = AGFSClient(api_base_url="http://localhost:1833")
+    client.session = Mock()
+    client.session.get.side_effect = Timeout("directory read")
+    original_ls = fs._client.ls
+    monkeypatch.setattr(fs._client, "ls", lambda name: client.ls(name) if name == path else original_ls(name))
+
+    assert fs.list_node_summaries_page(directory, CTX, limit=1) == []
+    http, mcp = await _public_query_payloads(service, monkeypatch, QUERY)
+    assert client.session.get.call_count == 3
+    assert http["hits"] == mcp["hits"] and http["hits"][0]["type"] == "entity"
+    assert http["message_evidence"] == mcp["message_evidence"] == {
+        "evidence": [], "facts": [], "groups": [], "partial": True, "truncated": False,
+    }
+
+
 def test_public_query_rendering_keeps_independent_groups_when_budget_is_tight(service, setup):
     setup[2].register([message("I visited Rome.", id="rome", sequence=12)], CTX, batch_id="rome")
     payload = query_memory(service, query="Where did I visit Paris and Rome?", request_context=CTX)

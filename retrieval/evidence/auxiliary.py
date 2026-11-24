@@ -34,6 +34,8 @@ def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
         if request.use_time:
             now = datetime.now(UTC)
             for key, unit in units.items():
+                if deadline_expired(deadline):
+                    break
                 source = sources[unit["source_key"]]
                 event_time, _ = resolve_event_time(unit["text"], source["recorded_at"], source.get("timezone"))
                 value = event_time or unit["recorded_at"]
@@ -46,6 +48,8 @@ def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
                     if recorded.tzinfo:
                         days = max(0, (now - recorded.astimezone(UTC)).total_seconds() / 86400)
                         auxiliary[key] = math.exp(-days / 30)
+            if deadline_expired(deadline):
+                return scores, {"route": route, "rho": 1.0, "reason": "deadline"}, True
             auxiliary = dict(sorted(auxiliary.items(), key=lambda item: (-item[1], item[0]))[:5])
             rho = .7
     if not auxiliary:

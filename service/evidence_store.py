@@ -15,13 +15,12 @@ from itertools import islice
 from core.errors import (
     AccessDeniedError,
     NodeNotFoundError,
-    OperationDeadlineExceededError,
     ValidationError,
 )
 from core.evidence import content_hash, digest, evidence_uri, message_source, reassemble_messages
 from core.evidence_timing import stage, timed
 from core.models import ContextNode, RequestContext
-from core.operation_deadline import check_deadline, deadline_expired
+from core.operation_deadline import check_deadline
 
 
 def snapshot_messages(snapshot, ctx, fs):
@@ -98,6 +97,7 @@ class EvidenceStore:
             cursor = getattr(fs, "list_node_order_key", lambda uri: uri)(after_uri) if after_uri else None
             count = 0
             while count < limit:
+                check_deadline()
                 with stage("list"):
                     page = pager(fs, directory, ctx, limit=min(100, limit - count), after_uri=cursor)
                 if not page:
@@ -107,6 +107,7 @@ class EvidenceStore:
                     count += 1
                 cursor = getattr(fs, "list_node_order_key", lambda uri: uri)(page[-1].uri)
         else:
+            check_deadline()
             yield from [uri for uri in sorted(fs.list_children(directory, ctx))
                         if after_uri is None or uri > after_uri][:limit]
 
@@ -116,12 +117,11 @@ class EvidenceStore:
         iterator = iter(uris)
         remaining = read_limit
         while remaining > 0:
+            check_deadline(deadline)
             page = list(islice(iterator, min(32, remaining) if callable(reader) else 1))
             if not page:
                 return
-            if deadline_expired(deadline):
-                yield [(page[0], None)]  # Caller observes its deadline before resolving.
-                return
+            check_deadline(deadline)
             with stage("node_batch_read"):
                 if callable(reader):
                     nodes = reader(self.fs, page, ctx)
@@ -130,16 +130,21 @@ class EvidenceStore:
                         nodes = {page[0]: self.fs.read_node(page[0], ctx)}
                     except Exception as exc:
                         nodes = {page[0]: exc}
+            check_deadline(deadline)
+            for uri in page:
+                if isinstance(nodes[uri], TimeoutError):
+                    raise nodes[uri]
             yield [(uri, nodes[uri]) for uri in page]
             remaining -= len(page)
         # Let the caller observe its existing limit sentinel without reading it.
+        check_deadline(deadline)
         for uri in islice(iterator, 1):
             yield [(uri, None)]
 
     def iter_sources(self, uris, ctx, *, read_limit, deadline=None):
         if not callable(getattr(type(self.fs), "read_nodes", None)):
             for uri in uris:
-                yield uri, lambda uri=uri: self.read_source(uri.rsplit("/", 1)[1], ctx)
+                yield uri, lambda uri=uri: self.read_source(uri.rsplit("/", 1)[1], ctx, deadline=deadline)
             return
         for page in self.node_pages(uris, ctx, read_limit=read_limit, deadline=deadline):
             values, sessions = {}, {}
@@ -319,17 +324,13 @@ class EvidenceStore:
 
     @timed("source_validate")
     def read_source(self, key: str, ctx: RequestContext, *, owner_ctx=None, deadline=None) -> dict | None:
-        def check_read_budget():
-            if deadline_expired(deadline):
-                raise OperationDeadlineExceededError("Evidence source read deadline exceeded")
-
         # The owner locates evidence; only the original caller authorizes reads.
         source_ctx = owner_ctx or ctx
-        check_read_budget()
+        check_deadline(deadline)
         value, version = self._read(evidence_uri(source_ctx, "sources", key), ctx, owner_ctx=owner_ctx)
 
         def manifest_for(source_ctx, *, session_id):
-            check_read_budget()
+            check_deadline(deadline)
             return self.manifest(ctx, session_id=session_id, owner_ctx=source_ctx)
 
         return self._validate_source(key, value, version, source_ctx, manifest_for)
