@@ -385,7 +385,9 @@ class Dreaming:
             return sources[source_id]
 
         read_evidence = read_source if self._read_source is not None else None
-        review_only = not self._allow_merge or event.payload.get("review_only") or event.payload.get("restore")
+        merge_duplicate = getattr(self._fs, "merge_dreaming_duplicate", None)
+        review_only = (not self._allow_merge or not callable(merge_duplicate)
+                       or event.payload.get("review_only") or event.payload.get("restore"))
         candidates = []
         if (not review_only and node.category in {"entity", "preference", "pattern", "event", "case"}
                 and not _has_temporal_bounds(node)):
@@ -405,11 +407,11 @@ class Dreaming:
         if pair is not None and not pair[1].metadata.get("pinned"):
             canonical, source, layers = pair
             if self._enqueue_after_projection:
-                merged = self._fs.merge_dreaming_duplicate(
+                merged = merge_duplicate(
                     canonical, source, ctx, event=event, outbox=self._outbox, layers=layers,
                 )
             else:
-                merged = self._fs.merge_dreaming_duplicate(canonical, source, ctx)
+                merged = merge_duplicate(canonical, source, ctx)
         if not merged:
             now = datetime.now(UTC)
             assessment = review(

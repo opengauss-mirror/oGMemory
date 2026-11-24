@@ -31,6 +31,7 @@ from urllib.parse import unquote
 from pyagfs import AGFSClient
 from pyagfs.exceptions import AGFSClientError
 
+from core.dreaming_evidence import node_created_at
 from core.enums import EventType, NodeStatus
 from core.errors import (
     AccessDeniedError,
@@ -49,7 +50,7 @@ from core.resource_identity import (
     validate_resource_uri_slug,
 )
 from fs.access_control import check_uri_access
-from fs.agfs_adapter.client import enable_registration_fence, publish_workspace_file
+from fs.agfs_adapter.client import enable_registration_fence, publish_staged_file
 
 logger = logging.getLogger(__name__)
 
@@ -584,7 +585,8 @@ class AGFSContextFS:
         "session_state_layout",
     }
 
-    def __init__(self, client: AGFSClient, mount_prefix: str = "/local", *, on_node_change=None):
+    def __init__(self, client: AGFSClient, mount_prefix: str = "/local", *,
+                 on_node_change=None, dreaming_enabled=False):
         """Initialize AGFS context filesystem adapter.
 
         Args:
@@ -596,6 +598,7 @@ class AGFSContextFS:
         enable_registration_fence(client)
         self._mount_prefix = mount_prefix.rstrip("/")
         self._on_node_change = on_node_change
+        self.dreaming_enabled = dreaming_enabled
         self._ensure_mount_prefix()
 
     def recovery_account_ids(self):
@@ -614,6 +617,22 @@ class AGFSContextFS:
         """Resolve a unique archive ID within its account and owner scope."""
         if not (ctx.user_id or ctx.agent_id):
             return None
+        owners = {"owner_user_id": ctx.user_id}
+        if ctx.agent_id:
+            owners["owner_agent_id"] = ctx.agent_id
+        return self._locate_archive_uri(archive_id, ctx, owners)
+
+    def find_dreaming_archive_uri(
+        self, archive_id: str, ctx: RequestContext, *, owner_kind: str | None = None,
+    ) -> str | None:
+        if owner_kind is None:
+            owner_kind = "agent" if ctx.user_id in {"", "outbox-worker"} else "user"
+        owner_id = {"user": ctx.user_id, "agent": ctx.agent_id}[owner_kind]
+        if not owner_id or owner_id == "outbox-worker":
+            return None
+        return self._locate_archive_uri(archive_id, ctx, {f"owner_{owner_kind}_id": owner_id})
+
+    def _locate_archive_uri(self, archive_id: str, ctx: RequestContext, owners: dict[str, str]) -> str | None:
         for part in (ctx.account_id, archive_id):
             if not part or part in {".", ".."} or "/" in part or "\\" in part:
                 raise ValueError("invalid archive identity")
@@ -635,9 +654,9 @@ class AGFSContextFS:
                 meta = json.loads(self._read_file(self._uri_to_agfs_path(uri) + self.FILE_META))
             except NodeNotFoundError:
                 continue
-            if (meta.get("status") == "ACTIVE"
-                    and meta.get("owner_user_id", "") == ctx.user_id
-                    and (not ctx.agent_id or meta.get("owner_agent_id", "") == ctx.agent_id)):
+            if meta.get("status") == "ACTIVE" and all(
+                meta.get(key, "") == owner_id for key, owner_id in owners.items()
+            ):
                 matches.append(uri)
                 if len(matches) > 1:
                     return None
@@ -934,7 +953,7 @@ class AGFSContextFS:
         try:
             self._ensure_workspace_binding_mutex_owned(lock_path, owner_token)
             try:
-                publish_workspace_file(self._client, temporary_path, state_path, payload.encode("utf-8"))
+                publish_staged_file(self._client, temporary_path, state_path, payload.encode("utf-8"))
             except Exception:
                 try:
                     persisted = self._read_code_workspace_binding_state_from_path(
@@ -2174,6 +2193,7 @@ class AGFSContextFS:
             node,
             expected_version,
             created_at=existing_meta.get("created_at"),
+            storage_created_at=node_created_at(existing_meta) if self.dreaming_enabled else "",
         )
         encoded = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
         meta_path = node_path + self.FILE_META
@@ -2293,6 +2313,8 @@ class AGFSContextFS:
         final_node_path: str,
         node: ContextNode,
         expected_version: int,
+        *,
+        update_metadata: Callable[[dict], None] | None = None,
     ) -> None:
         """Publish a version-checked replacement through an atomic metadata swap."""
 
@@ -2344,25 +2366,43 @@ class AGFSContextFS:
             )
             lease_thread.start()
 
-            actual_version = self._read_node_version(final_node_path)
-            if actual_version != expected_version:
+            expected_created_at = (node_created_at(node.metadata) if update_metadata is not None
+                                   else node.metadata.get("_expected_created_at"))
+            metadata = None
+            if update_metadata is not None or expected_created_at:
+                try:
+                    metadata = json.loads(self._read_file(final_node_path + self.FILE_META))
+                except NodeNotFoundError:
+                    metadata = {}
+            actual_version = (metadata.get("version", 0) if metadata is not None
+                              else self._read_node_version(final_node_path))
+            if (actual_version != expected_version
+                    or (expected_created_at and node_created_at(metadata) != expected_created_at)):
                 raise ConcurrentModificationError(
                     node.uri, expected_version, actual_version
                 )
 
-            self._write_node_files(
-                final_node_path,
-                node,
-                expected_version,
-                meta_path=temporary_meta_path,
-            )
+            if update_metadata is None:
+                if metadata is not None and metadata.get("status") != NodeStatus.ACTIVE.value:
+                    raise ConcurrentModificationError(node.uri, expected_version, actual_version)
+                self._write_node_files(
+                    final_node_path,
+                    node,
+                    expected_version,
+                    meta_path=temporary_meta_path,
+                )
+            else:
+                if metadata.get("status") != NodeStatus.ACTIVE.value:
+                    raise NodeNotFoundError(node.uri)
+                update_metadata(metadata)
+                self._write_file(temporary_meta_path, json.dumps(metadata, ensure_ascii=False))
             if lease_lost.is_set() or not self._owns_update_lock(lock_path, token):
                 raise ConcurrentModificationError(
                     node.uri,
                     expected_version,
                     self._read_node_version(final_node_path),
                 )
-            self._client.mv(temporary_meta_path, final_node_path + self.FILE_META)
+            publish_staged_file(self._client, temporary_meta_path, final_node_path + self.FILE_META)
         finally:
             lease_stop.set()
             if lease_thread is not None:
@@ -2393,8 +2433,9 @@ class AGFSContextFS:
             "owner_token": owner_token,
             "lease_updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._write_file(temporary_path, json.dumps(lease))
-        self._client.mv(temporary_path, lease_path)
+        payload = json.dumps(lease).encode("utf-8")
+        self._client.write(temporary_path, payload)
+        publish_staged_file(self._client, temporary_path, lease_path, payload)
 
     def _renew_update_lease(
         self,
@@ -2556,11 +2597,13 @@ class AGFSContextFS:
         layout = self._session_state_layout(node, relations_json)
         reuse_static = False
         stored_meta = {}
-        if _SESSION_STATE_PATTERN.fullmatch(node.uri):
+        is_session_state = _SESSION_STATE_PATTERN.fullmatch(node.uri)
+        if is_session_state or (self.dreaming_enabled and expected_version != 0):
             try:
                 stored_meta = json.loads(self._read_file(node_path + self.FILE_META))
             except (NodeNotFoundError, json.JSONDecodeError):
                 stored_meta = {}
+        if is_session_state:
             reuse_static = (layout is not None and mutation_lease is not None
                             and isinstance(stored_meta, dict)
                             and stored_meta.get("status") == NodeStatus.ACTIVE.value
@@ -2583,7 +2626,10 @@ class AGFSContextFS:
 
         # Step ④: Write status=ACTIVE metadata. Versioned updates pass a
         # temporary path and publish it with one atomic file rename.
-        meta = self._build_node_metadata(node, expected_version)
+        storage_created_at = (
+            node_created_at(stored_meta) if self.dreaming_enabled and isinstance(stored_meta, dict) else ""
+        )
+        meta = self._build_node_metadata(node, expected_version, storage_created_at=storage_created_at)
         if layout is not None:
             meta["session_state_layout"] = layout
         meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
@@ -2612,6 +2658,7 @@ class AGFSContextFS:
         *,
         created_at: object = None,
         version: object = None,
+        storage_created_at: str = "",
     ) -> dict:
         """Build the committed metadata document for a node write."""
 
@@ -2637,6 +2684,8 @@ class AGFSContextFS:
             "updated_at": now,
             "version": new_version,
         }
+        if self.dreaming_enabled:
+            meta["_storage_created_at"] = storage_created_at or now
 
         # Add any additional metadata (excluding internal _relations)
         extra_meta = {
@@ -2887,13 +2936,17 @@ class AGFSContextFS:
         except (ValueError, NodeNotFoundError, json.JSONDecodeError):
             return False
 
-    def archived_node_version(self, uri: str, ctx: RequestContext) -> int | None:
+    def archived_node_version(self, uri: str, ctx: RequestContext, *, created_at: str | None = None) -> int | None:
         self._ensure_accessible(uri, ctx)
         try:
             meta = json.loads(self._read_file(self._uri_to_agfs_path(uri) + self.FILE_META))
         except (NodeNotFoundError, json.JSONDecodeError):
             return None
-        return meta.get("version") if meta.get("status") == NodeStatus.ARCHIVED.value else None
+        if meta.get("status") == NodeStatus.ARCHIVED.value and (
+            created_at is None or node_created_at(meta) == created_at
+        ):
+            return meta.get("version")
+        return None
 
     def list_children(self, uri: str, ctx: RequestContext) -> list[str]:
         """List child URIs under a given URI.
@@ -3076,12 +3129,60 @@ class AGFSContextFS:
             uri, ctx, limit=limit, after_uri=after_uri, skip_broken=True,
         )
 
+    def dreaming_candidates(self, node: ContextNode, ctx: RequestContext, limit: int = 8) -> list[ContextNode]:
+        from fs.agfs_adapter.dreaming import candidates
+
+        return candidates(self, node, ctx, limit)
+
+    def dreaming_duplicates(self, node: ContextNode, ctx: RequestContext) -> list[ContextNode]:
+        return [peer for peer in self.dreaming_candidates(node, ctx) if peer.content == node.content]
+
+    def record_dreaming_review(self, node: ContextNode, ctx: RequestContext, review: dict) -> None:
+        self._ensure_accessible(node.uri, ctx)
+        version = node.metadata["version"]
+        previous = node.metadata.get("dreaming_review")
+
+        def update(metadata):
+            if metadata.get("dreaming_review") != previous:
+                raise ConcurrentModificationError(node.uri, version, metadata["version"])
+            metadata["dreaming_review"] = review
+
+        self._replace_node(
+            self._uri_to_agfs_path(node.uri), node, version, update_metadata=update,
+        )
+
+    def apply_dreaming_correction(self, current, prior, ctx, prior_review) -> bool:
+        from fs.agfs_adapter.dreaming import apply_correction
+
+        return apply_correction(self, current, prior, ctx, prior_review)
+
+    def demote_dreaming_node(self, node: ContextNode, ctx: RequestContext, archive_event_id: str) -> None:
+        from fs.agfs_adapter.dreaming import demote
+
+        demote(self, node, ctx, archive_event_id)
+
+    def iter_dreaming_nodes(self, account_id: str) -> Iterator[tuple[ContextNode, RequestContext]]:
+        from fs.agfs_adapter.dreaming import scan_nodes
+
+        return scan_nodes(self, account_id)
+
     def archive_node(self, uri: str, ctx: RequestContext) -> None:
         """Archive a node from AGFS by marking its metadata status ARCHIVED."""
         self._ensure_accessible(uri, ctx)
 
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
+        now = datetime.now(UTC).isoformat()
+        if self.dreaming_enabled:
+            node = self.read_node(uri, ctx)
+            version = node.metadata["version"]
+            self._replace_node(
+                node_path, node, version,
+                update_metadata=lambda metadata: metadata.update(
+                    status=NodeStatus.ARCHIVED.value, archived_at=now, updated_at=now, version=version + 1,
+                ),
+            )
+            return
 
         try:
             meta = json.loads(self._read_file(meta_path))
@@ -3091,7 +3192,6 @@ class AGFSContextFS:
         if meta.get("status") != NodeStatus.ACTIVE.value:
             raise NodeNotFoundError(uri)
 
-        now = datetime.now(UTC).isoformat()
         meta["status"] = NodeStatus.ARCHIVED.value
         meta["archived_at"] = now
         meta["updated_at"] = now

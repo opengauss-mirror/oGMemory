@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from urllib.parse import unquote
 
 from commit.outbox_scope import is_capturing_outbox_events, record_persisted_event
+from core.dreaming_evidence import node_created_at
 from core.enums import ContextType, EventType, NodeStatus
 from core.errors import (
     AccessDeniedError,
@@ -305,11 +306,13 @@ class SQLContextFS(PoolAdapterMixin):
         pool_size: int = 5,
         pool: SharedConnectionPool | None = None,
         dialect: str = "postgresql",
+        dreaming_enabled: bool = False,
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
                 "psycopg2 is required for SQLContextFS. Install with: pip install psycopg2-binary"
             )
+        self.dreaming_enabled = dreaming_enabled
         self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
@@ -823,7 +826,7 @@ class SQLContextFS(PoolAdapterMixin):
             Json(relations_json),
             Json(extra_meta),
             1 if create_only else new_version,
-            extra_meta.get("created_at", now),
+            now if getattr(self, "dreaming_enabled", False) else extra_meta.get("created_at", now),
         )
         written = self.sql_dialect.write_context_node(cur, values, create_only=create_only)
         if not written:
@@ -846,6 +849,72 @@ class SQLContextFS(PoolAdapterMixin):
             result = json.loads(cur.fetchone()[0] or "{}")
             if result.get("uri") == node.uri:
                 references.extend((node.uri, event_id) for event_id in result["event_ids"])
+
+    def _enqueue_dreaming(self, cur, node, account_id):
+        if getattr(self, "dreaming_enabled", False) is not True:
+            return
+        from commit.dreaming import eligible, maintenance_event
+
+        if eligible(node):
+            cur.execute("SELECT version, created_at FROM context_nodes WHERE account_id=%s AND uri=%s",
+                        (account_id, node.uri))
+            version, created_at = cur.fetchone()
+            event = maintenance_event(node.uri, version, created_at=created_at.astimezone(UTC).isoformat())
+            cur.execute("SELECT 1 FROM outbox_events WHERE event_id=%s", (event.event_id,))
+            if cur.fetchone() is None:
+                self._insert_dreaming_outbox(cur, event, account_id)
+
+    def _insert_dreaming_outbox(self, cur, event, account_id):
+        cur.execute(
+            "INSERT INTO outbox_events "
+            "(event_id,event_type,uri,account_id,payload,status,retry_count) "
+            "VALUES (%s,%s,%s,%s,%s,%s,0)",
+            (event.event_id, event.event_type, event.uri, account_id, Json(event.payload), event.status),
+        )
+        self.sql_dialect.notify_outbox(
+            cur, "ogmem_outbox", json.dumps({
+                "event_id": event.event_id, "account_id": account_id, "event_type": event.event_type,
+            }),
+        )
+
+    def dreaming_duplicates(self, node, ctx):
+        self._ensure_accessible(node.uri, ctx)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    _READ_NODE_SQL + " AND owner_space=%s AND category=%s AND status='ACTIVE' "
+                    "AND uri<>%s AND content=%s ORDER BY created_at, uri LIMIT 32",
+                    (ctx.account_id, node.owner_space, node.category, node.uri, node.content),
+                )
+                return [self._decode_node(row[0], row) for row in cur.fetchall()
+                        if row[0].rsplit("/", 1)[0] == node.uri.rsplit("/", 1)[0]]
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def record_dreaming_review(self, node, ctx, review):
+        self._ensure_accessible(node.uri, ctx)
+        version = node.metadata["version"]
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE context_nodes SET metadata=metadata || %s WHERE account_id=%s AND uri=%s "
+                    "AND status='ACTIVE' AND version=%s AND created_at=%s "
+                    "AND COALESCE(metadata->'dreaming_review', 'null'::jsonb) = %s::jsonb",
+                    (Json({"dreaming_review": review}),
+                     ctx.account_id, node.uri, version, node_created_at(node.metadata),
+                     Json(node.metadata.get("dreaming_review"))),
+                )
+                if cur.rowcount != 1:
+                    raise ConcurrentModificationError(node.uri, version, version)
+            conn.commit()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
 
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None:
         """Write a node — atomic upsert with optimistic locking.
@@ -893,6 +962,7 @@ class SQLContextFS(PoolAdapterMixin):
                     new_version,
                     now,
                 )
+                self._enqueue_dreaming(cur, node, account_id)
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
@@ -990,6 +1060,7 @@ class SQLContextFS(PoolAdapterMixin):
                         ensure_ascii=False,
                     ),
                 )
+                self._enqueue_dreaming(cur, node, account_id)
             conn.commit()
             for uri, event_id in references:
                 record_persisted_event(uri, event_id)
@@ -1111,6 +1182,7 @@ class SQLContextFS(PoolAdapterMixin):
         # Parse metadata
         meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
         meta.setdefault("created_at", str(created_at) if created_at else "")
+        meta["_storage_created_at"] = str(created_at) if created_at else ""
         meta.setdefault("updated_at", str(updated_at) if updated_at else "")
         meta.setdefault("version", version)
         meta["_relations"] = relations
@@ -1185,6 +1257,7 @@ class SQLContextFS(PoolAdapterMixin):
 
         meta = dict(metadata_raw or {})
         meta.setdefault("created_at", str(created_at) if created_at else "")
+        meta["_storage_created_at"] = str(created_at) if created_at else ""
         meta.setdefault("updated_at", str(updated_at) if updated_at else "")
         meta.setdefault("version", version)
         meta["has_content"] = bool(has_content)
@@ -1219,17 +1292,18 @@ class SQLContextFS(PoolAdapterMixin):
             conn.rollback()  # Reset SET LOCAL for RLS
             self._return_connection(conn)
 
-    def archived_node_version(self, uri: str, ctx: RequestContext) -> int | None:
+    def archived_node_version(self, uri: str, ctx: RequestContext, *, created_at: str | None = None) -> int | None:
         self._ensure_accessible(uri, ctx)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT version FROM context_nodes "
-                    "WHERE uri = %s AND account_id = %s AND status = 'ARCHIVED'",
-                    (uri, ctx.account_id),
-                )
+                query = "SELECT version FROM context_nodes WHERE uri = %s AND account_id = %s AND status = 'ARCHIVED'"
+                params = (uri, ctx.account_id)
+                if created_at is not None:
+                    query += " AND created_at = %s"
+                    params += (created_at,)
+                cur.execute(query, params)
                 row = cur.fetchone()
                 return row[0] if row else None
         finally:
@@ -1619,6 +1693,7 @@ class SQLContextFS(PoolAdapterMixin):
                 continue
             metadata = dict(metadata_raw or {})
             metadata.setdefault("created_at", str(created_at) if created_at else "")
+            metadata["_storage_created_at"] = str(created_at) if created_at else ""
             metadata.setdefault("updated_at", str(updated_at) if updated_at else "")
             metadata.setdefault("version", version)
             metadata["has_content"] = bool(has_content)

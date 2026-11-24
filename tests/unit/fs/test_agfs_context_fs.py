@@ -5,23 +5,25 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import replace
+from hashlib import sha256
 from threading import Barrier, Event, RLock
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from pyagfs.exceptions import AGFSClientError
 
 from commit.identity_resolver import MemoryIdentityResolver
 from commit.outbox_store import OutboxStore
-from core.enums import NodeStatus
+from core.enums import EventType, NodeStatus
 from core.errors import (
     AccessDeniedError,
     ConcurrentModificationError,
     NodeBrokenError,
     NodeNotFoundError,
 )
-from core.models import CandidateMemory, ContextNode, RequestContext, Role
+from core.models import CandidateMemory, ContextNode, OutboxEvent, RequestContext, Role
+from core.provenance_resolver import ProvenanceResolver
 from core.resource_identity import CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID, RootBindingError
 from core.uri_resolver import URIResolver
 from core.validation import validate_candidate
@@ -337,6 +339,157 @@ def _atomic_code_context() -> RequestContext:
         session_id="session",
         trace_id="trace",
     )
+
+
+@pytest.mark.parametrize("enqueue_after_projection", [False, True])
+def test_dreaming_reviews_duplicates_in_maintenance_only_storage(enqueue_after_projection, monkeypatch):
+    from commit.dreaming import Dreaming, maintenance_event
+    from core.dreaming_evidence import node_created_at
+
+    client = _AtomicMemoryAGFSClient()
+    client.api_base = "memory://dreaming-review-without-merge"
+    fs, ctx = AGFSContextFS(client, dreaming_enabled=True), _atomic_code_context()
+    monkeypatch.setattr(AGFSContextFS, "merge_dreaming_duplicate", None, raising=False)
+    outbox = OutboxStore(client, fs)
+    uri = "ctx://acme/users/alice/memories/patterns/first"
+    node = ContextNode(uri, "MEMORY", "pattern", 0, "user:alice", "Fact", "Fact", "Fact",
+                       {"_expected_version": 0, "routing_key": "same"})
+    fs.write_node(node, ctx)
+    fs.write_node(replace(node, uri=uri + "-peer"), ctx)
+    current = fs.read_node(uri, ctx)
+    event = maintenance_event(uri, current.metadata["version"], created_at=node_created_at(current.metadata))
+    outbox.register_once(event, ctx)
+    with outbox.claim_processing_event(event, uri, "worker") as acquired:
+        assert acquired
+        Dreaming(fs, outbox=outbox, enqueue_after_projection=enqueue_after_projection).process(event, ctx)
+
+    assert fs.read_node(uri, ctx).metadata["dreaming_review"]["version"] == 1
+    assert fs.read_node(uri + "-peer", ctx).content == node.content
+
+
+def test_dreaming_ordinary_archive_keeps_the_recreated_node_active():
+    client = _AtomicMemoryAGFSClient()
+    client.api_base = "memory://dreaming-ordinary-archive"
+    fs, ctx = AGFSContextFS(client, dreaming_enabled=True), _atomic_code_context()
+    uri = "ctx://acme/users/alice/memories/patterns/current"
+    original = ContextNode(uri, "MEMORY", "pattern", 0, "user:alice", "Fact", "Fact", "Fact",
+                           {"_expected_version": 0, "created_at": "2020-01-01T00:00:00Z"})
+    fs.write_node(original, ctx)
+    replace_node = fs._replace_node
+
+    def recreate():
+        fs.delete_node(uri, ctx)
+        fs.write_node(replace(original, content="A different current fact"), ctx)
+
+    def replace_after_recreation(*args, **kwargs):
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(recreate).result(timeout=3)
+        return replace_node(*args, **kwargs)
+
+    with patch.object(fs, "_replace_node", side_effect=replace_after_recreation):
+        try:
+            fs.archive_node(uri, ctx)
+        except ConcurrentModificationError:
+            pass
+    rebuilt = fs.read_node(uri, ctx)
+    assert (rebuilt.content, rebuilt.metadata["version"]) == ("A different current fact", 1)
+
+
+@pytest.mark.parametrize("category, target, owner", [
+    ("event", "pattern", "user:alice"), ("case", "experience", "agent:agent"),
+])
+def test_dreaming_promotes_and_demotes_corroborated_observations(category, target, owner):
+    from commit.dreaming import maintenance_event
+    from commit.dreaming_promotion import promotion_is_supported, reconcile_promotion, resume_promotion
+    from core.dreaming_evidence import node_created_at
+    from index.index_record_builder import build_index_records
+    from index.outbox_worker import OutboxWorker
+    from tests.unit.index.test_outbox_worker import MockVectorIndex
+
+    client = _AtomicMemoryAGFSClient()
+    client.api_base = "memory://dreaming-promotion"
+    fs = AGFSContextFS(client, dreaming_enabled=True)
+    outbox = OutboxStore(client=client, fs=fs, mount_prefix="/local")
+    ctx = _atomic_code_context()
+    if category == "case":
+        ctx = replace(ctx, user_id="outbox-worker")
+    pattern_body = "Alice cycles to the monthly meeting."
+    scope, owner_id = owner.split(":")
+    parent = f"ctx://acme/{scope}s/{owner_id}/memories"
+    for index in (1, 2):
+        source = f"source-{index}"
+        message_id = f"message-{index}"
+        reference = ProvenanceResolver.build_id("archive", source, [message_id])
+        raw_uri = f"ctx://acme/sessions/session/history/{source}"
+        fs.write_node(ContextNode(
+            raw_uri, "RESOURCE", "history", 0, "session:session",
+            pattern_body, pattern_body, json.dumps([{"id": message_id, "role": "user", "content": pattern_body}]),
+            {"owner_user_id": "alice", "owner_agent_id": "agent", "_expected_version": 0},
+        ), ctx)
+        uri = f"{parent}/{category}s/meeting-{index}"
+        fs.write_node(ContextNode(
+            uri, "MEMORY", category, 0, owner, pattern_body, pattern_body, pattern_body,
+            {"_expected_version": 0, "when": f"2026-0{index}-01", "provenance_ids": [reference]},
+        ), ctx)
+        node = fs.read_node(uri, ctx)
+        fs.record_dreaming_review(node, ctx, {
+            "version": node.metadata["version"],
+            "facts": {"cycle": {
+                "abstract": pattern_body, "content": pattern_body,
+                "evidence": [{
+                    "source_ref": reference, "quote": pattern_body, "supports": True, "message_id": message_id,
+                    "occurrence_id": message_id, "source_revision": sha256(pattern_body.encode()).hexdigest(), "weight": 4,
+                }],
+            }},
+        })
+
+    current = fs.read_node(uri, ctx)
+    reconcile_promotion(fs, outbox, current, ctx)
+    reconcile_promotion(fs, outbox, current, ctx)
+    [pattern_uri] = fs.list_children(f"{parent}/{target}s", ctx)
+    pattern = fs.read_node(pattern_uri, ctx)
+    assert pattern.category == target
+    assert pattern.content == pattern_body
+    assert promotion_is_supported(fs, pattern, ctx)
+    assert [parent["source_uri"] for parent in pattern.metadata["dreaming_promotion"]["parents"]] == [
+        "ctx://acme/sessions/session/history/source-1", raw_uri,
+    ]
+    assert pattern.metadata["version"] == 1
+
+    fs.archive_node(raw_uri, ctx)
+    event = maintenance_event(pattern_uri, pattern.metadata["version"], created_at=node_created_at(pattern.metadata))
+    outbox.register_once(event, ctx)
+    with outbox.claim_processing_event(event, pattern_uri, "worker") as acquired:
+        assert acquired
+        reconcile_promotion(fs, outbox, pattern, ctx, event=event)
+        resume_promotion(fs, outbox, event, ctx)
+    metadata = fs.read_node_metadata_including_inactive(pattern_uri, ctx)
+    assert metadata["status"] == NodeStatus.ARCHIVED.value
+    assert outbox.get_event_status(pattern_uri, metadata["dreaming_demotion"]) == "PENDING"
+    [(_, archive)] = outbox.list_pending_events([(pattern_uri, metadata["dreaming_demotion"])])
+    fs.delete_node(pattern_uri, ctx)
+    fs.write_node(replace(pattern, content="A different observation", metadata={"_expected_version": 0}), ctx)
+    index = MockVectorIndex()
+    index.upsert(build_index_records(fs.read_node(pattern_uri, ctx)))
+
+    assert OutboxWorker(index, None, fs=fs).process_event(archive, ctx).success
+    assert "A different observation" in {record.text for record in index.records.values()}
+
+
+def test_dreaming_scan_streams_user_and_agent_nodes_with_their_owner_contexts():
+    fs = AGFSContextFS(_AtomicMemoryAGFSClient(), dreaming_enabled=True)
+    ctx = _atomic_code_context()
+    memories = [
+        ("ctx://acme/users/alice/memories/preferences/release", "preference", "user:alice"),
+        ("ctx://acme/agents/agent/memories/experience/release", "experience", "agent:agent"),
+    ]
+    for uri, category, owner in memories:
+        fs.write_node(ContextNode(uri, "MEMORY", category, 4, owner, "Fact", "Fact", "Fact"), ctx)
+
+    scanned = {node.uri: node_ctx for node, node_ctx in fs.iter_dreaming_nodes("acme")}
+    assert set(scanned) == {item[0] for item in memories}
+    assert scanned[memories[0][0]].user_id == "alice"
+    assert scanned[memories[1][0]].agent_id == "agent"
 
 
 def _atomic_code_node(

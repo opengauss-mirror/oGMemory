@@ -284,12 +284,12 @@ class ControlPlaneStore:
                 Path(staged).unlink(missing_ok=True)
             return
 
-        from fs.agfs_adapter.client import publish_workspace_file
+        from fs.agfs_adapter.client import publish_staged_file
 
         staged = f"{path}.{uuid.uuid4().hex}.tmp"
         try:
             self._client.write(staged, payload)
-            publish_workspace_file(self._client, staged, path, payload)
+            publish_staged_file(self._client, staged, path, payload)
         except Exception:
             try:
                 self._client.rm(staged)
