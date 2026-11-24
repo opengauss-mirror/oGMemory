@@ -22,7 +22,7 @@ from run_qwenpaw_plugin_locomo import QwenPawHost  # noqa: E402
 
 
 @pytest.mark.usefixtures("service_threading")
-def test_conversation_workers_use_registered_admin_account(monkeypatch, tmp_path):
+def test_conversation_workers_use_registered_member_keys(monkeypatch, tmp_path):
     from importlib import import_module
 
     from core.models import RequestContext
@@ -41,6 +41,7 @@ def test_conversation_workers_use_registered_admin_account(monkeypatch, tmp_path
     monkeypatch.setenv("OGMEM_EVAL_KEY", "fixture-admin-key")
     headers = {"X-API-Key": "fixture-admin-key", "X-Account-ID": "eval-account", "X-User-ID": "admin"}
     client = module.app.test_client()
+    member_keys = {}
     for index in (1, 2):
         user, agent = f"reader-s{index:02d}", f"helper-s{index:02d}"
         for kind, body in (("users", {"user_id": user, "role": "user"}),
@@ -49,6 +50,8 @@ def test_conversation_workers_use_registered_admin_account(monkeypatch, tmp_path
             response = client.post(path, json=body, headers=headers)
             print("POST", path, body, "HTTP", response.status_code)
             assert response.status_code == 200
+            if kind == "users":
+                member_keys[user] = response.get_json()["user_key"]
 
     dataset = tmp_path / "dataset.json"
     dataset.write_text(json.dumps([
@@ -76,9 +79,10 @@ def test_conversation_workers_use_registered_admin_account(monkeypatch, tmp_path
                     "clientRequestId": key, "wait": True,
                     "messages": [{"role": "user", "content": text}]}
             request_headers = memory_headers(self.args)
+            request_headers["X-API-Key"] = member_keys[self.args.user_id]
             response = module.app.test_client().post("/api/v1/after_turn", json=body, headers=request_headers)
             requests.append(body)
-            print("POST /api/v1/after_turn", request_headers, body,
+            print("POST /api/v1/after_turn", body,
                   "HTTP", response.status_code, response.get_json())
             assert response.status_code == 200
             assert response.get_json()["request_status"] == "SUCCEEDED"

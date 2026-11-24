@@ -307,6 +307,7 @@ def test_custom_http_timeouts_preserve_tighter_components(clock, monkeypatch):
 def test_extraction_expiry_does_not_accept_or_write_candidates(clock):
     from service.api import MemoryWriteAPI
     api = object.__new__(MemoryWriteAPI)
+    api._fast_extraction = False
     api._node_processing_enabled = False
     api._fs = object()
     api._pipeline = Mock()
@@ -330,6 +331,7 @@ def test_completed_write_receipt_preserved_and_next_write_not_started(clock):
     from core.models import WritePlan
     from service.api import MemoryWriteAPI
     api = object.__new__(MemoryWriteAPI)
+    api._fast_writer = None
     api._writer = Mock()
     api._writer.prewrite_skip.return_value = None
     checkpoint = Mock()

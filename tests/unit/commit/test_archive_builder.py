@@ -17,6 +17,23 @@ from core.enums import ContextType
 from providers.llm.mock_llm import MockLLM
 
 
+@pytest.mark.parametrize(("category", "section"), [("entity", "## Home\n"), ("preference", "")])
+def test_fast_append_preserves_card_title_and_groups_facts(category, section):
+    ctx = RequestContext("acct", "user", "agent", "session", "trace")
+    builder = ArchiveBuilder(MockLLM(), card_format_enabled=True, allow_model_merge=False)
+    old = "# Nathan\n" + section + "- Lives in Denver."
+    new = "# Nate\n" + section + "- Lives in Denver.\n- Makes bread."
+    candidate = CandidateMemory(category, "user", "nate", "Nate makes bread.",
+                                "- Makes bread.", new, .96)
+    plan = WritePlan(
+        action="merge", target_uri="ctx://acct/users/user/memories/facts/nate",
+        merged_fields={"existing_content": old, "content_append": new},
+    )
+    assert builder.build(candidate, plan, ctx).content == (
+        "# Nathan\n\n" + section + "- Lives in Denver.\n- Makes bread."
+    )
+
+
 class TestArchiveBuilderInit:
     """Test ArchiveBuilder initialization."""
 
@@ -465,6 +482,16 @@ class TestArchiveBuilderMergeContent:
             "Caroline researched adoption agencies."
         )
         assert "falling back to deterministic append" in caplog.text
+
+    def test_merge_without_model_deduplicates_existing_and_new_content(self):
+        builder = ArchiveBuilder(llm=None, allow_model_merge=False)
+
+        result = builder._llm_merge_content(
+            "The receiver was repaired.\n\nThe antenna was tested.",
+            "The antenna was tested.\n\nThe cable was replaced.",
+        )
+
+        assert result == "The receiver was repaired.\n\nThe antenna was tested.\n\nThe cable was replaced."
 
 
 class TestArchiveBuilderMergeOverview:

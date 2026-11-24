@@ -25,7 +25,7 @@ llm:
   base_url: "https://api.openai.com/v1"  # [local] your endpoint; [docker] use "${LLM_BASE_URL}"
   model: "gpt-4o-mini"           # [local] your model; [docker] use "${LLM_MODEL}"
   temperature: 0.7               # [all] LLM sampling temperature
-  max_tokens: 4096               # [all]
+  max_tokens: 4096               # [all] Fast combines cards and summary. Allow more output for long batches if supported.
   json_mode: false               # [all]
   # is_reasoning_model: true     # [all] optional override; null means auto-detect
   #
@@ -233,7 +233,7 @@ sharing:
 memory:
   extraction:
     card_format_enabled: false  # Validate entity/preference cards and recover malformed output in background.
-    mode: eager                   # [all] eager / lazy (lazy = ReAct loop with read tools)
+    mode: eager                   # [all] eager / lazy / fast (one extraction and decision call per batch)
     node_processing_enabled: false # [all] eager or lazy extraction followed by topic node processing
     read_probability_threshold: 0.70  # [all] Minimum JEV probability required for an old-memory read
     dual_pass_enabled: false      # [all] Set true to run two native extraction passes per span

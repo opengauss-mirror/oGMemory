@@ -32,6 +32,9 @@ MAX_MEMORY_KEY_BYTES = MAX_PATH_SEGMENT_BYTES - len(".update-lock-") - 1 - 32
 APPEND_ONLY_KEY_SUFFIX_BYTES = 1 + 14 + 1 + 8
 
 SAFE_SLUG_PATTERN = re.compile(r'^[a-z0-9_-]+$')
+CANDIDATE_CATEGORIES = frozenset({
+    "profile", "preference", "entity", "event", "case", "pattern", "skill", "tool", "fact",
+})
 
 
 def validate_text_length(text: str, max_len: int, field_name: str) -> str:
@@ -148,7 +151,7 @@ def _legacy_routing_key(value: str) -> str:
         return f"auto-{hashlib.sha256(value.encode()).hexdigest()[:16]}"
 
 
-def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
+def validate_candidate(candidate: CandidateMemory, *, allow_session_summary: bool = False) -> CandidateMemory:
     """Validate a CandidateMemory before processing.
 
     Args:
@@ -228,14 +231,12 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         validated_confidence = max(0.0, min(1.0, validated_confidence))
 
     # Validate category (raises if invalid)
-    valid_categories = {
-        "profile", "preference", "entity", "event",
-        "case", "pattern", "skill", "tool", "fact"
-    }
-    if candidate.category not in valid_categories:
+    if candidate.category not in CANDIDATE_CATEGORIES and not (
+        allow_session_summary and candidate.category == "session_summary"
+    ):
         raise ValidationError(
             "category",
-            f"Must be one of {valid_categories}, got '{candidate.category}'"
+            f"Must be one of {sorted(CANDIDATE_CATEGORIES)}, got '{candidate.category}'"
         )
 
     # Validate routing_key != category (would write to parent directory)

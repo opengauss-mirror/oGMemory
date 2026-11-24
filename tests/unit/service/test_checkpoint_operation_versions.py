@@ -53,6 +53,22 @@ def candidate(key):
                    provenance_ids=[f"prov:1:archive:{ARCHIVE_ID}:source"])
 
 
+def test_checkpoint_replays_candidates_with_node_failures():
+    client, fs, _ = make_runtime()
+    ctx = request_context("fast-checkpoint")
+    checkpoint, _ = legacy_checkpoint(fs, ctx, [])
+    slot = "chunk:1"
+    failures = [{"tool": "edit_memory", "error": "The proposed edit was deferred."}]
+    accepted = checkpoint.journal.checkpoint(slot).accept(
+        [candidate("receiver")], 1, 0, node_failures=failures,
+    )
+
+    _, restored = restart_checkpoint(client, ctx)
+    replayed = restored.journal.checkpoint(slot)
+    assert replayed.load() == (accepted, 1, 0)
+    assert replayed.record["node_failures"] == failures
+
+
 def test_persisted_v1_checkpoint_replays_source_receipt_and_loads_completed_plan():
     client, fs, _ = make_runtime()
     ctx = request_context("legacy-checkpoint")

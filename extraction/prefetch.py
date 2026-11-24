@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import TYPE_CHECKING
 
+from core.errors import ExtractionBudgetError
 from core.interfaces import ContextFS, Embedder, VectorIndex
 from core.models import ContextNode, RequestContext, SeedHit
 
@@ -186,6 +187,7 @@ class MemoryPrefetcher:
         lazy: bool = False,
         *,
         prompt_chars: int | None = None,
+        context_fits=None,
     ) -> PrefetchResult:
         """Prefetch memories for multiple categories.
 
@@ -196,6 +198,7 @@ class MemoryPrefetcher:
             lazy: If True, collect URI hints only.
             prompt_chars: Complete extraction prompt length, before prefetch. When
                 omitted, reserve space for the supplied conversation text.
+            context_fits: Check the rendered context against the caller's request budget.
 
         Returns:
             Combined PrefetchResult from all categories
@@ -230,6 +233,19 @@ class MemoryPrefetcher:
                 logger.error(f"Prefetch failed for {cat}: {e}")
         if budget is not None:
             budget.apply()
+        if context_fits is not None and not context_fits(
+                [message for result in results.values() for message in result.messages]):
+            admitted = {}
+            context = []
+            for category in sorted(results, key=lambda name: name != "profile"):
+                result = results[category]
+                expanded = [*context, *result.messages]
+                if context_fits(expanded):
+                    context = expanded
+                    admitted[category] = result
+                elif category == "profile":
+                    raise ExtractionBudgetError("fast extraction cannot fit the complete profile snapshot")
+            results = admitted
         for cat in categories:
             if (result := results.get(cat)) is not None:
                 combined.messages.extend(result.messages)

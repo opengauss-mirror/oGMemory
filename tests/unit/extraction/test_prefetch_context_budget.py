@@ -127,6 +127,29 @@ def test_eager_prefetch_reserves_actual_prompt_and_output_space():
     assert span.prefetch_result.read_versions == {}
 
 
+def test_prefetch_context_budget_prioritizes_profile_and_its_read_version():
+    fs = FakeFS()
+    vector = FakeVectorIndex()
+    profile = "ctx://acct/users/user/memories/profile"
+    entity = "ctx://acct/users/user/memories/entities/atlas"
+    fs.nodes[profile] = _node(profile, "profile")
+    fs.nodes[profile].metadata.update(version=4)
+    fs.nodes[entity] = _node(entity, "entity")
+    fs.nodes[entity].content = "stored entity details " * 1000
+    vector.hits = [SeedHit(uri=entity, category="entity", score=.9, level=2)]
+
+    result = _prefetcher(fs, vector, FakeEmbedder()).prefetch_for_span(
+        ["entity", "profile"], _ctx(), conversation_text="profile and Atlas",
+        context_fits=lambda messages: len("\n".join(messages)) < 1000,
+    )
+
+    assert result.read_versions == {profile: 4}
+    assert result.read_uris == {profile}
+    assert set(result.read_nodes) == {profile}
+    body, = result.messages
+    assert f"URI: {profile}\nVersion: 4" in body
+
+
 def test_lazy_occurrence_budget_preserves_uris_for_on_demand_reads():
     fs = FakeFS()
     uris = _occurrences(fs)

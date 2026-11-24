@@ -10,7 +10,7 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 import threading
 import uuid
 from contextlib import nullcontext
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import replace
 from providers.llm_observation import correlate_extraction_calls
 
@@ -100,7 +100,7 @@ internal_tool_usage_tracker=None,
             embedder: Optional Embedder for prefetching existing memories
             uri_resolver: Optional URIResolver for prefetching existing memories
 internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
-            extraction_mode: Extraction mode — "eager" or "lazy". Defaults to "eager".
+            extraction_mode: Extraction mode — "eager", "lazy", or "fast". Defaults to "eager".
             directory_summary_enabled: Whether to register directory summary events
         """
         self._fs = fs
@@ -123,8 +123,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         self._source_occurrence_reconciliation_enabled = source_occurrence_reconciliation_enabled
         self._card_format_enabled = card_format_enabled
-        self._dual_pass_enabled = dual_pass_enabled
-        self._node_processing_enabled = node_processing_enabled
+        self._fast_extraction = extraction_engine == "llm" and extraction_mode == "fast"
+        self._dual_pass_enabled = dual_pass_enabled and not self._fast_extraction
+        self._node_processing_enabled = node_processing_enabled and not self._fast_extraction
         self._graph_enabled = graph_enabled
         self._relation_store = relation_store
         self._relation_candidate_service = relation_candidate_service
@@ -157,10 +158,22 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 fs, write_uris, schema_registry=schema_registry, policy_router=policy_router,
             ),
         )
-        self._pipeline = CandidatePipeline()
+        self._fast_writer = None
+        if self._fast_extraction:
+            self._fast_writer = copy(self._writer)
+            self._fast_writer._archive_builder = ArchiveBuilder(
+                self._llm, schema_registry=schema_registry, card_format_enabled=card_format_enabled,
+                allow_model_merge=False,
+            )
+            self._fast_writer._directory_summary_enabled = False
+        self._pipeline = CandidatePipeline(allow_session_summary=self._fast_extraction)
         self._pipeline.set_extractors(self._create_extractors())
         self._tasks: dict[str, dict] = {}
         self._tasks_lock = threading.Lock()
+
+    @property
+    def _session_writer(self):
+        return self._fast_writer or self._writer
 
     def _create_extractors(self) -> list[CandidateExtractor]:
         """Create default extractors for the pipeline.
@@ -168,6 +181,19 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         Returns:
             List of CandidateExtractor instances (single tool-use Extractor)
         """
+        if self._fast_extraction:
+            from extraction.fast import FastExtractor
+
+            return [FastExtractor(
+                self._llm,
+                schema_registry=self._schema_registry,
+                fs=self._fs,
+                vector_index=self._vector_index,
+                embedder=self._embedder,
+                uri_resolver=self._writer._identity_resolver.uris,
+                activation_enabled=self._graph_enabled,
+                card_format_enabled=self._card_format_enabled,
+            )]
         try:
             from extraction.prompts import PromptManager
             pm = PromptManager()
@@ -290,7 +316,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         def extract():
             thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
             execution_options = {"parallel": False} if (
-                self._node_processing_enabled or remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
+                self._fast_extraction or self._node_processing_enabled or remaining_seconds() is not None
+                or callable(thread_bound) and thread_bound(self._fs)) else {}
+            if self._fast_extraction:
+                execution_options["extractor_options"] = {"confidence_threshold": confidence_threshold}
             return self._pipeline.extract(
                 messages, ctx, session_time=session_time,
                 session_summary=session_summary,
@@ -299,13 +328,15 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 **execution_options,
             )
 
-        def refresh_profile(candidate):
+        def reextract_profile(candidate):
             refreshed = [entry for entry in self._pipeline.filter_by_confidence(extract(), confidence_threshold)
                          if entry.category == "profile" and entry.owner_scope == candidate.owner_scope
                          and entry.target_uri in ("", candidate.target_uri)]
             if len(refreshed) != 1:
                 raise ExtractionIncompleteError("profile refresh requires one complete source candidate")
             return refreshed[0]
+
+        refresh_profile = None if self._fast_extraction else reextract_profile
 
         def preflight(candidates):
             resolver = self._writer._identity_resolver
@@ -328,6 +359,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         partial_extracted = partial_filtered = 0
         others_complete = False
         partial_error = None
+        fast_failures = []
         partial_checkpoints = candidate_checkpoint.partial_checkpoints() if candidate_checkpoint is not None else []
         for partial in partial_checkpoints:
             stored, extracted, filtered_count = partial.load()
@@ -357,6 +389,15 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     candidates = sorted(candidates, key=lambda c: c.category not in {"entity", "preference"})
                     candidates = [replace(c, node_draft_indices=[i]) if c.category in {"entity", "preference"}
                                   else c for i, c in enumerate(candidates)]
+                elif self._fast_extraction:
+                    from extraction.fast import FastPartialError
+
+                    try:
+                        candidates = extract()
+                    except FastPartialError as exc:
+                        candidates = self._pipeline._validate_candidates(
+                            exc.candidates, ctx, allow_session_summary=True)
+                        fast_failures = exc.failures
                 else:
                     candidates = extract()
                 if self._node_processing_enabled and candidate_checkpoint is not None and not runtime.entries:
@@ -409,7 +450,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                                                             refresh_profile=refresh_profile,
                                                             publication_scope=publication_scope)
                         raise
-            else:
+            elif not self._fast_extraction:
                 from commit.topic_aliases import reconcile_topic_aliases
                 filtered = reconcile_topic_aliases(
                     filtered, messages, ctx, self._writer._identity_resolver, self._llm)
@@ -421,7 +462,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 from extraction.card_format import validate_memory_card
                 for candidate in filtered:
                     validate_memory_card(candidate)
-            if self._node_processing_enabled:
+            if self._node_processing_enabled or self._fast_extraction:
                 targets = [c.target_uri for c in filtered if c.target_uri]
                 if len(targets) != len(set(targets)):
                     raise ExtractionIncompleteError("memory decisions require one update per target")
@@ -440,9 +481,13 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     check_deadline()
                     if partial_checkpoints:
                         extracted_count = filtered_count = 0
-                    filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
+                    checkpoint_options = {"node_failures": fast_failures} if fast_failures else {}
+                    filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count,
+                                                           **checkpoint_options)
         else:
             filtered, extracted_count, filtered_count = accepted
+            if self._fast_extraction:
+                fast_failures = candidate_checkpoint.record.get("node_failures", [])
             if self._graph_enabled:
                 candidate_checkpoint.restore_relation_tracking()
             if before_write is not None:
@@ -468,7 +513,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                     publication_scope=publication_scope)
             else:
                 with publish(), topic_scope():
-                    plans = self._writer.write_candidates(deduplicated, ctx)
+                    plans = self._session_writer.write_candidates(deduplicated, ctx)
 
         deduplicated = [*partial_candidates, *deduplicated]
         plans = [*partial_plans, *plans]
@@ -477,7 +522,11 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         extraction_proposals.extend(take(partial_candidates))
 
         graph_diagnostics = None
-        if self._graph_enabled and partial_error is None:
+        if self._graph_enabled and self._fast_extraction:
+            with publish():
+                graph_diagnostics = self.finish_partial_relations(
+                    deduplicated, plans, ctx, checkpoint=candidate_checkpoint, proposals=extraction_proposals)
+        elif self._graph_enabled and partial_error is None:
             from extraction.cross_prompt_relations import run_integrated_relations
             from extraction.relation_proposals import resolve_edges, union_edges
             native_edges, native_rejections = resolve_edges(
@@ -515,6 +564,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             result.update(degraded=True, recovery_mode="partial",
                           failed_nodes=partial_error.failures,
                           reason=str(partial_error))
+        if fast_failures:
+            result.update(degraded=True, recovery_mode="partial",
+                          failed_nodes=fast_failures, reason="fast extraction deferred candidates")
 
         return self._complete_commit_result(result, wait)
 
@@ -649,17 +701,19 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         return plans
 
     def _persist_checkpointed_candidate(self, candidate, ctx, checkpoint, index, publication_scope):
+        fast_write = self._fast_writer is not None and checkpoint.journal.fast_extraction
+        writer = self._session_writer if fast_write else self._writer
         if publication_scope is None:
             checkpoint.begin(index)
             try:
-                plan = self._writer.write_candidate(candidate, ctx)
+                plan = writer.write_candidate(candidate, ctx)
             except (WriteDeadlineExceededError, WriteNotStartedError) as exc:
                 checkpoint.reject(index, str(exc))
                 raise
             checkpoint.complete(index, plan)
             return plan
 
-        builder = self._writer._archive_builder
+        builder = writer._archive_builder
         prepared = None
 
         def input_key(incoming, plan):
@@ -667,7 +721,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             return incoming, plan.action, plan.target_uri, fields, plan.relation_edges
 
         def build_archive(incoming, plan, write_ctx):
-            if not builder.needs_model(incoming, plan):
+            if fast_write or not builder.needs_model(incoming, plan):
                 return builder.build(incoming, plan, write_ctx)
             if prepared is None or prepared[0] != input_key(incoming, plan):
                 raise ArchivePreparationRequired(incoming, plan)
@@ -676,7 +730,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         for attempt in range(3):
             with publication_scope():
                 try:
-                    plan = self._writer.write_candidate(
+                    plan = writer.write_candidate(
                         candidate, ctx, build_archive=build_archive,
                         before_persistence=lambda: checkpoint.begin(index))
                 except ArchivePreparationRequired as required:
@@ -799,7 +853,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 raise RuntimeError("raw chunk rejected before writing")
             plan = plans[0]
         else:
-            plan = self._writer.write_candidate(candidate, ctx)
+            plan = self._session_writer.write_candidate(candidate, ctx)
         return {
             "action": plan.action,
             "target_uri": plan.target_uri,

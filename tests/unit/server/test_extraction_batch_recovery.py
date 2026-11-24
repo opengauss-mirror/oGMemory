@@ -9,13 +9,14 @@ import pytest
 
 pytestmark = pytest.mark.usefixtures("service_threading")
 
+from commit.outbox_scope import capture_outbox_events
 from commit.write_receipts import RECEIPTS_KEY, WriteNotStartedError
 from core.models import CandidateMemory, RequestContext
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 from service.api import MemoryWriteAPI
-from service.extraction_checkpoint import EXTENSION_KEY
-from session.session_manager import SessionManager
+from service.extraction_checkpoint import EXTENSION_KEY, ExtractionBatchJournal
+from session.session_manager import SessionManager, generate_archive_id
 from tests.unit.commit.test_memory_identity import MemoryFS
 
 
@@ -172,6 +173,48 @@ def test_early_recovery_uses_the_configured_session_backend(ctx):
     assert [message.content for message in service._session_mgr.get_or_create(ctx.session_id).messages] == [
         "I repaired the receiver."]
     service._get_context_fs.assert_not_called()
+
+
+@capture_outbox_events
+def test_fast_resumes_accepted_legacy_profile_merge(ctx):
+    from tests.unit.commit.test_profile_merge import ProfileLLM, profile, result
+
+    fs = MemoryFS()
+    old, writer, manager = setup_service(fs, ctx)
+    old._cfg.extraction_mode = "eager"
+    initial = "Alice lives in Utrecht."
+    updated = "Alice lives in Utrecht and plays chess."
+    uri = writer.write_memory(profile("identity", initial), ctx)["target_uri"]
+    request = {**params(ctx, content="I play chess."), "forceExtract": True}
+    request["messages"][0]["id"] = "source"
+    buffer = manager.get_or_create(ctx.session_id, ctx)
+    manager.enable_extraction_recovery(ctx.session_id, ctx, writer._fs)
+    manager.add_message(ctx.session_id, "user", "I play chess.", ctx, message_id="source")
+    journal = ExtractionBatchJournal(
+        manager, buffer, ctx, list(buffer.messages), archive_id=generate_archive_id(),
+        messages=request["messages"], session_time=None, session_summary="", tool_stats_text="",
+        client_request_id=request["clientRequestId"], request_messages=request["messages"],
+        request_source_ids=["source"], extraction_config={"engine": "llm"},
+    )
+    journal.chunks(lambda: [request["messages"]])
+    journal.checkpoint("chunk:0").accept([profile("hobby", "Alice plays chess.")], 1, 0)
+
+    restarted, _, _ = setup_service(fs, ctx)
+    restarted._cfg.extraction_mode = "fast"
+    model = ProfileLLM(result(updated))
+    restarted._write_api = MemoryWriteAPI(fs, model, extraction_mode=restarted._cfg.extraction_mode)
+    restarted._journal_write_apis[("eager", "llm")] = MemoryWriteAPI(fs, model, extraction_mode="eager")
+
+    response = restarted.after_turn(request)
+
+    assert restarted._write_api._extraction_mode == "fast"
+    assert response["status"] == "completed"
+    assert response["archive_id"] == journal._archive_id
+    assert response["writes_completed"] == 1
+    saved = fs.read_node(uri, ctx)
+    assert saved.content == updated
+    assert saved.metadata["version"] == 2
+    assert len(model.calls) == 1
 
 
 def test_public_partial_rejection_reuses_accepted_candidates_after_restart(ctx):

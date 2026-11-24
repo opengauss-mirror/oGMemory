@@ -753,6 +753,7 @@ class MemoryService:
         self._llm = None
         self._decision_client = None
         self._write_api = None
+        self._journal_write_apis = {}
         self._read_api = None
         self._agfs_fts = None
         self._code_resource_lifecycle_service: CodeResourceLifecycleService | None = None
@@ -1721,7 +1722,12 @@ class MemoryService:
             ),
         }
 
-    def _get_chunker(self) -> ConversationChunker | None:
+    def _fast_extraction_enabled(self) -> bool:
+        config = getattr(self, "_cfg", None)
+        return (getattr(config, "extraction_engine", "llm") == "llm"
+                and getattr(config, "extraction_mode", None) == "fast")
+
+    def _get_chunker(self, *, fast=None) -> ConversationChunker | None:
         """Create a ConversationChunker if chunking is enabled.
 
         Returns None if chunking is disabled or not configured.
@@ -1729,8 +1735,10 @@ class MemoryService:
         if not getattr(self._cfg, "chunking_enabled", False):
             return None
 
+        if fast is None:
+            fast = self._fast_extraction_enabled()
         return ConversationChunker(
-            llm=self.get_llm(),
+            llm=None if fast else self.get_llm(),
             max_tokens=getattr(self._cfg, "chunk_max_segment_tokens", 8000),
             max_messages=getattr(self._cfg, "chunk_max_messages", 500),
             min_chunk_tokens=getattr(self._cfg, "chunk_min_tokens", 300),
@@ -1796,6 +1804,11 @@ class MemoryService:
                                               accepted_candidates=restored[0],
                                               publication_scope=publication_scope)
             yield lambda: None
+            return
+        fast = (candidate_checkpoint.journal.fast_extraction if candidate_checkpoint is not None
+                else getattr(write_api, "_fast_extraction", False))
+        if fast is True:
+            yield None
             return
         llm = self.get_llm()
         inputs = (self._summary_stage_inputs(messages, session_time, session_id, llm)
@@ -2109,6 +2122,7 @@ class MemoryService:
 
     def _chunk_and_extract_recoverable(self, write_api, ctx, session_id, journal, *, publication_scope=None,
                                        summary_future=None):
+        write_api = self._write_api_for_journal(write_api, journal)
         batch = journal.batch
         messages = batch["messages"]
         session_time = _parse_session_time(batch.get("session_time"))
@@ -2116,7 +2130,10 @@ class MemoryService:
         def make_chunks():
             if journal.extraction_engine == "deterministic":
                 return [messages]
-            chunker = self._get_chunker()
+            if journal.fast_extraction == self._fast_extraction_enabled():
+                chunker = self._get_chunker()
+            else:
+                chunker = self._get_chunker(fast=journal.fast_extraction)
             return chunker.chunk_messages(messages, flush=True).chunks if chunker else [messages]
 
         chunks = journal.chunks(make_chunks)
@@ -2179,6 +2196,11 @@ class MemoryService:
                             "writes_skipped", "writes_failed"):
                     aggregated[key] += result.get(key, 0)
                 aggregated["plans"].extend(result.get("plans", []))
+                if journal.fast_extraction and result.get("degraded"):
+                    aggregated.update(degraded=True, recovery_mode=result.get("recovery_mode", "partial"),
+                                      reason=result.get("reason", "Fast extraction returned partial results"))
+                    aggregated.setdefault("failed_nodes", []).extend(
+                        {"slot": f"chunk:{index}", **failure} for failure in result.get("failed_nodes", []))
         if failures:
             raise NodeProcessingPartialError([], failures)
         return aggregated
@@ -3483,78 +3505,107 @@ class MemoryService:
     @_serialize_lazy_initialization("_write_api")
     def get_write_api(self):
         if self._write_api is None:
-            fs = self._get_context_fs()
-            if fs is None:
-                return None
-            outbox = self._get_outbox_store(fs)
-            if outbox is None:
-                return None
-            # Create SchemaRegistry for dynamic tool generation
-            schema_registry = None
-            try:
-                from extraction.schemas.registry import SchemaRegistry
-                schema_registry = SchemaRegistry()
-                if self._cfg.agent_memory_enabled:
-                    for category in ("case", "tool", "skill"):
-                        schema_registry.register(replace(schema_registry.get(category), enabled=False))
-                if self._cfg.skill_sedimentation_enabled:
-                    schema_registry.unregister("skill")
-                logger.info("SchemaRegistry initialized for dynamic tool generation")
-            except Exception as exc:
-                logger.warning("SchemaRegistry initialization failed; write API unavailable: %s", exc)
-                return None
-
-            # Create URIResolver for prefetch
-            uri_resolver = None
-            try:
-                from core.uri_resolver import URIResolver
-                if schema_registry:
-                    uri_resolver = URIResolver(schema_registry)
-                    logger.info("URIResolver initialized for prefetch")
-            except Exception as exc:
-                logger.warning("URIResolver initialization failed, prefetch disabled: %s", exc)
-
-            vector_index = None
-            embedder = None
-            if not self._agfs_retrieval_enabled:
-                vector_index = self._get_shared_vector_index()
-                embedder = self._get_shared_embedder()
-                self._ensure_scene_runtime()
-
-            graph_kwargs = {}
-            if self._graph_enabled():
-                from retrieval.authorized_vector_search import AuthorizedVectorSearch
-                from service.relation_candidate_service import RelationCandidateService
-                graph_kwargs = dict(graph_enabled=True,relation_store=self._get_relation_store(),
-                    relation_candidate_service=RelationCandidateService(AuthorizedVectorSearch(
-                        vector_index,embedder,ContextReader(fs=fs,storage_backend=self._cfg.storage_backend))))
-
-            self._write_api = MemoryWriteAPI(
-                fs=fs,
-                llm=self.get_llm(),
-                outbox_store=outbox,
-                schema_registry=schema_registry,
-                vector_index=vector_index,
-                embedder=embedder,
-                uri_resolver=uri_resolver,
-internal_tool_usage_tracker=self._internal_tool_usage,
-                extraction_mode=self._cfg.extraction_mode,
-                extraction_engine=self._cfg.extraction_engine,
-                deterministic_config=self._cfg.deterministic_config(),
-                decision_client=(self.get_decision_client()
-                                 if self._cfg.extraction_mode == "lazy" else None),
-                read_probability_threshold=self._cfg.read_probability_threshold,
-                source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
-                card_format_enabled=self._cfg.card_format_enabled,
-                dual_pass_enabled=self._cfg.dual_pass_enabled,
-                node_processing_enabled=self._cfg.node_processing_enabled,
-                directory_summary_enabled=self._cfg.directory_summary_enabled,
-                **graph_kwargs,
-            )
-            logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)
-            # Start outbox worker so written memories get indexed
-            self._start_outbox_worker()
+            self._write_api = self._create_write_api(self._cfg.extraction_mode, self._cfg.extraction_engine)
+            if self._write_api is not None:
+                self._start_outbox_worker()
         return self._write_api
+
+    def _write_api_for_journal(self, api, journal):
+        from service.api import MemoryWriteAPI
+
+        if not isinstance(api, MemoryWriteAPI):
+            return api
+        frozen = frozen_extraction_config(journal.batch)
+        if frozen["engine"] != "llm":
+            return api
+        default_mode = "eager" if api._extraction_mode == "fast" else api._extraction_mode
+        mode = frozen.get("mode", default_mode)
+        if mode == api._extraction_mode and (mode != "fast" or api._fast_extraction):
+            return api
+        with self._init_lock:
+            key = (mode, "llm")
+            writer = self._journal_write_apis.get(key)
+            if writer is None:
+                writer = self._create_write_api(mode, "llm")
+                if writer is None:
+                    raise RecoveryPersistenceError("frozen extraction writer is unavailable")
+                for context_writer in (writer._writer, writer._session_writer):
+                    context_writer._uri_locks = api._writer._uri_locks
+                    context_writer._uri_locks_guard = api._writer._uri_locks_guard
+                self._journal_write_apis[key] = writer
+        return writer
+
+    def _create_write_api(self, extraction_mode, extraction_engine):
+        fs = self._get_context_fs()
+        if fs is None:
+            return None
+        outbox = self._get_outbox_store(fs)
+        if outbox is None:
+            return None
+        # Create SchemaRegistry for dynamic tool generation
+        schema_registry = None
+        try:
+            from extraction.schemas.registry import SchemaRegistry
+            schema_registry = SchemaRegistry()
+            if self._cfg.agent_memory_enabled:
+                for category in ("case", "tool", "skill"):
+                    schema_registry.register(replace(schema_registry.get(category), enabled=False))
+            if self._cfg.skill_sedimentation_enabled:
+                schema_registry.unregister("skill")
+            logger.info("SchemaRegistry initialized for dynamic tool generation")
+        except Exception as exc:
+            logger.warning("SchemaRegistry initialization failed; write API unavailable: %s", exc)
+            return None
+
+        # Create URIResolver for prefetch
+        uri_resolver = None
+        try:
+            from core.uri_resolver import URIResolver
+            if schema_registry:
+                uri_resolver = URIResolver(schema_registry)
+                logger.info("URIResolver initialized for prefetch")
+        except Exception as exc:
+            logger.warning("URIResolver initialization failed, prefetch disabled: %s", exc)
+
+        vector_index = None
+        embedder = None
+        if not self._agfs_retrieval_enabled:
+            vector_index = self._get_shared_vector_index()
+            embedder = self._get_shared_embedder()
+            self._ensure_scene_runtime()
+
+        graph_kwargs = {}
+        if self._graph_enabled():
+            from retrieval.authorized_vector_search import AuthorizedVectorSearch
+            from service.relation_candidate_service import RelationCandidateService
+            graph_kwargs = dict(graph_enabled=True,relation_store=self._get_relation_store(),
+                relation_candidate_service=RelationCandidateService(AuthorizedVectorSearch(
+                    vector_index,embedder,ContextReader(fs=fs,storage_backend=self._cfg.storage_backend))))
+
+        write_api = MemoryWriteAPI(
+            fs=fs,
+            llm=self.get_llm(),
+            outbox_store=outbox,
+            schema_registry=schema_registry,
+            vector_index=vector_index,
+            embedder=embedder,
+            uri_resolver=uri_resolver,
+            internal_tool_usage_tracker=self._internal_tool_usage,
+            extraction_mode=extraction_mode,
+            extraction_engine=extraction_engine,
+            deterministic_config=self._cfg.deterministic_config(),
+            decision_client=(self.get_decision_client()
+                             if extraction_mode == "lazy" else None),
+            read_probability_threshold=self._cfg.read_probability_threshold,
+            source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
+            card_format_enabled=self._cfg.card_format_enabled,
+            dual_pass_enabled=self._cfg.dual_pass_enabled,
+            node_processing_enabled=self._cfg.node_processing_enabled,
+            directory_summary_enabled=self._cfg.directory_summary_enabled,
+            **graph_kwargs,
+        )
+        logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, extraction_mode)
+        return write_api
 
     def forget_memory(
         self,
@@ -4202,6 +4253,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
             self._session_mgr = SessionManager(
                 get_llm=self.get_llm,
+                fast_archive=self._fast_extraction_enabled(),
                 get_write_api=self.get_write_api,
                 get_agfs=self._get_context_fs,
                 get_archive_store=self._get_archive_store,
@@ -5789,6 +5841,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return outcome
 
     def _agent_turn_summary_request(self, ctx, journal, snapshot):
+        if journal.fast_extraction:
+            return None
         from extraction.summary_generator import SUMMARY_PROMPT, SUMMARY_SCHEMA
         from service.extraction_retry import source_only_reason
         from session.compressor import SessionCompressor
@@ -5812,7 +5866,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                      or "summary" in batch["slots"])):
             return None
         manager = journal.manager
-        llm = manager._archive_compression_llm()
+        llm = manager._archive_compression_llm(journal)
         if llm is None or llm is not self.get_llm():
             return None
         archive_inputs = manager._archive_compression_inputs(archived, ctx.session_id, ctx, llm, batch["archive_id"])

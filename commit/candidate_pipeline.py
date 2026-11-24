@@ -22,7 +22,7 @@ class CandidatePipeline:
     Runs all extractors concurrently and aggregates results.
     """
 
-    def __init__(self, extractors: list[CandidateExtractor] | None = None):
+    def __init__(self, extractors: list[CandidateExtractor] | None = None, *, allow_session_summary: bool = False):
         """Initialize CandidatePipeline.
 
         Args:
@@ -30,6 +30,7 @@ class CandidatePipeline:
                        If None, must be set before calling extract().
         """
         self._extractors = extractors or []
+        self._allow_session_summary = allow_session_summary
 
     def set_extractors(self, extractors: list[CandidateExtractor]) -> None:
         """Set the extractors to use.
@@ -48,6 +49,8 @@ class CandidatePipeline:
         session_summary: str = "",
         tool_stats_text: str = "",
         archive_id: str | None = None,
+        *,
+        extractor_options: dict | None = None,
     ) -> list[CandidateMemory]:
         """Extract candidates from messages using all extractors.
 
@@ -59,6 +62,7 @@ class CandidatePipeline:
             session_summary: Optional summary of previously extracted content
             tool_stats_text: Optional tool usage statistics text
             archive_id: Optional archive_id for provenance tracking
+            extractor_options: Request-scoped options supported by the configured extractors.
 
         Returns:
             List of CandidateMemory from all extractors
@@ -72,13 +76,12 @@ class CandidatePipeline:
         if parallel:
             return self._extract_parallel(
                 messages, ctx, session_time, session_summary, tool_stats_text,
-                archive_id,
+                archive_id, extractor_options,
             )
-        else:
-            return self._extract_serial(
-                messages, ctx, session_time, session_summary, tool_stats_text,
-                archive_id,
-            )
+        return self._extract_serial(
+            messages, ctx, session_time, session_summary, tool_stats_text,
+            archive_id, extractor_options,
+        )
 
     def _extract_parallel(
         self,
@@ -88,6 +91,7 @@ class CandidatePipeline:
         session_summary: str = "",
         tool_stats_text: str = "",
         archive_id: str | None = None,
+        extractor_options: dict | None = None,
     ) -> list[CandidateMemory]:
         """Run extractors in parallel using ThreadPoolExecutor.
 
@@ -110,7 +114,7 @@ class CandidatePipeline:
                 executor.submit(
                     copy_context().run, self._call_extractor,
                     extractor, messages, ctx, session_time, session_summary,
-                    tool_stats_text, archive_id,
+                    tool_stats_text, archive_id, extractor_options,
                 ): extractor
                 for extractor in self._extractors
             }
@@ -130,7 +134,7 @@ class CandidatePipeline:
                     raise
 
         # Validate all candidates
-        return self._validate_candidates(all_candidates, ctx)
+        return self._validate_candidates(all_candidates, ctx, allow_session_summary=self._allow_session_summary)
 
     def _extract_serial(
         self,
@@ -140,6 +144,7 @@ class CandidatePipeline:
         session_summary: str = "",
         tool_stats_text: str = "",
         archive_id: str | None = None,
+        extractor_options: dict | None = None,
     ) -> list[CandidateMemory]:
         """Run extractors serially.
 
@@ -160,7 +165,7 @@ class CandidatePipeline:
             try:
                 candidates = self._call_extractor(
                     extractor, messages, ctx, session_time,
-                    session_summary, tool_stats_text, archive_id,
+                    session_summary, tool_stats_text, archive_id, extractor_options,
                 )
                 all_candidates.extend(candidates)
             except Exception as e:
@@ -172,11 +177,12 @@ class CandidatePipeline:
                 raise
 
         # Validate all candidates
-        return self._validate_candidates(all_candidates, ctx)
+        return self._validate_candidates(all_candidates, ctx, allow_session_summary=self._allow_session_summary)
 
     @staticmethod
-    def _validate_candidates(candidates, ctx):
-        return [validate_candidate(validate_attribution(candidate, user_id=ctx.user_id if ctx else None))
+    def _validate_candidates(candidates, ctx, *, allow_session_summary=False):
+        return [validate_candidate(validate_attribution(candidate, user_id=ctx.user_id if ctx else None),
+                                   allow_session_summary=allow_session_summary)
                 for candidate in candidates]
 
     @staticmethod
@@ -188,6 +194,7 @@ class CandidatePipeline:
         session_summary,
         tool_stats_text,
         archive_id,
+        extractor_options,
     ):
         """Call one extractor through the stable candidate-extraction contract."""
         return extractor.extract(
@@ -197,6 +204,7 @@ class CandidatePipeline:
             session_summary,
             tool_stats_text,
             archive_id,
+            **(extractor_options or {}),
         )
 
     def filter_by_confidence(
