@@ -13,6 +13,7 @@
 | 任务、确认、记忆动作 | `memorybot/models.py`、`memorybot/service.py` | 生命周期 | 2026-11-18 |
 | 查看器导航与团队空间 | `server/memory_viewer_static/app.js`、`spaces.js` | 现有行为 | 2026-11-18 |
 | 迁移操作与反馈 | `server/memory_viewer_static/migration.js` | 现有行为 | 2026-11-18 |
+| 知识库文档与权限 | `server/document_resource_api.py`、`server/document_resource_runtime.py` | API | 2026-11-24 |
 
 ## Visual contract
 
@@ -35,6 +36,8 @@
 
 宿主导航使用 URL hash。会话和密钥通过 sessionStorage 保持当前标签页上下文；查询词、草稿、选中文件和内部筛选属于临时工作状态。切换页面保留聊天草稿，切换身份清理旧身份的会话与数据。
 
+资源管理位于 `/memory-viewer/#knowledge`。原生知识库选择框按个人、账户共享分组。进入时优先选中可访问的默认库，账户与库切换清空旧文档选择和检索状态。文档列表按服务端分页。提交语义检索后左侧显示当前库命中，清除后恢复同库文档列表并聚焦输入框。右侧详情显示来源 URI、文件类型、索引状态、片段数及选中的命中片段。窄屏依次显示列表和详情。
+
 ## Flow ledger
 
 | Operation | Trigger | Pending | Success destination | Success feedback | Failure recovery | Focus outcome | Source ref |
@@ -45,6 +48,8 @@
 | 上传资料 | 上传资料 / 收录网页 | 后台任务步骤 | 资料列表与处理记录 | 资料可用状态 | 停止 / 核对结果 | dialog / 资料卡 | ingest task |
 | 新建计划 | 新建计划 | 保存按钮 busy | 计划列表 | 成功提示 | 保留表单 | 原触发按钮 | ScheduleCreate |
 | 管理记忆 | 记住 / 更正 / 遗忘 | 后台任务步骤 | 处理记录与记忆列表 | 真实记忆状态 | 停止 / 核对结果 | dialog | MemoryAction |
+| 管理知识库 | 新建知识库 / 重命名 / 删除空库 | dialog 提交状态 | 新建或修改后的库，删除后切至默认或可访问库 | 页面状态区 | 保留表单和行内错误 | 当前知识库选择框 | `GET /api/v1/knowledge-bases` 及管理接口 |
+| 管理共享成员 | 成员管理 | 当前授权操作处理中 | 保持成员界面并刷新授权 | 成员对话框状态区 | 查找后核对授权状态 | 成员搜索或已更新成员的权限控件 | `/api/v1/knowledge-bases/{id}/members` |
 
 ## Interaction and recovery
 
@@ -55,6 +60,10 @@
 嵌入入口为 `/memory-viewer/#bot`，独立入口为 `/bot`。iframe 消息校验同源和发送窗口；宿主连接设置更新后重新载入 bot。API Key 保存在当前标签页的 sessionStorage。
 
 原生 dialog 提供焦点隔离、Escape 和关闭后焦点恢复。会话抽屉保持已有非模态导航行为。网络或权限错误呈现在可见状态区，编辑内容保留供重试。
+
+知识库的上传文档、替换原文和删除文档共用原生 dialog，删除确认显示文件名。解析由服务端异步执行，详情提供刷新状态。上传和替换成功时保留文档详情，删除后恢复文档列表。连接、权限和索引反馈使用知识库状态区；提交错误保留在 dialog 内供重试。
+
+知识库动作依据服务端权限。只读库保留文档列表、检索与下载。共享库管理者从当前账户搜索并选择已登记成员，再授予只读或可编辑权限。当前成员逐人保存角色，撤销前确认目标。删除库前显示库名，服务端执行空库检查。
 
 ## Verification
 

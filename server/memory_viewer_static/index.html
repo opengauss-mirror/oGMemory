@@ -322,6 +322,7 @@
           </div>
           <div class="knowledge-base-actions" role="group" aria-label="知识库管理">
             <button id="knowledge-base-edit" class="secondary-button" type="button" hidden>重命名</button>
+            <button id="knowledge-base-manage-members" class="secondary-button" type="button" hidden>成员管理</button>
             <button id="knowledge-base-delete" class="secondary-button knowledge-base-danger" type="button" hidden>删除空库</button>
           </div>
         </div>
@@ -467,6 +468,50 @@
           <button id="knowledge-base-dialog-submit" class="primary-button" type="submit">新建知识库</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="knowledge-members-dialog" class="settings-dialog knowledge-dialog knowledge-members-dialog" aria-labelledby="knowledge-members-title" aria-describedby="knowledge-members-context">
+      <div class="knowledge-members-content">
+        <header class="dialog-head">
+          <div><h2 id="knowledge-members-title">成员管理</h2><p id="knowledge-members-context" class="settings-description"></p></div>
+          <button id="knowledge-members-close" class="close-button" type="button" aria-label="关闭成员管理">×</button>
+        </header>
+        <section class="knowledge-members-panel" aria-labelledby="knowledge-current-members-title">
+          <div class="knowledge-member-section-head">
+            <h3 id="knowledge-current-members-title">已授权成员 <span id="knowledge-member-count"></span></h3>
+            <p class="knowledge-member-hint">账户管理员拥有管理权限。</p>
+          </div>
+          <ul id="knowledge-member-list" class="knowledge-member-list" role="list"></ul>
+          <p id="knowledge-member-empty" class="knowledge-member-empty" hidden>还没有授权成员。可在下方查找账户成员并授予权限。</p>
+          <div id="knowledge-member-confirm" class="knowledge-member-confirm" role="group" aria-labelledby="knowledge-member-confirm-label" hidden>
+            <p id="knowledge-member-confirm-label"></p>
+            <div class="knowledge-dialog-actions">
+              <button id="knowledge-member-confirm-cancel" class="secondary-button" type="button">取消</button>
+              <button id="knowledge-member-confirm-submit" class="primary-button space-danger-button" type="button">撤销权限</button>
+            </div>
+          </div>
+        </section>
+        <section class="knowledge-members-panel knowledge-member-add" aria-labelledby="knowledge-add-members-title">
+          <h3 id="knowledge-add-members-title">添加账户成员</h3>
+          <form id="knowledge-member-search" role="search" novalidate>
+            <div class="knowledge-member-search-field">
+              <input id="knowledge-member-query" type="search" maxlength="128" autocomplete="off" placeholder="按用户 ID 查找" aria-label="搜索当前账户成员" aria-controls="knowledge-member-results">
+              <button id="knowledge-member-clear" class="field-clear" type="button" aria-label="清除成员检索" hidden>×</button>
+            </div>
+            <button class="secondary-button" type="submit">查找成员</button>
+          </form>
+          <ul id="knowledge-member-results" class="knowledge-member-list knowledge-member-results" role="list" aria-label="账户成员检索结果"></ul>
+          <p id="knowledge-member-search-empty" class="knowledge-member-hint" aria-live="polite" hidden></p>
+          <form id="knowledge-member-grant" class="knowledge-member-grant" novalidate hidden>
+            <span class="knowledge-member-grantee">为 <strong id="knowledge-member-selected"></strong> 授权</span>
+            <label class="knowledge-member-permission">权限
+              <select id="knowledge-member-permission"><option value="read">只读</option><option value="write">可编辑</option></select>
+            </label>
+            <button class="primary-button" type="submit">授予权限</button>
+          </form>
+        </section>
+        <p id="knowledge-member-feedback" class="form-feedback knowledge-feedback" aria-live="polite" aria-atomic="true"></p>
+      </div>
     </dialog>
 
     <dialog id="task-detail-dialog" class="detail-dialog task-detail-dialog" aria-labelledby="task-detail-title">
