@@ -48,6 +48,20 @@ class TenantAdminService:
             "status": "active",
         }
 
+    def require_active_account(
+        self, ctx: RequestContext, account_id: str, *, admin_only: bool = True
+    ) -> None:
+        if admin_only:
+            self._require_account_admin(ctx, account_id)
+        elif self._normalize_role(ctx.role) != Role.ROOT and ctx.account_id != account_id:
+            raise PermissionError("account access denied")
+        for account in self._key_manager.get_accounts():
+            if account["account_id"] == account_id:
+                if account.get("status", "active") != "active":
+                    raise PermissionError("account is inactive")
+                return
+        raise FileNotFoundError("account not found")
+
     def create_user(self, ctx: RequestContext, account_id: str, user_id: str, role: str = "user") -> dict:
         self._require_account_admin(ctx, account_id)
         if not self._account_exists(account_id):
