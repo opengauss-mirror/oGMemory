@@ -155,6 +155,33 @@ def test_event_and_memory_channels_are_independent_and_events_are_capped(setup, 
         assert len(result.facts) == 2
 
 
+@pytest.mark.parametrize("limit", ["count", "shared_bytes"])
+def test_source_scan_limits_respect_remaining_card_budget(setup, monkeypatch, limit):
+    import service.evidence_service as search
+    from core.evidence import message_source
+
+    fs, _, store, _ = setup
+    messages = [message(f"I visited Paris on 2026-05-0{i + 1}.", id=str(i), sequence=i) for i in range(2)]
+    first, extra = sorted(messages, key=lambda item: message_source(item, CTX).source_key)
+    write_candidates(setup, [first], categories={"event"})
+    store.register([extra], CTX, batch_id="beyond-source-limit")
+    count_limit = limit == "count"
+    if count_limit:
+        monkeypatch.setattr(search, "_SOURCE_SCAN_LIMIT", 1)
+    else:
+        monkeypatch.setattr(search, "_SCAN_BYTE_LIMIT", len(first["content"].encode("utf-8")))
+
+    result = EvidenceService(fs).search("Paris visit", CTX, use_memories=True, use_events=True)
+
+    assert result.diagnostics["scanned_sources"] == (1 if count_limit else 2)
+    assert result.diagnostics["partial"] and result.diagnostics["truncated"]
+    assert result.diagnostics["events_admitted"] == int(count_limit)
+    assert [item["message_id"] for item in result.evidence] == [first["id"]]
+    assert [fact["quote"] for fact in result.facts] == ([first["content"]] if count_limit else [])
+    if not count_limit:
+        assert result.diagnostics["scanned_cards"] == 0
+
+
 @pytest.mark.parametrize("batch", [False, True])
 def test_shared_dependencies_are_removed_when_their_source_fails_final_check(setup, monkeypatch, batch):
     import service.evidence_service as search

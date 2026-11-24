@@ -26,6 +26,8 @@ from retrieval.evidence.ranking import (
 from service.evidence_store import EvidenceStore
 
 _SEARCH_TIMEOUT_SECONDS = 20
+_SOURCE_SCAN_LIMIT = 10000
+_SCAN_BYTE_LIMIT = 16 * 1024 * 1024
 
 
 @timed("serialize")
@@ -110,10 +112,10 @@ class EvidenceService:
         query = request.query
         with stage("source_scan"):
             units, sources, source_bytes = {}, {}, 0
-            source_uris = self.store.iter_uris(evidence_uri(ctx, "sources"), ctx, 10001)
-            for uri, read_source in self.store.iter_sources(source_uris, ctx, read_limit=10000):
+            source_uris = self.store.iter_uris(evidence_uri(ctx, "sources"), ctx, _SOURCE_SCAN_LIMIT + 1)
+            for uri, read_source in self.store.iter_sources(source_uris, ctx, read_limit=_SOURCE_SCAN_LIMIT):
                 check_deadline()
-                if diagnostics["scanned_sources"] >= 10000:
+                if diagnostics["scanned_sources"] >= _SOURCE_SCAN_LIMIT:
                     diagnostics.update(partial=True, truncated=True)
                     break
                 diagnostics["scanned_sources"] += 1
@@ -122,7 +124,7 @@ class EvidenceService:
                     continue
                 source_bytes += len(source["text"].encode("utf-8"))
                 diagnostics["source_bytes"] = source_bytes
-                if source_bytes > 16 * 1024 * 1024:
+                if source_bytes > _SCAN_BYTE_LIMIT:
                     diagnostics.update(partial=True, truncated=True)
                     break
                 sources[source["source_key"]] = source
@@ -158,7 +160,7 @@ class EvidenceService:
         context_hints, hint_attempts = set(), 0
         hint_topics_by_unit = {}
         with stage("card_scan"):
-            if request.use_memories or request.use_events:
+            if (request.use_memories or request.use_events) and source_bytes <= _SCAN_BYTE_LIMIT:
                 from extraction.deterministic.verification import record_verifier
 
                 verify = record_verifier(self.store, ctx)
@@ -185,7 +187,7 @@ class EvidenceService:
                             size = len(node.content.encode("utf-8"))
                             card_bytes += size
                             diagnostics["card_bytes"] = card_bytes
-                            if size > 2 * 1024 * 1024 or card_bytes + source_bytes > 16 * 1024 * 1024:
+                            if size > 2 * 1024 * 1024 or card_bytes + source_bytes > _SCAN_BYTE_LIMIT:
                                 diagnostics.update(partial=True, truncated=True)
                                 stop_cards = True
                                 break
@@ -236,7 +238,7 @@ class EvidenceService:
                                     records.append(record)
                         if stop_cards:
                             break
-                    if diagnostics["truncated"]:
+                    if stop_cards:
                         break
         with stage("fusion"):
             check_deadline()
