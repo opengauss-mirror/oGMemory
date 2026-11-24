@@ -88,11 +88,13 @@ async def test_http_and_mcp_only_expose_empty_evidence_when_partial(service, mon
     from time import monotonic
 
     import retrieval.evidence.auxiliary as auxiliary
+    from core.operation_deadline import operation_deadline_at
 
     fuse_auxiliary = auxiliary.fuse_auxiliary
 
-    def expire_before_fusion(*args, deadline):
-        return fuse_auxiliary(*args, deadline=monotonic())
+    def expire_before_fusion(*args):
+        with operation_deadline_at(monotonic()):
+            return fuse_auxiliary(*args)
 
     if expires:
         monkeypatch.setattr(auxiliary, "fuse_auxiliary", expire_before_fusion)

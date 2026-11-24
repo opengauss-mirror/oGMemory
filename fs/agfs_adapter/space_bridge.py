@@ -16,7 +16,7 @@ from pyagfs.exceptions import AGFSClientError
 
 from core.errors import NodeBrokenError
 from core.operation_deadline import check_deadline, current_deadline, operation_deadline_at
-from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, _raise_bounded_read_timeout
+from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from fs.sql_adapter.pool import SharedConnectionPool
 from fs.sql_adapter.sql_context_fs import SQLContextFS, _resource_mutation_lock_key
 
@@ -135,12 +135,7 @@ class AGFSSpaceBridge(SQLContextFS):
         if (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
                 or pointer.get("path") != path):
             raise NodeBrokenError(uri)
-        check_deadline()
-        try:
-            payload = self._agfs._client.read(path)
-        except AGFSClientError as exc:
-            _raise_bounded_read_timeout(exc)
-            raise
+        payload = self._agfs._read_blob(path)
         if hashlib.sha256(payload).hexdigest() != digest or len(payload) != pointer.get("bytes"):
             raise NodeBrokenError(uri)
         value = json.loads(payload)

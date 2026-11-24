@@ -27,6 +27,16 @@ def deadline_clock(monkeypatch):
     return clock
 
 
+@pytest.fixture(params=["local", "inherited"])
+def search_budget(request, monkeypatch, deadline_clock):
+    import service.evidence_service as search
+
+    if request.param == "inherited":
+        return operation_deadline(deadline_clock.budget)
+    monkeypatch.setattr(search, "_SEARCH_TIMEOUT_SECONDS", deadline_clock.budget)
+    return operation_deadline()
+
+
 def test_message_only_and_no_vector_dependency(setup):
     fs, _, store, _ = setup
     store.register([message("Caroline visited Paris.")], CTX, batch_id="batch")
@@ -220,9 +230,8 @@ def test_final_source_checks_stop_at_deadline_and_keep_only_complete_groups(
     assert result.diagnostics["uncovered_branches"] == ([1] if available_reads else [0, 1])
 
 
-@pytest.mark.parametrize("inherited_budget", [False, True])
 def test_final_source_read_cannot_start_manifest_read_after_deadline(
-    setup, monkeypatch, deadline_clock, inherited_budget,
+    setup, monkeypatch, deadline_clock, search_budget,
 ):
     import service.evidence_service as search
     from core.evidence import evidence_uri, message_source
@@ -247,9 +256,7 @@ def test_final_source_read_cannot_start_manifest_read_after_deadline(
         return selected
 
     monkeypatch.setattr(search, "select_groups", track_final_reads)
-    if not inherited_budget:
-        monkeypatch.setattr(search, "_SEARCH_TIMEOUT_SECONDS", deadline_clock.budget)
-    with operation_deadline(deadline_clock.budget if inherited_budget else None):
+    with search_budget:
         result = EvidenceService(fs).search("Paris", CTX)
 
     assert reads == [source_uri]
@@ -282,12 +289,9 @@ def test_time_channel_deadline_marks_partial_without_lexical_hits(setup, monkeyp
 
 
 @pytest.mark.parametrize("phase", ["serial_scan", "fact_verification"])
-@pytest.mark.parametrize("inherited_budget", [False, True])
 def test_source_read_deadline_stops_manifest_in_all_search_phases(
-    setup, monkeypatch, deadline_clock, phase, inherited_budget,
+    setup, monkeypatch, deadline_clock, search_budget, phase,
 ):
-    import service.evidence_service as search
-
     fs, _, _, _ = setup
     write_candidates(setup, [message("I visited Paris.")])
     read_node = fs.read_node
@@ -305,9 +309,7 @@ def test_source_read_deadline_stops_manifest_in_all_search_phases(
     else:
         install_batch(fs, monkeypatch)
     monkeypatch.setattr(fs, "read_node", expire_on_single_source)
-    if not inherited_budget:
-        monkeypatch.setattr(search, "_SEARCH_TIMEOUT_SECONDS", deadline_clock.budget)
-    with operation_deadline(deadline_clock.budget if inherited_budget else None):
+    with search_budget:
         result = EvidenceService(fs).search("Paris", CTX, use_memories=phase == "fact_verification")
 
     assert reads == ["sources"]

@@ -5,7 +5,7 @@ import re
 from datetime import UTC, datetime
 
 from core.evidence import resolve_event_time
-from core.operation_deadline import deadline_expired
+from core.operation_deadline import current_deadline, deadline_expired
 
 
 def date_prefixes(query):
@@ -22,9 +22,9 @@ def date_prefixes(query):
     return list(dict.fromkeys(prefixes))
 
 
-def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
+def fuse_auxiliary(request, scores, units, sources):
     """Return fused scores, channel diagnostics and whether the deadline prevented fusion."""
-    if deadline_expired(deadline):
+    if deadline_expired(current_deadline()):
         return scores, {"route": "none", "rho": 1.0, "reason": "deadline"}, True
     dates = date_prefixes(request.query)
     todo = bool(re.search(r"\b(todo|pending|unfinished)\b|待办|未完成", request.query, re.I))
@@ -34,7 +34,7 @@ def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
         if request.use_time:
             now = datetime.now(UTC)
             for key, unit in units.items():
-                if deadline_expired(deadline):
+                if deadline_expired(current_deadline()):
                     break
                 source = sources[unit["source_key"]]
                 event_time, _ = resolve_event_time(unit["text"], source["recorded_at"], source.get("timezone"))
@@ -48,7 +48,7 @@ def fuse_auxiliary(request, scores, units, sources, *, deadline=None):
                     if recorded.tzinfo:
                         days = max(0, (now - recorded.astimezone(UTC)).total_seconds() / 86400)
                         auxiliary[key] = math.exp(-days / 30)
-            if deadline_expired(deadline):
+            if deadline_expired(current_deadline()):
                 return scores, {"route": route, "rho": 1.0, "reason": "deadline"}, True
             auxiliary = dict(sorted(auxiliary.items(), key=lambda item: (-item[1], item[0]))[:5])
             rho = .7

@@ -70,9 +70,9 @@ class EvidenceService:
                        "verified_facts": 0, "rejected_facts": 0, "unverifiable_cards": 0, "channels": {
                            name: {"enabled": getattr(request, "use_" + name), "available": True}
                            for name in ("memories", "events", "time")}}
-        with operation_deadline_at(started + _SEARCH_TIMEOUT_SECONDS) as deadline:
+        with operation_deadline_at(started + _SEARCH_TIMEOUT_SECONDS):
             try:
-                evidence, groups, records = self._find_evidence(request, ctx, parsed_query, diagnostics, deadline)
+                evidence, groups, records = self._find_evidence(request, ctx, parsed_query, diagnostics)
             except TimeoutError:
                 # Before final validation, no evidence can safely be returned.
                 diagnostics["partial"] = True
@@ -106,12 +106,12 @@ class EvidenceService:
             diagnostics["response_bytes"] = _encoded_size(result.to_dict())
         return result
 
-    def _find_evidence(self, request, ctx, parsed_query, diagnostics, deadline):
+    def _find_evidence(self, request, ctx, parsed_query, diagnostics):
         query = request.query
         with stage("source_scan"):
             units, sources, source_bytes = {}, {}, 0
             source_uris = self.store.iter_uris(evidence_uri(ctx, "sources"), ctx, 10001)
-            for uri, read_source in self.store.iter_sources(source_uris, ctx, read_limit=10000, deadline=deadline):
+            for uri, read_source in self.store.iter_sources(source_uris, ctx, read_limit=10000):
                 check_deadline()
                 if diagnostics["scanned_sources"] >= 10000:
                     diagnostics.update(partial=True, truncated=True)
@@ -169,7 +169,7 @@ class EvidenceService:
                     prefix = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/{directory}"
                     card_uris = [prefix] if directory == "profile" else self.store.iter_uris(prefix, ctx, 2001)
                     stop_cards = False
-                    for page in self.store.node_pages(card_uris, ctx, read_limit=2000 - diagnostics["scanned_cards"], deadline=deadline):
+                    for page in self.store.node_pages(card_uris, ctx, read_limit=2000 - diagnostics["scanned_cards"]):
                         for uri, value in page:
                             check_deadline()
                             if diagnostics["scanned_cards"] >= 2000:
@@ -278,7 +278,7 @@ class EvidenceService:
                                event_bonus=round(event_bonus, 6))
         with stage("auxiliary"):
             from retrieval.evidence.auxiliary import fuse_auxiliary
-            scores, auxiliary, timed_out = fuse_auxiliary(request, scores, units, sources, deadline=deadline)
+            scores, auxiliary, timed_out = fuse_auxiliary(request, scores, units, sources)
             diagnostics["auxiliary"] = auxiliary
             if timed_out:
                 raise OperationDeadlineExceededError("Evidence auxiliary fusion deadline exceeded")
@@ -305,7 +305,7 @@ class EvidenceService:
             for key in selected:
                 item = units[key]
                 try:
-                    current = self.store.read_source(item["source_key"], ctx, deadline=deadline)
+                    current = self.store.read_source(item["source_key"], ctx)
                 except TimeoutError:
                     diagnostics["partial"] = True
                     break
