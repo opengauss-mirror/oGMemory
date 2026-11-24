@@ -103,6 +103,26 @@ class KnowledgeBaseRepository:
                 )
                 self._add_members(cur, base, members)
 
+    def put_member(self, base: KnowledgeBase, user_id: str, grant: KnowledgeBaseGrant) -> None:
+        with self._transaction() as cur:
+            cur.execute(
+                """
+                UPDATE knowledge_base_members SET permission = %s, user_generation = %s
+                WHERE account_id = %s AND knowledge_base_id = %s AND user_id = %s
+                """,
+                (grant.permission, grant.user_generation, base.account_id, str(base.id), user_id),
+            )
+            if not cur.rowcount:
+                self._add_members(cur, base, {user_id: grant})
+
+    def remove_member(self, base: KnowledgeBase, user_id: str) -> None:
+        with self._transaction() as cur:
+            cur.execute(
+                "DELETE FROM knowledge_base_members "
+                "WHERE account_id = %s AND knowledge_base_id = %s AND user_id = %s",
+                (base.account_id, str(base.id), user_id),
+            )
+
     def remove(self, base: KnowledgeBase) -> None:
         with self._transaction() as cur:
             cur.execute(

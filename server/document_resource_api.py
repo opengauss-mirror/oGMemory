@@ -79,6 +79,29 @@ def create_document_resource_blueprint(create_runtime, error_response):
         except Exception as exc:
             return operation_error(exc)
 
+    @blueprint.get("/knowledge-bases/<uuid:knowledge_base_id>/members")
+    @blueprint.route(
+        "/knowledge-bases/<uuid:knowledge_base_id>/members/<path:user_id>",
+        methods=["PUT", "DELETE"],
+    )
+    def members(knowledge_base_id: UUID, user_id: str | None = None):
+        try:
+            runtime, ctx = authenticated_runtime()
+            if user_id is None:
+                return jsonify(
+                    runtime.list_knowledge_base_members(
+                        ctx, knowledge_base_id, request.args.get("q", "")
+                    )
+                )
+            if request.method == "PUT":
+                return jsonify(
+                    runtime.put_knowledge_base_member(ctx, knowledge_base_id, user_id, _json_body())
+                )
+            runtime.remove_knowledge_base_member(ctx, knowledge_base_id, user_id)
+            return "", 204
+        except Exception as exc:
+            return operation_error(exc)
+
     @blueprint.route("/resources/documents", methods=["GET", "POST"])
     @blueprint.route("/resources/documents/<uuid:resource_id>", methods=["GET", "PUT", "DELETE"])
     @blueprint.get("/resources/documents/<uuid:resource_id>/content")
