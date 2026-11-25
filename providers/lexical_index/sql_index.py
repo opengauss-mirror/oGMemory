@@ -18,6 +18,7 @@ from core.lexical import (
     LexicalRecord,
 )
 from core.projection_ownership import check_projection_owner
+from fs.sql_adapter.postgresql_dialect import PostgreSQLDialect
 from providers.lexical_index.connection_pool import LexicalConnectionPool
 
 try:
@@ -92,6 +93,8 @@ class SQLNativeProjectionStore:
 
     supported_filters = _FILTER_COLUMNS
     _schema_version = _SCHEMA_VERSION
+
+    _schema_dialect = PostgreSQLDialect()
 
     @staticmethod
     def _rollback_preserving(conn) -> None:
@@ -622,7 +625,9 @@ class SQLNativeProjectionStore:
                     """
                 )
                 cur.execute(
-                    f"ALTER TABLE {self._docs_table} ADD COLUMN IF NOT EXISTS content TEXT"
+                    self._schema_dialect.prepare_schema(
+                        f"ALTER TABLE {self._docs_table} ADD COLUMN IF NOT EXISTS content TEXT;"
+                    )
                 )
                 cur.execute(
                     f"CREATE INDEX IF NOT EXISTS idx_{self._table}_scope ON {self._docs_table}(account_id, owner_space, level)"
@@ -667,7 +672,9 @@ class SQLNativeProjectionStore:
                     """
                 )
                 cur.execute(
-                    f"ALTER TABLE {self._rebuild_docs_table} ADD COLUMN IF NOT EXISTS content TEXT"
+                    self._schema_dialect.prepare_schema(
+                        f"ALTER TABLE {self._rebuild_docs_table} ADD COLUMN IF NOT EXISTS content TEXT;"
+                    )
                 )
                 cur.execute(
                     f"""

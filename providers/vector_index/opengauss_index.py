@@ -241,7 +241,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     ("before_clip", "INTEGER"),
                 ]:
                     cur.execute(
-                        f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"
+                        self.sql_dialect.prepare_schema(
+                            f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type};"
+                        )
                     )
 
                 # Legacy row backfills are explicitly run once by

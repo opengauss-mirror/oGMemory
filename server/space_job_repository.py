@@ -80,8 +80,8 @@ class SpaceJobRepository:
                 receipt = {"change_id": event["event_id"], "targets": [
                     {"space_id": t["space_id"], "rule_id": t["rule_id"]} for t in targets],
                     "confirmed_at": datetime.now(UTC).isoformat()}
-                cur.execute("""UPDATE outbox_events SET payload=payload || %s::jsonb,status='DONE'
-                    WHERE event_id=%s""", (Json({"space_dispatch_receipt": receipt}), event["event_id"]))
+                cur.execute("""UPDATE outbox_events SET payload=jsonb_set(payload, '{space_dispatch_receipt}', %s::jsonb, true),status='DONE'
+                    WHERE event_id=%s""", (Json(receipt), event["event_id"]))
             cur.execute("""DELETE FROM outbox_events WHERE event_id IN (
                 SELECT event_id FROM outbox_events WHERE account_id=%s AND event_type='SOURCE_CHANGED'
                 AND status='DONE' AND created_at<NOW()-INTERVAL '7 days' ORDER BY created_at LIMIT %s)""", (account_id, limit))
@@ -507,9 +507,9 @@ class SpaceJobRepository:
             content=CASE WHEN %s THEN '' ELSE content END,abstract=CASE WHEN %s THEN '' ELSE abstract END,
             overview=CASE WHEN %s THEN '' ELSE overview END,
             metadata=CASE WHEN %s THEN json_build_object('topic',metadata->>'topic',
-                'source_window',metadata->>'source_window')::jsonb || %s::jsonb ELSE metadata END
+                'source_window',metadata->>'source_window','job_id',%s::text,'state',%s::text)::jsonb ELSE metadata END
             WHERE account_id=%s AND uri=%s""",
-            (purge, purge, purge, purge, Json({"job_id": job_id, "state": state}), item["account_id"], item["uri"]))
+            (purge, purge, purge, purge, job_id, state, item["account_id"], item["uri"]))
         self._space_event(cur, item["account_id"], item["uri"], "DELETE_CONTEXT",
                           {"ids_to_delete": [IndexRecord.generate_id(item['uri'], 0),
                                              IndexRecord.generate_id(item['uri'] + '/content.md', 2)]})

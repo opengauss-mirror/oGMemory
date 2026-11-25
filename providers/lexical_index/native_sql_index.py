@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
 from core.lexical import LexicalHit, LexicalRecord
 from core.memory_names import AGFS_SEARCH_DIRECTORY_PATTERN
 from core.operation_deadline import check_deadline, remaining_seconds
+from fs.sql_adapter.opengauss_dialect import OpenGaussDialect
 from providers.lexical_index.sql_index import (
     PreparedSQLLexicalRecord,
     SQLNativeProjectionStore,
@@ -230,7 +232,22 @@ class DatabaseNativeLexicalIndex(SQLNativeProjectionStore):
                 pass
 
 def supports_native_bm25(cursor) -> bool:
-    """Check for the native text index and search operator."""
+    """Check the supported server version, native text index and search operator."""
+    cursor.execute("SELECT version()")
+    row = cursor.fetchone()
+    match = re.search(
+        r"\bopenGauss(?:-lite)? (\d+)\.(\d+)\.(\d+)(?:-RC(\d+))?\b",
+        str(row[0]) if row else "",
+        re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    release = tuple(int(part) for part in match.group(1, 2, 3))
+    candidate = match.group(4)
+    if release < (7, 0, 0) or (
+        release == (7, 0, 0) and candidate is not None and int(candidate) < 3
+    ):
+        return False
     cursor.execute(
         """
         SELECT
@@ -258,6 +275,8 @@ def supports_native_bm25(cursor) -> bool:
 
 class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
     """openGauss BM25 provider backed by the native BM25 access method."""
+
+    _schema_dialect = OpenGaussDialect()
 
     supported_filters = DatabaseNativeLexicalIndex.supported_filters | {"agfs_leaves_only"}
 
@@ -287,7 +306,7 @@ class OpenGaussLexicalIndex(DatabaseNativeLexicalIndex):
     def _ensure_schema(self) -> None:
         if not self._database_supports_bm25():
             raise RuntimeError(
-                "openGauss native BM25 access method and <&> operator are required"
+                "openGauss 7.0.0-RC3 or later with native BM25 access method and <&> operator is required"
             )
         self._engine = "opengauss_bm25"
         SQLNativeProjectionStore._ensure_schema(self)

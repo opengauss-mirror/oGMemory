@@ -206,8 +206,8 @@ class TestOpenGaussSearchByVector:
         )
 
         assert len(results) == 1
-        # Filter out CREATE TABLE statements from auto-init
-        select_sqls = [sql for sql in mock_cursor.executed_sql if "SELECT" in sql]
+        select_sqls = [sql for sql in mock_cursor.executed_sql if sql.lstrip().startswith("SELECT")]
+        assert len(select_sqls) == 1
         sql = select_sqls[0]
         # Remove extra whitespace for robust checking
         sql_normalized = " ".join(sql.split())
@@ -234,8 +234,8 @@ class TestOpenGaussSearchByVector:
             top_k=10
         )
 
-        # Filter out CREATE TABLE statements from auto-init
-        select_sqls = [sql for sql in mock_cursor.executed_sql if "SELECT" in sql]
+        select_sqls = [sql for sql in mock_cursor.executed_sql if sql.lstrip().startswith("SELECT")]
+        assert len(select_sqls) == 1
         sql = select_sqls[0]
         assert "metadata->>'parent_uri' = %(parent_uri)s" in sql
         assert mock_cursor.executed_params[0]["parent_uri"] == "ctx://acme/users/u1/memories/preferences/"

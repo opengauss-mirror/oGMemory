@@ -98,10 +98,9 @@ def test_shared_projection_completion_publishes_matching_revision(mock_sql_outbo
     ready_sql, ready_params = cursor.execute.call_args.args
     assert "version = %s" in ready_sql
     assert "metadata->>'shared_projection_event_id'" in ready_sql
-    assert ready_params == (
-        {"shared_projection_ready": True, "indexed_content_rev": 3},
-        event.uri, event.event_id, 3,
-    )
+    assert "'{shared_projection_ready}', 'true'::jsonb, true" in ready_sql
+    assert "'{indexed_content_rev}', %s::jsonb, true" in ready_sql
+    assert ready_params == (3, event.uri, event.event_id, 3)
     assert cursor.execute.call_args_list[1].args[1] == ("acme",)
     conn.commit.assert_called_once()
 

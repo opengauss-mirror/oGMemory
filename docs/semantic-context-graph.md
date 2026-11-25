@@ -236,8 +236,7 @@ changes invalidate projections; an old worker result cannot complete a newer
 revision's job. Queue SQL supports the existing PostgreSQL/openGauss dialect
 seam. The graph projection queue selects `FOR UPDATE` on openGauss through
 `supports_batch_claim`; this flag also selects the outbox polling/notification
-path. Team-memory queues use `SKIP LOCKED` with their independently verified
-[SQL storage baseline](deployment/team-memory-sql-compatibility.md).
+path. Team-memory queues use `SKIP LOCKED`.
 
 The vector adapter also guards a legacy `node_id` backfill: current upstream
 `context_nodes` is URI-keyed and has no `node_id` column. No legacy node-id

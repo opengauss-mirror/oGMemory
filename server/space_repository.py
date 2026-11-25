@@ -210,10 +210,10 @@ class SpaceRepository(SpaceJobRepository):
     @staticmethod
     def _cancel_jobs(cur, account_id, space_id, rule_id=None):
         cur.execute("""UPDATE space_jobs SET state='SUPERSEDED',claim_token=NULL,lease_until=NULL,
-            result=result || %s::jsonb,snapshot=snapshot - 'sources',updated_at=NOW()
+            result=jsonb_set(result, '{reason}', %s::jsonb, true),snapshot=snapshot - 'sources',updated_at=NOW()
             WHERE account_id=%s AND space_id=%s AND (%s IS NULL OR rule_id=%s)
             AND state IN ('QUEUED','RUNNING')""",
-            (Json({'reason': 'deleted'}), account_id, space_id, rule_id, rule_id))
+            (Json('deleted'), account_id, space_id, rule_id, rule_id))
 
     @staticmethod
     def _bump(cur, account_id, space_id):
