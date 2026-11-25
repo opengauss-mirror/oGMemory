@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from core.models import RequestContext, RetrievedBlock, SeedHit
 from retrieval.context_reader import ContextReader
+from retrieval.identity import canonical_uri
 from retrieval.owner_scope import validate_owner_filter
 
 
@@ -117,7 +118,7 @@ class AuthorizedVectorSearch:
             except Exception:
                 rejected.append("unavailable_or_unauthorized")
                 continue
-            if block.owner_space not in owner_values:
+            if block.owner_space not in owner_values or canonical_uri(block.uri) != canonical_uri(hit.uri):
                 rejected.append("unavailable_or_unauthorized")
                 continue
             if (

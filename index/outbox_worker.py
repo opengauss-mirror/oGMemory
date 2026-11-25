@@ -457,6 +457,7 @@ class OutboxWorker:
     def _notify_memory_projection(self, event: OutboxEvent, result: WorkerResult) -> None:
         if not self._is_memory_projection_event(event):
             return
+        event = self._archive_projection_event(event)
         if event.event_type == "UPSERT_CONTEXT" and result.records_upserted == 0:
             return
         if self._fs is None:
@@ -622,6 +623,14 @@ class OutboxWorker:
             records_upserted=0,
         )
 
+    @staticmethod
+    def _archive_projection_event(event: OutboxEvent) -> OutboxEvent:
+        if event.event_type == "ARCHIVE_CONTEXT" and "dreaming_archive_source" in event.payload:
+            from fs.agfs_adapter.dreaming import archive_source_uri
+
+            return replace(event, uri=archive_source_uri(event))
+        return event
+
     def _process_archive_context(self, event: OutboxEvent, ctx: RequestContext | None = None) -> WorkerResult:
         """Process ARCHIVE_CONTEXT event.
 
@@ -635,6 +644,7 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
+        event = self._archive_projection_event(event)
         if event.payload.get("dreaming_visibility") is True:
             ctx = ctx or self._build_request_context(event)
             if self._fs is None or ctx is None:

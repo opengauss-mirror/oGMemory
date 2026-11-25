@@ -3,6 +3,7 @@
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from hashlib import sha256
@@ -15,6 +16,7 @@ from pyagfs.exceptions import AGFSClientError
 
 from commit.identity_resolver import MemoryIdentityResolver
 from commit.outbox_store import OutboxStore
+from core.dreaming_evidence import EVIDENCE_KEY, bind_archive_evidence
 from core.enums import EventType, NodeStatus
 from core.errors import (
     AccessDeniedError,
@@ -341,15 +343,16 @@ def _atomic_code_context() -> RequestContext:
     )
 
 
-@pytest.mark.parametrize("enqueue_after_projection", [False, True])
-def test_dreaming_reviews_duplicates_in_maintenance_only_storage(enqueue_after_projection, monkeypatch):
+@pytest.mark.parametrize("enqueue_after_projection, merge_available", [(False, False), (True, False), (False, True)])
+def test_dreaming_reviews_duplicates_in_maintenance_mode(enqueue_after_projection, merge_available, monkeypatch):
     from commit.dreaming import Dreaming, maintenance_event
     from core.dreaming_evidence import node_created_at
 
     client = _AtomicMemoryAGFSClient()
     client.api_base = "memory://dreaming-review-without-merge"
     fs, ctx = AGFSContextFS(client, dreaming_enabled=True), _atomic_code_context()
-    monkeypatch.setattr(AGFSContextFS, "merge_dreaming_duplicate", None, raising=False)
+    if not merge_available:
+        monkeypatch.setattr(AGFSContextFS, "merge_dreaming_duplicate", None, raising=False)
     outbox = OutboxStore(client, fs)
     uri = "ctx://acme/users/alice/memories/patterns/first"
     node = ContextNode(uri, "MEMORY", "pattern", 0, "user:alice", "Fact", "Fact", "Fact",
@@ -365,6 +368,115 @@ def test_dreaming_reviews_duplicates_in_maintenance_only_storage(enqueue_after_p
 
     assert fs.read_node(uri, ctx).metadata["dreaming_review"]["version"] == 1
     assert fs.read_node(uri + "-peer", ctx).content == node.content
+
+
+@pytest.fixture
+def dreaming_storage():
+    client = _AtomicMemoryAGFSClient()
+    client.api_base = "memory://dreaming"
+    fs = AGFSContextFS(client, dreaming_enabled=True)
+    return fs, OutboxStore(client, fs), _atomic_code_context()
+
+
+@contextmanager
+def _dreaming_job(outbox, ctx, event_id, uri):
+    event = OutboxEvent(event_id, EventType.DREAM_MEMORY.value, uri, {}, "PENDING")
+    outbox.register_once(event, ctx)
+    with outbox.claim_processing_event(event, uri, "worker") as acquired:
+        assert acquired
+        yield event
+
+
+@pytest.mark.parametrize("layers", [None, {"abstract": "Combined", "overview": "Summary", "content": "Complete"}])
+def test_dreaming_merge_resumes_with_one_canonical_receipt_and_stable_projections(layers, dreaming_storage):
+    from fs.agfs_adapter import dreaming
+
+    fs, outbox, ctx = dreaming_storage
+    directory = "ctx://acme/users/alice/memories/patterns"
+    uris = [f"{directory}/first", f"{directory}/second"]
+    proofs = []
+    for index, uri in enumerate(uris):
+        reference = ProvenanceResolver.build_id("archive", f"source-{index}", [f"message-{index}"])
+        evidence = bind_archive_evidence(
+            [{"claim": "Fact", "subject": "Alice", "relation": "supports", "quote": "Fact", "scope_ref": "project"}],
+            reference, [{"id": f"message-{index}", "role": "user", "content": "Fact"}],
+        )
+        proofs.extend(evidence)
+        fs.write_node(ContextNode(
+            uri, "MEMORY", "pattern", 4, "user:alice", "Fact", "Fact", "Fact",
+            {"_expected_version": 0, "scope_ref": "project",
+             "routing_key": f"rule-{index}",
+             "provenance_ids": [reference], EVIDENCE_KEY: evidence,
+             "memory_write_receipts": {f"operation-{index}": f"digest-{index}"}},
+        ), ctx)
+
+    canonical, duplicate = [fs.read_node(uri, ctx) for uri in uris]
+    assert [peer.uri for peer in fs.dreaming_candidates(duplicate, ctx)] == [canonical.uri]
+    fs.record_dreaming_review(canonical, ctx, {"version": 1, "confidence": 0.8})
+    reviewed = fs.read_node(canonical.uri, ctx)
+    assert reviewed.metadata["dreaming_review"] == {"version": 1, "confidence": 0.8}
+    assert reviewed.metadata["version"] == 1
+    with _dreaming_job(outbox, ctx, "dreaming-merge", duplicate.uri) as event:
+        if layers is None:
+            assert fs.merge_dreaming_duplicate(reviewed, duplicate, ctx, event=event, outbox=outbox)
+        else:
+            with patch.object(dreaming, "_confirm_receipts", side_effect=OSError("confirmation interrupted")):
+                with pytest.raises(OSError, match="confirmation interrupted"):
+                    fs.merge_dreaming_duplicate(reviewed, duplicate, ctx, event=event, outbox=outbox, layers=layers)
+        assert fs.resume_dreaming_merge(event, ctx, outbox)
+
+    resolved = fs.read_dreaming_alias(duplicate.uri, ctx)
+    assert fs.list_children(directory, ctx) == [canonical.uri]
+    assert resolved.uri == canonical.uri
+    assert resolved.content == (layers["content"] if layers else canonical.content)
+    assert resolved.overview == (layers["overview"] if layers else canonical.overview)
+    assert resolved.abstract == (layers["abstract"] if layers else canonical.abstract)
+    assert resolved.metadata["version"] == 2
+    assert resolved.metadata["provenance_ids"] == [proof["source_ref"] for proof in proofs]
+    assert resolved.metadata[EVIDENCE_KEY] == proofs
+    assert resolved.metadata["routing_key_aliases"] == ["rule-1"]
+    assert resolved.metadata["memory_write_receipts"] == {"operation-0": "digest-0", "operation-1": "digest-1"}
+    receipt = resolved.metadata["memory_write_projection_receipts"]["operation-1"]
+    assert receipt["ownership"] == "confirmed"
+    projection = receipt["event_id"]
+    assert outbox.get_event_status(canonical.uri, projection) == "PENDING"
+    operations = [item for item in fs._client.operations if "/.outbox/" in str(item)]
+    assert sum(item[0] == "mv" and item[2].endswith(f"{projection}.json") for item in operations) == 1
+
+
+@pytest.mark.parametrize("recreate_source", [False, True])
+def test_dreaming_merge_recovers_located_receipt_on_canonical(recreate_source, dreaming_storage):
+    from commit.write_receipts import attach_receipt, bind_operation_target
+    from service.api import MemoryWriteAPI
+    from tests.unit.server.test_extraction_batch_recovery import NoModel
+
+    fs, outbox, ctx = dreaming_storage
+    uris = URIResolver(SchemaRegistry())
+    uri = "ctx://acme/users/alice/memories/patterns/first"
+    target = ContextNode(uri, "MEMORY", "pattern", 0, "user:alice", "Fact", "Fact", "Fact",
+                         {"_expected_version": 0})
+    source = replace(target, uri=uri + "-duplicate", metadata=dict(target.metadata))
+    candidate = CandidateMemory("pattern", "user", "pattern", "Fact", "Fact", "Fact", 0.8,
+                                target_uri=source.uri, expected_version=1,
+                                write_operation_id="receipt-v2:dreaming-merge")
+    bind_operation_target(fs, uris, candidate, ctx, source.uri)
+    attach_receipt(fs, source, candidate, ctx)
+    fs.write_node(target, ctx)
+    fs.write_node(source, ctx)
+    with _dreaming_job(outbox, ctx, "merge-located-receipt", source.uri) as event:
+        assert fs.merge_dreaming_duplicate(
+            fs.read_node(target.uri, ctx), fs.read_node(source.uri, ctx), ctx, event=event, outbox=outbox,
+        )
+
+    if recreate_source:
+        fs.delete_node(source.uri, ctx)
+        fs.write_node(replace(target, uri=source.uri, content="A newly created fact."), ctx)
+    replay = MemoryWriteAPI(fs, NoModel(), outbox, directory_summary_enabled=False).write_memory(candidate, ctx)
+    if recreate_source:
+        current = fs.read_node(source.uri, ctx)
+        assert (current.content, current.metadata["version"]) == ("A newly created fact.", 1)
+    assert (replay["target_uri"], replay["merged_fields"]["status"]) == (target.uri, "operation_committed")
+    assert replay["merged_fields"]["outbox_events"][0][0] == target.uri
 
 
 def test_dreaming_ordinary_archive_keeps_the_recreated_node_active():
@@ -393,6 +505,98 @@ def test_dreaming_ordinary_archive_keeps_the_recreated_node_active():
             pass
     rebuilt = fs.read_node(uri, ctx)
     assert (rebuilt.content, rebuilt.metadata["version"]) == ("A different current fact", 1)
+
+
+@pytest.mark.parametrize("timing", ["legacy", "incoming_during_merge", "outgoing_during_merge"])
+def test_dreaming_preserves_relation_targets(timing, dreaming_storage):
+    from core.models import RelationEdge
+    from fs.agfs_adapter import dreaming
+    from providers.relation_store.agfs_relation_store import AGFSRelationStore
+    from retrieval.context_reader import ContextReader
+
+    fs, outbox, ctx = dreaming_storage
+    relations = AGFSRelationStore(fs._client, fs=fs)
+    uri = "ctx://acme/users/alice/memories/patterns/target"
+    target = ContextNode(uri, "MEMORY", "pattern", 0, "user:alice", "Fact", "Fact", "Fact", {"_expected_version": 0})
+    source = replace(target, uri=uri + "-source")
+    peer = replace(target, uri="ctx://acme/users/alice/memories/preferences/related", category="preference")
+    for node in (target, source, peer):
+        fs.write_node(node, ctx)
+    outgoing = timing == "outgoing_during_merge"
+    start, end = (source, peer) if outgoing else (peer, source)
+    edge = RelationEdge(start.uri, end.uri, "related_to", 0.9, "Referenced memory")
+    if timing == "legacy":
+        AGFSRelationStore(fs._client).upsert_edges([edge], ctx)
+    publish = dreaming._publish_canonical
+    attempted = Event()
+
+    def write_edge():
+        attempted.set()
+        relations.upsert_edges([edge], ctx)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        submitted = []
+
+        def publish_during_edge_write(*args):
+            if timing != "legacy":
+                submitted.append(executor.submit(write_edge))
+                assert attempted.wait(timeout=3)
+                if not outgoing:
+                    submitted[0].result(timeout=3)
+            return publish(*args)
+
+        with (_dreaming_job(outbox, ctx, "related-dreaming-merge", source.uri) as event,
+              patch.object(dreaming, "_publish_canonical", side_effect=publish_during_edge_write)):
+            assert fs.merge_dreaming_duplicate(fs.read_node(uri, ctx), fs.read_node(source.uri, ctx),
+                                               ctx, event=event, outbox=outbox)
+        for result in submitted:
+            result.result(timeout=3)
+    if outgoing:
+        assert relations.get_edges(uri, ctx) == [replace(edge, from_uri=uri)]
+        return
+    reader = ContextReader(fs)
+    [old] = relations.get_edges(peer.uri, ctx)
+    assert reader.read_authorized(old.to_uri, ctx).uri == target.uri
+    fs.delete_node(source.uri, ctx)
+    fs.write_node(replace(source, content="New memory"), ctx)
+    relations.upsert_edges([edge], ctx)
+    assert {reader.read_authorized(related.to_uri, ctx).content_excerpt
+            for related in relations.get_edges(peer.uri, ctx)} == {"Fact", "New memory"}
+    fs.delete_node(source.uri, ctx)
+    fs.write_node(replace(source, content="Third memory"), ctx)
+    assert [related.to_uri for related in relations.get_edges(peer.uri, ctx)] == [target.uri]
+
+
+@pytest.mark.parametrize("recreate", [False, True])
+def test_dreaming_delayed_archive_cleans_deleted_source_generation(dreaming_storage, recreate):
+    from index.index_record_builder import build_index_records
+    from index.outbox_worker import OutboxWorker
+    from tests.unit.index.test_outbox_worker import MockVectorIndex
+
+    fs, outbox, ctx = dreaming_storage
+    index = MockVectorIndex()
+    uri = "ctx://acme/users/alice/memories/patterns/first"
+    target = ContextNode(uri, "MEMORY", "pattern", 0, "user:alice",
+                         "Fact", "Fact", "Fact", {"_expected_version": 0})
+    source = replace(target, uri=target.uri + "-duplicate")
+    for node in (target, source):
+        fs.write_node(node, ctx)
+    original = fs.read_node(source.uri, ctx)
+    index.upsert(build_index_records(original))
+    with _dreaming_job(outbox, ctx, "dreaming-delayed-archive", source.uri) as event:
+        assert fs.merge_dreaming_duplicate(
+            fs.read_node(uri, ctx), original, ctx, event=event, outbox=outbox,
+        )
+    fs.delete_node(source.uri, ctx)
+    if recreate:
+        fs.write_node(replace(source, content="Replacement"), ctx)
+        index.upsert(build_index_records(fs.read_node(source.uri, ctx)))
+    [archive] = [job for _, job in outbox.list_pending(ctx.account_id) if job.event_type == "ARCHIVE_CONTEXT"]
+    with outbox.claim_processing_event(archive, archive.uri, "worker") as claimed:
+        assert claimed
+        assert OutboxWorker(index, None, fs=fs).process_event(archive, ctx).success
+        outbox.mark_done(archive, archive.uri)
+    assert {record.text for record in index.records.values()} == ({"Fact", "Replacement"} if recreate else set())
 
 
 @pytest.mark.parametrize("category, target, owner", [

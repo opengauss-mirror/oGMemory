@@ -20,8 +20,9 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar, copy_context
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from threading import Event, Thread
@@ -1796,6 +1797,7 @@ class AGFSContextFS:
             "relation_type": edge.relation_type,
             "weight": edge.weight,
             "reason": edge.reason,
+            **({"target_created_at": edge.target_created_at} if edge.target_created_at is not None else {}),
         }
 
     def _dict_to_relation_edge(self, d: dict) -> RelationEdge:
@@ -1806,6 +1808,7 @@ class AGFSContextFS:
             relation_type=d["relation_type"],
             weight=d["weight"],
             reason=d["reason"],
+            target_created_at=d.get("target_created_at", "legacy"),
         )
 
     @classmethod
@@ -2268,6 +2271,12 @@ class AGFSContextFS:
         """
         # Step 0: Access control check
         self._ensure_accessible(node.uri, ctx)
+        if self.dreaming_enabled and (relations := node.metadata.get("_relations")):
+            from fs.agfs_adapter.dreaming import bind_relation_target
+
+            node = replace(node, metadata={**node.metadata, "_relations": [
+                bind_relation_target(self, edge, ctx) for edge in relations
+            ]})
         recovery = self.active_session_recovery()
         if recovery is not None:
             recovery[0].ensure_owned()
@@ -2971,7 +2980,13 @@ class AGFSContextFS:
         self._ensure_accessible(uri, ctx)
         try:
             meta = json.loads(self._read_file(self._uri_to_agfs_path(uri) + self.FILE_META))
-        except (NodeNotFoundError, json.JSONDecodeError):
+        except NodeNotFoundError:
+            if created_at:
+                from fs.agfs_adapter.dreaming import retained_archive_version
+
+                return retained_archive_version(self, uri, created_at)
+            return None
+        except json.JSONDecodeError:
             return None
         if meta.get("status") == NodeStatus.ARCHIVED.value and (
             created_at is None or node_created_at(meta) == created_at
@@ -3192,6 +3207,66 @@ class AGFSContextFS:
 
         demote(self, node, ctx, archive_event_id)
 
+    def merge_dreaming_duplicate(self, canonical, duplicate, ctx, *, event=None, outbox=None, layers=None) -> bool:
+        if event is None or outbox is None:
+            return False
+        from fs.agfs_adapter.dreaming import merge
+
+        return merge(self, canonical, duplicate, ctx, event, outbox, layers=layers)
+
+    def resume_dreaming_merge(self, event, ctx, outbox) -> bool:
+        from fs.agfs_adapter.dreaming import resume_merge
+
+        return resume_merge(self, event, ctx, outbox)
+
+    def read_dreaming_alias(self, uri: str, ctx: RequestContext, *, expected_created_at: str | None = None) -> ContextNode:
+        from fs.agfs_adapter.dreaming import retained_alias
+
+        original = uri
+        parent = uri.rsplit("/", 1)[0]
+        visited = set()
+        target_created_at = expected_created_at
+        while (uri, target_created_at) not in visited:
+            visited.add((uri, target_created_at))
+            try:
+                node = self.read_node(uri, ctx)
+            except NodeNotFoundError:
+                try:
+                    metadata = self.read_node_metadata_including_inactive(uri, ctx)
+                except NodeNotFoundError:
+                    metadata = {}
+                target = metadata.get("dreaming_canonical_uri")
+                target_time = metadata.get("dreaming_canonical_created_at")
+                if (
+                    metadata.get("status") == NodeStatus.ARCHIVED.value
+                    and isinstance(target, str) and target.rsplit("/", 1)[0] == parent
+                    and target_time and (target_created_at is None or node_created_at(metadata) == target_created_at)
+                ):
+                    uri, target_created_at = target, target_time
+                    continue
+            else:
+                if target_created_at is None or node_created_at(node.metadata) == target_created_at:
+                    return node
+            if not target_created_at or not (alias := retained_alias(self, uri, ctx, target_created_at)):
+                break
+            uri, target_created_at = alias
+        raise NodeNotFoundError(original)
+
+    def resolve_dreaming_relation_target(self, uri, ctx, created_at):
+        from fs.agfs_adapter.dreaming import retained_alias
+        if not _MEMORY_URI_PATTERN.fullmatch(uri):
+            return uri
+        if created_at and created_at != "legacy":
+            try:
+                metadata = self.read_node_metadata_including_inactive(uri, ctx)
+            except NodeNotFoundError:
+                metadata = {}
+            if metadata.get("status") == NodeStatus.ACTIVE.value and node_created_at(metadata) == created_at:
+                return uri
+            return self.read_dreaming_alias(uri, ctx, expected_created_at=created_at).uri
+        alias = retained_alias(self, uri, ctx, created_at)
+        return self.read_dreaming_alias(alias[0], ctx, expected_created_at=alias[1]).uri if alias else uri
+
     def iter_dreaming_nodes(self, account_id: str) -> Iterator[tuple[ContextNode, RequestContext]]:
         from fs.agfs_adapter.dreaming import scan_nodes
 
@@ -3242,15 +3317,19 @@ class AGFSContextFS:
         # Access control check
         self._ensure_accessible(uri, ctx)
 
-        node_path = self._uri_to_agfs_path(uri)
+        memory_node = _MEMORY_URI_PATTERN.fullmatch(uri) is not None
+        lock = self.memory_identity_lock(uri.rsplit("/", 1)[0], ctx) if memory_node else nullcontext()
+        with lock:
+            if memory_node:
+                from fs.agfs_adapter.dreaming import confirm_archived_receipts
 
-        # Delete recursively (removes all files and subdirectories)
-        try:
-            self._client.rm(node_path, recursive=True)
-        except AGFSClientError as e:
-            if _is_not_found_error(e):
-                raise NodeNotFoundError(uri)
-            raise
+                confirm_archived_receipts(self, uri, ctx, retain_alias=True)
+            try:
+                self._client.rm(self._uri_to_agfs_path(uri), recursive=True)
+            except AGFSClientError as e:
+                if _is_not_found_error(e):
+                    raise NodeNotFoundError(uri)
+                raise
         if self._on_node_change is not None:
             self._on_node_change(uri, subtree=True)
 

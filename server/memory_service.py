@@ -1076,7 +1076,7 @@ class MemoryService:
                 ))
         if _HAS_AGFS:
             client = self._get_agfs_client()
-            return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
+            return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix, fs=self._get_context_fs())
         return None
 
     @property
