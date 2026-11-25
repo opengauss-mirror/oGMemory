@@ -20,6 +20,7 @@ extern "C" {
 #endif
 
 #define OV_CACHE_PROVIDER_ABI_V1 1u
+#define OV_CACHE_PROVIDER_ENTRY_NAME "open" "viking" "_cache_provider_v1"
 
 #define OV_CACHE_STATUS_OK 0
 #define OV_CACHE_STATUS_TIMEOUT 2
@@ -341,12 +342,12 @@ const OvCacheProviderApiV1 *cache_provider_v1(void);
 /* Providers define cache_provider_v1 and emit this alias once. */
 #if defined(__APPLE__)
 #define OV_CACHE_PROVIDER_EXPORT_ENTRY \
-    __asm__(".globl _" "open" "viking" "_cache_provider_v1\n" \
-            "_" "open" "viking" "_cache_provider_v1 = _cache_provider_v1")
+    __asm__(".globl _" OV_CACHE_PROVIDER_ENTRY_NAME "\n" \
+            "_" OV_CACHE_PROVIDER_ENTRY_NAME " = _cache_provider_v1")
 #elif defined(__GNUC__) || defined(__clang__)
 #define OV_CACHE_PROVIDER_EXPORT_ENTRY \
-    __asm__(".globl " "open" "viking" "_cache_provider_v1\n" \
-            "open" "viking" "_cache_provider_v1 = cache_provider_v1")
+    __asm__(".globl " OV_CACHE_PROVIDER_ENTRY_NAME "\n" \
+            OV_CACHE_PROVIDER_ENTRY_NAME " = cache_provider_v1")
 #else
 #define OV_CACHE_PROVIDER_EXPORT_ENTRY
 #endif

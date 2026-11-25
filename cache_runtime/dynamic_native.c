@@ -85,10 +85,8 @@ NativeCache *native_open(const char *library, const void *params, size_t len,
   if (!lib) {
     return NULL;
   }
-  static const char entry_name[] = {
-      'o', 'p', 'e', 'n', 'v', 'i', 'k', 'i', 'n', 'g', '_', 'c', 'a', 'c',
-      'h', 'e', '_', 'p', 'r', 'o', 'v', 'i', 'd', 'e', 'r', '_', 'v', '1', 0};
-  const OvCacheProviderApiV1 *(*entry)(void) = dlsym(lib, entry_name);
+  const OvCacheProviderApiV1 *(*entry)(void) =
+      dlsym(lib, OV_CACHE_PROVIDER_ENTRY_NAME);
   if (!entry) {
     dlclose(lib);
     return NULL;

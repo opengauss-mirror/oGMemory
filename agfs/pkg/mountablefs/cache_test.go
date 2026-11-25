@@ -226,7 +226,7 @@ func TestCacheRejectsSQLiteURIStorageAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := NewMountableFS(api.PoolConfig{})
-	if err := m.UseCache(cachefs.Config{Enabled: true, Namespace: "test", Mounts: []string{"/cached"}}, r); err != nil {
+	if err := m.UseCache(cachefs.Config{Enabled: true, Namespace: "test", Mounts: []string{"/cached", "/cached-options"}}, r); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -248,6 +248,11 @@ func TestCacheRejectsSQLiteURIStorageAlias(t *testing.T) {
 		"backend": "sqlite", "db_path": uri,
 	}); err == nil {
 		t.Fatal("accepted SQLite URI storage alias")
+	}
+	if err := m.MountPlugin("sqlfs", "/cached-options", map[string]interface{}{
+		"backend": "sqlite", "db_path": plain + "?_busy_timeout=5000",
+	}); err == nil {
+		t.Fatal("accepted SQLite driver-option storage alias")
 	}
 }
 

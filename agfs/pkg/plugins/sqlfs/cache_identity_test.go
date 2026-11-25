@@ -15,6 +15,15 @@ func TestNormalizeSQLitePathAliases(t *testing.T) {
 	if got := normalizeSQLitePath("file::memory:?cache=shared"); got != "" {
 		t.Fatalf("shared memory path identity = %q", got)
 	}
+	if got := normalizeSQLitePath(":memory:?cache=shared"); got != "" {
+		t.Fatalf("memory DSN identity = %q", got)
+	}
+	if got := normalizeSQLitePath("file::memory:backup.db"); got != ":memory:backup.db" {
+		t.Fatalf("memory-prefixed filename = %q", got)
+	}
+	if got := normalizeSQLitePath("store.db?_busy_timeout=5000"); got != "store.db" {
+		t.Fatalf("driver-option filename = %q", got)
+	}
 	if got := normalizeSQLitePath(uri); got != plain {
 		t.Fatalf("URI path = %q, want %q", got, plain)
 	}

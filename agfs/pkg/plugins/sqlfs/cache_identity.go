@@ -38,12 +38,15 @@ func cacheStorageID(backend DBBackend, c map[string]interface{}) string {
 // URI escaping must be decoded before the identity is compared, otherwise a
 // file URI and its ordinary path spelling can create two cache domains.
 func normalizeSQLitePath(raw string) string {
-	if raw == ":memory:" || strings.HasPrefix(raw, "file::memory:") {
+	raw = strings.SplitN(raw, "?", 2)[0]
+	if raw == ":memory:" {
 		return ""
 	}
 	if strings.HasPrefix(raw, "file:") {
 		raw = strings.TrimPrefix(raw, "file:")
-		raw = strings.SplitN(raw, "?", 2)[0]
+		if raw == ":memory:" {
+			return ""
+		}
 		decoded, err := url.PathUnescape(raw)
 		if err != nil {
 			return ""
