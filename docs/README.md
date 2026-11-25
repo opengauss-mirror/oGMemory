@@ -5,6 +5,7 @@
 - [特性能力与使用指南](/docs/features.md)：记忆写入、检索、管理、关系网络、学习复用等对外特性的介绍、操作步骤与效果验证。
 - [快速开始](/docs/QUICKSTART.md)：本地 CLI 启动，以及 Compose、ARM64 和 OpenClaw 部署入口。
 - [客户端接入总览](/docs/integrations/README.md)：HTTP、Python、MCP 和 Agent 插件的选择规则。
+- [memoryBot 特性说明与使用指南](/docs/memorybot.md)：能力介绍、单机与多实例部署，以及前台、HTTP 和 CLI 操作。
 
 ## 配置
 
@@ -41,6 +42,7 @@
 
 ## 架构
 
+- [memoryBot 设计](/docs/memorybot-design.md)：功能、数据模型、接口报文、多实例执行与验收。
 - [仓库目录说明](/docs/architecture/repository-layout.md)
 - [AGFS 目录规范](/docs/architecture/agfs-directory-spec.md)
 - [记忆卡片格式](/docs/architecture/memory-card-format.md)
