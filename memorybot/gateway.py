@@ -30,25 +30,47 @@ def _node_uri(uri):
     return uri[:-11] if uri.endswith("/content.md") else uri.rstrip("/")
 
 
+def create_gateway(memory_service, context_resolver):
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+
+    fs = memory_service._get_context_fs()
+    if isinstance(fs, AGFSContextFS):
+        from memorybot.agfs_gateway import AGFSMemoryGateway
+
+        return AGFSMemoryGateway(memory_service, context_resolver, fs=fs)
+    return MemoryGateway(memory_service, context_resolver, fs=fs)
+
+
 class MemoryGateway:
-    def __init__(self, memory_service, context_resolver):
+    def __init__(self, memory_service, context_resolver, *, fs=None):
         self.service = memory_service
         self.context_resolver = context_resolver
         if type(memory_service.get_llm()).__module__.endswith("mock_llm"):
             raise ValueError("memoryBot 需要配置真实模型服务")
+        self.fs = fs if fs is not None else memory_service._get_context_fs()
+        self.index = memory_service._get_shared_vector_index()
+        self._validate_storage()
+
+    def _validate_storage(self):
+        from fs.agfs_adapter.space_bridge import AGFSSpaceBridge
         from fs.sql_adapter.session_mutation import _dsn_identity
         from fs.sql_adapter.sql_context_fs import SQLContextFS
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
-        fs, index = (
-            memory_service._get_context_fs(),
-            memory_service._get_shared_vector_index(),
-        )
-        if not isinstance(fs, SQLContextFS) or not isinstance(index, OpenGaussVectorIndex):
+        if not isinstance(self.fs, SQLContextFS):
             raise ValueError("memoryBot 需要 SQLContextFS 与同库 OpenGaussVectorIndex")
-        if _dsn_identity(fs._connection_string) != _dsn_identity(index._connection_string):
+        self._atomic_projection = isinstance(self.index, OpenGaussVectorIndex) and (
+            _dsn_identity(self.fs._connection_string)
+            == _dsn_identity(self.index._connection_string)
+        )
+        if isinstance(self.fs, AGFSSpaceBridge):
+            self._require_vector_index()
+        elif not self._atomic_projection:
             raise ValueError("memoryBot canonical 与向量索引必须使用同一 SQL 连接配置")
-        self.fs, self.index = fs, index
+
+    def _require_vector_index(self):
+        if not callable(getattr(self.index, "get_record", None)):
+            raise ValueError("memoryBot 的 AGFS 部署需要可按记录读取的向量索引")
 
     def context(self, task):
         return self.context_resolver(task)
@@ -90,6 +112,8 @@ class MemoryGateway:
 
     @staticmethod
     def _value(node):
+        from core.dreaming_evidence import node_created_at
+
         metadata = node.metadata
         return {
             "uri": node.uri,
@@ -97,10 +121,11 @@ class MemoryGateway:
                 :128
             ],
             "text": node.content,
-            "source_refs": metadata.get("bot_source_refs", []),
+            "source_refs": list(metadata.get("bot_source_refs", [])),
             "updated_at": str(metadata.get("updated_at") or ""),
             "source_time": metadata.get("source_time") or metadata.get("created_at"),
             "node_version": int(metadata.get("version", 1)),
+            "node_created_at": node_created_at(metadata),
             "sha256": _digest(node.content),
             "category": node.category,
             "context_type": node.context_type,
@@ -108,41 +133,47 @@ class MemoryGateway:
         }
 
     def read_memory(self, ctx, uri):
-        fs = self.service._get_context_fs()
-        value = self._value(fs.read_node(_node_uri(uri), ctx))
-        from psycopg2.extras import Json
+        return self._read_memory(ctx, uri, self.fs._get_connection, self.fs._return_connection)
 
-        conn = fs._get_connection()
+    def _read_memory(self, ctx, uri, get_connection, return_connection):
+        from fs.sql_adapter.pool import PoolAdapterMixin
+
+        value = self._value(self.fs.read_node(_node_uri(uri), ctx))
+        conn = get_connection()
         try:
-            fs.bind_tenant(conn, ctx.account_id)
+            PoolAdapterMixin.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 cur.execute("SET LOCAL app.bot_worker = 'off'")
-                cur.execute(
-                    "SELECT t.parent_task_id,t.task_id,s.input,t.input FROM bot_step s JOIN bot_task t "
-                    "ON t.account_id=s.account_id AND t.task_id=s.task_id "
-                    "WHERE s.account_id=%s AND s.user_id=%s AND s.kind='memory_submit' AND s.state='succeeded' "
-                    "AND s.output->'sources' @> %s::jsonb ORDER BY s.created_at DESC LIMIT 20",
-                    (ctx.account_id, ctx.user_id, Json([{"uri": value["uri"]}])),
-                )
-                for parent, task_id, accepted, task_input in cur.fetchall():
-                    refs = task_input.get("source_refs") or [
-                        {
-                            "file_id": None,
-                            "uri": None,
-                            "task_id": parent or task_id,
-                            "quote": "\n".join(
-                                message["content"]
-                                for message in accepted.get("messages", [])
-                                if message["role"] == "user"
-                            )[:1024],
-                        }
-                    ]
-                    for ref in refs:
-                        if ref not in value["source_refs"]:
-                            value["source_refs"].append(ref)
+                return self._source_refs(cur, ctx, value)
         finally:
             conn.rollback()
-            fs._return_connection(conn)
+            return_connection(conn)
+
+    @staticmethod
+    def _source_refs(cur, ctx, value):
+        from psycopg2.extras import Json
+
+        cur.execute(
+            "SELECT t.parent_task_id,t.task_id,s.input,t.input FROM bot_step s JOIN bot_task t "
+            "ON t.account_id=s.account_id AND t.task_id=s.task_id "
+            "WHERE s.account_id=%s AND s.user_id=%s AND s.kind='memory_submit' AND s.state='succeeded' "
+            "AND s.output->'sources' @> %s::jsonb ORDER BY s.created_at DESC LIMIT 20",
+            (ctx.account_id, ctx.user_id, Json([{"uri": value["uri"]}])),
+        )
+        for parent, task_id, accepted, task_input in cur.fetchall():
+            refs = task_input.get("source_refs") or [
+                {
+                    "file_id": None,
+                    "uri": None,
+                    "task_id": parent or task_id,
+                    "quote": "\n".join(
+                        message["content"]
+                        for message in accepted.get("messages", [])
+                        if message["role"] == "user"
+                    )[:1024],
+                }
+            ]
+            value["source_refs"].extend(ref for ref in refs if ref not in value["source_refs"])
         value["source_refs"] = value["source_refs"][:100]
         return value
 
@@ -194,7 +225,15 @@ class MemoryGateway:
                     "AND context_type='MEMORY' AND owner_space=ANY(%s) AND uri<>ALL(%s) "
                     "AND (uri=ANY(%s) OR regexp_replace(uri, '/[^/]+$', '')=ANY(%s)) "
                     "ORDER BY uri LIMIT %s OFFSET %s",
-                    (ctx.account_id, owner_aliases, list(hidden), profiles, directories, limit + 1, offset),
+                    (
+                        ctx.account_id,
+                        owner_aliases,
+                        list(hidden),
+                        profiles,
+                        directories,
+                        limit + 1,
+                        offset,
+                    ),
                 )
                 uris = [row[0] for row in cur.fetchall()]
         finally:
@@ -398,7 +437,7 @@ class MemoryGateway:
     def prepare_target(self, task, uri):
         return self.read_memory(self.context(task), uri)
 
-    def _correct_agent(self, fs, cur, node, ctx, frozen, operation_id, task):
+    def _correct_agent(self, node, ctx, frozen, operation_id, task, write_source):
         from commit.agent_memory import AgentMemoryPolicy
         from extraction.agent_memory import (
             AgentMemoryCandidate,
@@ -439,7 +478,7 @@ class MemoryGateway:
                 "_expected_version": 0,
             },
         )
-        fs._execute_write(cur, source, ctx.account_id, 0, True, *fs._build_row_data(source))
+        write_source(source)
         source_id = agent_source_id(source_uri)
         binding = {
             "uri": source_uri,
@@ -520,86 +559,99 @@ class MemoryGateway:
             )
             node.content = render_agent_memory(node.category, node.metadata["structured_fields"])
 
+    @classmethod
+    def _check_target(cls, node, frozen):
+        current = cls._value(node)
+        if (
+            current["node_version"] != frozen["target_version"]
+            or current["sha256"] != frozen["target_sha256"]
+        ):
+            raise BotError(
+                "MEMORY_CHANGED",
+                "记忆已更新，请读取最新内容",
+                409,
+                {
+                    "memory_uri": node.uri,
+                    "current_version": current["node_version"],
+                    "current_sha256": current["sha256"],
+                },
+            )
+        return current["node_version"]
+
+    @staticmethod
+    def _archive_ids(node, ctx):
+        from index.index_record_builder import agent_memory_index_ids, build_index_records
+
+        if node.category == "profile":
+            raise PermissionError("档案事实请通过更正维护")
+        if node.owner_space.startswith("agent:") and ctx.role not in {Role.ADMIN, Role.ROOT}:
+            raise PermissionError("代理记忆归档需要管理员权限")
+        if node.metadata.get("agent_memory_version") == 1:
+            return agent_memory_index_ids(node)
+        return [record.id for record in build_index_records(node)]
+
+    def _correct_node(self, node, ctx, frozen, operation_id, task, write_source):
+        node.content = frozen["new_text"]
+        if node.metadata.get("agent_memory_version") == 1:
+            self._correct_agent(node, ctx, frozen, operation_id, task, write_source)
+        node.abstract = node.content[:200]
+        node.overview = node.content[:4000]
+        node.metadata.update(
+            _expected_version=frozen["target_version"],
+            bot_source_refs=[
+                *frozen.get("source_refs", []),
+                {
+                    "file_id": None,
+                    "uri": None,
+                    "task_id": task.get("parent_task_id") or task["task_id"],
+                    "quote": frozen["new_text"][:1024],
+                },
+            ][-100:],
+        )
+
+    def _read_transaction_node(self, cur, uri, ctx):
+        node = self.fs.read_node_with_cursor(cur, uri, ctx)
+        hydrate = getattr(self.fs, "hydrate_nodes", None)
+        return hydrate([node])[0] if hydrate else node
+
     def mutate_target(self, tx, task, frozen, operation_id):
         """Apply a targeted edit and its outbox on the fenced Bot transaction."""
         from psycopg2.extras import Json
 
         ctx = self.context(task)
-        fs = self.service._get_context_fs()
+        fs = self.fs
         uri = frozen["memory_uri"]
         with tx.connection.cursor() as cur:
             cur.execute(
                 "SELECT version FROM context_nodes WHERE account_id=%s AND uri=%s FOR UPDATE",
                 (ctx.account_id, uri),
             )
-            node = fs.read_node_with_cursor(cur, uri, ctx)
-            current = self._value(node)
-            if (
-                current["node_version"] != frozen["target_version"]
-                or current["sha256"] != frozen["target_sha256"]
-            ):
-                raise BotError(
-                    "MEMORY_CHANGED",
-                    "记忆已更新，请读取最新内容",
-                    409,
-                    {
-                        "memory_uri": uri,
-                        "current_version": current["node_version"],
-                        "current_sha256": current["sha256"],
-                    },
-                )
+            node = self._read_transaction_node(cur, uri, ctx)
+            prior_version = self._check_target(node, frozen)
             action = frozen["action"]
             if action == "forget":
-                if node.category == "profile":
-                    raise PermissionError("档案事实请通过更正维护")
-                if node.owner_space.startswith("agent:") and ctx.role not in {
-                    Role.ADMIN,
-                    Role.ROOT,
-                }:
-                    raise PermissionError("代理记忆归档需要管理员权限")
-                from index.index_record_builder import (
-                    agent_memory_index_ids,
-                    build_index_records,
-                )
-
-                record_ids = (
-                    agent_memory_index_ids(node)
-                    if node.metadata.get("agent_memory_version") == 1
-                    else [record.id for record in build_index_records(node)]
-                )
                 event = OutboxEvent(
                     hashlib.sha256(operation_id.encode()).hexdigest()[:36],
                     "ARCHIVE_CONTEXT",
                     uri,
-                    {"ids_to_delete": record_ids},
+                    {"ids_to_delete": self._archive_ids(node, ctx)},
                     "PENDING",
                 )
                 cur.execute(
                     "UPDATE context_nodes SET status='ARCHIVED',version=version+1,updated_at=NOW() WHERE account_id=%s AND uri=%s",
                     (ctx.account_id, uri),
                 )
-                version = current["node_version"] + 1
+                version = prior_version + 1
             else:
-                node.content = frozen["new_text"]
-                if node.metadata.get("agent_memory_version") == 1:
-                    self._correct_agent(fs, cur, node, ctx, frozen, operation_id, task)
-                node.abstract = node.content[:200]
-                node.overview = node.content[:4000]
-                node.metadata["_expected_version"] = current["node_version"]
-                node.metadata["bot_source_refs"] = frozen.get("source_refs", [])
-                node.metadata["bot_source_refs"] = [
-                    *node.metadata["bot_source_refs"],
-                    {
-                        "file_id": None,
-                        "uri": None,
-                        "task_id": task.get("parent_task_id") or task["task_id"],
-                        "quote": frozen["new_text"][:1024],
-                    },
-                ][-100:]
+
+                def write_source(source):
+                    fs._execute_write(
+                        cur, source, ctx.account_id, 0, True, *fs._build_row_data(source)
+                    )
+
+                self._correct_node(node, ctx, frozen, operation_id, task, write_source)
                 values = fs._build_row_data(node)
-                fs._execute_write(
-                    cur, node, ctx.account_id, current["node_version"], False, *values
-                )
+                fs._execute_write(cur, node, ctx.account_id, prior_version, False, *values)
                 event = self.service._get_outbox_store(fs).build_write_event(node)
                 event.event_id = hashlib.sha256(operation_id.encode()).hexdigest()[:36]
                 version = values[2]
@@ -632,6 +684,38 @@ class MemoryGateway:
                 "source_refs": frozen.get("source_refs", []),
             }
 
+    @staticmethod
+    def _source_uri(account_id, user_id, file_id, chunk_index):
+        return (
+            f"ctx://{account_id}/users/{user_id}/memories/documents/bot_{file_id}_{chunk_index + 1}"
+        )
+
+    @classmethod
+    def _source_node(cls, ctx, file, content, chunk_index):
+        return ContextNode(
+            cls._source_uri(ctx.account_id, ctx.user_id, file["file_id"], chunk_index),
+            "RESOURCE",
+            "document",
+            2,
+            ctx.user_space_name(),
+            content[:200],
+            content[:2000],
+            content,
+            {
+                "title": file["name"],
+                "bot_source_refs": [
+                    {
+                        "file_id": file["file_id"],
+                        "task_id": None,
+                        "uri": None,
+                        "quote": content[:1024],
+                    }
+                ],
+                "source_time": str(file.get("created_at") or datetime.now(UTC).isoformat()),
+                "_expected_version": 0,
+            },
+        )
+
     def publish_source(self, tx, task, file, text, operation_id, *, chunk_index=0):
         from psycopg2.extras import Json
 
@@ -642,30 +726,8 @@ class MemoryGateway:
             for index, start in enumerate(range(0, max(1, len(text)), 12000)):
                 index += chunk_index
                 content = text[start : start + 12000]
-                uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/documents/bot_{file['file_id']}_{index + 1}"
-                node = ContextNode(
-                    uri,
-                    "RESOURCE",
-                    "document",
-                    2,
-                    ctx.user_space_name(),
-                    content[:200],
-                    content[:2000],
-                    content,
-                    {
-                        "title": file["name"],
-                        "bot_source_refs": [
-                            {
-                                "file_id": file["file_id"],
-                                "task_id": None,
-                                "uri": None,
-                                "quote": content[:1024],
-                            }
-                        ],
-                        "source_time": str(file.get("created_at") or datetime.now(UTC).isoformat()),
-                        "_expected_version": 0,
-                    },
-                )
+                node = self._source_node(ctx, file, content, index)
+                uri = node.uri
                 values = fs._build_row_data(node)
                 fs._execute_write(cur, node, ctx.account_id, 0, True, *values)
                 event = self.service._get_outbox_store(fs).build_write_event(node)
@@ -698,42 +760,51 @@ class MemoryGateway:
     def projection_ready(self, task, receipts):
         ctx = self.context(task)
         self.service.drain_outbox_sync(account_id=ctx.account_id)
-        fs = self.service._get_context_fs()
-        index = self.service._get_shared_vector_index()
+        return self._projection_matches(ctx, receipts)
+
+    def _projection_matches(self, ctx, receipts):
+        from index.index_record_builder import build_index_records
+
         for receipt in receipts:
             if receipt.get("action") == "forget":
-                if fs.archived_node_version(receipt["uri"], ctx) != receipt["node_version"]:
+                if self.fs.archived_node_version(receipt["uri"], ctx) != receipt["node_version"]:
                     raise BotError("MEMORY_CHANGED", "归档目标已变化", 409)
                 if any(
-                    index.get_record(record_id) is not None
+                    self.index.get_record(record_id) is not None
                     for record_id in receipt["ids_to_delete"]
                 ):
                     return False
                 continue
-            node = fs.read_node(receipt["uri"], ctx)
+            node = self.fs.read_node(receipt["uri"], ctx)
             if (
                 int(node.metadata.get("version", 1)) != receipt["node_version"]
                 or _digest(node.content) != receipt["sha256"]
             ):
                 raise BotError("MEMORY_CHANGED", "记忆目标已变化", 409)
-            from index.index_record_builder import build_index_records
-
             for expected in build_index_records(node):
-                actual = index.get_record(expected.id)
+                actual = self.index.get_record(expected.id)
                 if (
                     actual is None
                     or actual.text != expected.text
                     or actual.filters.get("account_id") != ctx.account_id
+                    or actual.filters.get("owner_space") != expected.filters["owner_space"]
+                    or actual.metadata.get("canonical_revision")
+                    != expected.metadata.get("canonical_revision")
                 ):
                     return False
             if any(
-                index.get_record(record_id) is not None
+                self.index.get_record(record_id) is not None
                 for record_id in receipt.get("retired_ids", [])
             ):
                 return False
         return True
 
     def verify_projection(self, tx, task, receipts):
+        if not self._atomic_projection:
+            if not self._projection_matches(self.context(task), receipts):
+                raise WorkPendingError("记忆索引正在更新")
+            return
+
         from psycopg2 import sql
 
         from fs.sql_adapter.session_mutation import _dsn_identity
@@ -759,7 +830,7 @@ class MemoryGateway:
                     expected = []
                     ids = receipt["ids_to_delete"]
                 else:
-                    node = self.fs.read_node_with_cursor(cur, receipt["uri"], ctx)
+                    node = self._read_transaction_node(cur, receipt["uri"], ctx)
                     if _digest(node.content) != receipt["sha256"]:
                         raise BotError("MEMORY_CHANGED", "记忆内容已变化", 409)
                     expected = build_index_records(node)

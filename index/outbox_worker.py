@@ -316,6 +316,17 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
+        revision = event.payload.get("canonical_write_revision")
+        if revision is not None:
+            if self._fs is None or ctx is None:
+                raise ValueError("Versioned write projection requires canonical node storage")
+            try:
+                current = self._fs.read_node(event.uri, ctx)
+            except NodeNotFoundError:
+                return WorkerResult(event_id=event.event_id, success=True)
+            if not matches_node_version(current.metadata, revision["version"], revision["created_at"]):
+                return WorkerResult(event_id=event.event_id, success=True)
+
         if self._projection is None:
             self._confirm_node_publication(event, ctx)
             return WorkerResult(event_id=event.event_id, success=True)
@@ -625,6 +636,10 @@ class OutboxWorker:
 
     @staticmethod
     def _archive_projection_event(event: OutboxEvent) -> OutboxEvent:
+        if event.event_type == "ARCHIVE_CONTEXT" and "canonical_archive_source" in event.payload:
+            from fs.agfs_adapter.archive_receipts import archive_source_uri
+
+            return replace(event, uri=archive_source_uri(event))
         if event.event_type == "ARCHIVE_CONTEXT" and "dreaming_archive_source" in event.payload:
             from fs.agfs_adapter.dreaming import archive_source_uri
 
@@ -645,6 +660,38 @@ class OutboxWorker:
             WorkerResult with success status
         """
         event = self._archive_projection_event(event)
+        if event.payload.get("canonical_archive_source"):
+            from fs.agfs_adapter.archive_receipts import read_receipt, retain_receipt
+
+            ctx = ctx or self._build_request_context(event)
+            revision = event.payload["canonical_archive_revision"]
+            receipt = read_receipt(self._fs, event.uri, ctx, event.payload["operation_id"],
+                                   created_at=revision["created_at"])
+            if receipt is None:
+                retain_receipt(self._fs, event.uri, ctx)
+                receipt = read_receipt(self._fs, event.uri, ctx, event.payload["operation_id"],
+                                       created_at=revision["created_at"])
+            if receipt is None or receipt["version"] != revision["version"]:
+                return WorkerResult(event_id=event.event_id, success=True)
+            try:
+                node = self._fs.read_node(event.uri, ctx)
+            except NodeNotFoundError:
+                node = None
+            if node is not None:
+                # Rebuild a replacement's projection instead of applying the old archive to it.
+                from commit.code_resource_events import build_code_resource_write_event
+
+                current = build_code_resource_write_event(node)
+                current.event_id = event.event_id
+                retired = set(event.payload["ids_to_delete"]) - {
+                    record["id"] for record in current.payload["records"]
+                }
+                if retired and self._projection is not None:
+                    self._projection.delete(sorted(retired))
+                    self._delete_bm25(sorted(retired))
+                return self._process_upsert_context(current, ctx)
+            self._delete_index_records(event)
+            return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
         if event.payload.get("dreaming_visibility") is True:
             ctx = ctx or self._build_request_context(event)
             if self._fs is None or ctx is None:
@@ -657,11 +704,13 @@ class OutboxWorker:
                                          event.payload.get("expected_created_at"))
                     or not self._hides_dreaming_projection(node.metadata)):
                 return WorkerResult(event_id=event.event_id, success=True)
-        archive_revision = event.payload.get("dreaming_archive_revision")
+        archive_revision = event.payload.get("canonical_archive_revision") or event.payload.get(
+            "dreaming_archive_revision"
+        )
         if archive_revision is not None:
             ctx = ctx or self._build_request_context(event)
             if self._fs is None or ctx is None:
-                raise ValueError("Dreaming archive projection requires canonical node storage")
+                raise ValueError("Versioned archive projection requires canonical node storage")
             created_at = archive_revision["created_at"]
             if not created_at or self._fs.archived_node_version(
                 event.uri, ctx, created_at=created_at,

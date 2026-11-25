@@ -99,6 +99,7 @@ def runtime():
         opengauss_table_name="memorybot_test_vector",
         provider="mock",
         embedding_provider="mock",
+        extraction_mode="eager",
         index_workers=0,
         enable_cache=False,
         dual_pass_enabled=False,

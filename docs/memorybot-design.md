@@ -577,7 +577,7 @@ erDiagram
 
 **首版建议：openGauss 保存表和记忆正文；AGFS 提供文件访问，底层挂载对象存储。已有共享卷时可改挂共享卷。**
 
-记忆存储与 Bot 文件存储独立选择。已有 `storage.backend=sql` 将记忆正文、摘要、关系等存入数据库；新增 `bot.files` 决定上传原件、解析副本和成果文件的存放方式。AGFS 是文件访问服务，跨机器共享由其挂载的存储提供。
+记忆部署可选择 SQL 或 AGFS。SQL 路径的正文、索引与 Bot 状态使用同库事务核验。AGFS 路径沿用现有挂载和向量库，`storage.connection_string` 提供 Bot 状态库。更正、归档及资料入库使用确定的操作标识登记索引事件。任务完成前核对当前正文版本及向量记录。两种路径均通过 `bot.files` 配置上传原件、解析副本和成果文件的挂载。
 
 | 部署条件 | 文件访问链路 | 多实例共享条件 | 选择依据 |
 |---|---|---|---|
@@ -589,9 +589,9 @@ erDiagram
 
 | 所在配置／字段 | 类型／必填 | 示例值 | 作用 |
 |---|---|---|---|
-| oGMemory：`storage.backend` | string／是 | `sql` | 选择记忆正文存储 |
-| oGMemory：`storage.connection_string` | string／是 | 部署注入的 openGauss 连接串 | 既有记忆表与新增 Bot 表共用数据库 |
-| oGMemory：`vector_db.type`、`vector_db.connection_string` | string／是 | `opengauss`、与正文存储相同的连接配置 | 向量索引共享；词法索引沿用 `retrieval.lexical.provider=opengauss_native` 配置；正文版本、索引结果及Bot完成状态同库核验 |
+| oGMemory：`storage.backend` | string／是 | `sql` 或 `agfs` | 选择记忆正文存储 |
+| oGMemory：`storage.connection_string` | string／是 | 部署注入的 SQL 连接串 | 保存 Bot 状态表。SQL 路径也通过此连接访问记忆表 |
+| oGMemory：`vector_db` | object／是 | 同库 openGauss，或 AGFS 部署已有的向量库配置 | 保存共享向量索引 |
 | oGMemory：`auth.role_control_enabled` | bool／是 | `true` | 启用用户 API Key 鉴权 |
 | Bot：`bot.enabled` | bool／是 | `true` | 启用 memoryBot；默认值为 `false` |
 | Bot：`bot.files.backend` | string／是 | `agfs` | 文件访问后端；本方案配置值为 `agfs` |

@@ -353,28 +353,7 @@ class Execution:
         if self.task["kind"] == "memory_write":
             self._memory_status(tx, "failed")
             # A committed forget operation still governs retrieval after later failures.
-            applied = next(
-                (
-                    step["output"]
-                    for step in tx.list(
-                        "bot_step", {"task_id": self.task["task_id"], "state": "succeeded"}
-                    )
-                    if (step.get("output") or {}).get("action") == "forget"
-                ),
-                None,
-            )
-            if applied:
-                tx.update(
-                    "bot_forget",
-                    {"task_id": self.task["task_id"], "state": "pending"},
-                    {"state": "effective", "source_refs": applied["source_refs"]},
-                )
-            else:
-                tx.update(
-                    "bot_forget",
-                    {"task_id": self.task["task_id"], "state": "pending"},
-                    {"state": "failed"},
-                )
+            self.store._settle_interrupted_forget(tx, self.task)
         elif self.task["kind"] == "ingest":
             tx.update("bot_file", {"task_id": self.task["task_id"]}, {"state": "failed"})
         elif self.task["kind"] == "delivery":

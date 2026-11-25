@@ -30,7 +30,12 @@ memoryBot 是 oGMemory 前台内置的长期记忆助手。你可以让它记住
 | 单机 | 在同一台主机运行一个 oGMemory HTTP 服务和一个 memoryBot 执行服务 | 个人使用或小团队共用 |
 | 多实例 | 多个 HTTP 实例接在同一服务地址后，分别启动一个或多个执行实例。所有实例使用同一数据库、用户注册表和 AGFS 文件挂载 | 多人并发，希望实例退出后其他实例接续工作 |
 
-**数据库与共享文件存储。** openGauss 保存会话、记忆、索引、计划与任务。AGFS 保存上传原件、解析正文和生成的文件。单机可让 AGFS 使用持久目录，多实例可共用一个 AGFS 服务，也可让多个 AGFS 实例挂载同一共享卷或对象存储桶。
+| 记忆部署 | 记忆正文 | 检索索引 | Bot 会话、计划和任务 |
+|---|---|---|---|
+| `storage.backend: sql` | openGauss | 同库 openGauss | 同库 SQL 表 |
+| `storage.backend: agfs` | 沿用现有 AGFS 挂载 | 沿用 `vector_db` 指定的向量数据库 | `storage.connection_string` 指定的 SQL 表 |
+
+上传原件、解析正文和生成文件均通过 `bot.files` 指定的 AGFS 挂载保存。多实例共享 Bot 状态库、向量数据库和相关 AGFS 挂载。
 
 ### memoryBot 启用条件与配置项
 
@@ -42,9 +47,9 @@ memoryBot 是 oGMemory 前台内置的长期记忆助手。你可以让它记住
    | 配置项 | 取值要求 |
    |---|---|
    | `auth.role_control_enabled` | `true`，沿用已配置的 `auth.root_api_key` 或 `auth.admin_api_keys` |
-   | `storage.backend` / `storage.dialect` | `sql` / `opengauss` |
-   | `vector_db.type` | `opengauss` |
-   | `storage.connection_string` / `vector_db.connection_string` | 两项使用相同连接配置，指向同一数据库和账号 |
+   | `storage.backend` | `sql` 或 `agfs`，沿用部署的记忆正文存储 |
+   | `storage.connection_string` / `storage.dialect` | 提供 Bot 状态库连接配置及方言。使用 openGauss 时，数据库采用 `PG` 兼容模式 |
+   | `vector_db` | SQL 路径配置同库 openGauss。AGFS 路径沿用现有向量库配置，状态库可独立配置 |
 
 3. 添加以下 `bot` 配置，将示例域名替换为服务地址。`mount_prefix` 填 AGFS 实际对外提供的挂载路径。数据库账号需要在首次启动时创建业务表和索引的权限。
 

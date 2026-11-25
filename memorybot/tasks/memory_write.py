@@ -15,6 +15,7 @@ def run(execution):
         mutation_input = {
             **task_input,
             "target_version": target["node_version"],
+            "target_created_at": target.get("node_created_at"),
             "target_sha256": target["sha256"],
         }
         source_refs = list(mutation_input.get("source_refs") or target.get("source_refs") or [])

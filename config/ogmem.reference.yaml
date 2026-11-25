@@ -199,6 +199,7 @@ mcp:
 storage:
   backend: sql                   # [all] canonical memory store: sql / agfs
   dialect: opengauss             # [all] opengauss / postgresql
+  # Bot state uses this SQL connection with either canonical memory backend.
   connection_string: "host=127.0.0.1 port=15432 dbname=ogmemory user=gaussdb password=CHANGE_ME"  # [local]
   pool_size: 5                   # [all]
   trace_max_turn_events: 128     # [all] first + newest events retained per finalized turn (2-1024)

@@ -244,6 +244,12 @@ class OutboxStore:
                     event._outbox_archive_source_lease = locks.enter_context(
                         self.processing_lock(archive_source_uri(event))
                     )
+                elif event.event_type == EventType.ARCHIVE_CONTEXT.value and "canonical_archive_source" in event.payload:
+                    from fs.agfs_adapter.archive_receipts import archive_source_uri
+
+                    event._outbox_archive_source_lease = locks.enter_context(
+                        self.processing_lock(archive_source_uri(event))
+                    )
                 yield self.try_acquire(event, node_uri, worker_id)
 
     def _write_processing_file(

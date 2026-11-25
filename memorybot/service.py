@@ -24,10 +24,12 @@ class BotService:
     def __init__(self, store, memory_service, files, config, *, gateway=None):
         self.store, self.memory, self.files, self.config = store, memory_service, files, config
         if gateway is None:
-            from memorybot.gateway import MemoryGateway
+            from memorybot.gateway import create_gateway
 
-            gateway = MemoryGateway(memory_service, self.resolve_task_context)
+            gateway = create_gateway(memory_service, self.resolve_task_context)
         self.gateway = gateway
+        if recover_memory_write := getattr(gateway, "recover_memory_write", None):
+            self.store.recover_memory_write = recover_memory_write
 
     def authenticate(self, headers, *, agent_id="memorybot", session_id="memorybot"):
         auth = self.memory.get_auth_service()

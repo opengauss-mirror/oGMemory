@@ -3278,17 +3278,10 @@ class AGFSContextFS:
 
         node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
-        now = datetime.now(UTC).isoformat()
         if self.dreaming_enabled:
-            node = self.read_node(uri, ctx)
-            version = node.metadata["version"]
-            self._replace_node(
-                node_path, node, version,
-                update_metadata=lambda metadata: metadata.update(
-                    status=NodeStatus.ARCHIVED.value, archived_at=now, updated_at=now, version=version + 1,
-                ),
-            )
+            self.archive_node_version(self.read_node(uri, ctx), ctx)
             return
+        now = datetime.now(UTC).isoformat()
 
         try:
             meta = json.loads(self._read_file(meta_path))
@@ -3302,6 +3295,23 @@ class AGFSContextFS:
         meta["archived_at"] = now
         meta["updated_at"] = now
         self._write_file(meta_path, json.dumps(meta, ensure_ascii=False, indent=2))
+
+    def archive_node_version(self, node: ContextNode, ctx: RequestContext, **receipt) -> None:
+        """Archive the observed node version and publish its operation receipt together."""
+        self._ensure_accessible(node.uri, ctx)
+        version = node.metadata["version"]
+        now = datetime.now(UTC).isoformat()
+        self._replace_node(
+            self._uri_to_agfs_path(node.uri), node, version,
+            update_metadata=lambda metadata: metadata.update({
+                **receipt, "status": NodeStatus.ARCHIVED.value,
+                "archived_at": now, "updated_at": now, "version": version + 1,
+            }),
+        )
+        if receipt.get("bot_mutation"):
+            from fs.agfs_adapter.archive_receipts import retain_receipt
+
+            retain_receipt(self, node.uri, ctx)
 
     def delete_node(self, uri: str, ctx: RequestContext) -> None:
         """Delete a node from AGFS.
@@ -3321,8 +3331,10 @@ class AGFSContextFS:
         lock = self.memory_identity_lock(uri.rsplit("/", 1)[0], ctx) if memory_node else nullcontext()
         with lock:
             if memory_node:
+                from fs.agfs_adapter.archive_receipts import retain_receipt
                 from fs.agfs_adapter.dreaming import confirm_archived_receipts
 
+                retain_receipt(self, uri, ctx)
                 confirm_archived_receipts(self, uri, ctx, retain_alias=True)
             try:
                 self._client.rm(self._uri_to_agfs_path(uri), recursive=True)
