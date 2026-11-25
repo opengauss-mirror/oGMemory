@@ -272,8 +272,8 @@ auth:
 
 memory:
   after_turn_threshold: 1
-  extraction:
-    mode: lazy
+  # extraction:
+  #   mode: lazy
   prefetch_enabled: true
   prefetch_top_k: 5
 ```
@@ -288,6 +288,7 @@ memory:
 - `dimension` 必须等于 Embedding 接口实际返回维度；
 - 上例 `text-embedding-v3` 按 1024 维配置；使用其他模型时必须同步修改；
 - `after_turn_threshold: 1` 便于教程立即观察记忆写入；正式环境可改为默认的 `400`，或按成本调整。
+- 源码部署默认使用 Fast 抽取。需要切换时设置 `memory.extraction.mode` 为 `eager` 或 `lazy`。
 
 检查解析后的配置。密钥会被遮蔽：
 

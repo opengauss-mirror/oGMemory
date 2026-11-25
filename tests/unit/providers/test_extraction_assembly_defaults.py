@@ -16,12 +16,12 @@ def test_default_configuration_has_no_write_planning_switch(tmp_path, monkeypatc
 
     cfg = OgMemConfig.load(str(path))
 
-    assert OgMemConfig().extraction_mode == "eager"
-    assert (cfg.extraction_mode, cfg.after_turn_threshold, cfg.dual_pass_enabled) == ("eager", 400, False)
+    assert OgMemConfig().extraction_mode == "fast"
+    assert (cfg.extraction_mode, cfg.after_turn_threshold, cfg.dual_pass_enabled) == ("fast", 400, False)
     assert not hasattr(OgMemConfig(), "eager_write_plan_enabled")
 
 
-@pytest.mark.parametrize("mode", ["fast", "lazy"])
+@pytest.mark.parametrize("mode", ["fast", "eager", "lazy"])
 def test_explicit_extraction_modes_override_default(tmp_path, monkeypatch, mode):
     monkeypatch.setenv("OGMEM_EXTRACTION_MODE", "lazy")
     path = tmp_path / "ogmemory.yaml"
@@ -32,6 +32,45 @@ def test_explicit_extraction_modes_override_default(tmp_path, monkeypatch, mode)
     path.write_text(f"memory:\n  extraction:\n    mode: {mode}\n", encoding="utf-8")
 
     assert OgMemConfig.load(str(path)).extraction_mode == mode
+
+
+@pytest.mark.parametrize("option", [
+    "source_occurrence_reconciliation_enabled",
+    "dual_pass_enabled",
+    "node_processing_enabled",
+])
+def test_implicit_mode_preserves_existing_extraction_options(tmp_path, monkeypatch, option):
+    monkeypatch.delenv("OGMEM_EXTRACTION_MODE", raising=False)
+    path = tmp_path / "ogmemory.yaml"
+    source = f"memory:\n  extraction:\n    {option}: true\n"
+    path.write_text(source, encoding="utf-8")
+    assert OgMemConfig(**{option: True}).extraction_mode == "eager"
+    assert OgMemConfig.load(str(path)).extraction_mode == "eager"
+
+    monkeypatch.setenv("OGMEM_EXTRACTION_MODE", "lazy")
+    assert OgMemConfig.load(str(path)).extraction_mode == "lazy"
+    path.write_text(source + "    mode: fast\n", encoding="utf-8")
+    assert OgMemConfig.load(str(path)).extraction_mode == "fast"
+
+
+@pytest.mark.parametrize("source", ["yaml", "env"])
+def test_implicit_mode_preserves_directory_summary(tmp_path, monkeypatch, source):
+    monkeypatch.delenv("OGMEM_EXTRACTION_MODE", raising=False)
+    monkeypatch.delenv("OGMEM_DIRECTORY_SUMMARY_ENABLED", raising=False)
+    path = tmp_path / "ogmemory.yaml"
+    if source == "yaml":
+        path.write_text("memory:\n  directory_summary_enabled: true\n", encoding="utf-8")
+    else:
+        path.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("OGMEM_DIRECTORY_SUMMARY_ENABLED", "true")
+
+    cfg = OgMemConfig.load(str(path))
+    assert cfg.directory_summary_enabled
+    assert cfg.extraction_mode == "eager"
+    assert OgMemConfig(directory_summary_enabled=True).extraction_mode == "eager"
+
+    monkeypatch.setenv("OGMEM_EXTRACTION_MODE", "fast")
+    assert OgMemConfig.load(str(path)).extraction_mode == "fast"
 
 
 def test_default_mode_preserves_explicit_deterministic_engine(tmp_path, monkeypatch):

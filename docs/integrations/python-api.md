@@ -200,7 +200,7 @@ write_api = MemoryWriteAPI(
 | `embedder` | `Embedder` | 否 | 查询向量生成 |
 | `uri_resolver` | `URIResolver` | 否 | URI 路由 |
 | `internal_tool_usage_tracker` | tracker | 否 | 内部工具统计 |
-| `extraction_mode` | string | 否 | `eager` 或 `lazy`；默认 `eager` |
+| `extraction_mode` | string | 否 | `fast`、`eager` 或 `lazy`。直接构造 `MemoryWriteAPI` 时默认 `eager`，服务端部署默认 `fast` |
 
 完整生产初始化优先使用 `MemoryService.get_write_api()`，它会自动提供 Outbox、索引和 Embedder。
 

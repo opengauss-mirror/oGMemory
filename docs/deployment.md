@@ -9,3 +9,5 @@
 - [生产部署与运维](deployment/deployment_operations_guide.md)：升级、备份、监控和故障处理。
 
 配置字段和环境变量见 [配置参考](OGMEMORY_ENV.md)，本地 CLI 流程见 [快速开始](QUICKSTART.md)。
+
+服务端默认使用 Fast，每批通过一次 LLM 调用生成新卡、已读取卡片的更新和会话摘要。切换模式与输出上限见 [记忆抽取配置](OGMEMORY_ENV.md#记忆与压缩)。

@@ -145,22 +145,20 @@ Agent 循环不是黑盒。它有明确的执行阶段。关键设计选择：**
 
 **不用这个方案会怎样**：分布式锁需要协调服务（etcd/ZooKeeper），增加运维复杂度。不加锁则可能出现"后写覆盖"导致数据丢失。乐观锁在常见场景（无竞争）下性能最优，在罕见场景下安全失败。
 
-### 为什么用 ReAct 循环做抽取？
+### 记忆抽取模式
 
-**问题**：如果系统已经知道"Alice 是后端工程师"，再次抽取就是浪费。但不知道已有什么就无法判断。
+服务端默认使用 `fast`。每个抽取批次用一次 LLM 调用，可生成新卡、已读取卡片的更新和会话摘要。服务端校验操作，并在写入前核对旧卡版本。
 
-**方案**：LLM 被赋予一组工具 — `read(uri)`、`list(uri)`、`get_relations(uri)`，以及 `extract_*` 抽取动作 — 然后在循环中执行。每一轮：先*读取*已有记忆节点（Reason），判断哪些信息是新的，再调用对应的 `extract_*` 工具（Act）。如果不确定，就读更多节点继续循环。这是真正的 ReAct：推理和工具调用交替进行，不是单次盲目抽取。
+`memory.extraction.mode` 可设为 `eager`，预取已有记忆后执行原有抽取，或设为 `lazy`，通过有轮次上限的 ReAct 循环读取已有记忆并抽取。显式配置继续生效。确定性抽取引擎优先于这些 LLM 模式。[配置参考](docs/OGMEMORY_ENV.md#记忆与压缩)
 
 ```
-  迭代 1:  read(profile_uri) → "Alice, 后端工程师, 伦敦"
-            → 无新信息，跳过
+  Lazy 第 1 轮  read(profile_uri) → "Alice, 后端工程师, 伦敦"
+                → 无新信息，跳过
 
-  迭代 2:  read(entities/go) → "Go 专家，偏好错误处理模式 X"
-            → 新增: "Alice 现在也在用 Rust 做副项目"
-            → extract_entity(slug="rust", ...)
+  Lazy 第 2 轮  read(entities/go) → "Go 专家，偏好错误处理模式 X"
+                → 新增 "Alice 现在也在用 Rust 做副项目"
+                → extract_entity(routing_key="rust", ...)
 ```
-
-**不用这个方案会怎样**：盲目的单次抽取要么重复存储已知信息（浪费 token 和存储），要么遗漏隐含的新信息（丢失信号）。ReAct 循环用少量额外成本换取显著更高的抽取质量。
 
 ---
 
@@ -199,14 +197,9 @@ Agent 循环不是黑盒。它有明确的执行阶段。关键设计选择：**
      │
      ▼
   ┌──────────────────────────────────────────────────┐
-  │  ReAct 抽取循环                                  │
-  │                                                  │
-  │  LLM 拥有工具: read(uri), list(uri),             │
-  │  get_relations(uri), extract_*()                 │
-  │                                                  │
-  │  迭代 1: read(profile) → "Alice, 工程师"          │
-  │  迭代 2: "Alice 现在也在用 Rust"                  │
-  │          → extract_entity(slug="rust")            │
+  │  默认 Fast 抽取                                   │
+  │  读取相关旧卡 → 单次模型调用                       │
+  │  生成新卡、旧卡更新、会话摘要                      │
   └────────────────────┬─────────────────────────────┘
                        │  CandidateMemory[]
                        ▼
@@ -596,6 +589,7 @@ result = write_api.commit_session(messages, ctx)
 | `SQL_CONNECTION_STRING` | — | SQL 数据库 DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
 | `OGMEM_CONFIG` | `ogmem.yaml` | YAML 配置文件路径 |
+| `OGMEM_EXTRACTION_MODE` | `fast` | LLM 抽取模式，可选 `eager` 或 `lazy` |
 | `OGMEM_AFTER_TURN_THRESHOLD` | `400` | 触发 after_turn 自动抽取的待处理 token 阈值 |
 | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 启用 Layer 2 滚动会话压缩 |
 | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | LLM 压缩不可用时启用规则 fallback |
@@ -723,7 +717,7 @@ ContextFS / SQL 存储 + 向量索引
 | ---- | -------- |
 | 核心模型与接口 | 全部数据类、Protocol 接口、枚举、URI 解析器 |
 | ContextFS / PostgreSQL 适配器 | SQLContextFS 原子 upsert、RLS 租户隔离、乐观锁 |
-| 抽取管线 | 统一 Extractor、YAML SchemaRegistry、ReAct 循环 |
+| 抽取管线 | Fast、Eager、Lazy（ReAct）、YAML SchemaRegistry |
 | 写入链路 | ContextWriter、PolicyRouter、4 种合并策略、OutboxStore |
 | 分层检索 | IntentClassifier → SeedRetriever → HierarchicalSearcher → ResultRanker |
 | 异步索引 | OutboxWorker、RepairJob、L0/L1/L2 IndexRecord 构建器 |
