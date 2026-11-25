@@ -57,7 +57,7 @@ cache:
     endpoint: 127.0.0.1:31501
 ```
 
-adapter 必须遵循 `cache_runtime/include/openviking_cache_provider_v1.h`，导出 `openviking_cache_provider_v1` 并实现 create/ping/close/get/set/del。library 之外的 params 原样传给 create。回调必须支持并发，返回内存使用 host allocator；基础 KV 的成功写删需对后续读取可见。首版不调用可选原子程序或列表/集合接口，不提供专门的 Yuanrong/Mooncake Provider。
+adapter 必须遵循 `cache_runtime/include/cache_provider_v1.h`，通过 `OV_CACHE_PROVIDER_EXPORT_ENTRY` 导出 v1 兼容入口，并实现 create/ping/close/get/set/del。library 之外的 params 原样传给 create。回调必须支持并发，返回内存使用 host allocator；基础 KV 的成功写删需对后续读取可见。首版不调用可选原子程序或列表/集合接口，不提供专门的 Yuanrong/Mooncake Provider。
 
 只加载可信 native adapter；ABI 校验无法隔离任意 C 代码崩溃。adapter 自身不得再嵌入 Go c-shared runtime。调用超时不会强行终止 native 回调；在途槽位和库保持存活直到回调结束，避免卸载仍在执行的代码。
 

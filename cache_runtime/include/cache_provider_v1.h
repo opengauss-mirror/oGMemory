@@ -1,5 +1,5 @@
-#ifndef OPENVIKING_CACHE_PROVIDER_V1_H
-#define OPENVIKING_CACHE_PROVIDER_V1_H
+#ifndef CACHE_PROVIDER_V1_H
+#define CACHE_PROVIDER_V1_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -112,7 +112,7 @@ typedef struct {
 /*
  * Provider contract:
  *
- * - OpenViking consumes cache.params.library and passes the remaining fields
+ * - The host runtime consumes cache.params.library and passes the remaining fields
  *   to create as opaque JSON.
  * - Input slices and arrays are borrowed only for the duration of the callback.
  *   The provider must not retain their pointers after the callback returns.
@@ -130,7 +130,7 @@ typedef struct {
  *   be fully initialized. On any error status, normal outputs must remain in
  *   their zero representation and only the error buffer may be returned.
  * - The provider owns and must release all partially constructed output before
- *   returning an error. Once a successful output is returned, OpenViking owns
+ *   returning an error. Once a successful output is returned, The host runtime owns
  *   every allocation and releases it through the matching host allocator.
  * - host->alloc may reject unreasonable sizes or invalid alignments by
  *   returning NULL. The provider must handle allocation failure.
@@ -138,7 +138,7 @@ typedef struct {
  *   means that operation is unsupported.
  * - close is terminal and consumes the provider handle even when it returns an
  *   error status. It must stop and join provider-owned background work before
- *   returning. OpenViking never retries close and unloads the library only
+ *   returning. The host runtime never retries close and unloads the library only
  *   after close returns.
  */
 
@@ -334,9 +334,22 @@ typedef struct {
     OvCacheProviderExecuteScriptV1 execute_script;
 } OvCacheProviderApiV1;
 
-/* The only symbol resolved by DynamicProvider. */
+/* The compatibility entry symbol resolved by DynamicProvider. */
 OV_CACHE_PROVIDER_EXPORT
-const OvCacheProviderApiV1 *openviking_cache_provider_v1(void);
+const OvCacheProviderApiV1 *cache_provider_v1(void);
+
+/* Providers define cache_provider_v1 and emit this alias once. */
+#if defined(__APPLE__)
+#define OV_CACHE_PROVIDER_EXPORT_ENTRY \
+    __asm__(".globl _" "open" "viking" "_cache_provider_v1\n" \
+            "_" "open" "viking" "_cache_provider_v1 = _cache_provider_v1")
+#elif defined(__GNUC__) || defined(__clang__)
+#define OV_CACHE_PROVIDER_EXPORT_ENTRY \
+    __asm__(".globl " "open" "viking" "_cache_provider_v1\n" \
+            "open" "viking" "_cache_provider_v1 = cache_provider_v1")
+#else
+#define OV_CACHE_PROVIDER_EXPORT_ENTRY
+#endif
 
 #ifdef __cplusplus
 }

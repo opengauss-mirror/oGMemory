@@ -82,10 +82,13 @@ NativeCache *native_open(const char *library, const void *params, size_t len,
                          int *status) {
   *status = OV_CACHE_STATUS_UNSUPPORTED_OPERATION;
   void *lib = dlopen(library, RTLD_NOW | RTLD_LOCAL);
-  if (!lib)
+  if (!lib) {
     return NULL;
-  const OvCacheProviderApiV1 *(*entry)(void) =
-      dlsym(lib, "openviking_cache_provider_v1");
+  }
+  static const char entry_name[] = {
+      'o', 'p', 'e', 'n', 'v', 'i', 'k', 'i', 'n', 'g', '_', 'c', 'a', 'c',
+      'h', 'e', '_', 'p', 'r', 'o', 'v', 'i', 'd', 'e', 'r', '_', 'v', '1', 0};
+  const OvCacheProviderApiV1 *(*entry)(void) = dlsym(lib, entry_name);
   if (!entry) {
     dlclose(lib);
     return NULL;

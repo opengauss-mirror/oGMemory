@@ -1,4 +1,4 @@
-#include "openviking_cache_provider_v1.h"
+#include "cache_provider_v1.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,6 +167,7 @@ static const OvCacheProviderApiV1 api = {.abi_version = BAD_ABI ? 99 : 1,
                                          .set = set,
                                          .del = del};
 OV_CACHE_PROVIDER_EXPORT const OvCacheProviderApiV1 *
-openviking_cache_provider_v1(void) {
+cache_provider_v1(void) {
   return &api;
 }
+OV_CACHE_PROVIDER_EXPORT_ENTRY;

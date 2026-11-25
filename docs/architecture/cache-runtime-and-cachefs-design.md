@@ -6,7 +6,7 @@
 
 ## 1. 目标与范围
 
-将 OpenViking 的文件系统读缓存能力按 oGMemory 的 Python + Go 架构移植，并落实两项调整：
+将 上游文件系统读缓存能力按 oGMemory 的 Python + Go 架构移植，并落实两项调整：
 
 1. CacheRuntime 是独立公共模块，AGFS 及其他业务均可调用；文件、目录、路径失效规则留在 CacheFS。
 2. 第三方缓存统一通过 DynamicProvider 加载动态库，不在仓库内增加 YuanrongProvider、MooncakeProvider 或对应 SDK 构建链。
@@ -19,9 +19,9 @@
 
 ### 2.1 参考资料
 
-- [GitCode PR #41](https://gitcode.com/weixin_59153604/OpenViking-0.4.1/pull/41)，标题 `feat(cache): unify runtime for CacheFS, QueueFS and PathLock`。已读取 PR head `338d6aa75cf0faa988c2cfff870309e6533d0063` 的代码和文档；页面记录的 merge commit 为 `08cf61b5c3dbe7d524906a81e34a77f457f92182`。
-- 用户提供的[设计文档](/Users/fang/Documents/llm-wiki-lab/raw/01-openviking/ov-fs-cache.html)，重点采用其 Cacheable、BypassAlways、BypassIfPermissionDependent、NoPrefetch 分类，并按 oGMemory 实际控制路径补全规则。
-- PR 重点参考路径：`crates/ragfs/src/cache_runtime/`、`crates/ragfs/src/cache/`、`crates/ragfs/src/plugins/queuefs/cache_backend.rs`、`cache_protocol.rs`、`crates/ragfs/include/openviking_cache_provider_v1.h`、`docs/zh/guides/14-ragfs-cache.md`。
+- 上游 CacheRuntime PR #41，标题 `feat(cache): unify runtime for CacheFS, QueueFS and PathLock`。已读取 PR head `338d6aa75cf0faa988c2cfff870309e6533d0063` 的代码和文档；页面记录的 merge commit 为 `08cf61b5c3dbe7d524906a81e34a77f457f92182`。
+- 用户提供的上游文件系统缓存设计资料，重点采用其 Cacheable、BypassAlways、BypassIfPermissionDependent、NoPrefetch 分类，并按 oGMemory 实际控制路径补全规则。
+- PR 重点参考路径：`crates/ragfs/src/cache_runtime/`、`crates/ragfs/src/cache/`、`crates/ragfs/src/plugins/queuefs/cache_backend.rs`、`cache_protocol.rs`、`the cache provider v1 header`、`docs/zh/guides/14-ragfs-cache.md`。
 
 PR 已将 Provider、连接、生命周期收敛到 CacheRuntime，并实现版本化动态库 ABI、能力检查、二进制 envelope、遍历批读。其文档仍明确要求 CacheFS 单写者；不能将 QueueFS/PathLock 的多进程协调能力理解为文件缓存具备多写者一致性。PR 的测试记录只作为参考，不是 oGMemory 的验证结果。
 
@@ -187,12 +187,12 @@ QueueFS 复用 4.3 的版本化原子程序机制，按自身需求校验能力�
 CacheRuntime
   -> DynamicProvider
   -> dlopen/dlsym + C 调用桥接
-  -> openviking_cache_provider_v1()
+  -> 兼容的 v1 provider entry symbol
   -> Provider handle
   -> 第三方 SDK / Worker
 ```
 
-建议原样采用 PR 的 `openviking_cache_provider_v1.h` v1 布局和入口名，保留来源与许可证信息，以便复用符合该 ABI 的 Provider 发布物。名称虽含 OpenViking，但不能仅为改名破坏二进制兼容。oGMemory 的缓存 key/envelope 独立版本化，不与 OpenViking 共用数据空间。
+建议保持 `cache_provider_v1.h` 的 v1 布局和兼容入口，以便复用符合该 ABI 的 Provider 发布物。源码文件名和文档使用通用名称，oGMemory 的缓存 key/envelope 独立版本化。
 
 兼容承诺以跨宿主 fixture 验证为准。Go loader 用 cgo + 小型 C shim 调用函数表，输入/输出及 Host allocator 使用 C 内存；不把 Go 堆指针交给 Provider 长期保存。现有 AGFS plugin loader 的纯 Go/purego 加载方式可以参考部署经验，但文件系统 plugin ABI 与缓存 Provider ABI 分开管理。
 

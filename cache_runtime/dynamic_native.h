@@ -1,4 +1,4 @@
-#include "include/openviking_cache_provider_v1.h"
+#include "include/cache_provider_v1.h"
 typedef struct NativeCache NativeCache;
 typedef struct {
   int status;
