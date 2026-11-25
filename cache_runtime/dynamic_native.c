@@ -94,7 +94,8 @@ NativeCache *native_open(const char *library, const void *params, size_t len,
     return NULL;
   }
   const OvCacheProviderApiV1 *api = entry();
-  if (!api || api->abi_version != 1 || api->struct_size < sizeof(*api) ||
+  if (!api || api->abi_version != OV_CACHE_PROVIDER_ABI_V1 ||
+      api->struct_size < sizeof(*api) ||
       !api->create || !api->ping || !api->close || !api->get || !api->set ||
       !api->del) {
     dlclose(lib);

@@ -220,6 +220,37 @@ func mountLocalForCacheTest(t *testing.T, m *MountableFS, path, dir string) {
 	}
 }
 
+func TestCacheRejectsSQLiteURIStorageAlias(t *testing.T) {
+	r, err := cache.WithProvider(&testStore{data: map[string][]byte{}}, cache.Config{CommandTimeoutMS: 500, MaxInflight: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewMountableFS(api.PoolConfig{})
+	if err := m.UseCache(cachefs.Config{Enabled: true, Namespace: "test", Mounts: []string{"/cached"}}, r); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := m.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+		_ = r.Close(context.Background())
+	})
+	m.RegisterPluginFactory("sqlfs", func() plugin.ServicePlugin { return sqlfs.NewSQLFSPlugin() })
+	root := t.TempDir()
+	plain := filepath.Join(root, "store.db")
+	uri := "file:" + filepath.ToSlash(root) + "/store%2Edb?mode=rwc"
+	if err := m.MountPlugin("sqlfs", "/plain", map[string]interface{}{
+		"backend": "sqlite", "db_path": plain,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MountPlugin("sqlfs", "/cached", map[string]interface{}{
+		"backend": "sqlite", "db_path": uri,
+	}); err == nil {
+		t.Fatal("accepted SQLite URI storage alias")
+	}
+}
+
 func TestCacheSQLiteRecursiveOperationsMatchBackend(t *testing.T) {
 	for _, tc := range []struct {
 		name, source, sibling string

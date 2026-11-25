@@ -52,6 +52,14 @@ type flight struct {
 type Counters struct{ Hits, Misses, Bypasses, Failures, Fills, Coalesced, Epochs uint64 }
 type metrics struct{ hits, misses, bypasses, failures, fills, coalesced, epochs atomic.Uint64 }
 
+type invalidationMode uint8
+
+const (
+	invalidateExact invalidationMode = iota
+	invalidateSubtree
+	invalidateSQLSubtree
+)
+
 // FS owns only mount-local state. Closing it never closes the shared Runtime.
 type FS struct {
 	backend                         filesystem.FileSystem
@@ -119,6 +127,9 @@ func (f *FS) rotateLocked() {
 func (f *FS) fail() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.failLocked()
+}
+func (f *FS) failLocked() {
 	f.stats.failures.Add(1)
 	f.bypass = true
 	f.rotateLocked()
@@ -282,9 +293,7 @@ func (f *FS) invalidate(paths []string, subtree, rotate bool) {
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
 	if _, err := f.runtime.Delete(context.Background(), keys); err != nil {
-		f.bypass = true
-		f.rotateLocked()
-		f.stats.failures.Add(1)
+		f.failLocked()
 	}
 }
 func (f *FS) keyLocked(kind, p string) string {
@@ -555,7 +564,7 @@ func (f *FS) ReadDirFresh(p string) ([]filesystem.FileInfo, error) {
 	}
 	return f.backend.ReadDir(p)
 }
-func (f *FS) mutation(paths []string, subtree, broadSQL bool, run func() error) error {
+func (f *FS) mutation(paths []string, mode invalidationMode, run func() error) error {
 	f.ops.Lock()
 	defer f.ops.Unlock()
 	if f.isClosed() {
@@ -566,37 +575,37 @@ func (f *FS) mutation(paths []string, subtree, broadSQL bool, run func() error) 
 		p := filesystem.NormalizePath(raw)
 		paths[i] = p
 		if !trackablePath(p) || (f.local && (!asciiPath(p) || !f.aliasSafe(p))) ||
-			(f.sqlite && broadSQL && (strings.ContainsAny(p, "%_") || !asciiPath(p))) {
+			(f.sqlite && mode == invalidateSQLSubtree && (strings.ContainsAny(p, "%_") || !asciiPath(p))) {
 			rotate = true
 		}
 	}
 	completed := false
-	defer func() { f.invalidate(paths, subtree, rotate || !completed) }()
+	defer func() { f.invalidate(paths, mode != invalidateExact, rotate || !completed) }()
 	err := run()
 	completed = true
 	return err
 }
 func (f *FS) Create(p string) error {
-	return f.mutation([]string{p}, false, false, func() error { return f.backend.Create(p) })
+	return f.mutation([]string{p}, invalidateExact, func() error { return f.backend.Create(p) })
 }
 func (f *FS) Mkdir(p string, m uint32) error {
-	return f.mutation([]string{p}, true, false, func() error { return f.backend.Mkdir(p, m) })
+	return f.mutation([]string{p}, invalidateSubtree, func() error { return f.backend.Mkdir(p, m) })
 }
 func (f *FS) Remove(p string) error {
-	return f.mutation([]string{p}, true, false, func() error { return f.backend.Remove(p) })
+	return f.mutation([]string{p}, invalidateSubtree, func() error { return f.backend.Remove(p) })
 }
 func (f *FS) RemoveAll(p string) error {
-	return f.mutation([]string{p}, true, true, func() error { return f.backend.RemoveAll(p) })
+	return f.mutation([]string{p}, invalidateSQLSubtree, func() error { return f.backend.RemoveAll(p) })
 }
 func (f *FS) Rename(a, b string) error {
-	return f.mutation([]string{a, b}, true, true, func() error { return f.backend.Rename(a, b) })
+	return f.mutation([]string{a, b}, invalidateSQLSubtree, func() error { return f.backend.Rename(a, b) })
 }
 func (f *FS) Chmod(p string, m uint32) error {
-	return f.mutation([]string{p}, true, false, func() error { return f.backend.Chmod(p, m) })
+	return f.mutation([]string{p}, invalidateSubtree, func() error { return f.backend.Chmod(p, m) })
 }
 func (f *FS) Write(p string, b []byte, o int64, flags filesystem.WriteFlag) (int64, error) {
 	var n int64
-	e := f.mutation([]string{p}, false, false, func() error { var e error; n, e = f.backend.Write(p, b, o, flags); return e })
+	e := f.mutation([]string{p}, invalidateExact, func() error { var e error; n, e = f.backend.Write(p, b, o, flags); return e })
 	return n, e
 }
 func (f *FS) Stat(p string) (*filesystem.FileInfo, error) {

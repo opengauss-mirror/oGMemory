@@ -964,9 +964,8 @@ func (h *Handler) resolveRipgrepPath(vfsPath string) (string, string, string, bo
 		if !ok {
 			return "", "", "", false
 		}
-		localPath := resolver.ResolvePath(relPath)
-		basePath := resolver.ResolvePath("/")
-		if localPath == "" || basePath == "" {
+		localPath, basePath, ok := resolveLocalPaths(resolver, relPath)
+		if !ok {
 			return "", "", "", false
 		}
 		return localPath, basePath, mount.Path, true
@@ -976,12 +975,17 @@ func (h *Handler) resolveRipgrepPath(vfsPath string) (string, string, string, bo
 	if !ok {
 		return "", "", "", false
 	}
-	localPath := resolver.ResolvePath(vfsPath)
-	basePath := resolver.ResolvePath("/")
-	if localPath == "" || basePath == "" {
+	localPath, basePath, ok := resolveLocalPaths(resolver, vfsPath)
+	if !ok {
 		return "", "", "", false
 	}
 	return localPath, basePath, "/", true
+}
+
+func resolveLocalPaths(resolver localPathResolver, virtualPath string) (string, string, bool) {
+	localPath := resolver.ResolvePath(virtualPath)
+	basePath := resolver.ResolvePath("/")
+	return localPath, basePath, localPath != "" && basePath != ""
 }
 
 func (h *Handler) grepStreamRipgrep(w http.ResponseWriter, localPath string, basePath string, mountPath string, pattern string, isDir bool, recursive bool, caseInsensitive bool, nodeLimit int) {

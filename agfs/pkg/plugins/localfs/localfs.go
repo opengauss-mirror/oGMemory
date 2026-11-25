@@ -778,10 +778,10 @@ var _ plugin.ServicePlugin = (*LocalFSPlugin)(nil)
 var _ filesystem.FileSystem = (*LocalFS)(nil)
 
 // CacheStorageIdentity rejects overlapping mounts of the same local backend.
-func (fs *LocalFS) CacheStorageIdentity() (string, string) {
+func (fs *LocalFS) CacheStorageIdentity() filesystem.StorageIdentity {
 	root, err := filepath.EvalSymlinks(fs.basePath)
 	if err != nil {
 		root = fs.basePath
 	}
-	return "local", filepath.ToSlash(root)
+	return filesystem.StorageIdentity{BackendID: "local", Root: filepath.ToSlash(root)}
 }

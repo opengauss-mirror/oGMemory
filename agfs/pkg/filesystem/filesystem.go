@@ -5,6 +5,17 @@ import (
 	"time"
 )
 
+// StorageIdentity identifies the backing storage and the root visible to a mount.
+// MountableFS uses it to reject overlapping cached views of the same backend.
+type StorageIdentity struct {
+	BackendID string
+	Root      string
+}
+
+type CacheStorageIdentityProvider interface {
+	CacheStorageIdentity() StorageIdentity
+}
+
 // WriteFlag defines write behavior flags (similar to POSIX open flags)
 type WriteFlag uint32
 

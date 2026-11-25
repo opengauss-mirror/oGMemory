@@ -80,17 +80,18 @@ func (mfs *MountableFS) executionFS(mount string, p plugin.ServicePlugin) (files
 		if !selected && old.cache == nil {
 			continue
 		}
-		a, ok := backend.(interface{ CacheStorageIdentity() (string, string) })
+		a, ok := backend.(filesystem.CacheStorageIdentityProvider)
 		if !ok {
 			continue
 		}
-		b, ok := old.Plugin.GetFileSystem().(interface{ CacheStorageIdentity() (string, string) })
+		b, ok := old.Plugin.GetFileSystem().(filesystem.CacheStorageIdentityProvider)
 		if !ok {
 			continue
 		}
-		aid, ap := a.CacheStorageIdentity()
-		bid, bp := b.CacheStorageIdentity()
-		if aid == bid && aid != "" && (pathWithin(ap, bp) || pathWithin(bp, ap)) {
+		aid := a.CacheStorageIdentity()
+		bid := b.CacheStorageIdentity()
+		if aid.BackendID == bid.BackendID && aid.BackendID != "" &&
+			(pathWithin(aid.Root, bid.Root) || pathWithin(bid.Root, aid.Root)) {
 			return nil, nil, fmt.Errorf("cachefs storage aliases mounts %s and %s", old.Path, mount)
 		}
 	}
@@ -137,10 +138,7 @@ func pathWithin(p, root string) bool {
 
 // ExecutionFS is the routed filesystem; Plugin is for metadata and shutdown.
 func (m *MountPoint) ExecutionFS() filesystem.FileSystem {
-	if m.FileSystem != nil {
-		return m.FileSystem
-	}
-	return m.Plugin.GetFileSystem()
+	return m.FileSystem
 }
 func (mfs *MountableFS) CacheStats() map[string]cachefs.Counters {
 	out := map[string]cachefs.Counters{}

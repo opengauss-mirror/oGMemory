@@ -993,4 +993,6 @@ func (fs *SQLFS) DisableInternalCache() {
 	fs.listCache.enabled = false
 }
 
-func (fs *SQLFS) CacheStorageIdentity() (string, string) { return fs.storageID, "/" }
+func (fs *SQLFS) CacheStorageIdentity() filesystem.StorageIdentity {
+	return filesystem.StorageIdentity{BackendID: fs.storageID, Root: "/"}
+}

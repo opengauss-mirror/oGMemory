@@ -23,13 +23,13 @@ func nativeError(s C.int) error {
 		return nil
 	}
 	switch s {
-	case 2:
+	case C.OV_CACHE_STATUS_TIMEOUT:
 		return context.DeadlineExceeded
-	case 6:
+	case C.OV_CACHE_STATUS_INVALID_ARGUMENT:
 		return ErrInvalidArgument
-	case 7:
+	case C.OV_CACHE_STATUS_INVALID_DATA:
 		return ErrInvalidData
-	case 10:
+	case C.OV_CACHE_STATUS_UNSUPPORTED_OPERATION:
 		return ErrUnsupported
 	}
 	return fmt.Errorf("%w: native status %d", ErrUnavailable, int(s))

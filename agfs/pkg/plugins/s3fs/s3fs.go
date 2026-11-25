@@ -1079,6 +1079,6 @@ func (fs *S3FS) DisableInternalCache() {
 	fs.statCache.mu.Unlock()
 }
 
-func (fs *S3FS) CacheStorageIdentity() (string, string) {
-	return fs.storageID, filesystem.NormalizePath(fs.client.prefix)
+func (fs *S3FS) CacheStorageIdentity() filesystem.StorageIdentity {
+	return filesystem.StorageIdentity{BackendID: fs.storageID, Root: filesystem.NormalizePath(fs.client.prefix)}
 }

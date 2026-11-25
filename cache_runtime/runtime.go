@@ -56,31 +56,31 @@ type Config struct {
 	Params           map[string]interface{} `yaml:"params" json:"params"`
 }
 
+type providerSpec struct {
+	validate func(map[string]interface{}) error
+	create   func(map[string]interface{}) (Provider, error)
+}
+
+var providerSpecs = map[string]providerSpec{
+	"redis":   {validate: validateRedis, create: newRedis},
+	"dynamic": {validate: validateDynamic, create: newDynamic},
+}
+
 func (c Config) Validate() error {
 	if c.CommandTimeoutMS < 0 || c.CommandTimeoutMS > 60000 || c.MaxInflight < 0 || c.MaxInflight > 4096 {
 		return ErrInvalidArgument
 	}
-	switch c.Provider {
-	case "redis":
-		return validateRedis(c.Params)
-	case "dynamic":
-		return validateDynamic(c.Params)
-	default:
+	spec, ok := providerSpecs[c.Provider]
+	if !ok {
 		return fmt.Errorf("%w: provider %q", ErrUnsupported, c.Provider)
 	}
+	return spec.validate(c.Params)
 }
 func New(c Config) (Runtime, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	var p Provider
-	var err error
-	switch c.Provider {
-	case "redis":
-		p, err = newRedis(c.Params)
-	case "dynamic":
-		p, err = newDynamic(c.Params)
-	}
+	p, err := providerSpecs[c.Provider].create(c.Params)
 	if err != nil {
 		return nil, err
 	}
