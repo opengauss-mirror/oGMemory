@@ -19,7 +19,7 @@ TOKEN_FIELDS = (
 )
 
 
-def session_metrics(path):
+def session_metrics(path, search_only=False):
     events, malformed = [], False
     for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
@@ -73,6 +73,10 @@ def session_metrics(path):
         (connected and plugin_names == ["og-memory"] and len(servers) == 1)
         or (not servers and not plugins)
     )
+    if search_only:
+        search = "mcp__ogmemory__ogm_search_code"
+        tools = {name for name in init.get("tools", []) if name.startswith("mcp__")}
+        isolation = connected and len(servers) == 1 and not plugins and tools == {search}
     return {
         "agent_completed": end.get("subtype") == "success" and end.get("is_error") is False,
         "isolation_valid": isolation,

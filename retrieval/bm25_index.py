@@ -13,6 +13,7 @@ import re
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import cache, lru_cache
 
 from rank_bm25 import BM25Okapi
 
@@ -40,6 +41,12 @@ def _ensure_nltk():
     _nltk_ready = True
 
 
+@cache
+def _english_stopwords() -> frozenset[str]:
+    import nltk
+    return frozenset(nltk.corpus.stopwords.words("english"))
+
+
 def _tokenize(text: str) -> list[str]:
     """Tokenize English text: lowercase, stem, remove stopwords."""
     _ensure_nltk()
@@ -47,7 +54,7 @@ def _tokenize(text: str) -> list[str]:
     from nltk.stem import PorterStemmer
 
     stemmer = PorterStemmer()
-    stops = set(nltk.corpus.stopwords.words("english"))
+    stops = _english_stopwords()
     tokens = nltk.word_tokenize(text.lower())
     return [stemmer.stem(t) for t in tokens if t.isalnum() and t not in stops]
 
@@ -247,9 +254,11 @@ class Bm25Index:
             return
 
         tokenized = [_tokenize(document.text) for document in prepared]
+        tokenize_field = lru_cache(maxsize=512)(_tokenize_code_field)
         with self._lock:
             check_projection_owner()
             for document, tokens in zip(prepared, tokenized):
+                field_tokens = {name: tokenize_field(value) for name, value in document.fields.items()}
                 position = self._positions.get(document.id)
                 if position is None:
                     self._positions[document.id] = len(self._ids)
@@ -258,17 +267,13 @@ class Bm25Index:
                     self._metas.append(document.metadata)
                     self._fields.append(document.fields)
                     self._tokenized.append(tokens)
-                    self._field_tokenized.append(
-                        {name: _tokenize_code_field(value) for name, value in document.fields.items()}
-                    )
+                    self._field_tokenized.append(field_tokens)
                     continue
                 self._texts[position] = document.text
                 self._metas[position] = document.metadata
                 self._fields[position] = document.fields
                 self._tokenized[position] = tokens
-                self._field_tokenized[position] = {
-                    name: _tokenize_code_field(value) for name, value in document.fields.items()
-                }
+                self._field_tokenized[position] = field_tokens
             self._dirty = True
 
     def replace_where(

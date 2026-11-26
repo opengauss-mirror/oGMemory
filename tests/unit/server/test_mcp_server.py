@@ -23,6 +23,7 @@ from server.mcp_server import (
     LIST_SKILLS_TOOL_NAME,
     READ_SKILL_TOOL_NAME,
     SEARCH_CODE_TOOL_NAME,
+    SEARCH_SHARED_MEMORY_TOOL_NAME,
     SEARCH_SKILLS_TOOL_NAME,
     UPDATE_SKILL_TOOL_NAME,
     _auth_kwargs_from_context,
@@ -282,14 +283,9 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
         "type": "integer",
     }
     for guidance in (
-        "Prefer one focused `ogm_search_code` call",
-        "Reuse snippets and examples",
-        "scope.paths",
-        "fall back to regular workspace methods",
-        "diagnose or verify the issue",
-        "add regression coverage, or verify a fix",
-        "after completing the task requirements and necessary verification",
-        "read_lines",
+        "Reuse the returned lines",
+        "Read only missing context",
+        "Verify a fix with a focused check",
     ):
         assert guidance in search_tool.description
     assert "recover_original" in read_tool.input_schema.get("properties", {})
@@ -487,7 +483,6 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "deduplication" in write_tool.description.lower()
     assert "correction" in write_tool.description.lower()
     assert "explicit user forget request" in delete_tool.description.lower()
-    assert "read_lines" in tools[SEARCH_CODE_TOOL_NAME].description
 
     query_schema = query_tool.input_schema["properties"]
     assert "self-contained" in query_schema["query"]["description"]
@@ -922,6 +917,27 @@ def test_create_mcp_server_code_toolset_isolates_search_read_and_enabled_edit():
     assert "skill" not in mcp.instructions.lower()
     assert "ogm_write_memory" not in mcp.instructions
     assert "ogm_delete_memory" not in mcp.instructions
+
+
+@pytest.mark.parametrize("shared_spaces", [False, True])
+@pytest.mark.parametrize("toolset", ["search-only", "code", "read-only"])
+def test_shared_memory_registration_respects_toolset(shared_spaces, toolset):
+    cfg = OgMemConfig(mcp_default_toolset=toolset, mcp_enable_code_edit_tools=True,
+                      shared_spaces_enabled=shared_spaces, storage_backend="sql",
+                      sql_connection_string="host=localhost dbname=test", role_control_enabled=True,
+                      admin_api_keys=["test:unit-only"])
+    server = create_mcp_server(service=_FakeService(), config=cfg)
+    names = {tool.name for tool in anyio.run(server.list_tools)}
+    if toolset == "search-only":
+        assert names == {SEARCH_CODE_TOOL_NAME}
+    else:
+        assert (SEARCH_SHARED_MEMORY_TOOL_NAME in names) == shared_spaces
+
+
+def test_search_code_returns_plain_text_without_structured_wrapper():
+    server = create_mcp_server(service=_FakeService(), config=OgMemConfig(mcp_default_toolset="search-only"))
+    tool = next(t for t in anyio.run(server.list_tools) if t.name == SEARCH_CODE_TOOL_NAME)
+    assert getattr(tool, "outputSchema", None) is None
 
 
 def test_create_mcp_server_code_toolset_registers_only_status_resource():

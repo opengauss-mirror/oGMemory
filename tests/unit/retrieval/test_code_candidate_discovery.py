@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -29,6 +30,22 @@ def _workspace(root) -> ResolvedCodeWorkspace:
         max_files=300,
         language_hints={},
     )
+
+
+def test_scoped_directories_share_pool_after_explicit_files(tmp_path):
+    for directory in ("src", "tests"):
+        (tmp_path / directory).mkdir()
+        for name in ("a.py", "b.py", "c.py"):
+            (tmp_path / directory / name).write_text("pass\n")
+    (tmp_path / "z.py").write_text("pass\n")
+    paths = ("src", "tests", "z.py")
+    for order in (paths, paths[::-1]):
+        found = discover_candidate_files(
+            workspace=_workspace(tmp_path), query_terms=(),
+            scope=SimpleNamespace(paths=order, glob_patterns=(), grep_terms=()),
+            budget=CandidateDiscoveryBudget(3, 3, 1024, time.monotonic() + 5),
+        )
+        assert {f.relative_path for f in found.files} == {"src/a.py", "tests/a.py", "z.py"}
 
 
 def test_file_and_predicate_is_ranked_before_selected_file_cap(tmp_path, monkeypatch):
@@ -386,3 +403,124 @@ def test_corpus_clip_keeps_line_grounded_literal_chunk_when_query_differs(tmp_pa
 
     assert [record["metadata"]["relative_path"] for record in corpus.records] == ["z.py"]
     assert len(corpus.literal_uris) == 1
+
+
+def test_positive_file_outside_full_prefix_replaces_nonmatch(tmp_path):
+    for name, text in [('a', 'first'), ('b', 'second'), ('z', 'first and second')]:
+        (tmp_path / (name + '.py')).write_text('# ' + text)
+    budget = CandidateDiscoveryBudget(2, 1, 1024, time.monotonic() + 5)
+    outcome = discover_candidate_files(workspace=_workspace(tmp_path),
+        scope=SimpleNamespace(paths=(), glob_patterns=(), grep_terms=('first','second')),
+        query_terms=(), budget=budget)
+    assert [c.relative_path for c in outcome.files] == ['z.py']
+    assert outcome.diagnostics['pool_count'] == 2
+    assert outcome.read_meter.used <= budget.read_bytes
+
+
+@pytest.mark.parametrize("definition,expected", [(True, "z.py"), (False, "a.py")])
+def test_named_definition_can_displace_a_reference_without_filtering(tmp_path, definition, expected):
+    (tmp_path / "a.py").write_text("needle_value = TargetType()\n")
+    (tmp_path / "b.py").write_text("pass\n")
+    (tmp_path / "z.py").write_text("class TargetType: pass\n" if definition else "pass\n")
+    budget = CandidateDiscoveryBudget(2, 1, 4096, time.monotonic() + 5)
+    outcome = discover_candidate_files(workspace=_workspace(tmp_path),
+        scope=SimpleNamespace(paths=(), glob_patterns=(), grep_terms=()),
+        query_terms=("TargetType",), budget=budget)
+    assert [c.relative_path for c in outcome.files] == [expected]
+    assert outcome.read_meter.used <= budget.read_bytes
+
+
+@pytest.mark.parametrize("mode", ["definition", "reference", "literal"])
+def test_expansion_deduplicates_unmerged_index_paths(tmp_path, mode):
+    root = tmp_path / "tests"
+    root.mkdir()
+    files = {"a.py": "pass\n", "b.py": "pass\n", "z.py": "class TargetType: pass\n"}
+    if mode == "reference":
+        files.update({"z.py": "value = TargetType()\n",
+                      "zz.py": "class TargetType: pass\n", "zzz.py": "def TargetType(): pass\n"})
+    for name, source in files.items():
+        (root / name).write_text(source)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    blob = subprocess.check_output(["git", "-C", str(tmp_path), "hash-object", "-w", "--stdin"],
+                                   input="pass\n", text=True).strip()
+    subprocess.run(["git", "-C", str(tmp_path), "update-index", "--index-info"],
+                   input=f"100644 {blob} 2\ttests/z.py\n100644 {blob} 3\ttests/z.py\n",
+                   text=True, check=True)
+    assert subprocess.check_output(["git", "-C", str(tmp_path), "ls-files", "--cached"],
+                                   text=True).splitlines() == ["tests/z.py", "tests/z.py"]
+    budget = CandidateDiscoveryBudget(2, 2, 4096, time.monotonic() + 10)
+    outcome = discover_candidate_files(
+        workspace=_workspace(tmp_path), query_terms=("TargetType",),
+        scope=SimpleNamespace(paths=("tests",), glob_patterns=(),
+                              grep_terms=("TargetType",) if mode == "literal" else ()),
+        budget=budget,
+    )
+    expected = {"tests/zz.py", "tests/zzz.py"} if mode == "reference" else {"tests/a.py", "tests/z.py"}
+    assert {file.relative_path for file in outcome.files} == expected
+    assert outcome.diagnostics["pool_count"] == len(outcome.files) == 2
+    assert set(outcome.paths_by_relative) == expected
+    assert outcome.read_meter.used <= budget.read_bytes
+
+
+def test_late_module_name_slots_preserve_strong_candidates_and_scope(tmp_path):
+    for path in ("fixed.py", "scope/a.py", "scope/b.py", "scope/c.py", "scope/z/Engine.py", "other/engine.py"):
+        file = tmp_path / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("def TargetName(): pass" if path == "scope/a.py" else "marker = 1")
+    query = ("TargetName", "engine")
+    scope = SimpleNamespace(paths=("fixed.py", "scope"), glob_patterns=(), grep_terms=())
+    def discover(terms, limit=1000):
+        o = discover_candidate_files(workspace=_workspace(tmp_path), scope=scope, query_terms=terms,
+            budget=CandidateDiscoveryBudget(4, 3, 10**7, time.monotonic()+10, entry_limit=limit))
+        return [f.relative_path for f in o.files], o
+    original, _ = discover(("TargetName",))
+    paths, result = discover(query)
+    assert paths == ["scope/a.py", "fixed.py", "scope/z/Engine.py"]
+    assert "scope/z/Engine.py" not in original
+    assert result.diagnostics["exact_basename_rescued"] == 1
+    assert set(result.paths_by_relative) == set(paths)
+    limited, result = discover(query, 2)
+    assert result.diagnostics["visited_entries"] <= 2 and "scope/z/Engine.py" not in limited
+    scope.grep_terms = ("marker",)
+    _, result = discover(query)
+    assert result.diagnostics["exact_basename_rescued"] == 0
+
+
+def test_basename_rescue_is_bounded_and_metadata_only(tmp_path):
+    for n in range(14):
+        p = tmp_path / ("a" if n < 8 else f"z{n}") / (f"f{n}.py" if n < 8 else "engine.py")
+        p.parent.mkdir(exist_ok=True)
+        p.write_text("v = 1")
+    def run(term):
+        return discover_candidate_files(workspace=_workspace(tmp_path),
+            scope=SimpleNamespace(paths=(),glob_patterns=(),grep_terms=()),
+            query_terms=[term], budget=CandidateDiscoveryBudget(8,6,10000,time.monotonic()+10))
+    prior, new = run("unused"), run("engine")
+    assert new.diagnostics["exact_basename_rescued"] == 4
+    assert len({f.relative_path for f in new.files}) == 6
+    assert new.files[:2] == prior.files[:2]
+    assert new.read_meter.used == prior.read_meter.used
+
+
+def test_scoped_suite_admits_late_api_use_and_preserves_definition_priority(tmp_path):
+    for root in ("tests", "src"):
+        files = {"a.py": "x = 1", "b.py": "class WidgetFactory: pass",
+                 "y.py": "x = LongWidgetFactorySuffix()", "z.py": "x = WidgetFactory()"}
+        for name, text in files.items():
+            path = tmp_path / root / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(text)
+    def find(root, grep=(), byte_cap=4096):
+        return discover_candidate_files(workspace=_workspace(tmp_path),
+            query_terms=("WidgetFactory",), scope=SimpleNamespace(paths=(root,), glob_patterns=(), grep_terms=grep),
+            budget=CandidateDiscoveryBudget(2, 2, byte_cap, time.monotonic() + 10))
+    assert [f.relative_path for f in find("tests").files] == ["tests/b.py", "tests/z.py"]
+    assert "src/z.py" not in find("src").paths_by_relative
+    assert "tests/z.py" not in find("tests", ("only_missing",)).paths_by_relative
+    limited = find("tests", byte_cap=16)
+    assert limited.read_meter.used <= 16 and "tests/z.py" not in limited.paths_by_relative
+
+    (tmp_path / "tests/a.py").write_text("x = WidgetFactory()")
+    (tmp_path / "tests/b.py").write_text("x = WidgetFactory()")
+    (tmp_path / "tests/z.py").write_text("class WidgetFactory: pass")
+    assert find("tests").files[0].relative_path == "tests/z.py"

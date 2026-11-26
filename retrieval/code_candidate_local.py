@@ -8,10 +8,14 @@ stack and releases it when the search returns.
 
 from __future__ import annotations
 
+from bisect import insort
+from collections import deque
+
 import fnmatch
 import json
 import math
 import os
+import re
 import selectors
 import subprocess
 import time
@@ -169,6 +173,8 @@ class _CandidateSignals:
     path_score: int = 0
     content_occurrences: int = 0
     all_grep_terms_match: bool = False
+    definition_count: int = 0
+    reference_count: int = 0
     sources: set[str] = field(default_factory=set)
 
 
@@ -202,11 +208,36 @@ def discover_candidate_files(
     walk_stats = BoundedCodeWorkspaceWalkStats()
     terms = _literal_terms(query_terms, getattr(scope, "grep_terms", ()))
     grep_terms = tuple(str(term).lower() for term in getattr(scope, "grep_terms", ()))
+    # Declarations are a ranking signal for explicit identifiers, never a scope filter.
+    identifiers = [v for v in query_terms if isinstance(v, str) and v.isidentifier() and len(v) <= 128
+                   and ("_" in v.strip("_") or any(c.isupper() for c in v[1:]))][:_MAX_RG_TERMS]
     path_values = tuple(getattr(scope, "paths", ()) or ())
+    declaration = reference = None
+    if identifiers and not grep_terms:
+        names = "|".join(map(re.escape, identifiers))
+        declaration = re.compile(rf"^[ \t]*(?:async[ \t]+)?(?:class|def)[ \t]+({names})\b", re.MULTILINE)
+
+        if len(path_values) == 1:
+            scoped = Path(path_values[0])
+            if not scoped.suffix and {"test", "tests", "spec", "specs"}.intersection(scoped.parts):
+                reference = re.compile(rf"\b(?:{names})\b")
+
+    def symbol_counts(path: str, source: str) -> tuple[int, int]:
+        if declaration is None or not path.endswith((".py", ".pyi")):
+            return 0, 0
+        return len(set(declaration.findall(source))), len(set(reference.findall(source))) if reference else 0
+
     glob_values = tuple(getattr(scope, "glob_patterns", ()) or ())
     signals: dict[str, _CandidateSignals] = {}
     walk_files: dict[str, Path] = {}
     content_universe: dict[str, Path] = {}
+
+    def walk(start: str | None = None):
+        return iter_bounded_code_files(
+            workspace.physical_root, language_hints=workspace.language_hints,
+            start_relative_path=start, entry_limit=budget.entry_limit, deadline=budget.deadline,
+            stats=walk_stats, monotonic_clock=monotonic_clock,
+        )
 
     def add_entry(entry: ValidatedCodeWorkspaceFile, *, source: str) -> _CandidateSignals:
         value = signals.get(entry.relative_path)
@@ -236,7 +267,8 @@ def discover_candidate_files(
     # Explicit paths are seeded before the generic walker cap.  Otherwise a
     # lexically later requested file could be starved by an unrelated first
     # 300 files in a large repository.
-    for requested_path in path_values:
+    directories = deque()
+    for requested_path in sorted(path_values):
         if monotonic_clock() >= budget.deadline or len(walk_files) >= budget.pool_limit:
             break
         try:
@@ -261,27 +293,26 @@ def discover_candidate_files(
             scoped_root.relative_to(workspace.physical_root)
         except (OSError, ValueError):
             continue
-        if not scoped_root.is_dir():
-            continue
+        if scoped_root.is_dir():
+            directories.append(walk(requested_path))
+
+    # Interleave scoped directories so one large prefix cannot fill the pool first.
+    while directories and len(walk_files) < budget.pool_limit:
+        if monotonic_clock() >= budget.deadline:
+            walk_stats.deadline_reached = True
+            break
+        entries = directories.popleft()
         try:
-            for entry in iter_bounded_code_files(
-                workspace.physical_root,
-                language_hints=workspace.language_hints,
-                start_relative_path=requested_path,
-                entry_limit=budget.entry_limit,
-                deadline=budget.deadline,
-                stats=walk_stats,
-                monotonic_clock=monotonic_clock,
-            ):
-                if not _matches_path_scope(entry.relative_path, path_values, glob_values):
-                    continue
-                walk_files.setdefault(entry.relative_path, entry.path)
-                item = add_entry(entry, source="scope_path")
-                _apply_path_signals(item, path_values, glob_values, terms)
-                if len(walk_files) >= budget.pool_limit:
-                    break
+            entry = next(entries)
+        except StopIteration:
+            continue
         except (OSError, ValueError):
             walk_stats.validation_failures += 1
+            continue
+        directories.append(entries)
+        if _matches_path_scope(entry.relative_path, path_values, glob_values):
+            walk_files.setdefault(entry.relative_path, entry.path)
+            _apply_path_signals(add_entry(entry, source="scope_path"), path_values, glob_values, terms)
 
     # Glob scopes are authorization predicates, not merely a weak ranking
     # signal.  Seed their matching candidates before the generic walk reaches
@@ -292,16 +323,7 @@ def discover_candidate_files(
         if monotonic_clock() >= budget.deadline or len(walk_files) >= budget.pool_limit:
             break
         try:
-            iterator = iter_bounded_code_files(
-                workspace.physical_root,
-                language_hints=workspace.language_hints,
-                start_relative_path=start_relative_path,
-                entry_limit=budget.entry_limit,
-                deadline=budget.deadline,
-                stats=walk_stats,
-                monotonic_clock=monotonic_clock,
-            )
-            for entry in iterator:
+            for entry in walk(start_relative_path):
                 if monotonic_clock() >= budget.deadline:
                     walk_stats.deadline_reached = True
                     break
@@ -336,15 +358,7 @@ def discover_candidate_files(
     # universe into hidden candidates beyond the configured pool.
     try:
         if len(walk_files) < budget.pool_limit:
-            iterator = iter_bounded_code_files(
-                workspace.physical_root,
-                language_hints=workspace.language_hints,
-                entry_limit=budget.entry_limit,
-                deadline=budget.deadline,
-                stats=walk_stats,
-                monotonic_clock=monotonic_clock,
-            )
-            for entry in iterator:
+            for entry in walk():
                 if monotonic_clock() >= budget.deadline:
                     walk_stats.deadline_reached = True
                     break
@@ -362,10 +376,10 @@ def discover_candidate_files(
         # A later filesystem race is a safe bounded partial outcome.
         walk_stats.validation_failures += 1
 
-    if grep_terms:
-        # Scan once for file-level AND, reserving budget for canonical reads.
+    if grep_terms or declaration is not None:
+        # Scan once for file-level AND or declarations, reserving budget for canonical reads.
         meter.release_discovery_paths(tuple(content_universe))
-        rg_state, rg_matches = "rg_skipped_file_scope", {}
+        rg_state, rg_matches = ("rg_skipped_file_scope" if grep_terms else "rg_skipped_definition_scan"), {}
     else:
         rg_state, rg_matches = _ripgrep_literal_candidates(
             workspace=workspace,
@@ -395,7 +409,7 @@ def discover_candidate_files(
     fallback_used = rg_state in {"rg_unavailable", "rg_timeout", "rg_error"}
     # Prioritize files satisfying all explicit terms before applying the cap.
     # Replace ripgrep; meter and revalidate discovery and canonical reads.
-    if (fallback_used or grep_terms) and not walk_stats.deadline_reached:
+    if (fallback_used or grep_terms or declaration is not None) and not walk_stats.deadline_reached:
         fallback_universe = content_universe if terms else walk_files
         for relative_path in sorted(fallback_universe):
             if monotonic_clock() >= budget.deadline:
@@ -425,6 +439,7 @@ def discover_candidate_files(
                     break
                 continue
             item = signals[relative_path]
+            item.definition_count, item.reference_count = symbol_counts(relative_path, text)
             source_lower = text.lower()
             item.all_grep_terms_match = bool(grep_terms) and all(term in source_lower for term in grep_terms)
             line_hits = _literal_line_hits(text, terms)
@@ -440,12 +455,90 @@ def discover_candidate_files(
                 len(literal_matches[relative_path]),
             )
 
+    # A full prefix can hide exact matches in later directories. Keep the same
+    # retained pool and canonical-read headroom while replacing nonmatches.
+    expanded = 0
+    if (grep_terms or declaration is not None) and len(walk_files) == budget.pool_limit and not walk_stats.deadline_reached:
+        weak = sorted((v for v in signals.values() if not v.all_grep_terms_match and not v.definition_count),
+                      key=_candidate_rank_key)
+        matched = len(signals) - len(weak)
+        if weak and matched < budget.file_limit:
+            sizes = []
+            for item in signals.values():
+                try:
+                    sizes.append(item.path.stat().st_size)
+                except OSError:
+                    continue
+            reserved = sum(sorted(sizes, reverse=True)[:budget.file_limit])
+            # Each extra byte read could also be needed for canonicalization.
+            extra = CandidateReadMeter(max(0, (meter.cap - meter.used - reserved) // 2))
+            if extra.cap:
+                for entry in walk():
+                    rel = entry.relative_path
+                    if rel in walk_files or rel in signals or not _matches_path_scope(rel, path_values, glob_values):
+                        continue
+                    source = _read_literal_source(entry.path, extra, relative_path=rel)
+                    if extra.exhausted:
+                        break
+                    text = source.lower() if source else ""
+                    defs, refs = symbol_counts(rel, source or "")
+                    if not (all(t in text for t in grep_terms) if grep_terms else defs or refs):
+                        continue
+                    reference_only = bool(refs and not defs)
+                    if reference_only and refs <= weak[-1].reference_count:
+                        continue
+                    evicted = weak.pop()
+                    del signals[evicted.relative_path]
+                    literal_matches.pop(evicted.relative_path, None)
+                    item = add_entry(entry, source="scope_scan")
+                    item.all_grep_terms_match = bool(grep_terms)
+                    item.definition_count, item.reference_count = defs, refs
+                    hits = _literal_line_hits(source, terms)
+                    literal_matches[rel] = hits
+                    item.content_occurrences = len(hits)
+                    _apply_path_signals(item, path_values, glob_values, terms)
+                    expanded += 1
+                    if reference_only:
+                        # A reference can still be displaced by a later definition or stronger match.
+                        insort(weak, item, key=_candidate_rank_key)
+                    if not weak or len(signals) - len(weak) >= budget.file_limit:
+                        break
+                meter.reserve(extra.used)
+
     # Bound after all discovery sources merge so a ripgrep content hit can
     # displace a weak lexical walker candidate.  No physical path is retained
     # in the returned public-facing diagnostics.
     ranked = sorted(signals.values(), key=_candidate_rank_key)
     pool = ranked[: budget.pool_limit]
     selected_signals = pool[: budget.file_limit]
+    # Use only spare walk budget to surface filenames explicitly mentioned in the query.
+    rescued = []
+    if (not grep_terms and len(selected_signals) == budget.file_limit and budget.file_limit > 0
+            and not meter.exhausted and not walk_stats.entry_limit_reached and not walk_stats.deadline_reached):
+        stems = {term.casefold() for term in query_terms if len(term) >= 4}
+        slots = [n for n, item in enumerate(selected_signals)
+                 if not item.definition_count and not item.reference_count and item.relative_path not in path_values
+                 and item.path.stem.casefold() not in stems][-4:]
+        if stems and slots and walk_stats.visited_entries < budget.entry_limit and monotonic_clock() < budget.deadline:
+            seen = {item.relative_path for item in selected_signals}
+            try:
+                for entry in walk():
+                    rel = entry.relative_path
+                    if (rel in seen or entry.path.stem.casefold() not in stems
+                            or not _matches_path_scope(rel, path_values, glob_values)):
+                        continue
+                    item = signals.get(rel) or _CandidateSignals(path=entry.path, relative_path=rel)
+                    item.sources.add("exact_basename")
+                    _apply_path_signals(item, path_values, glob_values, terms)
+                    rescued.append(item)
+                    seen.add(rel)
+                    if len(rescued) == len(slots):
+                        break
+            except (OSError, ValueError):
+                walk_stats.validation_failures += 1
+            if rescued:
+                evicted = set(slots[-len(rescued):])
+                selected_signals = [item for n, item in enumerate(selected_signals) if n not in evicted] + rescued
     selected = tuple(
         CandidateFile(
             relative_path=item.relative_path,
@@ -468,13 +561,15 @@ def discover_candidate_files(
     state = "scope_literal_scan" if grep_terms else "fallback_literal_scan" if fallback_used else rg_state
     diagnostics = {
         "state": state,
-        "backend": "literal_scan" if fallback_used or grep_terms else "ripgrep",
+        "backend": "literal_scan" if fallback_used or grep_terms or declaration is not None else "ripgrep",
         "fallback": fallback_used,
         "rg_state": rg_state,
         "visited_entries": walk_stats.visited_entries,
         "matched_paths": len(literal_matches),
         "content_universe_count": len(content_universe),
         "pool_count": len(pool),
+        "late_literal_matches": expanded,
+        "exact_basename_rescued": len(rescued),
         "pool_limit_reached": len(walk_files) >= budget.pool_limit,
         "file_limit_reached": len(pool) > budget.file_limit,
         "scope_path_count": len(path_values),
@@ -793,11 +888,13 @@ def _apply_path_signals(
     item.path_score = max(item.path_score, path_hits)
 
 
-def _candidate_rank_key(item: _CandidateSignals) -> tuple[int, int, int, int, int, int, str]:
+def _candidate_rank_key(item: _CandidateSignals) -> tuple[int, int, int, int, int, int, int, int, str]:
     return (
         -int(item.explicit_path_match),
         -int(item.glob_anchor_match),
         -int(item.all_grep_terms_match),
+        -item.definition_count,
+        -item.reference_count,
         -item.basename_score,
         -item.path_score,
         -item.content_occurrences,

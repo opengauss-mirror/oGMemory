@@ -31,6 +31,7 @@ from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDis
 from server.mcp_resources import (
     mcp_code_edit_tools_enabled,
     mcp_code_toolset_enabled,
+    mcp_search_only,
     mcp_delete_tools_enabled,
     mcp_write_tools_enabled,
     render_resource,
@@ -299,7 +300,7 @@ class CodeSearchScopeInput(BaseModel):
 class CodeSearchBudgetInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    result_limit: StrictInt | None = Field(default=None, gt=0, description="Max hits.")
+    result_limit: StrictInt | None = Field(default=None, gt=0, description="Usually omit. Set only to request fewer hits; the server cap applies.")
 
 
 @lru_cache(maxsize=1)
@@ -456,7 +457,7 @@ def create_mcp_server(
         mcp.tool(name=QUERY_MEMORY_TOOL_NAME)(query_memory)
         mcp.tool(name=LIST_MEMORY_TOOL_NAME)(list_memories)
 
-    if cfg.shared_spaces_enabled:
+    if cfg.shared_spaces_enabled and not mcp_search_only(cfg):
         @mcp.tool(name=SEARCH_SHARED_MEMORY_TOOL_NAME)
         def search_shared_memory(
             query: str,
@@ -478,24 +479,16 @@ def create_mcp_server(
                 **_auth_kwargs_from_context(ctx),
             )
 
-    @mcp.tool(name=SEARCH_CODE_TOOL_NAME)
+    # Plain text: a structured {"result": ...} wrapper makes clients show
+    # JSON-escaped source, which costs tokens on every later turn.
+    @mcp.tool(name=SEARCH_CODE_TOOL_NAME, structured_output=False)
     def search_code(
         query: Annotated[StrictStr, Field(pattern=_NON_BLANK_QUERY_PATTERN, description="Search query containing non-whitespace text.")],
         scope: CodeSearchScopeInput | None = None,
         budget: CodeSearchBudgetInput | None = None,
         ctx: Context | None = None,
     ) -> str:
-        """Locate code by symbol or description. Narrow scope.paths when known.
-        Reuse snippets and examples; read only needed missing ranges from read_lines.
-
-        Keep the workflow compact:
-
-        - Prefer one focused `ogm_search_code` call; use a second only if the first result is clearly insufficient.
-        - If five `ogm_search_code` calls around the same code area do not locate the needed file or context, fall back to regular workspace methods such as `find`, `grep`, or `Read` instead of continuing oGMemory search.
-        - Create a standalone reproduction script when needed to diagnose or verify the issue, or when the task calls for one.
-        - Look for relevant tests to understand behavior, add regression coverage, or verify a fix.
-        - Provide a concise summary after completing the task requirements and necessary verification.
-        """
+        """Find source or tests by symbol or behavior. Usually pass query alone; narrow to a known path when useful. Reuse the returned lines. Batch already-needed independent searches and reads in one turn. Read only missing context, or search for a specific unresolved caller or test. Use workspace text search for docs. Consult version history only when the task depends on it. Verify a fix with a focused check, expanding coverage for affected behavior or task requirements. Summarize the change and checks briefly."""
 
         try:
             return search_code_tool(
@@ -524,6 +517,9 @@ def create_mcp_server(
     search_arguments.model_config["extra"] = "forbid"
     search_arguments.model_rebuild(force=True)
     search_tool.parameters = search_arguments.model_json_schema(by_alias=True)
+
+    if mcp_search_only(cfg):
+        return mcp
 
     def read_memory(
         uri: Annotated[
@@ -1148,6 +1144,8 @@ def _auth_kwargs_from_context(ctx: Any | None) -> dict[str, Any]:
 
 def _mcp_instructions_for_config(cfg: OgMemConfig) -> str:
     code_toolset = mcp_code_toolset_enabled(cfg)
+    if mcp_search_only(cfg):
+        return "Workspace source search."
     if code_toolset:
         instructions = f"Read known files directly; use {SEARCH_CODE_TOOL_NAME} for missing context. "
     else:

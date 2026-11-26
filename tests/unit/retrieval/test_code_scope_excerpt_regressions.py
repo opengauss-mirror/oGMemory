@@ -235,6 +235,18 @@ def test_long_implementation_clips_to_matching_lines_and_reports_complement():
 
 
 @pytest.mark.parametrize("mode", ["full", "candidate_local"])
+def test_exact_python_class_returns_full_first_excerpt(tmp_path, mode):
+    path = tmp_path / "sample.py"
+    source = "class Widget:\n" + "\n".join(f"    value_{i} = {i}" for i in range(115))
+    path.write_text(source)
+    service, _ = _source_service(path, mode=mode)
+    service._cfg.code_retrieval_snippet_chars = 2400
+    ctx = RequestContext("acct", "user", "agent", "session", "trace")
+    hit = service.search_active(ActiveCodeSearchRequest("Widget"), ctx).evidence[0]
+    assert hit.symbol_kind == "type" and hit.excerpt == source
+
+
+@pytest.mark.parametrize("mode", ["full", "candidate_local"])
 def test_complete_implementation_includes_first_statement_decorators(tmp_path, mode):
     body = "    @register\n    def inner():\n        return 1\n    return inner"
     source = 'def outer():\n    """outer documentation.\n' + '    outer explanation.\n' * 65 + '    """\n' + body
@@ -263,3 +275,16 @@ def test_module_long_line_tail_remains_partial_through_mcp(tmp_path, mode):
     rendered = _render_code_search_result(outcome.to_dict(), query="CONFIG", max_chars=5000)
     assert hit.excerpt in rendered
     assert '"truncated":true' in rendered and '"read_lines":[[1,1]]' in rendered
+
+
+def test_filtered_implementation_keeps_literal_and_short_body():
+    source = ('def compute(x):\n    """compute examples.\n' + '    explanation\n' * 40
+              + '    >>> compute(3)\n    9\n    """\n    return x * x\n')
+    last = len(source.splitlines())
+    metadata = dict(start_line=1, symbol_start_line=1, symbol_end_line=last,
+                    symbol="compute", implementation_start_line=last)
+    excerpt, start, end, coverage = _code_excerpt(source, metadata, 100, ("compute",), ("implementation",))
+    assert "compute(3)" in excerpt and coverage["implementation_complete"]
+    assert excerpt == "\n".join(source.splitlines()[start-1:end]) and len(excerpt) <= 100
+    documentation, *_ = _code_excerpt(source, metadata, 100, ("compute",), ("documentation",))
+    assert "compute examples" in documentation

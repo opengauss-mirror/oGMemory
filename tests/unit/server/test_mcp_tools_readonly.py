@@ -743,8 +743,8 @@ def test_search_code_renders_safe_deduplicated_edit_evidence():
     assert "# code_search status: partial_failure" in payload
     assert 'edit_target: {"locator": "repo/src/service.py"}\n# lines 10-18' in payload
     assert "symbol=run_service" in payload
-    assert "signature=def run_service(value: str) -> str:" in payload
-    assert payload.count("def run_service(value: str) -> str:") == 2
+    assert "signature=def run_service(value: str) -> str:" not in payload
+    assert payload.count("def run_service(value: str) -> str:") == 1
     assert "ctx://" not in payload
     assert "/srv/private" not in payload
     assert "fusion_score" not in payload
@@ -1977,3 +1977,69 @@ def test_query_never_retries_inside_session_mutation(monkeypatch):
     with pytest.raises(psycopg2.OperationalError):
         query_memory(service, query='testing preference')
     assert search.call_count == 1
+
+
+@pytest.mark.parametrize("source,end,short", [([5, 6], 6, True), ([4, 6], 6, False)])
+def test_search_formats_only_verified_complete_spans(source, end, short):
+    service = _CodeAdapterService(result={"status": "ok", "evidence": [
+        dict(relative_path="a.py", root_slug="repo", start_line=5, end_line=end,
+             excerpt="def f():\n    pass", coverage=dict(source_lines=source,
+             truncated=False, read_lines=[], implementation_complete=True))]})
+    text = search_code(service, query="find f")
+    assert "# query:" not in text
+    assert ("# coverage: complete\n" in text) == short
+    assert ('"source_lines":' in text) != short
+    assert 'edit_target: {"locator": "repo/a.py"}' in text and "def f():\n    pass" in text
+
+
+def _search_only_hit(**overrides):
+    hit = dict(relative_path="pkg/a.py", root_slug="repo", start_line=5, end_line=6,
+               excerpt="def compute(x):\n    pass", symbol="compute", signature="compute(x)",
+               coverage=dict(source_lines=[5, 6], truncated=False, read_lines=[],
+                             implementation_complete=True))
+    hit.update(overrides)
+    return hit
+
+
+def test_search_only_renders_one_line_workspace_relative_hit_header():
+    service = _CodeAdapterService(cfg=OgMemConfig(mcp_default_toolset="search-only"),
+                                  result={"status": "ok", "evidence": [_search_only_hit()]})
+    text = search_code(service, query="compute")
+    assert "# code_search status: ok\n# hit_count: 1\n" in text
+    assert "\n# hit 1: pkg/a.py lines 5-6 symbol=compute complete\ndef compute(x):\n    pass" in text
+    assert "edit_target" not in text and "repo/" not in text and "signature=" not in text
+
+
+def test_search_only_compact_header_keeps_partial_coverage_and_related_files():
+    hit = _search_only_hit(coverage=dict(source_lines=[4, 6], truncated=False, read_lines=[],
+                                         implementation_complete=True),
+                           graph_context=[{"target_locator": "repo/pkg/b.py"}])
+    service = _CodeAdapterService(cfg=OgMemConfig(mcp_default_toolset="search-only"),
+                                  result={"status": "ok", "evidence": [hit]})
+    header = next(line for line in search_code(service, query="compute").splitlines()
+                  if line.startswith("# hit 1: "))
+    assert header.startswith("# hit 1: pkg/a.py lines 5-6 symbol=compute ")
+    assert "related=pkg/b.py" in header and 'coverage={"truncated":false' in header
+
+
+@pytest.mark.parametrize("cfg", [OgMemConfig(mcp_default_toolset="code"),
+                                 OgMemConfig(mcp_default_toolset="code", mcp_enable_code_edit_tools=True)])
+def test_non_search_only_toolsets_keep_edit_locator(cfg):
+    service = _CodeAdapterService(cfg=cfg, result={"status": "ok", "evidence": [_search_only_hit()]})
+    assert 'edit_target: {"locator": "repo/pkg/a.py"}' in search_code(service, query="compute")
+
+
+@pytest.mark.parametrize("header, cap, keep", [
+    ("def compute(x):", 10000, False), ("def compute(x):", 320, True),
+    ("# comment", 10000, True),
+])
+def test_search_repeated_signature_only_compacted_with_visible_source(header, cap, keep):
+    source = header + "\n" + "    pass\n" * 60
+    service = _CodeAdapterService(cfg=OgMemConfig(mcp_max_response_chars=cap), result={
+        "status": "ok", "evidence": [dict(relative_path="a.py", root_slug="repo", start_line=1,
+        end_line=61, excerpt=source, symbol="compute", signature="compute(x)")]})
+    text = search_code(service, query="compute")
+    assert ('signature=compute(x)' in text) == keep
+    assert 'edit_target: {"locator": "repo/a.py"}' in text
+    if cap == 10000:
+        assert source.rstrip() in text and "# lines 1-61" in text

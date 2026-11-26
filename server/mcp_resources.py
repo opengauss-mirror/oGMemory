@@ -58,7 +58,7 @@ _HIDDEN_RESOURCE_TYPES = {"session_summary", "session_archive"}
 _WRITE_TOOLSETS = {"read-write", "read_write", "readwrite", "all", "full"}
 _DELETE_TOOLSETS = {"all", "full"}
 _READ_ONLY_TOOLSETS = {"read-only", "read_only", "readonly"}
-_CODE_TOOLSETS = {"code"}
+_CODE_TOOLSETS = {"code", "search-only"}
 
 
 @dataclass(frozen=True)
@@ -634,6 +634,10 @@ def mcp_code_edit_tools_enabled(cfg: Any) -> bool:
     return bool(getattr(cfg, "mcp_enable_code_edit_tools", False))
 
 
+def mcp_search_only(cfg: Any) -> bool:
+    return _normalized_toolset(cfg) == "search-only"
+
+
 def mcp_code_toolset_enabled(cfg: Any) -> bool:
     """Return whether MCP exposes the isolated code-oriented tool surface."""
 
@@ -644,7 +648,7 @@ def _normalized_toolset(cfg: Any) -> str:
     toolset = str(getattr(cfg, "mcp_default_toolset", "read-only") or "read-only").strip().lower()
     if toolset in _READ_ONLY_TOOLSETS | _WRITE_TOOLSETS | _DELETE_TOOLSETS | _CODE_TOOLSETS:
         return toolset
-    raise ValueError("mcp_default_toolset must be read-only, read-write, all, full, or code")
+    raise ValueError("mcp_default_toolset must be read-only, read-write, all, full, code, or search-only")
 
 
 def _configured_max_response_chars(service: Any) -> int:

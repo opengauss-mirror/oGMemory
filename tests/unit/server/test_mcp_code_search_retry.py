@@ -1,5 +1,6 @@
 """Search failures and corrected retries over the real MCP transport."""
 import anyio
+import pytest
 
 from tests.unit.server.test_mcp_code_edit_transport import _stdio_session
 
@@ -77,3 +78,24 @@ def test_stdio_zero_match_absolute_path_and_successful_retry(tmp_path):
             assert "repo/forms.py" in text(result)
             assert "../password/" in text(result)
     anyio.run(exercise)
+
+
+def test_interactive_deadline_only_defaults_in_candidate_mode():
+    from types import SimpleNamespace
+    from server.mcp_tools import _code_search_budget_for_response
+
+    service = SimpleNamespace(_cfg=SimpleNamespace(code_retrieval_mode="candidate_local"))
+    assert "route_deadline_ms" not in _code_search_budget_for_response(service, {})
+    service._cfg.mcp_candidate_search_default_deadline_ms = 120_000
+    assert _code_search_budget_for_response(service, None)["route_deadline_ms"] == 120_000
+    custom = {"route_deadline_ms": 90_000}
+    assert _code_search_budget_for_response(service, custom)["route_deadline_ms"] == 90_000
+    service._cfg.code_retrieval_mode = "full"
+    assert "route_deadline_ms" not in _code_search_budget_for_response(service, {})
+
+@pytest.mark.parametrize("value", [0, 360_001, True, 1.5])
+def test_mcp_candidate_deadline_bounds(value):
+    from providers.unified_config import OgMemConfig
+
+    with pytest.raises(ValueError, match="mcp_candidate_search_default_deadline_ms"):
+        OgMemConfig(mcp_candidate_search_default_deadline_ms=value)
