@@ -1,12 +1,16 @@
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import replace
+from threading import Event
 
 import psycopg2
 import pytest
+from psycopg2.extensions import cursor
 
 from commit.sql_outbox_store import SQLOutboxStore
-from core.errors import ConcurrentModificationError
-from core.models import ContextNode, RelationEdge, RequestContext
+from core.errors import ConcurrentModificationError, NodeNotFoundError
+from core.models import CandidateMemory, ContextNode, RelationEdge, RequestContext
 from fs.sql_adapter import SharedConnectionPool, SQLContextFS
 from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
 from providers.relation_store.sql_relation_store import SQLRelationStore
@@ -240,3 +244,136 @@ def test_opengauss_sql_trace_storage_round_trip(opengauss_sql_dsn):
         finally:
             pool.return_connection(conn)
             pool.close_all()
+
+
+def test_dreaming_merge_serializes_inline_relation_writes(dreaming_storage, monkeypatch):
+    pool, fs, _, ctx, canonical = dreaming_storage
+    source = replace(canonical, uri=canonical.parent_uri + "source")
+    peer = replace(canonical, uri=canonical.parent_uri + "peer")
+    relation = RelationEdge(peer.uri, source.uri, "related_to", 1.0, "Shared fact")
+    writer = SQLContextFS(pool=pool, dreaming_enabled=True)
+    relations = SQLRelationStore(pool=pool)
+    started = Event()
+
+    def write_relation():
+        started.set()
+        writer.write_node(replace(peer, metadata={"_expected_version": 1, "_relations": [relation]}), ctx)
+
+    for node in (canonical, source, peer):
+        fs.write_node(node, ctx)
+    stored = [fs.read_node(node.uri, ctx) for node in (canonical, source)]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = []
+
+        class MergeCursor(cursor):
+            def execute(self, query, params=None):
+                super().execute(query, params)
+                if query.startswith("SELECT EXISTS (SELECT 1 FROM relation_edges"):
+                    pending.append(executor.submit(write_relation))
+                    assert started.wait(5)
+                    wait(pending, timeout=1)
+
+        conn = pool.get_connection()
+        previous_factory = conn.cursor_factory
+        conn.cursor_factory = MergeCursor
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(fs, "_get_connection", lambda: conn)
+                patch.setattr(fs, "_return_connection", lambda _: None)
+                assert fs.merge_dreaming_duplicate(*stored, ctx)
+        finally:
+            conn.cursor_factory = previous_factory
+            pool.return_connection(conn)
+        with pytest.raises(NodeNotFoundError):
+            pending[0].result(timeout=10)
+    assert fs.read_dreaming_alias(source.uri, ctx).uri == canonical.uri
+    assert relations.get_edges(peer.uri, ctx) == []
+
+
+@pytest.fixture
+def dreaming_storage(opengauss_sql_dsn):
+    account = f"ogmem-dream-{uuid.uuid4().hex[:12]}"
+    ctx = RequestContext(account, "alice", "main", "session-1", "trace-1")
+    pool = SharedConnectionPool(opengauss_sql_dsn, pool_size=5, dialect="opengauss")
+    fs = SQLContextFS(pool=pool, dreaming_enabled=True)
+    outbox = SQLOutboxStore(pool=pool, fs=fs)
+    template = ContextNode(f"ctx://{account}/users/alice/memories/patterns/a-primary", "MEMORY", "pattern",
+                           0, ctx.user_space_name(), "Shared fact", "Shared fact", "Shared fact",
+                           {"_expected_version": 0, "routing_key": "primary"})
+    try:
+        yield pool, fs, outbox, ctx, template
+    finally:
+        conn = pool.get_connection()
+        try:
+            fs.bind_tenant(conn, account)
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM outbox_events WHERE account_id=%s", (account,))
+                cur.execute("DELETE FROM context_nodes WHERE account_id=%s", (account,))
+            conn.commit()
+        finally:
+            pool.return_connection(conn)
+            pool.close_all()
+
+
+def test_dreaming_merge_projects_the_committed_revision(dreaming_storage):
+    from index.index_record_builder import build_index_records
+
+    _, fs, outbox, ctx, canonical = dreaming_storage
+    canonical.metadata["expected_version"] = 0
+    source = replace(canonical, uri=canonical.parent_uri + "z-source")
+    for node in (canonical, source):
+        fs.write_node(node, ctx)
+    stored = [fs.read_node(node.uri, ctx) for node in (canonical, source)]
+    assert fs.merge_dreaming_duplicate(*stored, ctx)
+    fresh = fs.read_node(canonical.uri, ctx)
+    [project] = [event for uri, event in outbox.list_pending(ctx.account_id)
+                 if uri == canonical.uri and event.event_type == "UPSERT_CONTEXT"]
+    assert fresh.metadata["version"] == 2
+    assert {record["metadata"]["canonical_revision"] for record in project.payload["records"]} == {2}
+    assert {record.metadata["canonical_revision"] for record in build_index_records(fresh)} == {2}
+
+
+def test_dreaming_merge_serializes_paged_identity_writes(dreaming_storage, monkeypatch):
+    from service.api import MemoryWriteAPI
+    from tests.unit.server.test_extraction_batch_recovery import NoModel
+
+    _, fs, _, ctx, canonical = dreaming_storage
+    directory = canonical.parent_uri
+    source = replace(canonical, uri=directory + "z-source",
+                     metadata={**canonical.metadata, "routing_key_aliases": ["old_name"]})
+    for node in (canonical, source):
+        fs.write_node(node, ctx)
+    for i in range(99):
+        fs.write_node(replace(canonical, uri=f"{directory}m-{i:03}",
+                              metadata={"_expected_version": 0, "routing_key": f"unrelated_{i}"}), ctx)
+    stored = [fs.read_node(node.uri, ctx) for node in (canonical, source)]
+    started = Event()
+    real_page = SQLContextFS.list_node_summaries_page
+
+    def merge():
+        started.set()
+        try:
+            fs.merge_dreaming_duplicate(*stored, ctx)
+        except ConcurrentModificationError:
+            pass
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = []
+
+        def first_page_then_merge(self, path, context, *, limit=100, after_uri=None):
+            page = real_page(self, path, context, limit=limit, after_uri=after_uri)
+            if not pending and limit == 100 and after_uri is None:
+                assert len(page) == 100 and page[0].uri == canonical.uri
+                assert all(node.uri != source.uri for node in page)
+                pending.append(executor.submit(merge))
+                assert started.wait(5)
+                wait(pending, timeout=1)
+            return page
+
+        with monkeypatch.context() as patch:
+            patch.setattr(SQLContextFS, "list_node_summaries_page", first_page_then_merge)
+            candidate = CandidateMemory("pattern", "user", "old_name", "Added detail", "Added detail",
+                                        "Added detail", 0.8)
+            result = MemoryWriteAPI(fs, NoModel(), directory_summary_enabled=False).write_memory(candidate, ctx)
+        pending[0].result(timeout=10)
+    assert result["target_uri"] in {canonical.uri, source.uri}

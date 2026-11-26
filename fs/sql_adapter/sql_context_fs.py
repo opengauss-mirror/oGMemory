@@ -15,13 +15,15 @@ import logging
 import re
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from urllib.parse import unquote
 
 from commit.outbox_scope import is_capturing_outbox_events, record_persisted_event
-from core.dreaming_evidence import node_created_at
+from core.dreaming_evidence import EVIDENCE_KEY, merge_evidence, node_created_at
+from core.memory_names import merge_name_aliases
 from core.enums import ContextType, EventType, NodeStatus
 from core.errors import (
     AccessDeniedError,
@@ -41,6 +43,7 @@ from core.resource_identity import (
 from fs.access_control import check_uri_access
 from fs.sql_adapter.outbox_receipt import PROJECTION_RECEIPT_SQL
 from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
+from fs.sql_adapter.relation_endpoints import lock_relation_endpoints
 
 # ---------------------------------------------------------------------------
 # URI parsing (independent copy — no dependency on agfs_adapter)
@@ -778,6 +781,11 @@ class SQLContextFS(PoolAdapterMixin):
 
         Shared by write_node and write_node_with_outbox to avoid duplication.
         """
+        if relations_json:
+            endpoints = {node.uri}
+            for relation in relations_json:
+                endpoints.update((relation["from_uri"], relation["to_uri"]))
+            lock_relation_endpoints(cur, account_id, endpoints)
         if node.category == "state":
             self.sql_dialect.ensure_extraction_work_account(cur, account_id)
         if expected_version is not None and not create_only:
@@ -913,6 +921,127 @@ class SQLContextFS(PoolAdapterMixin):
                 if cur.rowcount != 1:
                     raise ConcurrentModificationError(node.uri, version, version)
             conn.commit()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def merge_dreaming_duplicate(self, canonical, duplicate, ctx):
+        for node in (canonical, duplicate):
+            self._ensure_accessible(node.uri, ctx)
+        directory = canonical.parent_uri.rstrip("/")
+        if (canonical.owner_space != duplicate.owner_space
+                or directory != duplicate.parent_uri.rstrip("/")):
+            raise ValueError("Dreaming merge requires a shared owner and directory")
+        with self.memory_identity_lock(directory, ctx):
+            return self._merge_dreaming_duplicate(canonical, duplicate, ctx)
+
+    def _merge_dreaming_duplicate(self, canonical, duplicate, ctx):
+        from commit.code_resource_events import build_code_resource_write_event
+        from commit.write_receipts import PROJECTION_RECEIPTS_KEY, RECEIPTS_KEY
+        from core.models import IndexRecord
+
+        nodes = {node.uri: node for node in (canonical, duplicate)}
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    _READ_NODE_SQL + " AND uri=ANY(%s) AND status='ACTIVE' ORDER BY uri FOR UPDATE",
+                    (ctx.account_id, sorted(nodes)),
+                )
+                locked = {row[0]: row for row in cur.fetchall()}
+                stored = {}
+                for uri, node in nodes.items():
+                    expected = node.metadata["version"]
+                    actual = locked[uri][-1] if uri in locked else 0
+                    if actual != expected:
+                        raise ConcurrentModificationError(uri, expected, actual)
+                    metadata = self._decode_node(uri, locked[uri]).metadata
+                    identity = node_created_at(metadata)
+                    if not identity or identity != node_created_at(node.metadata):
+                        raise ConcurrentModificationError(uri, expected, actual)
+                    stored[uri] = metadata
+                current, source = stored[canonical.uri], stored[duplicate.uri]
+                if source.get("pinned") or locked[duplicate.uri][8]:
+                    return False
+                cur.execute(
+                    "SELECT EXISTS (SELECT 1 FROM relation_edges WHERE account_id=%s AND (from_uri=%s OR to_uri=%s)) "
+                    "OR EXISTS (SELECT 1 FROM context_nodes WHERE account_id=%s AND relations @> %s::jsonb)",
+                    (ctx.account_id, duplicate.uri, duplicate.uri, ctx.account_id, Json([{"to_uri": duplicate.uri}])),
+                )
+                if cur.fetchone()[0]:
+                    return False
+                receipts = dict(current.get(RECEIPTS_KEY, {}))
+                for key, digest in source.get(RECEIPTS_KEY, {}).items():
+                    if receipts.setdefault(key, digest) != digest:
+                        return False
+                provenance = list(dict.fromkeys(
+                    [*current.get("provenance_ids", []), *source.get("provenance_ids", [])],
+                ))
+                event_id = str(uuid.uuid4())
+                projection_receipts = dict(current.get(PROJECTION_RECEIPTS_KEY, {}))
+                for key in source.get(RECEIPTS_KEY, {}):
+                    projection_receipts[key] = {"event_id": event_id}
+                metadata = {
+                    **merge_name_aliases(current, source),
+                    "provenance_ids": provenance,
+                    RECEIPTS_KEY: receipts,
+                    PROJECTION_RECEIPTS_KEY: projection_receipts,
+                    "version": locked[canonical.uri][-1] + 1,
+                }
+                evidence = merge_evidence(current.get(EVIDENCE_KEY), source.get(EVIDENCE_KEY),
+                                          references=set(provenance))
+                if evidence:
+                    metadata[EVIDENCE_KEY] = evidence
+                observations = list(dict.fromkeys([
+                    *current.get("memory_observations", []), *source.get("memory_observations", []),
+                ]))
+                if observations:
+                    metadata["memory_observations"] = observations
+                for field in ("memory_observation_sources", "occurrence_replay_sources"):
+                    merged_sources = dict(current.get(field, {}))
+                    for key, references in source.get(field, {}).items():
+                        merged_sources[key] = list(dict.fromkeys([*merged_sources.get(key, []), *references]))
+                    if merged_sources:
+                        metadata[field] = merged_sources
+                raw_metadata = locked[canonical.uri][9]
+                previous = json.loads(raw_metadata) if isinstance(raw_metadata, str) else (raw_metadata or {})
+                metadata = {**previous, **metadata}
+                metadata.pop("expected_version", None)
+                cur.execute(
+                    "UPDATE context_nodes SET metadata=%s, version=version+1 WHERE account_id=%s AND uri=%s",
+                    (Json(metadata), ctx.account_id, canonical.uri),
+                )
+                cur.execute(
+                    "UPDATE context_nodes SET status='ARCHIVED', version=version+1, "
+                    "metadata=jsonb_set(jsonb_set(metadata, '{dreaming_canonical_uri}', %s::jsonb, true), "
+                    "'{dreaming_canonical_created_at}', %s::jsonb, true) WHERE account_id=%s AND uri=%s",
+                    (Json(canonical.uri), Json(node_created_at(current)), ctx.account_id, duplicate.uri),
+                )
+                refreshed = self.read_node_with_cursor(cur, canonical.uri, ctx)
+                event = build_code_resource_write_event(refreshed)
+                event.event_id = event_id
+                self._insert_dreaming_outbox(cur, event, ctx.account_id)
+                self._enqueue_dreaming(cur, refreshed, ctx.account_id)
+                source_version, source_created_at = locked[duplicate.uri][-1], node_created_at(source)
+                archive_key = f"dream-archive:{duplicate.uri}:{source_version}:{source_created_at}"
+                event_id = hashlib.sha256(archive_key.encode()).hexdigest()
+                self._insert_dreaming_outbox(cur, OutboxEvent(
+                    event_id=event_id[:32], event_type=EventType.ARCHIVE_CONTEXT.value, uri=duplicate.uri,
+                    payload={
+                        "ids_to_delete": [
+                            IndexRecord.generate_id(duplicate.uri, 0),
+                            IndexRecord.generate_id(duplicate.uri, 1),
+                            IndexRecord.generate_id(duplicate.uri.rstrip("/") + "/content.md", 2),
+                        ],
+                        "dreaming_archive_revision": {
+                            "version": source_version + 1, "created_at": source_created_at, "persisted_with_archive": True,
+                        },
+                    },
+                    status="PENDING",
+                ), ctx.account_id)
+            conn.commit()
+            return True
         finally:
             conn.rollback()
             self._return_connection(conn)
@@ -1111,6 +1240,40 @@ class SQLContextFS(PoolAdapterMixin):
         )
         return cls._decode_node(uri, cursor.fetchone())
 
+    def read_dreaming_alias(self, uri: str, ctx: RequestContext, *, expected_created_at: str | None = None) -> ContextNode:
+        """Resolve a merged memory URI within its authorized directory."""
+        self._ensure_accessible(uri, ctx)
+        original_uri = uri
+        directory = uri.rsplit("/", 1)[0]
+        visited = set()
+        target_created_at = expected_created_at
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                while uri not in visited:
+                    visited.add(uri)
+                    cur.execute(_READ_NODE_SQL + " AND uri=%s", (ctx.account_id, uri))
+                    row = cur.fetchone()
+                    if row is None:
+                        break
+                    raw_metadata, status, created_at = row[9:12]
+                    if (target_created_at is not None
+                            and node_created_at({"_storage_created_at": str(created_at)}) != target_created_at):
+                        break
+                    if status != NodeStatus.ARCHIVED.value:
+                        return self._decode_node(uri, row)
+                    meta = raw_metadata if isinstance(raw_metadata, dict) else json.loads(raw_metadata or "{}")
+                    target = meta.get("dreaming_canonical_uri")
+                    target_created_at = meta.get("dreaming_canonical_created_at")
+                    if not target_created_at or not isinstance(target, str) or target.rsplit("/", 1)[0] != directory:
+                        break
+                    uri = target
+                raise NodeNotFoundError(original_uri)
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
     def read_nodes(
         self, uris: list[str], ctx: RequestContext,
     ) -> dict[str, ContextNode | Exception]:
@@ -1183,7 +1346,7 @@ class SQLContextFS(PoolAdapterMixin):
             ]
 
         # Parse metadata
-        meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
+        meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else dict(metadata_raw or {})
         meta.setdefault("created_at", str(created_at) if created_at else "")
         meta["_storage_created_at"] = str(created_at) if created_at else ""
         meta.setdefault("updated_at", str(updated_at) if updated_at else "")
@@ -1301,13 +1464,30 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                query = "SELECT version FROM context_nodes WHERE uri = %s AND account_id = %s AND status = 'ARCHIVED'"
-                params = (uri, ctx.account_id)
-                if created_at is not None:
-                    query += " AND created_at = %s"
-                    params += (created_at,)
-                cur.execute(query, params)
+                cur.execute(
+                    "SELECT CASE WHEN status = 'ARCHIVED' AND (%s::timestamptz IS NULL OR created_at = %s) "
+                    "THEN version END FROM context_nodes WHERE uri = %s AND account_id = %s",
+                    (created_at, created_at, uri, ctx.account_id),
+                )
                 row = cur.fetchone()
+                if row is None and created_at:
+                    cur.execute(
+                        """
+                        SELECT (event.payload->'dreaming_archive_revision'->>'version')::integer
+                        FROM outbox_events AS event
+                        WHERE event.account_id = %s AND event.uri = %s AND event.event_type = 'ARCHIVE_CONTEXT'
+                          AND event.status IN ('PENDING', 'PROCESSING')
+                          AND event.payload->'dreaming_archive_revision'->>'persisted_with_archive' = 'true'
+                          AND event.payload->'dreaming_archive_revision'->>'created_at' = %s
+                          AND NOT EXISTS (
+                            SELECT 1 FROM context_nodes AS node
+                            WHERE node.account_id = event.account_id AND node.uri = event.uri
+                          )
+                        LIMIT 1
+                        """,
+                        (ctx.account_id, uri, created_at),
+                    )
+                    row = cur.fetchone()
                 return row[0] if row else None
         finally:
             conn.rollback()
