@@ -27,7 +27,9 @@ func cacheStorageID(backend DBBackend, c map[string]interface{}, db sqlExecutor)
 			if err != nil {
 				return "", fmt.Errorf("invalid SQLite memory storage identity")
 			}
-			if uri.Scheme == "file" && uri.Query().Get("cache") == "shared" {
+			// SQLite applies URI options in order, so the last cache value wins.
+			cacheModes := uri.Query()["cache"]
+			if uri.Scheme == "file" && len(cacheModes) > 0 && cacheModes[len(cacheModes)-1] == "shared" {
 				name := uri.Path
 				if uri.Opaque != "" {
 					name, err = url.PathUnescape(uri.Opaque)

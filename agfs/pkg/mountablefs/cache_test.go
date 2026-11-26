@@ -273,12 +273,20 @@ func TestCacheRejectsSQLiteSharedMemoryStorageAlias(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			err := m.MountPlugin("sqlfs", second, map[string]interface{}{
-				"backend": "sqlite", "db_path": "file:" + url.PathEscape(name) + "?cache=shared&mode=memory",
-			})
-			if !errors.Is(err, ErrCacheStorageAlias) || !strings.Contains(err.Error(), first) || !strings.Contains(err.Error(), second) {
-				t.Fatalf("shared memory alias mount: got %v, want storage alias between %s and %s", err, first, second)
+			for _, options := range []string{"cache=shared&mode=memory", "mode=memory&cache=private&cache=shared"} {
+				err := m.MountPlugin("sqlfs", second, map[string]interface{}{
+					"backend": "sqlite", "db_path": "file:" + url.PathEscape(name) + "?" + options,
+				})
+				if !errors.Is(err, ErrCacheStorageAlias) || !strings.Contains(err.Error(), first) || !strings.Contains(err.Error(), second) {
+					t.Fatalf("shared memory alias mount: got %v, want storage alias between %s and %s", err, first, second)
+				}
 			}
+			if err := m.MountPlugin("sqlfs", second, map[string]interface{}{
+				"backend": "sqlite", "db_path": "file:" + name + "?mode=memory&cache=shared&cache=private",
+			}); err != nil {
+				t.Fatalf("private memory database mistaken for shared alias: %v", err)
+			}
+
 		})
 	}
 }

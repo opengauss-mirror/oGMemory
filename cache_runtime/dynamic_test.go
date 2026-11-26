@@ -13,28 +13,36 @@ import (
 	"time"
 )
 
-func compileFixture(t *testing.T, bad bool) string {
+func compileNativeTest(t *testing.T, args ...string) {
 	t.Helper()
 	cc, e := exec.LookPath("cc")
 	if e != nil {
 		t.Skip("C compiler unavailable")
 	}
-	out := filepath.Join(t.TempDir(), "provider.so")
-	args := []string{"-shared", "-fPIC", "-pthread", "-Iinclude", "testdata/provider.c", "-o", out}
 	if runtime.GOOS == "darwin" {
-		args[0] = "-dynamiclib"
 		if root := os.Getenv("SDKROOT"); root != "" {
 			args = append(args, "-isysroot", root)
 		}
 	}
-	if bad {
-		args = append(args, "-DBAD_ABI=1")
-	}
 	if b, e := exec.Command(cc, args...).CombinedOutput(); e != nil {
 		t.Fatalf("compile: %v\n%s", e, b)
 	}
+}
+
+func compileFixture(t *testing.T, bad bool) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "provider.so")
+	args := []string{"-shared", "-fPIC", "-pthread", "-Iinclude", "testdata/provider.c", "-o", out}
+	if runtime.GOOS == "darwin" {
+		args[0] = "-dynamiclib"
+	}
+	if bad {
+		args = append(args, "-DBAD_ABI=1")
+	}
+	compileNativeTest(t, args...)
 	return out
 }
+
 func TestDynamicContract(t *testing.T) {
 	r, err := New(Config{Provider: "dynamic", CommandTimeoutMS: 500, Params: map[string]interface{}{
 		"library": compileFixture(t, false),
@@ -78,12 +86,8 @@ func TestDynamicCompatibilityEntry(t *testing.T) {
 	args := []string{"testdata/entry_check.c", "-o", out}
 	if runtime.GOOS == "linux" {
 		args = append(args, "-ldl")
-	} else if root := os.Getenv("SDKROOT"); root != "" {
-		args = append(args, "-isysroot", root)
 	}
-	if b, err := exec.Command("cc", args...).CombinedOutput(); err != nil {
-		t.Fatalf("compile entry check: %v\n%s", err, b)
-	}
+	compileNativeTest(t, args...)
 	if b, err := exec.Command(out, lib).CombinedOutput(); err != nil {
 		t.Fatalf("v1 entry compatibility: %v\n%s", err, b)
 	}

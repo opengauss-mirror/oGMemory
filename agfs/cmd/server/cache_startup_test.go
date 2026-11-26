@@ -20,16 +20,16 @@ import (
 
 type orderedLocalPlugin struct {
 	plugin.ServicePlugin
-	path, first string
-	published   chan struct{}
-	once        *sync.Once
+	path, first               string
+	firstMountEnteredAssembly chan struct{}
+	once                      *sync.Once
 }
 
 func (p *orderedLocalPlugin) Initialize(cfg map[string]interface{}) error {
 	p.path, _ = cfg["mount_path"].(string)
 	if p.path != p.first {
 		select {
-		case <-p.published:
+		case <-p.firstMountEnteredAssembly:
 		case <-time.After(5 * time.Second):
 			return fmt.Errorf("first mount %s did not start", p.first)
 		}
@@ -41,17 +41,17 @@ func (p *orderedLocalPlugin) GetFileSystem() filesystem.FileSystem {
 	// Mount holds the routing mutex here. The second mount can initialize,
 	// but cannot enter its conflict check until the first mount is published.
 	if p.path == p.first {
-		p.once.Do(func() { close(p.published) })
+		p.once.Do(func() { close(p.firstMountEnteredAssembly) })
 	}
 	return p.ServicePlugin.GetFileSystem()
 }
 
 func TestCacheStartupRejectsStorageAlias(t *testing.T) {
 	if first := os.Getenv("OGMEM_STARTUP_FIRST"); first != "" {
-		published := make(chan struct{})
+		firstMountEnteredAssembly := make(chan struct{})
 		once := new(sync.Once)
 		availablePlugins["localfs"] = func() plugin.ServicePlugin {
-			return &orderedLocalPlugin{ServicePlugin: localfs.NewLocalFSPlugin(), first: first, published: published, once: once}
+			return &orderedLocalPlugin{ServicePlugin: localfs.NewLocalFSPlugin(), first: first, firstMountEnteredAssembly: firstMountEnteredAssembly, once: once}
 		}
 		flag.CommandLine = flag.NewFlagSet("agfs", flag.ExitOnError)
 		os.Args = []string{"agfs", "-c", os.Getenv("OGMEM_STARTUP_CONFIG")}

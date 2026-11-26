@@ -47,10 +47,13 @@ func testKVContract(t *testing.T, r Runtime, advance func(time.Duration)) {
 	if err := r.Set(ctx, "bad", nil, -time.Second); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatal(err)
 	}
-	if err := r.Set(ctx, "expires", []byte("value"), 20*time.Millisecond); err != nil {
+	if err := r.Set(ctx, "expires", []byte("value"), time.Second); err != nil {
 		t.Fatal(err)
 	}
-	advance(50 * time.Millisecond)
+	if v, err := r.Get(ctx, "expires"); err != nil || !v.Found || !bytes.Equal(v.Data, []byte("value")) {
+		t.Fatalf("before TTL: %+v, %v", v, err)
+	}
+	advance(1100 * time.Millisecond)
 	if v, err := r.Get(ctx, "expires"); err != nil || v.Found {
 		t.Fatalf("TTL: %+v, %v", v, err)
 	}

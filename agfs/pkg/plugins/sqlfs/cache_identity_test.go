@@ -55,7 +55,7 @@ func TestSQLiteStorageIdentity(t *testing.T) {
 			}
 		})
 	}
-	for _, dsn := range []string{":memory:", ":memory:?cache=shared", "file:%3Amemory%3A", "file:named?mode=memory&cache=private"} {
+	for _, dsn := range []string{":memory:", ":memory:?cache=shared", "file:%3Amemory%3A", "file:named?mode=memory&cache=private", "file:named?mode=memory&cache=shared&cache=private"} {
 		t.Run(dsn, func(t *testing.T) {
 			fs, err := NewSQLFS(NewSQLiteBackend(), map[string]interface{}{"db_path": dsn})
 			if err != nil {
@@ -67,7 +67,7 @@ func TestSQLiteStorageIdentity(t *testing.T) {
 			}
 		})
 	}
-	for _, dsn := range []string{"file:named?mode=memory&cache=shared", "file:na%6Ded?cache=shared&mode=memory"} {
+	for _, dsn := range []string{"file:named?mode=memory&cache=shared", "file:na%6Ded?cache=shared&mode=memory", "file:named?mode=memory&cache=private&cache=shared"} {
 		fs, err := NewSQLFS(NewSQLiteBackend(), map[string]interface{}{"db_path": dsn})
 		if err != nil {
 			t.Fatal(err)

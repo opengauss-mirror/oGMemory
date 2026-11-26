@@ -249,6 +249,7 @@ func main() {
 	var startupMounts sync.WaitGroup
 	var mountErrorsMu sync.Mutex
 	var mountErrors []error
+	startupCtx := context.Background()
 	mountPlugin := func(pluginName, instanceName, mountPath string, pluginConfig map[string]interface{}) {
 		selected := cfg.CacheFS.Selected(mountPath)
 		reportMountError := func(err error) {
@@ -309,8 +310,14 @@ func main() {
 			}
 
 			// Initialize plugin
-			if err := p.Initialize(configWithPath); err != nil {
-				reportMountError(fmt.Errorf("Failed to initialize %s instance '%s': %w", pluginName, instanceName, err))
+			var initErr error
+			if cfg.CacheFS.Enabled {
+				initErr = initializeStartupPlugin(startupCtx, p, configWithPath)
+			} else {
+				initErr = p.Initialize(configWithPath)
+			}
+			if initErr != nil {
+				reportMountError(fmt.Errorf("Failed to initialize %s instance '%s': %w", pluginName, instanceName, initErr))
 				return
 			}
 
@@ -363,6 +370,11 @@ func main() {
 	}
 
 	// Mount all enabled plugins
+	if cfg.CacheFS.Enabled {
+		var cancelStartup context.CancelFunc
+		startupCtx, cancelStartup = context.WithTimeout(startupCtx, startupMountTimeout)
+		defer cancelStartup()
+	}
 	log.Info("Mounting plugin filesytems...")
 	for pluginName, pluginCfg := range cfg.Plugins {
 		// Normalize to instance array (convert single instance to array of one)
