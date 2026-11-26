@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,9 +29,11 @@ func TestStartupDiscardsAndClosesLateInitialization(t *testing.T) {
 	p := &blockedStartupPlugin{started: make(chan struct{}), release: make(chan struct{}), stopped: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(p.release) }) })
 	result := make(chan error, 1)
 	go func() { result <- prepareStartupPlugin(ctx, p, nil) }()
-	<-p.started
+	waitPreparationStarted(t, p.started, result)
 	cancel()
 	select {
 	case err := <-result:
@@ -40,7 +43,7 @@ func TestStartupDiscardsAndClosesLateInitialization(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("startup did not stop waiting after cancellation")
 	}
-	close(p.release)
+	release.Do(func() { close(p.release) })
 	select {
 	case <-p.stopped:
 	case <-time.After(5 * time.Second):
@@ -50,14 +53,13 @@ func TestStartupDiscardsAndClosesLateInitialization(t *testing.T) {
 
 type blockedValidationPlugin struct {
 	plugin.ServicePlugin
-	started, release, validated chan struct{}
-	initialized                 atomic.Bool
+	started, release chan struct{}
+	initialized      atomic.Bool
 }
 
 func (p *blockedValidationPlugin) Validate(map[string]interface{}) error {
 	close(p.started)
 	<-p.release
-	defer close(p.validated)
 	return nil
 }
 func (p *blockedValidationPlugin) Initialize(map[string]interface{}) error {
@@ -65,26 +67,56 @@ func (p *blockedValidationPlugin) Initialize(map[string]interface{}) error {
 	return nil
 }
 
+// Both paths must stop waiting or stop before Initialize. Only the synchronous
+// result proves preparation has actually finished after Validate returns.
 func TestStartupDiscardsBlockedValidation(t *testing.T) {
-	p := &blockedValidationPlugin{started: make(chan struct{}), release: make(chan struct{}), validated: make(chan struct{})}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan error, 1)
-	go func() { result <- prepareStartupPlugin(ctx, p, nil) }()
-	<-p.started
-	cancel()
-	select {
-	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatal(err)
+	for _, timed := range []bool{false, true} {
+		name := "synchronous"
+		if timed {
+			name = "timed"
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("startup did not stop waiting for validation")
+		t.Run(name, func(t *testing.T) {
+			p := &blockedValidationPlugin{started: make(chan struct{}), release: make(chan struct{})}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var release sync.Once
+			t.Cleanup(func() { release.Do(func() { close(p.release) }) })
+			result := make(chan error, 1)
+			go func() {
+				if timed {
+					result <- prepareStartupPlugin(ctx, p, nil)
+				} else {
+					result <- preparePlugin(ctx, p, nil)
+				}
+			}()
+			waitPreparationStarted(t, p.started, result)
+			cancel()
+			if !timed {
+				release.Do(func() { close(p.release) })
+			}
+			select {
+			case err := <-result:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("preparation did not finish after cancellation")
+			}
+			if !timed && p.initialized.Load() {
+				t.Fatal("initialized after validation cancellation")
+			}
+		})
 	}
-	close(p.release)
-	<-p.validated
-	if p.initialized.Load() {
-		t.Fatal("initialized after validation cancellation")
+}
+
+func waitPreparationStarted(t *testing.T, started <-chan struct{}, result <-chan error) {
+	t.Helper()
+	select {
+	case <-started:
+	case err := <-result:
+		t.Fatalf("preparation returned before expected phase: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("preparation never entered expected phase")
 	}
 }
 

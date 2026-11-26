@@ -59,3 +59,21 @@ func waitStartupMarker(t *testing.T, ctx context.Context, path string) {
 		}
 	}
 }
+
+// Publish only the completed address. Existence of READY is the reader's signal.
+func publishStartupAddress(path, address string) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".startup-address-*")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	defer os.Remove(name)
+	if _, err := file.WriteString(address); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}

@@ -23,19 +23,7 @@ func prepareStartupPlugin(ctx context.Context, p plugin.ServicePlugin, cfg map[s
 	}
 	result := make(chan error)
 	go func() {
-		err := p.Validate(cfg)
-		if err == nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				err = ctxErr
-			} else {
-				err = p.Initialize(cfg)
-				if err != nil {
-					err = fmt.Errorf("initialize plugin: %w", err)
-				}
-			}
-		} else {
-			err = fmt.Errorf("validate plugin: %w", err)
-		}
+		err := preparePlugin(ctx, p, cfg)
 		select {
 		case result <- err:
 		case <-ctx.Done():
@@ -56,4 +44,21 @@ func prepareStartupPlugin(ctx context.Context, p plugin.ServicePlugin, cfg map[s
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// preparePlugin owns the preparation sequence for both startup paths.
+func preparePlugin(ctx context.Context, p plugin.ServicePlugin, cfg map[string]interface{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := p.Validate(cfg); err != nil {
+		return fmt.Errorf("validate plugin: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := p.Initialize(cfg); err != nil {
+		return fmt.Errorf("initialize plugin: %w", err)
+	}
+	return nil
 }

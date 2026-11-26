@@ -306,10 +306,8 @@ func main() {
 			var prepareErr error
 			if cfg.CacheFS.Enabled {
 				prepareErr = prepareStartupPlugin(startupCtx, p, configWithPath)
-			} else if err := p.Validate(configWithPath); err != nil {
-				prepareErr = fmt.Errorf("validate plugin: %w", err)
-			} else if err := p.Initialize(configWithPath); err != nil {
-				prepareErr = fmt.Errorf("initialize plugin: %w", err)
+			} else {
+				prepareErr = preparePlugin(context.Background(), p, configWithPath)
 			}
 			if prepareErr != nil {
 				reportMountError(fmt.Errorf("Failed to prepare %s instance '%s' at %s: %w", pluginName, instanceName, mountPath, prepareErr))

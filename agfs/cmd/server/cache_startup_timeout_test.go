@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugins/localfs"
 )
@@ -25,8 +26,6 @@ func (p *controlledLocalPlugin) Validate(cfg map[string]interface{}) error {
 	if p.late && os.Getenv("OGMEM_STARTUP_STAGE") == "validate" {
 		startupMarker(os.Getenv("OGMEM_STARTUP_ENTERED"))
 		awaitStartupMarker(os.Getenv("OGMEM_STARTUP_RELEASE"))
-		// A canceled validation must never be followed by Initialize.
-		startupMarker(os.Getenv("OGMEM_STARTUP_VALIDATED"))
 	}
 	return p.ServicePlugin.Validate(cfg)
 }
@@ -38,11 +37,15 @@ func (p *controlledLocalPlugin) Initialize(cfg map[string]interface{}) error {
 		startupMarker(os.Getenv("OGMEM_STARTUP_ENTERED"))
 		awaitStartupMarker(os.Getenv("OGMEM_STARTUP_RELEASE"))
 	}
-	err := p.ServicePlugin.Initialize(cfg)
-	if !p.late && err == nil {
+	return p.ServicePlugin.Initialize(cfg)
+}
+func (p *controlledLocalPlugin) GetFileSystem() filesystem.FileSystem {
+	// Mount holds the routing lock and preparation has already been accepted.
+	// Canceling startup after this point cannot discard the healthy preparation.
+	if !p.late {
 		startupMarker(os.Getenv("OGMEM_STARTUP_HEALTHY"))
 	}
-	return err
+	return p.ServicePlugin.GetFileSystem()
 }
 func (p *controlledLocalPlugin) Shutdown() error {
 	err := p.ServicePlugin.Shutdown()
@@ -66,7 +69,7 @@ func TestCacheStartupTimeout(t *testing.T) {
 				return err
 			}
 			defer listener.Close()
-			if err := os.WriteFile(os.Getenv("OGMEM_STARTUP_READY"), []byte(listener.Addr().String()), 0600); err != nil {
+			if err := publishStartupAddress(os.Getenv("OGMEM_STARTUP_READY"), listener.Addr().String()); err != nil {
 				return err
 			}
 			return server.Serve(listener)
@@ -111,7 +114,7 @@ plugins:
 `, redis.Addr(), cachePath, cached, late)
 				markers := map[string]string{}
 				env := []string{"OGMEM_STARTUP_TIMEOUT_HELPER=1", "OGMEM_STARTUP_STAGE=" + stage}
-				for _, name := range []string{"ENTERED", "RELEASE", "VALIDATED", "HEALTHY", "CANCEL", "CLEANED", "READY"} {
+				for _, name := range []string{"ENTERED", "RELEASE", "HEALTHY", "CANCEL", "CLEANED", "READY"} {
 					markers[name] = filepath.Join(work, name)
 					env = append(env, "OGMEM_STARTUP_"+name+"="+markers[name])
 				}
@@ -167,12 +170,12 @@ plugins:
 					}
 				}
 				check("/cached", http.StatusOK)
-				startupMarker(markers["RELEASE"])
-				completed := "CLEANED"
-				if stage == "validate" {
-					completed = "VALIDATED"
+				if stage == "initialize" {
+					startupMarker(markers["RELEASE"])
+					waitStartupMarker(t, ctx, markers["CLEANED"])
 				}
-				waitStartupMarker(t, ctx, markers[completed])
+				// The synchronous preparation unit test checks cancellation
+				// after Validate returns. This test checks startup visibility.
 				check("/late/present", http.StatusNotFound)
 				_ = cmd.Process.Signal(os.Interrupt)
 				if err := cmd.Wait(); err != nil {
