@@ -1,12 +1,8 @@
 package main
 
 import (
-	"context"
-	"flag"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -53,9 +49,7 @@ func TestCacheStartupRejectsStorageAlias(t *testing.T) {
 		availablePlugins["localfs"] = func() plugin.ServicePlugin {
 			return &orderedLocalPlugin{ServicePlugin: localfs.NewLocalFSPlugin(), first: first, firstMountEnteredAssembly: firstMountEnteredAssembly, once: once}
 		}
-		flag.CommandLine = flag.NewFlagSet("agfs", flag.ExitOnError)
-		os.Args = []string{"agfs", "-c", os.Getenv("OGMEM_STARTUP_CONFIG")}
-		main()
+		runStartupMain()
 		return
 	}
 	for _, first := range []string{"/cached", "/uncached"} {
@@ -89,14 +83,7 @@ plugins:
       config:
         local_dir: %q
 `, redis.Addr(), first, root, second, root)
-			path := filepath.Join(t.TempDir(), "config.yaml")
-			if err := os.WriteFile(path, []byte(cfg), 0600); err != nil {
-				t.Fatal(err)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCacheStartupRejectsStorageAlias$")
-			cmd.Env = append(os.Environ(), "OGMEM_STARTUP_FIRST="+first, "OGMEM_STARTUP_CONFIG="+path)
+			cmd, ctx := startupTestCommand(t, "TestCacheStartupRejectsStorageAlias", cfg, "OGMEM_STARTUP_FIRST="+first)
 			out, err := cmd.CombinedOutput()
 			if ctx.Err() != nil || err == nil {
 				t.Fatalf("expected startup failure, got %v (%v)\n%s", err, ctx.Err(), out)

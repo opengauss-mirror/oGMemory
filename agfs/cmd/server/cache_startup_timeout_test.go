@@ -2,73 +2,92 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugins/localfs"
 )
 
-type delayedLocalPlugin struct {
+type controlledLocalPlugin struct {
 	plugin.ServicePlugin
 	late bool
 }
 
-func (p *delayedLocalPlugin) Initialize(cfg map[string]interface{}) error {
+func (p *controlledLocalPlugin) Validate(cfg map[string]interface{}) error {
 	p.late = cfg["mount_path"] == "/late"
-	if p.late {
-		time.Sleep(1500 * time.Millisecond)
+	if p.late && os.Getenv("OGMEM_STARTUP_STAGE") == "validate" {
+		startupMarker(os.Getenv("OGMEM_STARTUP_ENTERED"))
+		awaitStartupMarker(os.Getenv("OGMEM_STARTUP_RELEASE"))
+		// A canceled validation must never be followed by Initialize.
+		startupMarker(os.Getenv("OGMEM_STARTUP_VALIDATED"))
 	}
-	return p.ServicePlugin.Initialize(cfg)
+	return p.ServicePlugin.Validate(cfg)
 }
-
-func (p *delayedLocalPlugin) Shutdown() error {
+func (p *controlledLocalPlugin) Initialize(cfg map[string]interface{}) error {
+	if p.late {
+		if os.Getenv("OGMEM_STARTUP_STAGE") == "validate" {
+			panic("initialized after validation timeout")
+		}
+		startupMarker(os.Getenv("OGMEM_STARTUP_ENTERED"))
+		awaitStartupMarker(os.Getenv("OGMEM_STARTUP_RELEASE"))
+	}
+	err := p.ServicePlugin.Initialize(cfg)
+	if !p.late && err == nil {
+		startupMarker(os.Getenv("OGMEM_STARTUP_HEALTHY"))
+	}
+	return err
+}
+func (p *controlledLocalPlugin) Shutdown() error {
 	err := p.ServicePlugin.Shutdown()
 	if p.late {
-		_ = os.WriteFile(os.Getenv("OGMEM_STARTUP_CLEANED"), nil, 0600)
+		startupMarker(os.Getenv("OGMEM_STARTUP_CLEANED"))
 	}
 	return err
 }
 
 func TestCacheStartupTimeout(t *testing.T) {
 	if os.Getenv("OGMEM_STARTUP_TIMEOUT_HELPER") == "1" {
-		startupMountTimeout = 500 * time.Millisecond
-		availablePlugins["localfs"] = func() plugin.ServicePlugin {
-			return &delayedLocalPlugin{ServicePlugin: localfs.NewLocalFSPlugin()}
+		newStartupContext = func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() { awaitStartupMarker(os.Getenv("OGMEM_STARTUP_CANCEL")); cancel() }()
+			return ctx, cancel
 		}
-		flag.CommandLine = flag.NewFlagSet("agfs", flag.ExitOnError)
-		os.Args = []string{"agfs", "-c", os.Getenv("OGMEM_STARTUP_CONFIG")}
-		main()
+		availablePlugins["localfs"] = func() plugin.ServicePlugin { return &controlledLocalPlugin{ServicePlugin: localfs.NewLocalFSPlugin()} }
+		serveHTTP = func(server *http.Server) error {
+			listener, err := net.Listen("tcp", server.Addr)
+			if err != nil {
+				return err
+			}
+			defer listener.Close()
+			if err := os.WriteFile(os.Getenv("OGMEM_STARTUP_READY"), []byte(listener.Addr().String()), 0600); err != nil {
+				return err
+			}
+			return server.Serve(listener)
+		}
+		runStartupMain()
 		return
 	}
-	for _, selected := range []bool{false, true} {
-		t.Run(fmt.Sprint(selected), func(t *testing.T) {
-			redis := miniredis.RunT(t)
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			addr := listener.Addr().String()
-			listener.Close()
-			cached, late, work := t.TempDir(), t.TempDir(), t.TempDir()
-			if err := os.WriteFile(filepath.Join(late, "present"), []byte("late"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			cachePath := "/cached"
-			if selected {
-				cachePath = "/late"
-			}
-			cfg := fmt.Sprintf(`server:
-  address: %q
+	for _, stage := range []string{"validate", "initialize"} {
+		for _, selected := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/%v", stage, selected), func(t *testing.T) {
+				redis := miniredis.RunT(t)
+				cached, late, work := t.TempDir(), t.TempDir(), t.TempDir()
+				if err := os.WriteFile(filepath.Join(late, "present"), []byte("late"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				cachePath := "/cached"
+				if selected {
+					cachePath = "/late"
+				}
+				cfg := fmt.Sprintf(`server:
+  address: "127.0.0.1:0"
 cache:
   provider: redis
   params:
@@ -89,69 +108,78 @@ plugins:
       path: /late
       config:
         local_dir: %q
-`, addr, redis.Addr(), cachePath, cached, late)
-			path, cleaned := filepath.Join(work, "config.yaml"), filepath.Join(work, "cleaned")
-			if err := os.WriteFile(path, []byte(cfg), 0600); err != nil {
-				t.Fatal(err)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCacheStartupTimeout$")
-			cmd.Env = append(os.Environ(), "OGMEM_STARTUP_TIMEOUT_HELPER=1", "OGMEM_STARTUP_CONFIG="+path, "OGMEM_STARTUP_CLEANED="+cleaned)
-			if selected {
-				out, err := cmd.CombinedOutput()
-				if ctx.Err() != nil || err == nil || !strings.Contains(string(out), "context deadline exceeded") || strings.Contains(string(out), "Starting AGFS server") {
-					t.Fatalf("selected cache mount must fail startup on timeout: %v\n%s", err, out)
+`, redis.Addr(), cachePath, cached, late)
+				markers := map[string]string{}
+				env := []string{"OGMEM_STARTUP_TIMEOUT_HELPER=1", "OGMEM_STARTUP_STAGE=" + stage}
+				for _, name := range []string{"ENTERED", "RELEASE", "VALIDATED", "HEALTHY", "CANCEL", "CLEANED", "READY"} {
+					markers[name] = filepath.Join(work, name)
+					env = append(env, "OGMEM_STARTUP_"+name+"="+markers[name])
 				}
-				return
-			}
-			logPath := filepath.Join(work, "server.log")
-			log, err := os.Create(logPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer log.Close()
-			cmd.Stdout, cmd.Stderr = log, log
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			defer func() {
-				_ = cmd.Process.Signal(os.Interrupt)
-				_ = cmd.Wait()
-			}()
-			client := &http.Client{Timeout: 200 * time.Millisecond}
-			deadline := time.Now().Add(8 * time.Second)
-			for {
-				resp, err := client.Get("http://" + addr + "/api/v1/stat?path=/cached")
-				if err == nil {
-					resp.Body.Close()
-					if resp.StatusCode == http.StatusOK {
-						break
+				cmd, ctx := startupTestCommand(t, "TestCacheStartupTimeout", cfg, env...)
+				logPath := filepath.Join(work, "server.log")
+				log, err := os.Create(logPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer log.Close()
+				cmd.Stdout, cmd.Stderr = log, log
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				waited := false
+				defer func() {
+					if !waited {
+						_ = cmd.Process.Kill()
+						_ = cmd.Wait()
+					}
+				}()
+				waitStartupMarker(t, ctx, markers["HEALTHY"])
+				waitStartupMarker(t, ctx, markers["ENTERED"])
+				startupMarker(markers["CANCEL"])
+				if selected {
+					err := cmd.Wait()
+					waited = true
+					out, _ := os.ReadFile(logPath)
+					if ctx.Err() != nil || err == nil || !strings.Contains(string(out), "context canceled") || strings.Contains(string(out), "Starting AGFS server") {
+						t.Fatalf("selected mount must fail before listening: %v\n%s", err, out)
+					}
+					return
+				}
+				waitStartupMarker(t, ctx, markers["READY"])
+				addr, err := os.ReadFile(markers["READY"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				client := &http.Client{}
+				check := func(path string, want int) {
+					t.Helper()
+					request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+string(addr)+"/api/v1/stat?path="+path, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					resp, err := client.Do(request)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode != want {
+						t.Fatalf("%s status=%d, want %d", path, resp.StatusCode, want)
 					}
 				}
-				if time.Now().After(deadline) {
-					out, _ := os.ReadFile(logPath)
-					t.Fatalf("healthy cached mount did not start\n%s", out)
+				check("/cached", http.StatusOK)
+				startupMarker(markers["RELEASE"])
+				completed := "CLEANED"
+				if stage == "validate" {
+					completed = "VALIDATED"
 				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			for {
-				if _, err := os.Stat(cleaned); err == nil {
-					break
+				waitStartupMarker(t, ctx, markers[completed])
+				check("/late/present", http.StatusNotFound)
+				_ = cmd.Process.Signal(os.Interrupt)
+				if err := cmd.Wait(); err != nil {
+					t.Fatal(err)
 				}
-				if time.Now().After(deadline) {
-					t.Fatal("late plugin was not shut down")
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			resp, err := client.Get("http://" + addr + "/api/v1/stat?path=/late/present")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusNotFound {
-				t.Fatalf("late initialized plugin was published: status %d", resp.StatusCode)
-			}
-		})
+				waited = true
+			})
+		}
 	}
 }

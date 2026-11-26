@@ -303,21 +303,16 @@ func main() {
 				return
 			}
 
-			// Validate plugin configuration
-			if err := p.Validate(configWithPath); err != nil {
-				reportMountError(fmt.Errorf("Failed to validate %s instance '%s': %w", pluginName, instanceName, err))
-				return
-			}
-
-			// Initialize plugin
-			var initErr error
+			var prepareErr error
 			if cfg.CacheFS.Enabled {
-				initErr = initializeStartupPlugin(startupCtx, p, configWithPath)
-			} else {
-				initErr = p.Initialize(configWithPath)
+				prepareErr = prepareStartupPlugin(startupCtx, p, configWithPath)
+			} else if err := p.Validate(configWithPath); err != nil {
+				prepareErr = fmt.Errorf("validate plugin: %w", err)
+			} else if err := p.Initialize(configWithPath); err != nil {
+				prepareErr = fmt.Errorf("initialize plugin: %w", err)
 			}
-			if initErr != nil {
-				reportMountError(fmt.Errorf("Failed to initialize %s instance '%s': %w", pluginName, instanceName, initErr))
+			if prepareErr != nil {
+				reportMountError(fmt.Errorf("Failed to prepare %s instance '%s' at %s: %w", pluginName, instanceName, mountPath, prepareErr))
 				return
 			}
 
@@ -372,7 +367,7 @@ func main() {
 	// Mount all enabled plugins
 	if cfg.CacheFS.Enabled {
 		var cancelStartup context.CancelFunc
-		startupCtx, cancelStartup = context.WithTimeout(startupCtx, startupMountTimeout)
+		startupCtx, cancelStartup = newStartupContext()
 		defer cancelStartup()
 	}
 	log.Info("Mounting plugin filesytems...")
@@ -446,7 +441,7 @@ func main() {
 			log.Errorf("Filesystem shutdown: %v", err)
 		}
 	}()
-	serveErr := server.ListenAndServe()
+	serveErr := serveHTTP(server)
 	cancel()
 	<-stopped
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
