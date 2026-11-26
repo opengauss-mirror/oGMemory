@@ -444,6 +444,83 @@ def test_dreaming_merge_resumes_with_one_canonical_receipt_and_stable_projection
     assert sum(item[0] == "mv" and item[2].endswith(f"{projection}.json") for item in operations) == 1
 
 
+@pytest.mark.parametrize("source_change", [
+    "recreated", "updated", "merged_elsewhere", "confirmation_interrupted", "pending_source_moved",
+    "pending_target_reused",
+])
+def test_dreaming_resume_projects_canonical_with_active_changed_source(source_change, dreaming_storage):
+    from commit.write_receipts import attach_receipt, receipt_plan
+    from fs.agfs_adapter import dreaming
+
+    fs, outbox, ctx = dreaming_storage
+    directory = "ctx://acme/users/alice/memories/patterns"
+    original = ContextNode(f"{directory}/first", "MEMORY", "pattern", 0, "user:alice",
+                           "Fact", "Fact", "Fact",
+                           {"_expected_version": 0, "created_at": "2020-01-01T00:00:00Z"})
+    duplicate = replace(original, uri=f"{directory}/second", metadata=dict(original.metadata))
+    recreate_source = source_change == "recreated"
+    accepted = CandidateMemory("pattern", "user", "pattern", "Fact", "Fact", "Fact", 0.8,
+                               write_operation_id="legacy-dreaming-replay")
+    attach_receipt(fs, duplicate, accepted, ctx)
+    for node in (original, duplicate):
+        fs.write_node(node, ctx)
+    canonical, source = (fs.read_node(node.uri, ctx) for node in (original, duplicate))
+    layers = {"abstract": "Merged abstract", "overview": "Merged overview", "content": "Merged fact"}
+    with _dreaming_job(outbox, ctx, "dreaming-recreated-source", canonical.uri) as event:
+        with patch.object(dreaming, "_archive_source", side_effect=OSError("archive interrupted")):
+            with pytest.raises(OSError, match="archive interrupted"):
+                fs.merge_dreaming_duplicate(canonical, source, ctx, event=event, outbox=outbox, layers=layers)
+        if recreate_source:
+            fs.delete_node(source.uri, ctx)
+        expected = 0 if recreate_source else 1
+        updated = original.metadata if recreate_source else source.metadata
+        fs.write_node(replace(duplicate, content="A different fact",
+                              metadata={**updated, "_expected_version": expected}), ctx)
+        fs.resume_dreaming_merge(event, ctx, outbox)
+
+    rebuilt = fs.read_node(source.uri, ctx)
+    assert (rebuilt.content, rebuilt.metadata["version"]) == ("A different fact", expected + 1)
+    [(_, projection)] = outbox.list_pending_events([(canonical.uri, dreaming._event_id(event, "projection"))])
+    assert projection.event_type == EventType.UPSERT_CONTEXT.value
+    assert any(record["text"] == layers["content"] for record in projection.payload["records"])
+    if recreate_source:
+        return
+    replay = receipt_plan(fs, URIResolver(SchemaRegistry()), accepted, ctx, outbox_store=outbox)
+    assert replay.target_uri == source.uri
+    if source_change not in {"recreated", "updated"}:
+        other = replace(original, uri=f"{directory}/third")
+        fs.write_node(other, ctx)
+        other = fs.read_node(other.uri, ctx)
+        with _dreaming_job(outbox, ctx, "dreaming-second-merge", other.uri) as event:
+            if source_change != "merged_elsewhere":
+                with patch.object(dreaming, "_confirm_receipts", side_effect=OSError("confirmation interrupted")):
+                    with pytest.raises(OSError, match="confirmation interrupted"):
+                        fs.merge_dreaming_duplicate(other, rebuilt, ctx, event=event, outbox=outbox)
+            else:
+                assert fs.merge_dreaming_duplicate(other, rebuilt, ctx, event=event, outbox=outbox)
+            destination = other
+            if source_change == "pending_source_moved":
+                destination = replace(original, uri=f"{directory}/fourth")
+                fs.write_node(destination, ctx)
+                with _dreaming_job(outbox, ctx, "dreaming-next-merge", destination.uri) as next_event:
+                    assert fs.merge_dreaming_duplicate(fs.read_node(destination.uri, ctx), fs.read_node(other.uri, ctx),
+                                                       ctx, event=next_event, outbox=outbox)
+            if source_change == "pending_target_reused":
+                stale = fs.read_node(canonical.uri, ctx)
+                with _dreaming_job(outbox, ctx, "dreaming-repeat-target", stale.uri) as next_event:
+                    with patch.object(dreaming, "_archive_source", side_effect=OSError("archive interrupted")):
+                        with pytest.raises(OSError, match="archive interrupted"):
+                            fs.merge_dreaming_duplicate(fs.read_node(other.uri, ctx), stale, ctx,
+                                                       event=next_event, outbox=outbox)
+            replay = receipt_plan(fs, URIResolver(SchemaRegistry()), accepted, ctx, outbox_store=outbox)
+            assert replay.target_uri == destination.uri
+            fs.delete_node(rebuilt.uri, ctx)
+            fs.write_node(replace(original, uri=rebuilt.uri), ctx)
+            assert fs.resume_dreaming_merge(event, ctx, outbox)
+        replay = receipt_plan(fs, URIResolver(SchemaRegistry()), accepted, ctx, outbox_store=outbox)
+        assert replay.target_uri == destination.uri
+
+
 @pytest.mark.parametrize("recreate_source", [False, True])
 def test_dreaming_merge_recovers_located_receipt_on_canonical(recreate_source, dreaming_storage):
     from commit.write_receipts import attach_receipt, bind_operation_target
