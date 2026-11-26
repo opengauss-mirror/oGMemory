@@ -2,6 +2,7 @@ package mountablefs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/cachefs"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
@@ -9,6 +10,9 @@ import (
 	cache "github.com/ogmemory/cache-runtime"
 	"path/filepath"
 )
+
+// ErrCacheStorageAlias means two mounts would bypass each other's invalidation.
+var ErrCacheStorageAlias = errors.New("cachefs storage aliases")
 
 // ConfigureCache runs before mounts; all selected mounts share one runtime.
 func (mfs *MountableFS) ConfigureCache(c cachefs.Config, rc cache.Config) error {
@@ -92,7 +96,7 @@ func (mfs *MountableFS) executionFS(mount string, p plugin.ServicePlugin) (files
 		bid := b.CacheStorageIdentity()
 		if aid.BackendID == bid.BackendID && aid.BackendID != "" &&
 			(pathWithin(aid.Root, bid.Root) || pathWithin(bid.Root, aid.Root)) {
-			return nil, nil, fmt.Errorf("cachefs storage aliases mounts %s and %s", old.Path, mount)
+			return nil, nil, fmt.Errorf("%w mounts %s and %s", ErrCacheStorageAlias, old.Path, mount)
 		}
 	}
 	if !selected {

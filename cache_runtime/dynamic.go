@@ -19,7 +19,7 @@ import (
 type dynamicProvider struct{ native *C.NativeCache }
 
 func nativeError(s C.int) error {
-	if s == 0 {
+	if s == C.OV_CACHE_STATUS_OK {
 		return nil
 	}
 	switch s {

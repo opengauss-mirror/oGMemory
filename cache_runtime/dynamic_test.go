@@ -35,73 +35,57 @@ func compileFixture(t *testing.T, bad bool) string {
 	}
 	return out
 }
-func TestDynamicKVAndInvalidOutputs(t *testing.T) {
-	lib := compileFixture(t, false)
-	for _, bad := range []bool{false, true} {
-		params := map[string]interface{}{"library": lib}
-		if bad {
-			params["mode"] = "badoutput"
-		}
-		r, e := New(Config{Provider: "dynamic", CommandTimeoutMS: 500, Params: params})
-		if e != nil {
-			t.Fatal(e)
-		}
-		ctx := context.Background()
-		if e = r.Ping(ctx); e != nil {
-			t.Fatal(e)
-		}
-		if v, e := r.Get(ctx, "k"); e != nil || v.Found {
-			t.Fatal("miss", v, e)
-		}
-		if e = r.Set(ctx, "k", nil, 0); e != nil {
-			t.Fatal(e)
-		}
-		if v, e := r.Get(ctx, "k"); e != nil || !v.Found || len(v.Data) != 0 {
-			t.Fatal("empty", v, e)
-		}
-		if e = r.Set(ctx, "k", []byte{0, 255, 1}, time.Second); e != nil {
-			t.Fatal(e)
-		}
-		v, e := r.Get(ctx, "k")
-		if bad {
-			if !errors.Is(e, ErrInvalidData) {
-				t.Fatal("malformed buffer accepted", e)
-			}
-		} else if e != nil || !v.Found || len(v.Data) != 3 || v.Data[1] != 255 {
-			t.Fatal(v, e)
-		}
-		if !bad {
-			if e := r.Set(ctx, "other", nil, 0); e != nil {
-				t.Fatal(e)
-			}
-			values, e := r.MGet(ctx, []string{"k", "absent", "other", "k"})
-			if e != nil || len(values) != 4 || values[1].Found || !values[2].Found || len(values[2].Data) != 0 || values[3].Data[1] != 255 {
-				t.Fatal(values, e)
-			}
-			if e := r.Set(ctx, "expires", []byte("value"), 5*time.Millisecond); e != nil {
-				t.Fatal(e)
-			}
-			time.Sleep(20 * time.Millisecond)
-			if v, e := r.Get(ctx, "expires"); e != nil || v.Found {
-				t.Fatal("TTL", v, e)
-			}
-			if v, e := r.Get(ctx, "other"); e != nil || !v.Found {
-				t.Fatal("zero TTL", v, e)
-			}
-		}
-
-		if n, e := r.Delete(ctx, []string{"k", "k"}); e != nil || n != 1 {
-			t.Fatal(n, e)
-		}
-		if e = r.Close(ctx); e != nil {
-			t.Fatal(e)
-		}
-		if e = r.Close(ctx); e != nil {
-			t.Fatal(e)
-		}
+func TestDynamicContract(t *testing.T) {
+	r, err := New(Config{Provider: "dynamic", CommandTimeoutMS: 500, Params: map[string]interface{}{
+		"library": compileFixture(t, false),
+	}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, e := New(Config{Provider: "dynamic", Params: map[string]interface{}{"library": compileFixture(t, true)}}); e == nil {
+	testKVContract(t, r, time.Sleep)
+}
+
+func TestDynamicInvalidOutputs(t *testing.T) {
+	r, err := New(Config{Provider: "dynamic", CommandTimeoutMS: 500, Params: map[string]interface{}{
+		"library": compileFixture(t, false), "mode": "badoutput",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	defer r.Close(ctx)
+	// Empty values are valid, while this fixture corrupts nonempty outputs.
+	if err := r.Set(ctx, "empty", nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := r.Get(ctx, "empty"); err != nil || !v.Found || len(v.Data) != 0 {
+		t.Fatal(v, err)
+	}
+	if err := r.Set(ctx, "k", []byte{0, 255, 1}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Get(ctx, "k"); !errors.Is(err, ErrInvalidData) {
+		t.Fatal("malformed buffer accepted", err)
+	}
+	if _, err := New(Config{Provider: "dynamic", Params: map[string]interface{}{"library": compileFixture(t, true)}}); err == nil {
 		t.Fatal("accepted wrong ABI")
+	}
+}
+
+func TestDynamicCompatibilityEntry(t *testing.T) {
+	lib := compileFixture(t, false)
+	out := filepath.Join(t.TempDir(), "entry-check")
+	args := []string{"testdata/entry_check.c", "-o", out}
+	if runtime.GOOS == "linux" {
+		args = append(args, "-ldl")
+	} else if root := os.Getenv("SDKROOT"); root != "" {
+		args = append(args, "-isysroot", root)
+	}
+	if b, err := exec.Command("cc", args...).CombinedOutput(); err != nil {
+		t.Fatalf("compile entry check: %v\n%s", err, b)
+	}
+	if b, err := exec.Command(out, lib).CombinedOutput(); err != nil {
+		t.Fatalf("v1 entry compatibility: %v\n%s", err, b)
 	}
 }
 

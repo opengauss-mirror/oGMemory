@@ -252,10 +252,15 @@ func NewSQLFS(backend DBBackend, config map[string]interface{}) (*SQLFS, error) 
 		cacheTTLSeconds = val
 	}
 
+	storageID, err := cacheStorageID(backend, config, db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	fs := &SQLFS{
 		mu:         new(sync.RWMutex),
 		db:         db,
-		storageID:  cacheStorageID(backend, config),
+		storageID:  storageID,
 		backend:    backend,
 		pluginName: PluginName,
 		listCache:  NewListDirCache(cacheMaxSize, time.Duration(cacheTTLSeconds)*time.Second, cacheEnabled),

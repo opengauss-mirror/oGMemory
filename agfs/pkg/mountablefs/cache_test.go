@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,13 +248,38 @@ func TestCacheRejectsSQLiteURIStorageAlias(t *testing.T) {
 	}
 	if err := m.MountPlugin("sqlfs", "/cached", map[string]interface{}{
 		"backend": "sqlite", "db_path": uri,
-	}); err == nil {
-		t.Fatal("accepted SQLite URI storage alias")
+	}); !errors.Is(err, ErrCacheStorageAlias) || !strings.Contains(err.Error(), "/plain") || !strings.Contains(err.Error(), "/cached") {
+		t.Fatalf("URI alias mount: got %v, want storage alias between /plain and /cached", err)
 	}
 	if err := m.MountPlugin("sqlfs", "/cached-options", map[string]interface{}{
 		"backend": "sqlite", "db_path": plain + "?_busy_timeout=5000",
-	}); err == nil {
-		t.Fatal("accepted SQLite driver-option storage alias")
+	}); !errors.Is(err, ErrCacheStorageAlias) || !strings.Contains(err.Error(), "/plain") || !strings.Contains(err.Error(), "/cached-options") {
+		t.Fatalf("DSN alias mount: got %v, want storage alias between /plain and /cached-options", err)
+	}
+}
+
+func TestCacheRejectsSQLiteSharedMemoryStorageAlias(t *testing.T) {
+	for _, cachedFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint(cachedFirst), func(t *testing.T) {
+			m := cachedMounts(t)
+			m.RegisterPluginFactory("sqlfs", func() plugin.ServicePlugin { return sqlfs.NewSQLFSPlugin() })
+			name := filepath.ToSlash(t.TempDir()) + "/memory"
+			first, second := "/plain", "/data"
+			if cachedFirst {
+				first, second = second, first
+			}
+			if err := m.MountPlugin("sqlfs", first, map[string]interface{}{
+				"backend": "sqlite", "db_path": "file:" + name + "?mode=memory&cache=shared",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			err := m.MountPlugin("sqlfs", second, map[string]interface{}{
+				"backend": "sqlite", "db_path": "file:" + url.PathEscape(name) + "?cache=shared&mode=memory",
+			})
+			if !errors.Is(err, ErrCacheStorageAlias) || !strings.Contains(err.Error(), first) || !strings.Contains(err.Error(), second) {
+				t.Fatalf("shared memory alias mount: got %v, want storage alias between %s and %s", err, first, second)
+			}
+		})
 	}
 }
 

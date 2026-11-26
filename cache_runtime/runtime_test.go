@@ -1,6 +1,7 @@
 package cacheruntime
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"github.com/alicebob/miniredis/v2"
@@ -15,48 +16,61 @@ func TestRedisContract(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer r.Close(context.Background())
+	testKVContract(t, r, server.FastForward)
+}
+
+// The same assertions run against Redis and a native Provider. Each backend
+// supplies only how its clock advances for expiration.
+func testKVContract(t *testing.T, r Runtime, advance func(time.Duration)) {
+	t.Helper()
 	ctx := context.Background()
-	if e = r.Ping(ctx); e != nil {
-		t.Fatal(e)
+	t.Cleanup(func() { _ = r.Close(ctx) })
+	if err := r.Ping(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if v, e := r.Get(ctx, "missing"); e != nil || v.Found {
-		t.Fatalf("miss %v %v", v, e)
+	if v, err := r.Get(ctx, "missing"); err != nil || v.Found {
+		t.Fatalf("miss: %+v, %v", v, err)
 	}
 	for k, v := range map[string][]byte{"empty": {}, "binary": {0, 1, 255}} {
-		if e = r.Set(ctx, k, v, time.Second); e != nil {
-			t.Fatal(e)
+		if err := r.Set(ctx, k, v, 0); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := r.Get(ctx, k); err != nil || !got.Found || !bytes.Equal(got.Data, v) {
+			t.Fatalf("%s: %+v, %v", k, got, err)
 		}
 	}
-	vals, e := r.MGet(ctx, []string{"binary", "empty", "missing", "binary"})
-	if e != nil || len(vals) != 4 || !vals[1].Found || vals[2].Found || len(vals[0].Data) != 3 || vals[3].Data[2] != 255 {
-		t.Fatalf("mget %v %v", vals, e)
+	vals, err := r.MGet(ctx, []string{"binary", "empty", "missing", "binary"})
+	if err != nil || len(vals) != 4 || !vals[0].Found || !bytes.Equal(vals[0].Data, []byte{0, 1, 255}) ||
+		!vals[1].Found || len(vals[1].Data) != 0 || vals[2].Found || !vals[3].Found || !bytes.Equal(vals[3].Data, vals[0].Data) {
+		t.Fatalf("mget: %+v, %v", vals, err)
 	}
-	if e = r.Set(ctx, "bad", nil, -time.Second); !errors.Is(e, ErrInvalidArgument) {
-		t.Fatal(e)
+	if err := r.Set(ctx, "bad", nil, -time.Second); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatal(err)
 	}
-	server.FastForward(time.Second)
-	if v, e := r.Get(ctx, "binary"); e != nil || v.Found {
-		t.Fatal("TTL")
+	if err := r.Set(ctx, "expires", []byte("value"), 20*time.Millisecond); err != nil {
+		t.Fatal(err)
 	}
-	if e = r.Set(ctx, "persist", nil, 0); e != nil {
-		t.Fatal(e)
+	advance(50 * time.Millisecond)
+	if v, err := r.Get(ctx, "expires"); err != nil || v.Found {
+		t.Fatalf("TTL: %+v, %v", v, err)
 	}
-	server.FastForward(time.Hour)
-	if v, e := r.Get(ctx, "persist"); e != nil || !v.Found {
-		t.Fatal("no TTL")
+	if v, err := r.Get(ctx, "empty"); err != nil || !v.Found || len(v.Data) != 0 {
+		t.Fatalf("zero TTL: %+v, %v", v, err)
 	}
-	if n, e := r.Delete(ctx, []string{"persist", "persist"}); e != nil || n != 1 {
-		t.Fatalf("delete %d %v", n, e)
+	if n, err := r.Delete(ctx, []string{"empty", "empty", "missing"}); err != nil || n != 1 {
+		t.Fatalf("delete: %d, %v", n, err)
 	}
-	if e = r.Close(ctx); e != nil {
-		t.Fatal(e)
+	if v, err := r.Get(ctx, "empty"); err != nil || v.Found {
+		t.Fatalf("deleted key: %+v, %v", v, err)
 	}
-	if _, e = r.Get(ctx, "x"); !errors.Is(e, ErrClosed) {
-		t.Fatal(e)
+	if err := r.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if e = r.Close(ctx); e != nil {
-		t.Fatal(e)
+	if _, err := r.Get(ctx, "x"); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if err := r.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 

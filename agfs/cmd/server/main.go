@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -243,14 +244,20 @@ func main() {
 		})
 	}
 
-	// Only selected mounts must finish validation before serving HTTP.
+	// With CacheFS enabled, every configured mount must finish before serving:
+	// a non-cached mount can conflict with an already mounted cached backend.
+	var startupMounts sync.WaitGroup
+	var mountErrorsMu sync.Mutex
+	var mountErrors []error
 	mountPlugin := func(pluginName, instanceName, mountPath string, pluginConfig map[string]interface{}) {
 		selected := cfg.CacheFS.Selected(mountPath)
-		logMountError := func(format string, args ...interface{}) {
-			if selected {
-				log.Fatalf(format, args...)
+		reportMountError := func(err error) {
+			if selected || errors.Is(err, mountablefs.ErrCacheStorageAlias) {
+				mountErrorsMu.Lock()
+				mountErrors = append(mountErrors, err)
+				mountErrorsMu.Unlock()
 			}
-			log.Errorf(format, args...)
+			log.Error(err)
 		}
 		// Get plugin factory (try built-in first, then external)
 		factory, ok := availablePlugins[pluginName]
@@ -261,7 +268,7 @@ func main() {
 			p = mfs.CreatePlugin(pluginName)
 			if p == nil {
 				if selected {
-					log.Fatalf("CacheFS mount %s uses unknown plugin %s", mountPath, pluginName)
+					reportMountError(fmt.Errorf("CacheFS mount %s uses unknown plugin %s", mountPath, pluginName))
 				}
 				log.Warnf("Unknown plugin: %s, skipping instance '%s'", pluginName, instanceName)
 				return
@@ -285,31 +292,32 @@ func main() {
 			}
 		}
 
-		// Mount asynchronously
+		startupMounts.Add(1)
 		mountInstance := func() {
+			defer startupMounts.Done()
 			// Inject mount_path into config
 			configWithPath, err := mfs.PrepareMountConfig(pluginName, mountPath, pluginConfig)
 			if err != nil {
-				logMountError("Mount cache configuration failed: %v", err)
+				reportMountError(fmt.Errorf("Mount cache configuration failed: %w", err))
 				return
 			}
 
 			// Validate plugin configuration
 			if err := p.Validate(configWithPath); err != nil {
-				logMountError("Failed to validate %s instance '%s': %v", pluginName, instanceName, err)
+				reportMountError(fmt.Errorf("Failed to validate %s instance '%s': %w", pluginName, instanceName, err))
 				return
 			}
 
 			// Initialize plugin
 			if err := p.Initialize(configWithPath); err != nil {
-				logMountError("Failed to initialize %s instance '%s': %v", pluginName, instanceName, err)
+				reportMountError(fmt.Errorf("Failed to initialize %s instance '%s': %w", pluginName, instanceName, err))
 				return
 			}
 
 			// Mount plugin
 			if err := mfs.Mount(mountPath, p); err != nil {
 				_ = p.Shutdown()
-				logMountError("Failed to mount %s instance '%s' at %s: %v", pluginName, instanceName, mountPath, err)
+				reportMountError(fmt.Errorf("Failed to mount %s instance '%s' at %s: %w", pluginName, instanceName, mountPath, err))
 				return
 			}
 
@@ -383,6 +391,10 @@ func main() {
 	}
 
 	if cfg.CacheFS.Enabled {
+		startupMounts.Wait()
+		if err := errors.Join(mountErrors...); err != nil {
+			log.Fatalf("CacheFS mount setup failed: %v", err)
+		}
 		mounted := mfs.CacheStats()
 		for _, mount := range cfg.CacheFS.Mounts {
 			if _, ok := mounted[filesystem.NormalizePath(mount)]; !ok {
