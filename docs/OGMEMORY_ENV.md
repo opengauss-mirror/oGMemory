@@ -238,7 +238,73 @@ retrieval:
 | `storage.connection_string` | `STORAGE_DB_CONNECTION_STRING`（旧名 `SQL_CONNECTION_STRING` 仍生效） | 无 | `backend: sql` 时必填 | libpq DSN，例如 `host=127.0.0.1 port=15432 dbname=ogmemory user=gaussdb password=CHANGE_ME`。 |
 | `storage.pool_size` | `STORAGE_DB_POOL_SIZE`（旧名 `SQL_POOL_SIZE`） | `5` | 否 | SQL storage 连接池大小 |
 
-团队任务与 AGFS 正文存储采用 openGauss 7.0.0-RC3、PG/UTF8 基线；版本能力和实际请求见[团队记忆 SQL 存储兼容性](deployment/team-memory-sql-compatibility.md)。
+#### openGauss 首次部署与版本验收
+
+数据库使用 PG 兼容模式、UTF8 编码，并设置 `SQL_DIALECT=opengauss`。按以下范围选择版本：
+
+| 版本 | 团队记忆首次部署 | 原生 BM25 |
+| --- | --- | --- |
+| 7.0.0-RC2 | 支持 SQL 存储，或 SQL 元数据 + AGFS 正文；配置如下 | 重建提交存在实例崩溃风险，初始化时返回最低版本错误 |
+| 7.0.0-RC3、7.0.0 LTS | 支持上述两种存储 | 支持写入、更新、作用域重建与重建后检索 |
+
+RC2 部署团队记忆时，保留已有可用的 LLM、Embedding 和向量库配置，替换以下配置块。AGFS 使用空白命名空间；`backend: sql` 则将正文一并存入 SQL。
+
+```yaml
+storage:
+  backend: agfs
+  dialect: opengauss
+  connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=gaussdb password=CHANGE_ME"
+agfs:
+  transport: http
+  base_url: "http://127.0.0.1:1833"
+  mount_prefix: "/local"
+auth:
+  role_control_enabled: true
+  root_api_key: "CHANGE_ME"
+shared_spaces:
+  enabled: true
+retrieval:
+  mode: default
+  hybrid_enabled: false
+  inverted_index:
+    provider: none
+```
+
+上述配置关闭原生 BM25。`retrieval.mode: vector_free` 与团队记忆互斥。RC3/LTS 使用原生 BM25 时，按“向量 + 倒排”配置 `opengauss_native`。
+
+在仓库根目录准备专用空库和可写 AGFS 实例。测试会创建表并清理测试数据。建库示例：`CREATE DATABASE ogmemory_test TEMPLATE template0 ENCODING 'UTF8' DBCOMPATIBILITY 'PG';`。
+
+RC2 空库团队记忆验收入口（RC3/LTS 同样适用）：
+
+```bash
+export OGMEM_SPACE_TEST_DSN='host=127.0.0.1 port=5432 dbname=ogmemory_test user=gaussdb password=CHANGE_ME'
+export TEST_OPENGAUSS_CONNECTION_STRING="$OGMEM_SPACE_TEST_DSN"
+export OGMEM_SPACE_TEST_CONFIG='/tmp/ogmemory-space-test.json'
+printf '%s\n' '{"agfs_url":"http://127.0.0.1:1833","agfs_mount_prefix":"/local"}' > "$OGMEM_SPACE_TEST_CONFIG"
+python -m pytest -q -s \
+  tests/integration/test_shared_space_lifecycle.py \
+  tests/integration/test_space_control_plane.py \
+  tests/integration/test_space_job_review.py \
+  tests/integration/test_space_queue_compat.py
+```
+
+该入口覆盖空库 schema、控制面 HTTP 请求、SQL/AGFS 正文、规则发布、权限及到期回收；队列用例打印实际请求和回显。LLM、Embedding 和向量投影使用测试替身，SQL 与 AGFS 使用真实服务。
+
+RC3/LTS 另执行原生 BM25 验收，覆盖写入、更新、重建后检索及并发写入：
+
+```bash
+python -m pytest -q -s tests/integration/test_native_sql_lexical_index.py
+```
+
+2026-11-25 在 WSL x86_64、PG/UTF8 专用空库及 HTTP AGFS 上执行上述入口，结果如下。每轮执行前确认业务表数量为 `0`，执行后 `SELECT 1` 均成功。
+
+| 实测数据库 | 团队存储入口 | 原生 BM25 入口 |
+| --- | --- | --- |
+| openGauss-lite 7.0.0-RC2 `e5fe3f9f` | 42 passed | 初始化返回 RC3 最低版本错误，实例保持可用 |
+| openGauss-lite 7.0.0-RC3 `01b7e318` | 42 passed | 3 passed |
+| openGauss-lite 7.0.0 LTS `2397a86f` | 42 passed | 3 passed |
+
+团队存储的关键回显：`dispatch_source_events → 1`、发布状态 `ACTIVE`、维护状态 `EXPIRED → PURGED`，最终 `reclaimed='true'`。
 
 ### 服务配置
 

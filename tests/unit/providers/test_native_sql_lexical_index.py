@@ -15,7 +15,8 @@ from providers.lexical_index.sql_index import _schema_lock_key
 
 
 class FakeCursor:
-    def __init__(self, *, one=None, rows=()):
+    def __init__(self, *, one=None, rows=(), version="openGauss-lite 7.0.0-RC3 build test"):
+        self.version = version
         self.one = one
         self.rows = list(rows)
         self.executed = []
@@ -30,6 +31,8 @@ class FakeCursor:
         self.executed.append((sql, params))
 
     def fetchone(self):
+        if self.executed[-1][0] == "SELECT version()":
+            return (self.version,)
         return self.one
 
     def fetchall(self):
@@ -196,6 +199,19 @@ def test_bm25_capability_requires_access_method_and_operator(catalog_row, expect
     assert "am.amname='bm25'" in sql
     assert "opr.oprname='<&>'" in sql
     assert "pg_operator_is_visible(opr.oid)" in sql
+
+
+@pytest.mark.parametrize("version", [
+    "openGauss-lite 7.0.0-RC3 build 2b515af1",
+    "openGauss 7.0.0 build 2397a86f",
+    "openGauss-lite 7.0.1 build test",
+    "openGauss 8.0.0-RC1 build test",
+])
+def test_bm25_capability_accepts_supported_server_versions(version):
+    cursor = FakeCursor(one=(True, True), version=version)
+    index, _ = _index(cursor)
+
+    assert index._database_supports_bm25()
 
 
 def test_provider_fails_when_native_bm25_is_unavailable():

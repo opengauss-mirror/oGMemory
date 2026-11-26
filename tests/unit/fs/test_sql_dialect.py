@@ -62,6 +62,16 @@ def test_graph_trigger_uses_portable_procedure_invocation_for_both_dialects():
         assert 'EXECUTE FUNCTION invalidate_edge_projections_for_node_update()' not in text
 
 
+def test_opengauss_schema_prepares_idempotent_column_add():
+    schema = OpenGaussDialect().prepare_schema(
+        "ALTER TABLE cp_accounts ADD COLUMN IF NOT EXISTS authz_rev BIGINT NOT NULL DEFAULT 1;"
+    )
+
+    assert "LOCK TABLE cp_accounts IN ACCESS EXCLUSIVE MODE" in schema
+    assert "attrelid = 'cp_accounts'::regclass AND attname = 'authz_rev'" in schema
+    assert "ALTER TABLE cp_accounts ADD COLUMN authz_rev BIGINT NOT NULL DEFAULT 1;" in schema
+
+
 def test_opengauss_schema_preserves_tenant_write_isolation():
     conn = _Connection()
     schema_module._schema_ensured.clear()

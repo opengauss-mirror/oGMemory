@@ -839,12 +839,12 @@ class SQLOutboxStore(PoolAdapterMixin):
                         and event.payload.get("content_rev") is not None):
                     account_id = cur.fetchone()[0]
                     cur.execute("SELECT set_config('app.account_id', %s, true)", (account_id,))
-                    cur.execute("""UPDATE context_nodes SET metadata = metadata || %s::jsonb
+                    cur.execute("""UPDATE context_nodes SET metadata = jsonb_set(
+                            jsonb_set(metadata, '{shared_projection_ready}', 'true'::jsonb, true),
+                            '{indexed_content_rev}', %s::jsonb, true)
                         WHERE uri = %s AND owner_space LIKE 'space:%%' AND status = 'ACTIVE'
                           AND metadata->>'shared_projection_event_id' = %s AND version = %s""",
-                        (Json({"shared_projection_ready": True,
-                               "indexed_content_rev": event.payload["content_rev"]}),
-                         node_uri, event.event_id, event.payload["content_rev"]))
+                        (Json(event.payload["content_rev"]), node_uri, event.event_id, event.payload["content_rev"]))
             conn.commit()
         except Exception:
             conn.rollback()

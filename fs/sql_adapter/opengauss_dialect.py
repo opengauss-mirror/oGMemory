@@ -17,6 +17,25 @@ _WITH_CHECK_RE = re.compile(
 )
 
 
+_ADD_COLUMN_RE = re.compile(
+    r"^ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+) ([^;]+);",
+    re.MULTILINE,
+)
+
+
+def _add_column_if_missing(match: re.Match[str]) -> str:
+    table, column, definition = match.groups()
+    return f"""DO $$ BEGIN
+    LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute
+        WHERE attrelid = '{table}'::regclass AND attname = '{column}'
+            AND attnum > 0 AND NOT attisdropped
+    ) THEN
+        ALTER TABLE {table} ADD COLUMN {column} {definition};
+    END IF;
+END $$;"""
+
 def _tenant_write_constraints(table_names: list[str]) -> str:
     return "\n".join(
         f"""
@@ -50,6 +69,7 @@ class OpenGaussDialect(PostgreSQLDialect):
             "current_setting('app.account_id')",
         )
         sql = _WITH_CHECK_RE.sub("", sql)
+        sql = _ADD_COLUMN_RE.sub(_add_column_if_missing, sql)
         return sql + "\n" + _tenant_write_constraints(table_names)
 
     def validate_connection(self, cursor: Any) -> None:

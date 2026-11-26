@@ -347,9 +347,10 @@ BEGIN
                 NEW.version := GREATEST(NEW.version, OLD.version + 1);
             END IF;
         END IF;
-        NEW.metadata := NEW.metadata || json_build_object(
-            'shared_source_epoch', COALESCE(source_epoch,md5(random()::text || clock_timestamp()::text || NEW.uri)),
-            'version', NEW.version)::jsonb;
+        NEW.metadata := jsonb_set(
+            jsonb_set(NEW.metadata, '{shared_source_epoch}',
+                to_json(COALESCE(source_epoch,md5(random()::text || clock_timestamp()::text || NEW.uri)))::jsonb, true),
+            '{version}', NEW.version::text::jsonb, true);
     END IF;
     RETURN NEW;
 END;

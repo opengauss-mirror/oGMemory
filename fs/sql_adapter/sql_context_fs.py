@@ -903,10 +903,10 @@ class SQLContextFS(PoolAdapterMixin):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE context_nodes SET metadata=metadata || %s WHERE account_id=%s AND uri=%s "
+                    "UPDATE context_nodes SET metadata=jsonb_set(metadata, '{dreaming_review}', %s::jsonb, true) WHERE account_id=%s AND uri=%s "
                     "AND status='ACTIVE' AND version=%s AND created_at=%s "
                     "AND COALESCE(metadata->'dreaming_review', 'null'::jsonb) = %s::jsonb",
-                    (Json({"dreaming_review": review}),
+                    (Json(review),
                      ctx.account_id, node.uri, version, node_created_at(node.metadata),
                      Json(node.metadata.get("dreaming_review"))),
                 )
@@ -1508,11 +1508,11 @@ class SQLContextFS(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE context_nodes SET status = 'ARCHIVED', "
-                    "metadata = metadata || %s, "
+                    "metadata = jsonb_set(metadata, '{archived_at}', %s::jsonb, true), "
                     "updated_at = NOW() "
                     "WHERE uri = %s AND status = 'ACTIVE'",
                     (
-                        Json({"archived_at": datetime.now(UTC).isoformat()}),
+                        Json(datetime.now(UTC).isoformat()),
                         uri,
                     ),
                 )

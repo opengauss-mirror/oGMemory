@@ -240,9 +240,9 @@ class AGFSSpaceBridge(SQLContextFS):
                 AND (metadata->'agfs_content'->>'uri')=%s LIMIT 1""", (account, origin))
             if cur.fetchone() is None:
                 self.cleanup_shared(origin)
-                cur.execute("""UPDATE context_nodes SET metadata=metadata || %s::jsonb
+                cur.execute("""UPDATE context_nodes SET metadata=jsonb_set(metadata, '{agfs_purged}', 'true'::jsonb, true)
                     WHERE account_id=%s AND uri=%s AND metadata->>'state'='PURGED'""",
-                    (Json({"agfs_purged": True}), account, origin))
+                    (account, origin))
             return
         digest = event["payload"]["sha256"]
         path = f"{self._content_directory(origin)}/{digest}.json"

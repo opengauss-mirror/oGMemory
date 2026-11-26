@@ -43,18 +43,20 @@ def registry_connection():
 def control_store(registry_connection):
     conn = registry_connection
     cur = conn.cursor()
-    base = Path('fs/sql_adapter/db_schema.sql').read_text()
-    cur.execute(base[base.index('CREATE TABLE IF NOT EXISTS cp_accounts'):base.index('-- Protected workspace-sync registry')])
+    dialect = resolve_sql_dialect('opengauss' if os.environ.get('TEST_OPENGAUSS_CONNECTION_STRING') else 'postgresql')
+    base = Path('fs/sql_adapter/db_schema.sql').read_text(encoding='utf-8')
+    control_plane = base[base.index('CREATE TABLE IF NOT EXISTS cp_accounts'):base.index('-- Protected workspace-sync registry')]
+    cur.execute(dialect.prepare_schema(control_plane))
     cur.execute('CREATE TABLE context_nodes(account_id varchar(128), uri varchar(512), abstract text, content text, owner_space text)')
-    ddl = Path('server/space_schema.sql').read_text()
+    ddl = Path('server/space_schema.sql').read_text(encoding='utf-8')
     # Exercise the exact new control-plane references and indexes.
-    cur.execute(ddl[:ddl.index('CREATE TABLE IF NOT EXISTS space_rules')])
+    cur.execute(dialect.prepare_schema(ddl[:ddl.index('CREATE TABLE IF NOT EXISTS space_rules')]))
     conn.autocommit = False
     store = SQLControlPlaneStore.__new__(SQLControlPlaneStore)
     store._get_connection = lambda: conn
     store._return_connection = lambda connection: None
     store._snapshots = threading.local()
-    store._dialect = resolve_sql_dialect('opengauss' if os.environ.get('TEST_OPENGAUSS_CONNECTION_STRING') else 'postgresql')
+    store._dialect = dialect
     return store
 
 
