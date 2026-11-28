@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from cli.lib.colors import fail, info, ok
 from cli.lib.prompt import input_masked, input_validated, select
 
-NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "opencode", "deepseek-harness", "hermes", "deepagents")
+NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "zcode", "opencode", "deepseek-harness", "hermes", "deepagents")
 ALIASES = {"claude": "claude-code", "claude_hooks": "claude-code", "dsh": "deepseek-harness", "deepagent": "deepagents"}
 
 
@@ -152,6 +152,19 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "--ref dev --sparse .agents/plugins --sparse plugins/ogmemory\n"
             "       codex plugin add ogmemory@ogmemory\n\n"
             "3. Refresh Codex and trust its hooks in /hooks. Hook scripts require Python 3.\n"
+        )
+    elif adapter == "zcode":
+        if urlsplit(c.url).scheme == "http" and urlsplit(c.url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("The ZCode plugin requires HTTPS for non-loopback endpoints")
+        files = {"zcode-plugin.json": _json({
+            "url": c.url, "api_key": c.api_key, "account_id": c.account_id,
+            "user_id": c.user_id, "agent_id": c.agent_id,
+        })}
+        steps = (
+            "1. Copy zcode-plugin.json to ~/.ogmemory/zcode-plugin.json or set "
+            "OG_MEMORY_ZCODE_CONFIG to its private path.\n"
+            "2. Follow docs/integrations/zcode.md to load plugins/zcode and verify Python.\n"
+            "3. Open a new task after enabling plugin hooks.\n"
         )
     elif adapter == "opencode":
         host = urlsplit(c.url).hostname or ""

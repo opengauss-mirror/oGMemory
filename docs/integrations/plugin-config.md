@@ -34,6 +34,7 @@ ogmem onboard --mode plugin --agent my-agent --non-interactive \
 | `deepseek-harness` / `dsh` | `ogmemory.env.sh`、`ogmemory.env.ps1` | 在启动对应 DSH profile 的进程环境加载 |
 | `hermes` | `hermes.config.patch.yaml`、两种环境脚本 | 合并 memory.provider 配置，设置启动 Hermes 的进程环境 |
 | `deepagents` / `deepagent` | Python 接入示例、两种环境脚本 | 传给 `create_deep_agent(middleware=[...])`，见 [Deep Agents](deepagents.md) |
+| `zcode` | `zcode-plugin.json` | 放入用户配置目录并加载原生 Hook 插件，见 [ZCode](zcode.md) |
 | `mcp` 或任意未适配名称 | `mcp.config.json` | 支持 HTTP MCP 和自定义 Headers 的客户端设置 |
 | `agent-plugins` | `agent-plugin.json` | `~/.ogmemory/agent-plugin.json` 或 `OGMEM_AGENT_PLUGIN_CONFIG`，搭配通用插件包 |
 
