@@ -56,8 +56,6 @@ class BotConfig:
             values["enabled"] = os.environ["OGMEM_BOT_ENABLED"].lower() in {"true", "1", "yes"}
         config = cls(**values)
         config.validate()
-        if config.enabled and getattr(ogmem, "storage_backend", None) != "sql":
-            raise ValueError("memoryBot requires storage.backend=sql")
         return config
 
     def validate(self) -> None:

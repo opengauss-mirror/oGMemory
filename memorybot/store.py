@@ -439,6 +439,7 @@ class BotStore:
             cast(str, connection_string), pool_size=pool_size, dialect=dialect
         )
         self._owns_pool = pool is None
+        self.recover_memory_write = None
         if initialize:
             self.initialize()
 
@@ -1008,24 +1009,32 @@ class BotStore:
             ):
                 self.set_memory_status(tx, related_id, "failed")
 
-        applied = tx.list(
-            "bot_step", {"task_id": task_id, "kind": "memory_apply", "state": "succeeded"}
-        )
-        forget_changes: dict[str, Any] = {"state": "failed"}
-        if applied:
-            forget_changes["state"] = "effective"
-            for step in applied:
-                output = step.get("output") or {}
-                if output.get("action") == "forget" and output.get("source_refs"):
-                    forget_changes["source_refs"] = output["source_refs"]
-                    break
+        if self._settle_interrupted_forget(tx, task):
             result = result or {
                 "text": "已停止后续处理，已提交的记忆变更保留。",
                 "citations": [],
                 "file_ids": [],
             }
-        tx.update("bot_forget", {"task_id": task_id, "state": "pending"}, forget_changes)
         return result
+
+    def _settle_interrupted_forget(self, tx: UnitOfWork, task: dict) -> bool:
+        applied = False
+        changes: dict[str, Any] = {"state": "failed"}
+        for step in tx.list("bot_step", {"task_id": task["task_id"], "kind": "memory_apply"}):
+            if step["state"] == "succeeded":
+                applied = True
+                refs = (step.get("output") or {}).get("source_refs")
+            elif self.recover_memory_write is not None:
+                refs = self.recover_memory_write(task, step)
+                applied = applied or refs is not None
+            else:
+                continue
+            if refs:
+                changes["source_refs"] = refs
+        if applied:
+            changes["state"] = "effective"
+        tx.update("bot_forget", {"task_id": task["task_id"], "state": "pending"}, changes)
+        return applied
 
     def _terminal(
         self, tx: UnitOfWork, task: dict, state: str, result: dict | None, error: dict | None
