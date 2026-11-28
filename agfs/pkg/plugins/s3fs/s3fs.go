@@ -25,6 +25,7 @@ type S3FS struct {
 	client     *S3Client
 	mu         sync.RWMutex
 	pluginName string
+	storageID  string
 
 	// Caches for performance optimization
 	dirCache  *ListDirCache
@@ -62,7 +63,7 @@ func NewS3FSWithCache(cfg S3Config, cacheCfg CacheConfig) (*S3FS, error) {
 	}
 
 	return &S3FS{
-		client:     client,
+		client: client, storageID: "s3:" + cfg.Endpoint + ":" + cfg.Bucket,
 		pluginName: PluginName,
 		dirCache:   NewListDirCache(cacheCfg.MaxSize, cacheCfg.DirCacheTTL, cacheCfg.Enabled),
 		statCache:  NewStatCache(cacheCfg.MaxSize*5, cacheCfg.StatCacheTTL, cacheCfg.Enabled),
@@ -1067,3 +1068,17 @@ func (fs *S3FS) OpenStream(path string) (filesystem.StreamReader, error) {
 var _ plugin.ServicePlugin = (*S3FSPlugin)(nil)
 var _ filesystem.FileSystem = (*S3FS)(nil)
 var _ filesystem.Streamer = (*S3FS)(nil)
+
+// DisableInternalCache prevents a CacheFS miss from reading stale inner caches.
+func (fs *S3FS) DisableInternalCache() {
+	fs.dirCache.mu.Lock()
+	fs.dirCache.enabled = false
+	fs.dirCache.mu.Unlock()
+	fs.statCache.mu.Lock()
+	fs.statCache.enabled = false
+	fs.statCache.mu.Unlock()
+}
+
+func (fs *S3FS) CacheStorageIdentity() filesystem.StorageIdentity {
+	return filesystem.StorageIdentity{BackendID: fs.storageID, Root: filesystem.NormalizePath(fs.client.prefix)}
+}

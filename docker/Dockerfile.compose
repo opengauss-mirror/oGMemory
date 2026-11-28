@@ -7,6 +7,7 @@ ARG GOSUMDB=sum.golang.org
 ENV GOPROXY=${GOPROXY} GOSUMDB=${GOSUMDB}
 WORKDIR /build/agfs
 COPY agfs/ ./
+COPY cache_runtime/ /build/cache_runtime/
 RUN go mod download && go mod verify
 
 FROM ${PYTHON_BASE_IMAGE} AS python-deps

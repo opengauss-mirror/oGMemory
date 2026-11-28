@@ -97,6 +97,11 @@ def native_agfs(tmp_path, request):
         pytest.skip("set OGMEM_TEST_AGFS_BINARY to compiled AGFS")
     root = Path(__file__).resolve().parents[2]
     config = yaml.safe_load((root / "config/agfs/config.reference.yaml").read_text(encoding="utf-8"))
+    cache_url = os.environ.get("OGMEM_TEST_CACHE_REDIS_URL")
+    if cache_url:
+        config["cache"] = {"provider": "redis", "command_timeout_ms": 500,
+                           "params": {"endpoints": [cache_url]}}
+        config["cachefs"] = {"enabled": True, "namespace": "snapshot-test", "mounts": ["/local"]}
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]

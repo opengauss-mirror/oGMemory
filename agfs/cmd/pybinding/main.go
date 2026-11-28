@@ -9,8 +9,10 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/c4pt0r/agfs/agfs-server/pkg/config"
 	"path"
 	"regexp"
 	"sync"
@@ -876,3 +878,37 @@ func GetPluginLoaderInternal() *loader.PluginLoader {
 }
 
 func main() {}
+
+//export AGFS_ConfigureCache
+func AGFS_ConfigureCache(configJSON *C.char) *C.char {
+	var cfg config.Config
+	if err := json.Unmarshal([]byte(C.GoString(configJSON)), &cfg); err != nil {
+		return C.CString(err.Error())
+	}
+	globalFSMu.Lock()
+	defer globalFSMu.Unlock()
+	if err := globalFS.ConfigureCache(cfg.CacheFS, cfg.Cache); err != nil {
+		return C.CString(err.Error())
+	}
+	return nil
+}
+
+//export AGFS_Shutdown
+func AGFS_Shutdown() *C.char {
+	globalFSMu.Lock()
+	defer globalFSMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := globalFS.Close(ctx); err != nil {
+		return C.CString(err.Error())
+	}
+	return nil
+}
+
+//export AGFS_CacheStats
+func AGFS_CacheStats() *C.char {
+	globalFSMu.RLock()
+	defer globalFSMu.RUnlock()
+	data, _ := json.Marshal(globalFS.CacheStats())
+	return C.CString(string(data))
+}

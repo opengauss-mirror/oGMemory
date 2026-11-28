@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/cachefs"
+	cache "github.com/ogmemory/cache-runtime"
 	"gopkg.in/yaml.v3"
 )
 
 // Config represents the entire configuration file
 type Config struct {
+	Cache           cache.Config            `yaml:"cache" json:"cache"`
+	CacheFS         cachefs.Config          `yaml:"cachefs" json:"cachefs"`
 	Server          ServerConfig            `yaml:"server"`
 	Plugins         map[string]PluginConfig `yaml:"plugins"`
 	ExternalPlugins ExternalPluginsConfig   `yaml:"external_plugins"`
@@ -85,6 +89,14 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	if err := cfg.CacheFS.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.CacheFS.Enabled {
+		if err := cfg.Cache.Validate(); err != nil {
+			return nil, err
+		}
+	}
 	return &cfg, nil
 }
 

@@ -8,11 +8,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/cachefs"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/api"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/loader"
 	iradix "github.com/hashicorp/go-immutable-radix"
+	cache "github.com/ogmemory/cache-runtime"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -24,9 +26,11 @@ const (
 
 // MountPoint represents a mounted service plugin
 type MountPoint struct {
-	Path   string
-	Plugin plugin.ServicePlugin
-	Config map[string]interface{} // Plugin configuration
+	FileSystem filesystem.FileSystem
+	cache      *cachefs.FS
+	Path       string
+	Plugin     plugin.ServicePlugin
+	Config     map[string]interface{} // Plugin configuration
 }
 
 // PluginFactory is a function that creates a new plugin instance
@@ -34,6 +38,13 @@ type PluginFactory func() plugin.ServicePlugin
 
 // MountableFS is a FileSystem that supports mounting service plugins at specific paths
 type MountableFS struct {
+	cacheConfig         cachefs.Config
+	cacheRuntime        cache.Runtime
+	ownsCache           bool
+	localCacheAmbiguous bool // protected by mu, sticky until the filesystem is recreated
+	closing             atomic.Bool
+	closeMu             sync.Mutex
+	closeAttempt        *closeAttempt
 	// mountTree stores the radix tree for mount routing.
 	// We use atomic.Value to store *iradix.Tree to enable lock-free reads.
 	mountTree atomic.Value
@@ -145,6 +156,10 @@ func (mfs *MountableFS) Mount(path string, plugin plugin.ServicePlugin) error {
 	mfs.mu.Lock()
 	defer mfs.mu.Unlock()
 
+	if mfs.closing.Load() {
+		return fmt.Errorf("filesystem is closing")
+	}
+
 	// Normalize path
 	path = filesystem.NormalizePath(path)
 
@@ -165,9 +180,13 @@ func (mfs *MountableFS) Mount(path string, plugin plugin.ServicePlugin) error {
 		log.Debugf("Set parentFS for plugin at %s", path)
 	}
 
+	executed, cached, err := mfs.executionFS(path, plugin)
+	if err != nil {
+		return err
+	}
 	// Create new tree with added mount
 	newTree, _, _ := tree.Insert([]byte(path), &MountPoint{
-		Path:   path,
+		Path: path, FileSystem: executed, cache: cached,
 		Plugin: plugin,
 		Config: make(map[string]interface{}),
 	})
@@ -182,6 +201,10 @@ func (mfs *MountableFS) Mount(path string, plugin plugin.ServicePlugin) error {
 func (mfs *MountableFS) MountPlugin(fstype string, path string, config map[string]interface{}) error {
 	mfs.mu.Lock()
 	defer mfs.mu.Unlock()
+
+	if mfs.closing.Load() {
+		return fmt.Errorf("filesystem is closing")
+	}
 
 	// Normalize path
 	path = filesystem.NormalizePath(path)
@@ -222,11 +245,10 @@ func (mfs *MountableFS) MountPlugin(fstype string, path string, config map[strin
 	}
 
 	// Inject mount_path into config
-	configWithPath := make(map[string]interface{})
-	for k, v := range config {
-		configWithPath[k] = v
+	configWithPath, err := mfs.PrepareMountConfig(fstype, path, config)
+	if err != nil {
+		return err
 	}
-	configWithPath["mount_path"] = path
 
 	// Validate plugin configuration
 	if err := pluginInstance.Validate(configWithPath); err != nil {
@@ -238,9 +260,14 @@ func (mfs *MountableFS) MountPlugin(fstype string, path string, config map[strin
 		return fmt.Errorf("failed to initialize plugin: %v", err)
 	}
 
+	executed, cached, err := mfs.executionFS(path, pluginInstance)
+	if err != nil {
+		_ = pluginInstance.Shutdown()
+		return err
+	}
 	// Create new tree with added mount
 	newTree, _, _ := tree.Insert([]byte(path), &MountPoint{
-		Path:   path,
+		Path: path, FileSystem: executed, cache: cached,
 		Plugin: pluginInstance,
 		Config: config,
 	})
@@ -268,6 +295,11 @@ func (mfs *MountableFS) Unmount(path string) error {
 	}
 	mount := val.(*MountPoint)
 
+	if mount.cache != nil {
+		if err := mount.cache.Close(); err != nil {
+			return err
+		}
+	}
 	// Shutdown the plugin
 	if err := mount.Plugin.Shutdown(); err != nil {
 		return fmt.Errorf("failed to shutdown plugin: %v", err)
@@ -465,7 +497,7 @@ func (mfs *MountableFS) Create(path string) error {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().Create(relPath)
+		return mount.ExecutionFS().Create(relPath)
 	}
 	return filesystem.NewPermissionDeniedError("create", path, "not allowed to create file in rootfs, use mount instead")
 }
@@ -474,7 +506,7 @@ func (mfs *MountableFS) Mkdir(path string, perm uint32) error {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().Mkdir(relPath, perm)
+		return mount.ExecutionFS().Mkdir(relPath, perm)
 	}
 	return filesystem.NewPermissionDeniedError("mkdir", path, "not allowed to create directory in rootfs, use mount instead")
 }
@@ -483,7 +515,7 @@ func (mfs *MountableFS) Remove(path string) error {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().Remove(relPath)
+		return mount.ExecutionFS().Remove(relPath)
 	}
 	return filesystem.NewNotFoundError("remove", path)
 }
@@ -492,7 +524,7 @@ func (mfs *MountableFS) RemoveAll(path string) error {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().RemoveAll(relPath)
+		return mount.ExecutionFS().RemoveAll(relPath)
 	}
 	return filesystem.NewNotFoundError("removeall", path)
 }
@@ -501,7 +533,7 @@ func (mfs *MountableFS) Read(path string, offset int64, size int64) ([]byte, err
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().Read(relPath, offset, size)
+		return mount.ExecutionFS().Read(relPath, offset, size)
 	}
 	return nil, filesystem.NewNotFoundError("read", path)
 }
@@ -510,7 +542,7 @@ func (mfs *MountableFS) Write(path string, data []byte, offset int64, flags file
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().Write(relPath, data, offset, flags)
+		return mount.ExecutionFS().Write(relPath, data, offset, flags)
 	}
 	return 0, filesystem.NewNotFoundError("write", path)
 }
@@ -531,7 +563,7 @@ func (mfs *MountableFS) readDir(path string, fresh bool) ([]filesystem.FileInfo,
 	mount, relPath, found := mfs.findMount(path)
 	if found {
 		// Get contents from the mounted filesystem
-		fs := mount.Plugin.GetFileSystem()
+		fs := mount.ExecutionFS()
 		readDir := fs.ReadDir
 		if reader, ok := fs.(interface {
 			ReadDirFresh(string) ([]filesystem.FileInfo, error)
@@ -657,7 +689,7 @@ func (mfs *MountableFS) Stat(path string) (*filesystem.FileInfo, error) {
 	// Check if path is a mount point or within a mount
 	mount, relPath, found := mfs.findMount(path)
 	if found {
-		stat, err := mount.Plugin.GetFileSystem().Stat(relPath)
+		stat, err := mount.ExecutionFS().Stat(relPath)
 		if err != nil {
 			return nil, err
 		}
@@ -723,7 +755,7 @@ func (mfs *MountableFS) Rename(oldPath, newPath string) error {
 		if oldMount != newMount {
 			return fmt.Errorf("cannot rename across different mounts")
 		}
-		return oldMount.Plugin.GetFileSystem().Rename(oldRelPath, newRelPath)
+		return oldMount.ExecutionFS().Rename(oldRelPath, newRelPath)
 	}
 
 	return fmt.Errorf("cannot rename: paths not in same mounted filesystem")
@@ -733,7 +765,7 @@ func (mfs *MountableFS) Chmod(path string, mode uint32) error {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().Chmod(relPath, mode)
+		return mount.ExecutionFS().Chmod(relPath, mode)
 	}
 	return filesystem.NewNotFoundError("chmod", path)
 }
@@ -743,7 +775,7 @@ func (mfs *MountableFS) Touch(path string) error {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		fs := mount.Plugin.GetFileSystem()
+		fs := mount.ExecutionFS()
 		if toucher, ok := fs.(filesystem.Toucher); ok {
 			return toucher.Touch(relPath)
 		}
@@ -770,7 +802,7 @@ func (mfs *MountableFS) Open(path string) (io.ReadCloser, error) {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().Open(relPath)
+		return mount.ExecutionFS().Open(relPath)
 	}
 	return nil, filesystem.NewNotFoundError("open", path)
 }
@@ -779,7 +811,7 @@ func (mfs *MountableFS) OpenWrite(path string) (io.WriteCloser, error) {
 	mount, relPath, found := mfs.findMount(path)
 
 	if found {
-		return mount.Plugin.GetFileSystem().OpenWrite(relPath)
+		return mount.ExecutionFS().OpenWrite(relPath)
 	}
 	return nil, filesystem.NewNotFoundError("openwrite", path)
 }
@@ -792,7 +824,7 @@ func (mfs *MountableFS) OpenStream(path string) (filesystem.StreamReader, error)
 		return nil, filesystem.NewNotFoundError("openstream", path)
 	}
 
-	fs := mount.Plugin.GetFileSystem()
+	fs := mount.ExecutionFS()
 	if streamer, ok := fs.(filesystem.Streamer); ok {
 		log.Debugf("[mountablefs] OpenStream: found streamer for path %s (relPath: %s, fs type: %T)", path, relPath, fs)
 		return streamer.OpenStream(relPath)
@@ -815,7 +847,7 @@ func (mfs *MountableFS) GetStream(path string) (interface{}, error) {
 		GetStream(path string) (interface{}, error)
 	}
 
-	fs := mount.Plugin.GetFileSystem()
+	fs := mount.ExecutionFS()
 	if sg, ok := fs.(streamGetter); ok {
 		log.Debugf("[mountablefs] GetStream: found stream getter for path %s (relPath: %s, fs type: %T)", path, relPath, fs)
 		return sg.GetStream(relPath)
@@ -832,13 +864,16 @@ func (mfs *MountableFS) GetStream(path string) (interface{}, error) {
 // OpenHandle opens a file and returns a handle for stateful operations
 // This delegates to the underlying filesystem if it supports HandleFS
 func (mfs *MountableFS) OpenHandle(path string, flags filesystem.OpenFlag, mode uint32) (filesystem.FileHandle, error) {
+	if mfs.closing.Load() {
+		return nil, fmt.Errorf("filesystem is closing")
+	}
 	mount, relPath, found := mfs.findMount(path)
 
 	if !found {
 		return nil, filesystem.NewNotFoundError("openhandle", path)
 	}
 
-	fs := mount.Plugin.GetFileSystem()
+	fs := mount.ExecutionFS()
 	handleFS, ok := fs.(filesystem.HandleFS)
 	if !ok {
 		return nil, filesystem.NewNotSupportedError("openhandle", path)
@@ -903,8 +938,8 @@ func (mfs *MountableFS) CloseHandle(id int64) error {
 
 	// Close the underlying local handle
 	err := info.localHandle.Close()
-	if err == nil {
-		// Remove from mapping
+	if err == nil || info.mount.cache != nil {
+		// CacheFS handle close is terminal even when it reports a write error.
 		mfs.handleInfosMu.Lock()
 		delete(mfs.handleInfos, id)
 		mfs.handleInfosMu.Unlock()
