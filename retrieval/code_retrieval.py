@@ -614,6 +614,15 @@ def _focused_candidate_excerpt(
     return excerpt, None, None
 
 
+def _ranked_excerpt_limit(metadata, query_terms, first, configured):
+    if not first:
+        return min(800, configured)
+    symbol = str(metadata.get("symbol") or "").rsplit(".", 1)[-1].casefold()
+    exact = (metadata.get("symbol_kind") in {"function", "method", "type", "class", "async_function"}
+             and any(symbol == term.casefold() for term in query_terms))
+    return min(2400 if exact else 1800, configured)
+
+
 def _code_excerpt(
     content: str, metadata: Mapping[str, Any], max_chars: int,
     primary_terms: Sequence[str] = (), fallback_terms: Sequence[str] = (),
@@ -627,6 +636,7 @@ def _code_excerpt(
     documentation = bool(terms & {"docstring", "documentation", "docs", "example", "examples", "doctest"})
     prefer = (not terms or bool(terms & {"implementation", "logic", "body"}) or
               (symbol.rsplit(".", 1)[-1].casefold() in terms and not documentation))
+    match_implementation = prefer and not documentation and bool(primary_terms)
     prefer = prefer and not any(str(t).casefold() in content.casefold() for t in primary_terms)
     excerpt, shown_start, shown_end = _focused_candidate_excerpt(
         content, max_chars=max_chars, source_start_line=start,
@@ -642,6 +652,26 @@ def _code_excerpt(
     if not all(type(n) is int for n in (source_start, source_end)) or not 0 < source_start <= start <= start + len(lines) - 1 <= source_end:
         return excerpt, shown_start, shown_end, coverage
     coverage["source_lines"] = [source_start, source_end]
+    if (match_implementation and type(implementation) is int and start <= implementation <= source_end
+            and source_end == start + len(lines) - 1 and not metadata.get("partial_source_line")
+            and len(content) > max_chars and (shown_end != source_end or shown_start is None or shown_start > implementation)):
+        # Keep each literal from the original window and the complete implementation if they fit together.
+        raw_lines = content.rstrip().splitlines(keepends=True)
+        first = implementation - start
+        body = "".join(raw_lines[first:])
+        if len(body) <= max_chars and len(raw_lines) == len(lines) and first < len(raw_lines):
+            original, folded_body = excerpt.casefold(), body.casefold()
+            needed = {str(t).casefold() for t in primary_terms if str(t).casefold() in original}
+            missing = {term for term in needed if term not in folded_body}
+            size = len(body)
+            while missing and first and size + len(raw_lines[first - 1]) <= max_chars:
+                first -= 1
+                line = raw_lines[first]
+                size += len(line)
+                missing = {term for term in missing if term not in line.casefold()}
+            if needed and not missing:
+                excerpt, shown_start, shown_end = "".join(raw_lines[first:]), start + first, source_end
+                logger.info("CodeSearch literal and complete implementation window: %d-%d", shown_start, shown_end)
     whole_lines = (not metadata.get("partial_source_line") and shown_start is not None and shown_end is not None and
                    "\n".join(excerpt.splitlines()).rstrip() == "\n".join(lines[shown_start-start:shown_end-start+1]).rstrip())
     coverage["truncated"] = not (whole_lines and shown_start == source_start and shown_end == source_end)
@@ -1285,6 +1315,7 @@ class CodeRetrievalService:
                         extra_kwargs["allowed_ids"] = allowed_bm25_ids
                     elif route == "symbolic":
                         extra_kwargs["records"] = scoped_records
+                        extra_kwargs["paths"] = request.scope.paths
                     hits = self._invoke_route_searcher(
                         route_searchers[route],
                         request.query,
@@ -1681,6 +1712,7 @@ class CodeRetrievalService:
                         request.query,
                         ctx,
                         records=corpus.records,
+                        paths=request.scope.paths,
                         top_k=candidate_limit,
                         deadline=request_deadline,
                     )
@@ -2706,7 +2738,7 @@ class CodeRetrievalService:
                 safe_root_slug = ""
             body = str(node.content or node.overview or node.abstract or "")
             remaining = max(0, batch_chars - body_used)
-            allowed = min(snippet_chars, remaining)
+            allowed = min(remaining, _ranked_excerpt_limit(metadata, fallback_focus_terms, not evidence, snippet_chars))
             body, start_line, end_line, coverage = _code_excerpt(
                 body, metadata, allowed, primary_focus_terms, fallback_focus_terms,
             )
@@ -2888,7 +2920,7 @@ class CodeRetrievalService:
                 safe_root_slug = ""
             body = str(node.content or node.overview or node.abstract or "")
             remaining = max(0, batch_chars - body_used)
-            allowed = min(snippet_chars, remaining)
+            allowed = min(remaining, _ranked_excerpt_limit(metadata, fallback_focus_terms, not evidence, snippet_chars))
             body, start_line, end_line, coverage = _code_excerpt(
                 body, metadata, allowed, primary_focus_terms, fallback_focus_terms,
             )
@@ -3127,11 +3159,18 @@ class CodeRetrievalService:
         top_k: int,
         deadline: float | None = None,
         records: Sequence[Mapping[str, Any]] | None = None,
+        paths: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
-        query_terms = [term.lower() for term in _extract_code_query_terms(query)]
+        terms = _extract_code_query_terms(query)
+        query_terms = [term.lower() for term in terms]
         if not query_terms:
             return []
         query_vocab = set(query_terms)
+        tests_only = paths and all({"test", "tests"}.intersection(path.split("/")) for path in paths)
+        test_subjects = {
+            term.lower().replace("_", ""): re.compile(rf"\b{re.escape(term)}\b(?![ \t]*=(?!=))")
+            for term in terms if "_" in term.strip("_") or any(c.isupper() for c in term[1:])
+        } if tests_only and query_vocab.intersection({"test", "tests"}) else {}
         scored: list[tuple[float, dict[str, Any]]] = []
         source_records = self._get_snapshot(ctx).records if records is None else records
         for raw_record in source_records:
@@ -3161,6 +3200,16 @@ class CodeRetrievalService:
                     score += 0.6
             if query_vocab & _SYMBOL_KIND_TERMS.get(symbol_kind, set()):
                 score += 0.8
+            if test_subjects:
+                filename = str(metadata.get("relative_path") or "").rsplit("/", 1)[-1]
+                module = re.fullmatch(r"test_(\w+)\.py|(\w+)_test\.py", filename)
+                if module:
+                    subject = test_subjects.get((module[1] or module[2]).lower().replace("_", ""))
+                    if subject and any(
+                        subject.search(line) for line in str(record.get("content") or "").splitlines()
+                        if not line.lstrip().startswith("#")
+                    ):
+                        score += 6.0  # Same weight as an exact symbol and signature match.
             if score > 0.0:
                 scored.append((score, record))
         scored.sort(key=lambda item: (-item[0], code_source_key(item[1])))

@@ -61,6 +61,8 @@ def load_config(path):
         raise ValueError("Only baseline and sql are supported")
     if not isinstance(cfg.get("concurrency"), int) or cfg["concurrency"] < 1:
         raise ValueError("concurrency must be a positive integer")
+    if cfg.get("ogmemory", {}).get("profile", "code") not in {"code", "search-only"}:
+        raise ValueError("ogmemory.profile must be code or search-only")
     ids = cfg["instances"]
     if ids != "all" and (not isinstance(ids, list) or not ids or len(ids) != len(set(ids))):
         raise ValueError("instances must be all or a nonempty unique list")

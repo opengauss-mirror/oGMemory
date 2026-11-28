@@ -25,6 +25,7 @@ from server.mcp_resources import (
     external_to_internal_uri_candidates,
     internal_to_external_uri,
     iter_internal_uri_candidates,
+    mcp_search_only,
     parse_ogmemory_uri,
     public_type_from_internal,
     read_case_node,
@@ -678,6 +679,8 @@ def search_code(
         result,
         query=normalized_query,
         max_chars=_configured_max_response_chars(service),
+        # search-only never registers the edit facade, so no caller needs edit_target.
+        compact=mcp_search_only(service._cfg),
     )
 
 
@@ -1793,14 +1796,14 @@ def _safe_inline_code_metadata(value: object, *, max_chars: int) -> str:
     return rendered[:max_chars]
 
 
-def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str, dict]]:
+def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str, dict, str]]:
     raw_hits = result.get("evidence")
     if not isinstance(raw_hits, list):
         raw_hits = result.get("results")
     if not isinstance(raw_hits, list):
         return []
 
-    blocks: list[tuple[str, str, dict]] = []
+    blocks: list[tuple[str, str, dict, str]] = []
     seen: set[tuple[str, int | None, int | None, str, str, str]] = set()
     related_seen: set[str] = set()
     for raw_hit in raw_hits:
@@ -1826,7 +1829,10 @@ def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str, d
             qualifiers.append(f"lines {start_line}-{end_line}")
         if symbol:
             qualifiers.append(f"symbol={symbol}")
+        repeated_signature = ""
         if signature and signature != symbol:
+            if qualifiers and signature in excerpt.partition("\n")[0]:
+                repeated_signature = f" signature={signature}\n"
             qualifiers.append(f"signature={signature}")
         if qualifiers:
             locator = f"{locator}\n# {' '.join(qualifiers)}"
@@ -1863,7 +1869,7 @@ def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str, d
             ranges = coverage.get("read_lines")
             if isinstance(ranges, (list, tuple)) and len(ranges) <= 2 and all(valid_range(v) for v in ranges):
                 safe_coverage["read_lines"] = ranges
-        blocks.append((locator, excerpt, safe_coverage))
+        blocks.append((locator, excerpt, safe_coverage, repeated_signature))
     return blocks
 
 
@@ -1912,13 +1918,60 @@ def _code_search_retry_hint(result: Mapping[str, Any]) -> str:
     return hint
 
 
+def _workspace_relative_code_path(locator: str) -> str:
+    """Strip the root slug so the path matches native file tools and scope.paths."""
+
+    try:
+        return _parse_code_edit_locator(locator)[1]
+    except ValueError:
+        return locator
+
+
+def _compact_code_hit_prefix(index: int, locator: str, note: str, repeated_signature: str) -> str:
+    """Render one hit header line from the internal multi-line locator form."""
+
+    first, _, rest = locator.partition("\n")
+    try:
+        path = json.loads(first.removeprefix("edit_target: "))["locator"]
+    except (ValueError, TypeError, KeyError):
+        path = first
+    parts = [f"# hit {index}: {_workspace_relative_code_path(str(path))}"]
+    drop = repeated_signature.strip()
+    for line in rest.splitlines():
+        if line.startswith("# related_files: "):
+            try:
+                related = json.loads(line.removeprefix("# related_files: "))
+            except ValueError:
+                continue
+            parts.append("related=" + ",".join(_workspace_relative_code_path(str(p)) for p in related))
+            continue
+        line = line.removeprefix("#").strip()
+        if drop:
+            line = line.replace(drop, "", 1).strip()
+        if line:
+            parts.append(line)
+    note = note.strip().removeprefix("# coverage: ")
+    if note == "complete":
+        parts.append("complete")
+    elif note:
+        parts.append("coverage=" + note)
+    return "\n" + " ".join(parts) + "\n"
+
+
 def _render_code_search_result(
     result: Mapping[str, Any],
     *,
     query: str,
     max_chars: int,
+    compact: bool = False,
 ) -> str:
-    """Project one bounded, deduplicated Agent-facing code-search result."""
+    """Project one bounded, deduplicated Agent-facing code-search result.
+
+    ``compact`` renders each hit header on one line with a workspace-relative
+    path.  It is meant for search-only surfaces, where no edit facade consumes
+    root-qualified ``edit_target`` locators and every repeated header line is
+    re-read by the Agent on all later turns.
+    """
 
     status = str(result.get("status") or "error").strip().lower()
     if status not in _CODE_SEARCH_STATUSES:
@@ -1928,9 +1981,10 @@ def _render_code_search_result(
     retry_hint = _code_search_retry_hint(result) if not blocks else ""
 
     def header_for(count):
+        query_line = "" if blocks else f"# query: {safe_query}\n"
         return (
             f"# code_search status: {status}\n"
-            f"# query: {safe_query}\n"
+            f"{query_line}"
             f"# hit_count: {count}\n"
             f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
             f"{retry_hint}"
@@ -1943,9 +1997,16 @@ def _render_code_search_result(
 
     selected: list[str] = []
     used = len(reserved_header)
-    for index, (locator, excerpt, coverage) in enumerate(blocks, start=1):
+    for index, (locator, excerpt, coverage, repeated_signature) in enumerate(blocks, start=1):
         def prefix_for(locator, coverage):
             note = "# coverage: " + json.dumps(coverage, separators=(",", ":")) + "\n" if coverage else ""
+            if (coverage.get("truncated") is False and coverage.get("read_lines") == []
+                    and coverage.get("implementation_complete") is not False):
+                span = re.search(r"(?m)^# lines (\d+)-(\d+)(?: |$)", locator)
+                if span and [int(n) for n in span.groups()] == coverage.get("source_lines"):
+                    note = "# coverage: complete\n"
+            if compact:
+                return _compact_code_hit_prefix(index, locator, note, repeated_signature)
             return f"\n# hit {index}\n{locator}\n{note}"
         prefix = prefix_for(locator, coverage)
         remaining = max_chars - used
@@ -1967,6 +2028,8 @@ def _render_code_search_result(
         clipped_excerpt = _clip_code_excerpt(excerpt, remaining - len(prefix))
         if not clipped_excerpt:
             break
+        if repeated_signature and not clipped and not compact:
+            prefix = prefix.replace(repeated_signature, "\n", 1)
         block = prefix + clipped_excerpt
         selected.append(block)
         used += len(block)
@@ -1998,6 +2061,9 @@ def _code_search_budget_for_response(
 
     response_cap = _configured_max_response_chars(service)
     effective = dict(budget or {})
+    deadline = getattr(service._cfg, "mcp_candidate_search_default_deadline_ms", None)
+    if deadline is not None and getattr(service._cfg, "code_retrieval_mode", None) == "candidate_local":
+        effective.setdefault("route_deadline_ms", deadline)
     requested_batch = effective.get("batch_chars")
     if requested_batch is None:
         effective_batch = response_cap

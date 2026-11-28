@@ -9,9 +9,9 @@ SWE-bench Lite test 集包含 300 道 Python 项目问题，主要涉及功能�
 | 方案 | 工具与存储 |
 | --- | --- |
 | baseline | Claude Code 原生 Bash、Read、Edit、Write、Glob、Grep，不加载 oGMemory |
-| sql | 使用与 baseline 相同的编程助手和模型，额外启用本仓库 Claude 插件及代码 MCP 工具。每次执行自动创建独立的 openGauss 数据库容器，保存 oGMemory 的用户、Agent、资源及工作区注册信息，执行结束后清理容器。 |
+| sql | 使用与 baseline 相同的编程助手和模型，默认启用本仓库 Claude 插件及代码 MCP 工具，选择 `search-only` 时仅增加代码搜索。每次执行自动创建独立的 openGauss 数据库容器，保存 oGMemory 的用户、Agent、资源及工作区注册信息，执行结束后清理容器。 |
 
-SQL 配置使用当前 dev 的 `storage.backend=sql`、`storage.dialect=opengauss`、`features.code_retrieval.mode=candidate_local` 和工作区注册接口。设置 `mcp.default_toolset=code`，仅提供代码任务相关的 MCP 工具；同时设置 `mcp.enable_code_edit_tools=true`，允许通过 `ogm_edit_file` 修改源代码。openGauss 保存 oGMemory 的资源、身份及工作区注册等服务状态；题集、补丁、Token 统计和评分报告仍保存在文件中。代码搜索在请求内生成候选代码向量，不依赖数据库中的持久化代码向量索引。脚本自动部署 openGauss，不部署 AGFS 或另一套 LLM 服务；代码检索需要用户提供真实 Embedding API。通用会话写入关闭，未使用的记忆提取 LLM 配置为 mock，解题模型仍是真实模型。
+SQL 配置使用当前 dev 的 `storage.backend=sql`、`storage.dialect=opengauss`、`features.code_retrieval.mode=candidate_local` 和工作区注册接口。默认设置 `mcp.default_toolset=code`，仅提供代码任务相关的 MCP 工具；同时设置 `mcp.enable_code_edit_tools=true`，允许通过 `ogm_edit_file` 修改源代码。openGauss 保存 oGMemory 的资源、身份及工作区注册等服务状态；题集、补丁、Token 统计和评分报告仍保存在文件中。代码搜索在请求内生成候选代码向量，不依赖数据库中的持久化代码向量索引。脚本自动部署 openGauss，不部署 AGFS 或另一套 LLM 服务；代码检索需要用户提供真实 Embedding API。通用会话写入关闭，未使用的记忆提取 LLM 配置为 mock，解题模型仍是真实模型。
 
 因此，本参考实现测量代码检索、编辑与可选输出过滤的组合效果，不是 openGauss 向量索引性能或通用长期记忆效果。AGFS 暂不提供方案选项。
 
@@ -48,6 +48,10 @@ SQL 配置使用当前 dev 的 `storage.backend=sql`、`storage.dialect=opengaus
 挂载会遮住镜像原有源码目录中的编译产物，因此脚本在每次解题前执行 SWE-bench 固定版本为该项目和版本定义的预安装、安装命令；安装失败或超时则记录 error，不启动模型。命令和输出分别保存在 setup.sh、setup.log。安装完成后恢复被安装步骤改动的受版本控制文件，保留构建产物；新增的安装文件逐项加入本工作区的 Git 排除规则并记录到 setup.json，避免混入模型补丁。该步骤可能需要联网下载构建依赖，默认超时 1800 秒，可通过 evaluation.setup_timeout_seconds 调整。
 
 这与宿主机另建 Conda 的流程不同：减少依赖安装差异，但容器启动和 ARM 模拟耗时不能直接与其他流程比较。模型自行执行系统 python 的结果不能代替官方评分。
+
+要单独测量代码搜索的收益，可在测试配置的 `ogmemory` 下设置 `profile: search-only`。baseline 和 SQL 使用相同题面，SQL 只增加 `ogm_search_code`，不加载 Claude Code 插件。该配置最多返回 3 条结果，片段上限为 2400 字符，每批编码 4 个候选，保留默认的 4096 字符向量输入上限。报告保留零搜索调用的样本，实际尝试搜索却全部报错时标记为异常。可通过 `actions.by_tool` 和 `sql_tool_succeeded` 核对实际使用情况。省略 `profile` 时沿用带插件的 SQL 集成测试，仍须有成功的工具调用。
+
+CPU 向量服务较慢时，可设置 `ogmemory.candidate_search_default_deadline_ms: 90000`，给一次 MCP candidate_local 搜索 90 秒。省略时沿用检索服务的预算。该参数取值为 1～360000 毫秒，客户端也应允许相应等待时间。
 
 ## 2. 文件与环境要求
 
@@ -172,11 +176,11 @@ python run.py --config config.yaml --check
 python run.py --config config.yaml
 ```
 
-脚本打印本次 Batch 路径。默认顺序执行同一道题的 baseline 和 SQL，各用独立工作目录、测试容器和会话。SQL 自动启动数据库、本仓库源码的 HTTP 服务和 Streamable HTTP MCP，创建用户及 Agent，注册本题工作区；正常结束或捕获到异常后清理其临时服务。无需手工常驻数据库或预先安装用户级插件。
+脚本打印本次 Batch 路径。默认顺序执行同一道题的 baseline 和 SQL，各用独立工作目录、测试容器和会话。SQL 自动启动数据库、本仓库源码的 HTTP 服务和 Streamable HTTP MCP，用管理员凭据创建用户及 Agent、注册工作区，再以该用户的凭据连接 MCP；正常结束或捕获到异常后清理其临时服务。无需手工常驻数据库或预先安装用户级插件。
 
 若需要断开终端运行，可将上述命令放在 tmux 中，或用 nohup 重定向到自行指定的日志。不要因为暂时没有评分再次启动相同运行。
 
-SQL 初始化必须包含 og-memory 插件和已连接的 ogmemory MCP，并至少产生一条成功的 oGMemory 工具结果。若接口只输出文字、MCP 未连接或只有失败调用，记录为异常，不当成正常接入结果。
+默认集成模式的 SQL 初始化必须包含 og-memory 插件和已连接的 ogmemory MCP，并至少产生一条成功的 oGMemory 工具结果。若接口只输出文字、MCP 未连接或只有失败调用，记录为异常，不当成正常接入结果。
 
 ### 4.4 查看结果
 

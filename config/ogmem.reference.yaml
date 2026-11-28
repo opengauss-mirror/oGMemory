@@ -191,6 +191,8 @@ mcp:
   max_request_bytes: 1048576
   max_sse_connections: 64
   max_response_chars: 50000
+  # Default for candidate_local searches over MCP. Keep below the client timeout.
+  # candidate_search_default_deadline_ms: 90000
   collection_limit: 50
   allowed_origins: []
   allowed_hosts: ["127.0.0.1", "localhost"]

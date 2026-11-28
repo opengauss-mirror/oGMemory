@@ -223,7 +223,7 @@ def _resolve_optional_bool(yaml_val: Any, env_name: str) -> bool | None:
     raise ValueError(f"{env_name} must be a boolean")
 
 
-def _resolve_filter_int(yaml_val: Any, env_name: str, default: int) -> int:
+def _resolve_filter_int(yaml_val: Any, env_name: str, default: int | None) -> int | None:
     """Resolve a filter integer without silently truncating YAML numbers."""
 
     value = yaml_val if yaml_val is not None else os.environ.get(env_name)
@@ -701,6 +701,7 @@ class OgMemConfig:
     mcp_max_request_bytes: int = 1048576
     mcp_max_sse_connections: int = 64
     mcp_max_response_chars: int = 50000
+    mcp_candidate_search_default_deadline_ms: int | None = None
     mcp_collection_limit: int = 50
     mcp_allowed_origins: list[str] = field(default_factory=list)
     mcp_allowed_hosts: list[str] = field(default_factory=lambda: ["127.0.0.1", "localhost"])
@@ -1112,6 +1113,9 @@ class OgMemConfig:
             raise ValueError("code_retrieval_snippet_chars cannot exceed batch chars")
         if self.code_retrieval_route_deadline_ms > 60000:
             raise ValueError("code_retrieval_route_deadline_ms must not exceed 60000")
+        deadline = self.mcp_candidate_search_default_deadline_ms
+        if deadline is not None and (type(deadline) is not int or not 1 <= deadline <= 360_000):
+            raise ValueError("mcp_candidate_search_default_deadline_ms must be an integer from 1 to 360000")
         candidate_local_limits = (
             "code_retrieval_candidate_discovery_pool_limit",
             "code_retrieval_candidate_file_limit",
@@ -2150,6 +2154,11 @@ class OgMemConfig:
                 "OGMEM_MCP_MAX_RESPONSE_CHARS",
                 50000,
                 int,
+            ),
+            mcp_candidate_search_default_deadline_ms=_resolve_filter_int(
+                mcp.get("candidate_search_default_deadline_ms"),
+                "OGMEM_MCP_CANDIDATE_SEARCH_DEFAULT_DEADLINE_MS",
+                None,
             ),
             mcp_collection_limit=_resolve(
                 mcp.get("collection_limit"),

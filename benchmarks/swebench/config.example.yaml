@@ -22,6 +22,9 @@ ogmemory:
   # builds request-local code vectors; it does not benchmark a persistent index.
   opengauss_image: swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-lite:7.0.0lts
   startup_timeout_seconds: 300
+  # profile: search-only  # Compare the search tool alone, without the plugin.
+  # Optional MCP search deadline in ms for slow embedding deployments.
+  # candidate_search_default_deadline_ms: 90000
   embedding:
     provider: openai
     model: ${SWE_EMBEDDING_MODEL}

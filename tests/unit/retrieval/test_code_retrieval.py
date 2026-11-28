@@ -812,6 +812,31 @@ def test_symbolic_query_terms_apply_length_stopword_and_dedup_rules():
     ) == ["xy", "Abc", "_id", "callable", "max_length"]
 
 
+@pytest.mark.parametrize("filename", ["test_retry_budget.py", "retry_budget_test.py"])
+def test_symbolic_test_module_requires_named_subject_in_excerpt(filename):
+    service = CodeRetrievalService(config=SimpleNamespace())
+
+    def score(path, body, query, paths=("tests",)):
+        record = {"uri": "ctx://acct/resources/s", "content": body,
+                  "metadata": {"relative_path": "tests/" + path, "symbol": "test_default"}}
+        hits = service._search_symbolic(query, _ctx(), records=[record], paths=paths, top_k=1)
+        return hits[0]["raw_score"] if hits else 0.0
+
+    query = "tests for RetryBudget"
+    body = "assert RetryBudget().remaining == 0"
+    ordinary = score(filename, "assert RetryBudgetFactory()", query)
+    assert score(filename, body, query) > ordinary
+    header = "@override_settings(\n    RetryBudget=True,\n)\nclass RetryTests(TestCase):"
+    assert score(filename, header, query) == ordinary
+    assert score(filename, header + "\n    def test_retry(self):\n        check(RetryBudget())", query) > ordinary
+    assert score(filename, "    # uses RetryBudget\n    configure(RetryBudget = 0)", query) == ordinary
+    assert score(filename, "assert RetryBudget == 0", query) > ordinary
+    for mixed in [(), ("src", "tests"), ("package",)]:
+        assert score(filename, body, query, mixed) == ordinary
+    for path, search in [(filename, "RetryBudget implementation"), ("retry_budget.py", query)]:
+        assert score(path, body, search) == score(path, "", search)
+
+
 def test_symbolic_ranking_prioritizes_exact_identifier_and_survives_route_top_k(monkeypatch):
     def record(symbol, *, relative_path, signature):
         return {

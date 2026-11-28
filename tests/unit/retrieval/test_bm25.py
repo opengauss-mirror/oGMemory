@@ -390,3 +390,13 @@ class TestVectorAnchoredFusion:
         result = SeedRetriever._fuse_results([], bm25_low + bm25_high)
         scores = {h.uri: h.score for h in result}
         assert scores["b"] > scores["a"]
+
+
+def test_reuses_field_tokenization_only_within_a_bulk_update():
+    with patch("retrieval.bm25_index._tokenize_code_field", wraps=_mock_tokenize) as tokenize:
+        index = Bm25Index()
+        docs = [Bm25Document(str(i), "alpha", {}, {"kind": "function"}) for i in range(3)]
+        index.bulk_upsert(docs)
+        assert tokenize.call_count == 1
+        index.bulk_upsert(docs)
+        assert tokenize.call_count == 2

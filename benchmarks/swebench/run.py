@@ -171,6 +171,10 @@ def wait_http(url, key, proc, timeout):
 
 
 def service_config(cfg, workspace, db_port, password, key, http_port, mcp_port):
+    search_only = cfg["ogmemory"].get("profile") == "search-only"
+    retrieval = {"mode": "candidate_local"}
+    if search_only:
+        retrieval.update(result_limit=3, snippet_chars=2400, candidate_embedding_batch_texts=4)
     embedding = expand_environment(cfg["ogmemory"]["embedding"])
     return {
         "storage": {
@@ -192,15 +196,16 @@ def service_config(cfg, workspace, db_port, password, key, http_port, mcp_port):
             "code_sync_enabled": False,
             "code_workspace_allowed_roots": [str(workspace)],
             "code_retrieval_enabled": True,
-            "code_retrieval": {"mode": "candidate_local"},
+            "code_retrieval": retrieval,
             "tool_output_filter": {"enabled": cfg["ogmemory"]["tool_output_filter"]},
         },
         "mcp": {
             "enabled": True,
             "host": "127.0.0.1",
             "port": mcp_port,
-            "default_toolset": "code",
-            "enable_code_edit_tools": True,
+            "default_toolset": "search-only" if search_only else "code",
+            "candidate_search_default_deadline_ms": cfg["ogmemory"].get("candidate_search_default_deadline_ms"),
+            "enable_code_edit_tools": not search_only,
             "enable_write_tools": False,
             "enable_delete_tools": False,
         },
@@ -356,7 +361,7 @@ def sql_services(cfg, attempt, workspace):
             env=env,
         ) as http:
             wait_http(url, key, http, timeout)
-            api(url, key, "/api/v1/admin/accounts/swebench/users", {"user_id": "tester"})
+            tester = api(url, key, "/api/v1/admin/accounts/swebench/users", {"user_id": "tester"})
             api(
                 url,
                 key,
@@ -403,7 +408,7 @@ def sql_services(cfg, attempt, workspace):
                         time.sleep(0.5)
                 yield {
                     "url": url,
-                    "key": key,
+                    "key": tester["user_key"],
                     "config": str(generated),
                     "mcp_url": f"http://127.0.0.1:{mcp_port}/mcp",
                 }
@@ -573,7 +578,7 @@ def solve(cfg, row, arm, attempt, workspace, container, service):
         str(mcp_path),
         "--dangerously-skip-permissions",
     ]
-    if service:
+    if service and cfg["ogmemory"].get("profile") != "search-only":
         args += ["--plugin-dir", str(ROOT / "plugins" / "claude-code")]
     with (
         (attempt / "session.jsonl").open("w", encoding="utf-8") as output,
@@ -728,6 +733,8 @@ def evaluate(cfg, row, patch, target, expected=None):
 def run_job(cfg, row, arm, batch):
     from report import session_metrics
 
+    search_only = arm == "sql" and cfg.get("ogmemory", {}).get("profile") == "search-only"
+
     job = batch / "jobs" / f"{arm}--{row['instance_id']}"
     job.mkdir(parents=True, exist_ok=True)
     numbers = [int(p.name.split("-")[1]) for p in job.glob("attempt-*") if p.is_dir()]
@@ -746,13 +753,14 @@ def run_job(cfg, row, arm, batch):
         )
         with task_container(cfg, row, workspace, attempt, expected) as container, context as service:
             solve(cfg, row, arm, attempt, workspace, container, service)
-        metrics = session_metrics(attempt / "session.jsonl")
+        metrics = session_metrics(attempt / "session.jsonl", search_only)
         result.update(metrics)
         if not metrics["agent_completed"]:
             raise RuntimeError("Agent has no successful terminal result")
         if not metrics["isolation_valid"] or metrics["sql_connected"] != (arm == "sql"):
             raise RuntimeError("Agent tool/plugin initialization does not match the selected arm")
-        if arm == "sql" and not metrics["sql_tool_succeeded"]:
+        search_attempted = metrics["actions"]["by_tool"].get("mcp__ogmemory__ogm_search_code", 0) if search_only else 0
+        if arm == "sql" and (not search_only or search_attempted) and not metrics["sql_tool_succeeded"]:
             raise RuntimeError(
                 "SQL has no successful oGMemory tool result; not a valid integration run"
             )
@@ -770,7 +778,7 @@ def run_job(cfg, row, arm, batch):
             except Exception as exc:
                 result["patch_error"] = str(exc)
         if (attempt / "session.jsonl").exists():
-            result.update(session_metrics(attempt / "session.jsonl"))
+            result.update(session_metrics(attempt / "session.jsonl", search_only))
         save_json(attempt / "result.json", result)
     print(
         f"{arm} {row['instance_id']}: {result['status']} resolved={result['resolved']}", flush=True

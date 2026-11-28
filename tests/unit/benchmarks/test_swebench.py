@@ -60,6 +60,17 @@ def test_usage_counts_cache_once_and_deduplicates_calls(tmp_path):
     assert m["isolation_valid"] and not m["sql_connected"]
 
 
+def test_search_only_isolation_requires_exact_tool_and_no_plugin(tmp_path):
+    init = {"type": "system", "subtype": "init", "plugins": [],
+            "tools": ["Bash", "mcp__ogmemory__ogm_search_code"],
+            "mcp_servers": [{"name": "ogmemory", "status": "connected"}]}
+    p = session(tmp_path, [init])
+    assert report.session_metrics(p, True)["isolation_valid"]
+    assert not report.session_metrics(p)["isolation_valid"]
+    init["tools"].append("mcp__ogmemory__ogm_edit_file")
+    assert not report.session_metrics(session(tmp_path, [init]), True)["isolation_valid"]
+
+
 def test_truncated_session_does_not_report_zero(tmp_path):
     m = report.session_metrics(session(tmp_path, []))
     assert m["usage"]["total_tokens"] is None
@@ -147,18 +158,21 @@ def test_patch_includes_new_files_and_agent_commits(tmp_path):
     assert (clean / "a.py").read_text() == "new = 2\n\n"
 
 
-def test_sql_config_matches_current_product_contract(tmp_path, monkeypatch):
+@pytest.mark.parametrize("deadline", [None, 90000])
+def test_sql_config_matches_current_product_contract(tmp_path, monkeypatch, deadline):
     monkeypatch.setenv("SWE_EMBEDDING_MODEL", "test-embedding")
     monkeypatch.setenv("SWE_EMBEDDING_BASE_URL", "http://localhost:9999/v1")
     monkeypatch.setenv("SWE_EMBEDDING_API_KEY", "test-only")
     cfg = prepare.load_config(SCRIPTS / "config.example.yaml")
+    if deadline is not None:
+        cfg["ogmemory"].update(profile="search-only", candidate_search_default_deadline_ms=deadline)
     service = runner.service_config(cfg, tmp_path, 5432, "test-only", "test-only", 8090, 8091)
     assert service["storage"]["backend"] == "sql"
     assert service["storage"]["dialect"] == "opengauss"
     assert "user=swebench" in service["storage"]["connection_string"]
     assert service["features"]["code_workspace_allowed_roots"] == [str(tmp_path)]
     assert service["features"]["code_retrieval"]["mode"] == "candidate_local"
-    assert service["mcp"]["default_toolset"] == "code"
+    assert service["mcp"]["default_toolset"] == ("code" if deadline is None else "search-only")
     # Validate against the actual latest-dev parser, not a duplicated schema.
     import yaml
 
@@ -170,7 +184,12 @@ def test_sql_config_matches_current_product_contract(tmp_path, monkeypatch):
     assert product.storage_backend == "sql"
     assert product.admin_api_keys == ["swebench:test-only"]
     assert product.code_retrieval_mode == "candidate_local"
-    assert product.mcp_enable_code_edit_tools is True
+    assert product.mcp_candidate_search_default_deadline_ms == deadline
+    assert product.mcp_enable_code_edit_tools is (deadline is None)
+    if deadline:
+        assert product.mcp_default_toolset == "search-only"
+        assert product.code_retrieval_result_limit == 3
+        assert product.code_retrieval_candidate_embedding_batch_texts == 4
 
 
 def test_unknown_instance_is_rejected():
@@ -182,81 +201,32 @@ def test_unknown_instance_is_rejected():
 @pytest.mark.skipif(
     os.environ.get("SWE_SQL_INTEGRATION") != "1", reason="Opt-in Docker SQL compatibility check"
 )
-def test_sql_account_registration_and_mcp_tools(tmp_path, monkeypatch):
+def test_sql_account_registration_and_mcp_tools(tmp_path):
     """Exercise current product APIs against a real, disposable openGauss database."""
     import asyncio
-    import contextlib
-    import uuid
+    import httpx
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
 
-    import yaml
-
-    key = uuid.uuid4().hex
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "example.py").write_text("def add(a, b):\n    return a + b\n")
-    private = tmp_path / "private"
-    private.mkdir(mode=0o700)
     cfg = prepare.load_config(SCRIPTS / "config.example.yaml")
     cfg["ogmemory"]["embedding"] = {"provider": "mock"}
-    application = None
-    stack = contextlib.ExitStack()
-    try:
-        port, password = stack.enter_context(runner.sql_database(cfg, tmp_path, private))
-        generated = runner.service_config(cfg, workspace, port, password, key, 8090, 8091)
-        path = tmp_path / "ogmemory.yaml"
-        path.write_text(yaml.safe_dump(generated), encoding="utf-8")
-        monkeypatch.setenv("OGMEM_CONFIG", str(path))
-        from providers.unified_config import reset_config
-
-        reset_config()
-        from mcp import Client
-
-        import server.app as application
-        from server.mcp_server import create_mcp_server
-
-        application._shutdown_service()
-        monkeypatch.setattr(application, "_service", None)
-        client = application.app.test_client()
-        headers = {
-            "X-API-Key": key,
-            "X-Account-ID": "swebench",
-            "X-User-ID": "tester",
-            "X-Agent-ID": "solver",
-        }
-        for url, body in [
-            ("/api/v1/admin/accounts/swebench/users", {"user_id": "tester"}),
-            (
-                "/api/v1/admin/accounts/swebench/agents",
-                {"agent_id": "solver", "owner_user_id": "tester"},
-            ),
-            (
-                "/api/v1/resources/code/sync/registrations",
-                {
-                    "path": str(workspace),
-                    "name": "task",
-                    "trigger_mode": "manual",
-                    "watch_enabled": False,
-                    "wait_mode": "accepted",
-                },
-            ),
-        ]:
-            response = client.post(url, json=body, headers=headers)
-            assert response.status_code == 200, response.get_json()
-        assert client.get("/api/v1/health").get_json()["sql"] == "connected"
-        server = create_mcp_server(service=application._get_service())
-
-        async def tools():
-            async with Client(server) as connection:
-                return {t.name for t in (await connection.list_tools()).tools}
-
-        assert asyncio.run(tools()) == {"ogm_search_code", "ogm_read_memory", "ogm_edit_file"}
-    finally:
-        if application is not None:
-            application._shutdown_service()
-            from providers.unified_config import reset_config
-
-            reset_config()
-        stack.close()
+    with runner.sql_services(cfg, tmp_path, workspace) as service:
+        async def exercise():
+            headers = {"X-API-Key": service["key"], "X-Account-ID": "swebench",
+                       "X-User-ID": "tester", "X-Agent-ID": "solver"}
+            async with httpx.AsyncClient(headers=headers) as client:
+                async with streamable_http_client(service["mcp_url"], http_client=client) as streams:
+                    async with ClientSession(*streams[:2]) as session:
+                        await session.initialize()
+                        tools = {t.name for t in (await session.list_tools()).tools}
+                        assert tools == {"ogm_search_code", "ogm_read_memory", "ogm_edit_file"}
+                        result = await session.call_tool("ogm_search_code", {"query": "add", "scope": {"paths": ["example.py"]}})
+                        assert not result.is_error
+                        assert any("return a + b" in part.text for part in result.content)
+        asyncio.run(exercise())
 
 
 def test_setup_runs_official_install_after_mount(tmp_path, monkeypatch):
