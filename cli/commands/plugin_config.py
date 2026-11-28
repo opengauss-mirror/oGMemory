@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from cli.lib.colors import fail, info, ok
 from cli.lib.prompt import input_masked, input_validated, select
 
-NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "opencode", "deepseek-harness", "hermes", "deepagents")
+NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "zcode", "opencode", "deepseek-harness", "hermes", "deepagents")
 ALIASES = {"claude": "claude-code", "claude_hooks": "claude-code", "dsh": "deepseek-harness", "deepagent": "deepagents"}
 
 
@@ -61,6 +61,12 @@ def _json(value: object) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
 
 
+def _require_https_outside_loopback(url: str, adapter_name: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError(f"The {adapter_name} requires HTTPS for non-loopback endpoints")
+
+
 def _environment_files(values: dict[str, str]) -> dict[str, str]:
     # Separate shell formats; never instruct users to source a dotenv file.
     shell = "# Source this file in the shell used to launch the Agent.\n"
@@ -78,8 +84,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
     c = connection
     identity = {"accountId": c.account_id, "userId": c.user_id, "agentId": c.agent_id}
     if adapter == "agent-plugins":
-        if urlsplit(c.url).scheme == "http" and urlsplit(c.url).hostname not in {"localhost", "127.0.0.1", "::1"}:
-            raise ValueError("The Agent Plugin requires HTTPS for non-loopback endpoints")
+        _require_https_outside_loopback(c.url, "Agent Plugin")
         files = {"agent-plugin.json": _json({
             "mcp_url": c.url, "api_key": c.api_key or "<OGMEM_TENANT_API_KEY>",
             "account_id": c.account_id, "user_id": c.user_id,
@@ -152,6 +157,18 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "--ref dev --sparse .agents/plugins --sparse plugins/ogmemory\n"
             "       codex plugin add ogmemory@ogmemory\n\n"
             "3. Refresh Codex and trust its hooks in /hooks. Hook scripts require Python 3.\n"
+        )
+    elif adapter == "zcode":
+        _require_https_outside_loopback(c.url, "ZCode plugin")
+        files = {"zcode-plugin.json": _json({
+            "url": c.url, "api_key": c.api_key, "account_id": c.account_id,
+            "user_id": c.user_id, "agent_id": c.agent_id,
+        })}
+        steps = (
+            "1. Copy zcode-plugin.json to ~/.ogmemory/zcode-plugin.json or set "
+            "OG_MEMORY_ZCODE_CONFIG to its private path.\n"
+            "2. Follow docs/integrations/zcode.md to load plugins/zcode and verify Python.\n"
+            "3. Open a new task after enabling plugin hooks.\n"
         )
     elif adapter == "opencode":
         host = urlsplit(c.url).hostname or ""

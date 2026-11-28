@@ -1,0 +1,68 @@
+[
+  {
+    "pattern": "-----BEGIN [^-\\r\\n]*PRIVATE KEY-----[\\s\\S]*?-----END [^-\\r\\n]*PRIVATE KEY-----",
+    "flags": "g",
+    "replacement": "[REDACTED_PRIVATE_KEY]"
+  },
+  {
+    "pattern": "\\b(?:password|passwd|pwd|secret|token|api[_-]?key)\\s*[:=]\\s*(?:[\"'][^\"']*[\"']|[^\\s,;]+)",
+    "flags": "gi",
+    "replacement": "[REDACTED_SECRET]"
+  },
+  {
+    "pattern": "\\bBearer\\s+[A-Za-z0-9._~+/-]+=*",
+    "flags": "gi",
+    "replacement": "Bearer [REDACTED]"
+  },
+  {
+    "pattern": "\\b(cookie|set-cookie|authorization)\\s*[:=]\\s*[^\\r\\n]+",
+    "flags": "gi",
+    "replacement": "$1=[REDACTED]"
+  },
+  {
+    "pattern": "\\bAKIA[0-9A-Z]{16}\\b",
+    "flags": "g",
+    "replacement": "[REDACTED_AWS_KEY]"
+  },
+  {
+    "pattern": "\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b",
+    "flags": "g",
+    "replacement": "[REDACTED_JWT]"
+  },
+  {
+    "pattern": "\\b(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{12,}\\b",
+    "flags": "g",
+    "replacement": "[REDACTED_TOKEN]"
+  },
+  {
+    "pattern": "\\b[a-z][a-z0-9+.-]*://[^\\s/@]+@[^\\s\"'<>]+",
+    "flags": "gi",
+    "replacement": "[REDACTED_CONNECTION_STRING]"
+  },
+  {
+    "pattern": "\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b",
+    "flags": "gi",
+    "replacement": "[REDACTED_EMAIL]"
+  },
+  {
+    "pattern": "\\b(?:\\+?\\d[\\d ()-]{7,}\\d)\\b",
+    "flags": "g",
+    "replacement": "[REDACTED_PHONE]"
+  },
+  {
+    "pattern": "\\b(?:\\d[ -]*?){13,19}\\b",
+    "flags": "g",
+    "replacement": "[REDACTED_NUMBER]"
+  },
+  {
+    "pattern": "(?<![\\w:])(?:[0-9A-Fa-f]{0,4}:){2,}(?:(?:\\d{1,3}\\.){3}\\d{1,3}|[0-9A-Fa-f]{0,4})(?![\\w:.])",
+    "flags": "g",
+    "replacement": "[REDACTED_IP]",
+    "validator": "ipv6"
+  },
+  {
+    "pattern": "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b",
+    "flags": "g",
+    "replacement": "[REDACTED_IP]"
+  }
+]
