@@ -1,3 +1,17 @@
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { recallSource } from './adapter.js'
+
+export function createRecallMessage(pluginName, context) {
+  return createUserMessage({
+    source: {
+      ...recallSource(pluginName),
+      form: 'snapshot',
+      sections: [{ name: 'ogmemory', text: context }],
+    },
+    content: [{ type: 'text', text: context }],
+  })
+}
+
 const SLOT_DEFINITIONS = [
   ['identityContext', 'User Profile'],
   ['episodicContext', 'Archive History'],

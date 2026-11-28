@@ -1,4 +1,5 @@
 import { PendingStore } from './pending-queue.js'
+import { readToolResult } from './adapter.js'
 
 export function collectTurnMessages(events, turn, options) {
   if (!Array.isArray(events)) return []
@@ -40,10 +41,10 @@ export function collectTurnMessages(events, turn, options) {
       continue
     }
     if (options.captureToolResults && event?.type === 'tool/result' && event.data?.turn === turn) {
-      if (event.data.message?.source?.kind !== 'tool') continue
-      const callId = String(event.data.message?.source?.callId ?? '')
-      const call = calls.get(callId)
-      const output = toolResultText(event.data.message?.content)
+      const result = readToolResult(event.data.message)
+      if (!result) continue
+      const call = calls.get(String(result.callId))
+      const output = visibleText(result.content)
       const text = [
         `tool=${call?.name ?? 'unknown'}`,
         call?.arguments ? `arguments=${call.arguments}` : '',
@@ -279,17 +280,6 @@ function visibleText(content) {
     .map(block => block.text)
     .join('\n')
     .trim()
-}
-
-function toolResultText(content) {
-  if (!Array.isArray(content)) return ''
-  const blocks = []
-  for (const block of content) {
-    if (block?.type !== 'tool-result' || !Array.isArray(block.content)) continue
-    const text = visibleText(block.content)
-    if (text) blocks.push(text)
-  }
-  return blocks.join('\n')
 }
 
 function pushMessage(messages, role, content, time, maxChars) {

@@ -3,14 +3,20 @@
 This plugin connects a user's DeepSeek Harness installation to an available
 oGMemory HTTP service and enables automatic cross-session memory recall.
 
+The walkthrough below uses the `web` profile. For one-shot command-line tasks,
+follow the [headless installation and verification guide](../../docs/integrations/deepseek-harness.md#headless).
+
 Prerequisites:
 
-- DSH `0.1.5-rc.2` is installed with a working model provider configuration.
+- DSH `0.1.5-rc.2` or `0.2.1-rc.2` is installed with a working model provider configuration.
 - The oGMemory HTTP service address is known and reachable from DSH.
 
-Plugin `0.1.1` supports DSH CLI `0.1.5-rc.2`, core packages `0.1.5-rc.2`,
-and Cordis `4.0.2`. It automatically writes completed turns to oGMemory
-and recalls relevant memories across sessions.
+Each package targets one DSH release.
+
+| DSH CLI and core packages | oGMemory plugin | Installation source |
+| --- | --- | --- |
+| `0.1.5-rc.2` | `0.1.1` | Git repository root or the `0.1.1` tarball |
+| `0.2.1-rc.2` | `0.2.1` | The `0.2.1` tarball |
 
 ## Automatic memory controls
 
@@ -25,11 +31,26 @@ again. Recall and Trace remain independent. Explicit tools retain their existing
 permissions, including `writeToolsEnabled`. The existing `composeEnabled`,
 `writebackEnabled` and `disposeEnabled` flags still apply.
 
-## Install
+## Install in the web profile
+
+For DSH `0.1.5-rc.2`, the repository root installs the legacy adapter.
 
 ```powershell
 dsh plugin --profile web add https://gitcode.com/opengauss/oGMemory.git#dev
 ```
+
+For DSH `0.2.1-rc.2`, run the following commands from a repository checkout
+with Node.js and `tar` on your PATH. Use the `dsh` CLI from the target installation.
+
+```sh
+cd plugins/deepseek-harness
+node scripts/pack.mjs 0.2.1-rc.2
+dsh plugin --profile web add ./dist/opengauss-ogmemory-dsh-plugin-0.2.1.tgz
+```
+
+Run `node scripts/pack.mjs` to build both archives in `dist/`. Each includes
+the shared runtime, its selected adapter and its DSH peer versions. Keep the
+installed archive at its installation path for subsequent profile restores.
 
 ## Connect DSH to oGMemory
 
@@ -40,7 +61,6 @@ $env:OGMEM_URL='http://127.0.0.1:8090'
 $env:OGMEM_ACCOUNT_ID='acct-demo'
 $env:OGMEM_USER_ID='user-dsh'
 $env:OGMEM_AGENT_ID='deepseek-harness'
-dsh --profile web
 ```
 
 If the oGMemory HTTP API requires authentication, also set:
@@ -49,8 +69,12 @@ If the oGMemory HTTP API requires authentication, also set:
 $env:OGMEM_DSH_API_KEY='<oGMemory API key>'
 ```
 
-`OGMEM_DSH_API_KEY` is the oGMemory HTTP API credential, not a model-provider
-credential.
+Use the oGMemory Tenant Key for `OGMEM_DSH_API_KEY`. Start the web profile
+from the same terminal after setting the environment variables.
+
+```powershell
+dsh --profile web
+```
 
 Retryable write failures are persisted before delivery under
 `~/.ogmemory/dsh-pending`, retried in session order while DSH remains running,

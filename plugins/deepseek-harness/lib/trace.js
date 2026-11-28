@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { readToolResult } from './adapter.js'
 import { redactString } from './redaction.js'
 
 const CONTENT_CHARS = 10_000
@@ -68,18 +69,17 @@ export function collectTurnTraces(events, turn, sessionId, config) {
       }
       calls.set(String(data.callId), tool)
       event = addContent({ event_type: 'tool_start', ...tool }, 'tool_input', String(data.arguments || ''))
-    } else if (raw.type === 'tool/result' && data.message?.source?.kind === 'tool') {
-      const callId = String(data.message.source.callId)
-      const tool = calls.get(callId)
+    } else if (raw.type === 'tool/result') {
+      const result = readToolResult(data.message)
+      if (!result) continue
+      const tool = calls.get(String(result.callId))
       if (!tool) continue
-      calls.delete(callId)
-      const blocks = data.message.content.filter(item => item.type === 'tool-result')
-      const failed = blocks.some(item => item.isError === true)
-      const output = blocks.map(item => text(item.content)).filter(Boolean).join('\n')
+      calls.delete(String(result.callId))
+      const output = text(result.content)
       event = addContent(
-        { event_type: failed ? 'tool_failure' : 'tool_success', ...tool },
-        failed ? 'error' : 'tool_response',
-        output || (failed ? String(data.error?.message || 'Tool failed') : ''),
+        { event_type: result.failed ? 'tool_failure' : 'tool_success', ...tool },
+        result.failed ? 'error' : 'tool_response',
+        output || (result.failed ? String(data.error?.message || 'Tool failed') : ''),
       )
     } else if (raw.type === 'turn/end') {
       event = addContent({

@@ -4,6 +4,29 @@ import test from 'node:test'
 import { OgMemoryClient } from '../lib/client.js'
 import { resolveConfig } from '../lib/config.js'
 
+test('headless profile resolves its tenant key from the launch snapshot', async t => {
+  const inherited = 'OGMEM_DSH_CLIENT_TEST'
+  t.mock.method(globalThis, 'fetch', async (_url, init) =>
+    Response.json({ key: init.headers['X-API-Key'] }))
+  const saved = process.env[inherited]
+  process.env[inherited] = 'inherited'
+  t.after(() => {
+    if (saved === undefined) delete process.env[inherited]
+    else process.env[inherited] = saved
+  })
+  const snapshot = { get: ref => ref === inherited ? { value: 'snapshot' } : undefined }
+  const config = resolveConfig({ apiKeyEnv: inherited })
+  const query = ctx => new OgMemoryClient(ctx, config).queryMemory({ sessionId: 's', query: 'x', topK: 1 })
+  assert.deepEqual(await query({ get: name => name === 'launchEnvironment' ? snapshot : undefined }), { key: 'snapshot' })
+  assert.deepEqual(await query({ get: () => undefined }), { key: 'inherited' })
+  assert.deepEqual(await query({
+    get: name => name === 'credentials' ? { resolve: async () => ({ value: 'stored' }) } : snapshot,
+  }), { key: 'stored' })
+  assert.deepEqual(await query({
+    get: name => name === 'credentials' ? { resolve: async () => undefined } : snapshot,
+  }), {})
+})
+
 test('dispose marks unavailable server cleanup as retryable', async t => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => Response.json({

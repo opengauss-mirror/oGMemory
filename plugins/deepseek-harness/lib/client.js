@@ -152,8 +152,17 @@ export class OgMemoryClient {
       'X-Agent-ID': this.config.agentId,
     }
     if (this.config.apiKeyEnv) {
-      const resolved = await this.ctx.credentials.resolve(this.config.apiKeyEnv)
-      if (resolved?.value) headers['X-API-Key'] = resolved.value
+      const ref = this.config.apiKeyEnv
+      const credentials = this.ctx.get ? this.ctx.get('credentials') : this.ctx.credentials
+      let key
+      if (credentials) {
+        key = (await credentials.resolve(ref))?.value
+      } else {
+        // Headless DSH can omit the credential store and supply its launch environment.
+        const launch = this.ctx.get?.('launchEnvironment')
+        key = launch ? launch.get(ref)?.value : process.env[ref]
+      }
+      if (key) headers['X-API-Key'] = key
     }
 
     const timeoutSignal = AbortSignal.timeout(timeoutMs)
