@@ -149,6 +149,9 @@ plugins:
 					return
 				}
 				waitStartupMarker(t, ctx, markers["READY"])
+				// READY proves cancellation has ended startup's preparation wait.
+				// Release either blocked stage without racing that decision.
+				startupMarker(markers["RELEASE"])
 				addr, err := os.ReadFile(markers["READY"])
 				if err != nil {
 					t.Fatal(err)
@@ -171,7 +174,6 @@ plugins:
 				}
 				check("/cached", http.StatusOK)
 				if stage == "initialize" {
-					startupMarker(markers["RELEASE"])
 					waitStartupMarker(t, ctx, markers["CLEANED"])
 				}
 				// The synchronous preparation unit test checks cancellation
