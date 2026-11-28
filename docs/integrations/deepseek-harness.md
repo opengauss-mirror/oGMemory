@@ -2,6 +2,9 @@
 
 oGMemory 插件为 DeepSeek Harness（DSH）提供自动记忆召回、对话写回和跨会话记忆能力。
 
+在浏览器中使用插件可按第 1–5 节操作。在命令行运行一次性任务可按
+[Headless](#headless) 完成安装、配置、跨会话验证和卸载。
+
 ## 1. 准备 oGMemory 服务
 
 在服务器上按照 [oGMemory 一键部署与体验指南](../../deploy/user-quickstart/README_zh.md) 完成部署，并通过 HTTPS 发布 HTTP API。
@@ -24,9 +27,10 @@ curl -fsS https://memory.example.com/api/v1/health
 
 响应中的 `status` 为 `ok` 后继续安装 DSH。
 
-## 2. 安装并初始化 DSH
+## 2. 安装 DSH 并初始化 Web UI
 
-安装 Git、Node.js `22.19.0+` 或 `24.0.0+`，以及 pnpm，然后安装插件适配的 DSH 版本：
+安装 Git、Node.js `22.19.0+` 或 `24.0.0+`，以及 pnpm。已有 DSH 环境可通过
+`dsh --version` 查看版本，并在第 3 步选择对应的插件。新安装 `0.1.5-rc.2` 的示例如下。
 
 ```bash
 npm install -g pnpm
@@ -36,8 +40,7 @@ pnpm --version
 dsh --version
 ```
 
-插件 `0.1.1` 支持 DSH CLI `0.1.5-rc.2`、核心包 `0.1.5-rc.2`、Cordis `4.0.2`，
-提供已完成对话的自动写回和跨会话记忆召回。
+DSH CLI 和核心包 `0.1.5-rc.2` 对应插件 `0.1.1`，`0.2.1-rc.2` 对应插件 `0.2.1`。
 
 启动 Web UI：
 
@@ -47,12 +50,21 @@ dsh --profile web
 
 在浏览器中打开 DSH 显示的地址，按照引导配置模型提供方并完成一次普通对话。完成后按 `Ctrl+C` 结束进程。
 
-## 3. 安装 oGMemory 插件
+## 3. 将 oGMemory 插件安装到 Web profile
 
-将插件安装到 DSH 的 `web` profile：
+DSH `0.1.5-rc.2` 直接从仓库安装插件 `0.1.1`。
 
 ```bash
 dsh plugin --profile web add https://gitcode.com/opengauss/oGMemory.git#dev
+```
+
+DSH `0.2.1-rc.2` 使用插件 `0.2.1` 的安装包。在同一 `dev` 分支的本地仓库中，
+使用 Node.js 和 `tar` 构建新版安装包，然后用目标 DSH 的 CLI 安装。
+
+```bash
+cd plugins/deepseek-harness
+node scripts/pack.mjs 0.2.1-rc.2
+dsh plugin --profile web add ./dist/opengauss-ogmemory-dsh-plugin-0.2.1.tgz
 ```
 
 查看 profile 配置：
@@ -69,7 +81,7 @@ id: ogmemory-lifecycle
 name: '@opengauss/ogmemory-dsh-plugin'
 ```
 
-## 4. 配置连接
+## 4. 配置连接并启动 Web UI
 
 在启动 DSH 的运行环境中设置：
 
@@ -99,7 +111,7 @@ dsh --profile web
 
 同一用户在不同会话中使用相同的 Account ID 和 User ID。不同用户使用不同的 User ID。
 
-## 5. 体验跨会话记忆
+## 5. 在 Web UI 体验跨会话记忆
 
 体验前确认自动采集与召回均开启。如果 DSH 已运行，先按 `Ctrl+C` 退出，设置环境变量后重新启动：
 
@@ -178,3 +190,59 @@ dsh --profile web
 
 关闭采集后，新对话不会自动写入，延长等待也不会生成新记忆。再次执行第 5 节跨会话体验时，
 须将两个变量重新设为 `true` 并重启 DSH，然后发送新的记忆内容。
+
+## Headless
+
+以下 Bash 示例使用 DSH `0.2.1-rc.2` 和插件 `0.2.1`。先配置可用的模型提供方，
+并准备第 1 节所列的 oGMemory 地址、Tenant Key 和身份信息。示例中的 `dsh` 指目标安装的 CLI。
+使用 AgentBench 时，用同一安装目录的 `node_modules/.bin/dsh` 管理插件和查看配置，
+用任务包装器启动下面的两次 headless 任务。安装、验证和运行都使用相同的 `DSH_HOME`。
+
+**安装并检查配置。** 在仓库根目录中构建安装包，再将其加入 `headless` profile。
+
+```bash
+node plugins/deepseek-harness/scripts/pack.mjs 0.2.1-rc.2
+dsh plugin --profile headless add ./plugins/deepseek-harness/dist/opengauss-ogmemory-dsh-plugin-0.2.1.tgz
+dsh --profile headless --dump-config | grep -F ogmemory-lifecycle
+```
+
+输出中应出现 `ogmemory-lifecycle`。如果使用 DSH `0.1.5-rc.2`，安装命令为
+`dsh plugin --profile headless add https://gitcode.com/opengauss/oGMemory.git#dev`。
+
+**配置连接。** 在运行任务的同一终端中设置以下变量，替换服务地址和身份示例值。
+按提示输入该租户的 oGMemory Tenant Key。
+
+```bash
+export OGMEM_URL='https://memory.example.com'
+export OGMEM_ACCOUNT_ID='customer-a'
+export OGMEM_USER_ID='alice'
+export OGMEM_AGENT_ID='customer-a-api-agent'
+read -rsp 'oGMemory Tenant Key: ' OGMEM_DSH_API_KEY && echo
+export OGMEM_DSH_API_KEY
+export OGMEM_AUTO_CAPTURE=true OGMEM_AUTO_RECALL=true
+```
+
+**验证跨会话记忆。** 第一次运行生成一个新的测试项目和随机口令，并请模型记住它。
+
+```bash
+project=$(node -p "require('node:crypto').randomUUID()")
+marker=$(node -p "require('node:crypto').randomUUID()")
+dsh --profile headless "请记住：项目 ${project} 的验收口令是 ${marker}。只回复已记住。"
+```
+
+等 oGMemory 完成本轮写回、提取和索引，再运行第二条任务。两次独立启动均省略
+`--session-id`，DSH 会创建两个不同的会话。
+
+```bash
+dsh --profile headless "项目 ${project} 的验收口令是什么？只回复口令。"
+printf '预期口令：%s\n' "$marker"
+```
+
+第二次输出应包含本次生成的口令。在第二个会话的轨迹中确认 `<ogmemory-context>`
+包含同一口令，即可核实本次回答使用了插件召回的内容。
+
+**卸载。** 如需移除本次安装，使用同一个 CLI 和 profile。
+
+```bash
+dsh plugin --profile headless remove @opengauss/ogmemory-dsh-plugin
+```

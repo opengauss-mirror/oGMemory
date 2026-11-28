@@ -8,12 +8,10 @@
  */
 
 import { join } from 'node:path'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-
 import { resolveConfig } from './lib/config.js'
 import { OgMemoryClient } from './lib/client.js'
 import { scopedPendingDir } from './lib/pending-queue.js'
-import { extractDirectUserPrompt, renderComposeContext } from './lib/recall.js'
+import { createRecallMessage, extractDirectUserPrompt, renderComposeContext } from './lib/recall.js'
 import { registerOgMemoryTools } from './lib/tools.js'
 import { guardOgMemoryUri } from './lib/uri-guard.js'
 import { collectTurnMessages, OrderedWriteQueue } from './lib/writeback.js'
@@ -21,7 +19,7 @@ import { collectTurnTraces, traceEnvelope } from './lib/trace.js'
 
 export const name = 'ogmemory-lifecycle'
 
-export const inject = ['agents', 'credentials', 'sessions', 'tools']
+export const inject = ['agents', 'sessions', 'tools']
 
 export function apply(ctx, inputConfig = {}) {
   const config = resolveConfig(inputConfig)
@@ -88,18 +86,10 @@ export function apply(ctx, inputConfig = {}) {
       )
       if (context.length === 0) return decision
       return {
-        kind: 'enter',
+        ...decision,
         messages: [
           ...decision.messages,
-          createUserMessage({
-            source: {
-              kind: 'plugin',
-              plugin: name,
-              form: 'snapshot',
-              sections: [{ name: 'ogmemory', text: context }],
-            },
-            content: [{ type: 'text', text: context }],
-          }),
+          createRecallMessage(name, context),
         ],
       }
     } catch (error) {
