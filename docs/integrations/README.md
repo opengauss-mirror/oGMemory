@@ -1,7 +1,7 @@
 # 客户端 Agent 对接 oGMemory
 
 为已有 Agent 导出配置：`ogmem onboard --mode plugin`。
-七种原生适配器之外的 Agent 自动回退到 HTTP MCP。参见[接入配置生成](plugin-config.md)。
+其他 Agent 可回退到 HTTP MCP。参见[接入配置生成](plugin-config.md)。
 
 | 接入方式 | 文档 | 入口 | 适用场景 |
 | --- | --- | --- | --- |
@@ -11,6 +11,7 @@
 | 通用 Agent Plugin | [记忆检索与写入](agent-plugins.md) | Agent Plugins 1.0 / stdio 代理 + Skill | OpenClaw、DSH、Claude Code、Codex 等 MCP Agent |
 | Claude Code | [Claude Code 插件](claude-code.md) | Claude Code Hooks | Claude Code |
 | Codex | [Codex 插件](codex.md) | 全生命周期 Codex Hooks | Codex App、CLI、IDE |
+| ZCode | [ZCode 插件](zcode.md) | ZCode 原生 Hooks | ZCode Agent |
 | OpenCode | [OpenCode 插件](opencode.md) | OpenCode lifecycle hooks | OpenCode 1.15.11+ |
 | DeepSeek Harness | [DSH 插件](deepseek-harness.md) | DSH bundle 与生命周期 Hook | DSH 0.1.5-rc.2 |
 | Hermes Agent | [Hermes MemoryProvider](hermes.md) | Hermes Memory Provider Hook | Hermes Agent |

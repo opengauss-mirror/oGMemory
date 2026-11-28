@@ -1,0 +1,5 @@
+{
+  "name": "ogmemory",
+  "version": "0.1.0",
+  "description": "Recall oGMemory context and capture ZCode conversations and execution traces."
+}
